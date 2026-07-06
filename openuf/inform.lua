@@ -465,26 +465,19 @@ function M.run(cfg, ufhw)
 			socket.select(nil, nil, backoff)
 		else
 			backoff = interval
-			local resp_json, resp_flags = pcall(M.parse_packet, body, st)
-			if resp_flags then
+			-- pcall returns: status, first_return, second_return, ...
+			local parse_ok, json_body, resp_flags = pcall(M.parse_packet, body, st)
+			if parse_ok then
 				-- Auto-detect GCM from controller response flags
-				if bit.band(resp_flags, FLAG_GCM) ~= 0 then
+				if resp_flags and bit.band(resp_flags, FLAG_GCM) ~= 0 then
 					use_gcm = true
 				end
-			end
-			local json_ok, json_body
-			if type(resp_json) == "string" then
-				json_ok  = true
-				json_body = resp_json
-			end
-			if json_ok then
 				local need_followup = M.handle_response(json_body, st)
-				if need_followup then
-					-- Send another inform immediately after config apply
-				else
+				if not need_followup then
 					socket.select(nil, nil, interval)
 				end
 			else
+				io.stderr:write("inform: parse error: " .. tostring(json_body) .. "\n")
 				socket.select(nil, nil, interval)
 			end
 		end

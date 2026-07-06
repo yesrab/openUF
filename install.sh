@@ -43,32 +43,9 @@ case "$1" in
 		ln -sf "$INSTALL_DIR/hook/syswrapper.sh" "$BIN_LINK"
 		chmod +x "$BIN_LINK"
 
-		# Install init.d service if not already present
-		if [ ! -f "$INIT_SCRIPT" ]; then
-			cat > "$INIT_SCRIPT" << 'EOF'
-#!/bin/sh /etc/rc.common
-START=99
-STOP=01
-USE_PROCD=1
-
-start_service() {
-	procd_open_instance announce
-	procd_set_param command lua /opt/openuf/announce.lua
-	procd_set_param respawn
-	procd_set_param stdout 1
-	procd_set_param stderr 1
-	procd_close_instance
-
-	procd_open_instance inform
-	procd_set_param command lua /opt/openuf/inform.lua
-	procd_set_param respawn
-	procd_set_param stdout 1
-	procd_set_param stderr 1
-	procd_close_instance
-}
-EOF
-			chmod +x "$INIT_SCRIPT"
-		fi
+		# Install init.d service
+		cp openuf/etc/init.d/openuf "$INIT_SCRIPT"
+		chmod +x "$INIT_SCRIPT"
 
 		# Enable and start services
 		"$INIT_SCRIPT" enable 2>/dev/null

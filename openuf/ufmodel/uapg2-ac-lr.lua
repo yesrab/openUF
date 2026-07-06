@@ -15,7 +15,7 @@ uap = {
 		buildtime	= "160101.0000",
 		factoryver  = "3.4.1"
 	},
-	bootver			= ""
+	bootver			= "",
 	field			= {},
 }
 
