@@ -15,10 +15,10 @@ jobs:
       - name: Install Lua and dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y lua5.1 luarocks openssl
+          sudo apt-get install -y lua5.1 lua-bitop luarocks openssl
           # lua-cjson requires lua5.1 dev headers
           sudo apt-get install -y liblua5.1-dev
-          sudo luarocks install lua-cjson
+          sudo luarocks --lua-version 5.1 install lua-cjson
 
       - name: Run tests
         run: lua5.1 tests/run_tests.lua

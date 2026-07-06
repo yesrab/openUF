@@ -117,7 +117,7 @@ function M.aes_cbc_encrypt(key_hex, iv, plaintext)
 			-- Some versions don't take the raw flag; try without
 			result = _lcrypto.encrypt("aes-128-cbc", padded, key, iv)
 			-- Decode base64 if returned as base64
-			if result and result:find("[A-Za-z0-9+/=]") and not result:find("[\x00-\x1f]") then
+			if result and result:find("[A-Za-z0-9+/=]") and not result:find("[\0-\31]") then
 				local ok2, dec = pcall(require("mime").unb64, result)
 				if ok2 then result = dec end
 			end

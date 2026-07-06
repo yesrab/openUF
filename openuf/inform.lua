@@ -25,12 +25,14 @@ local bit = (function()
 	if ok then return b end
 	ok, b = pcall(require, "bit32")
 	if ok then return b end
+	local _l = load or loadstring
+	local function _f(e) return _l("return function(a,b) return "..e.." end")() end
 	return {
-		band   = function(a, b) return a & b  end,
-		bor    = function(...) local r = 0; for i = 1, select('#', ...) do r = r | select(i, ...) end; return r end,
-		bxor   = function(a, b) return a ~ b  end,
-		lshift = function(a, b) return a << b end,
-		rshift = function(a, b) return a >> b end,
+		band   = _f("a&b"),
+		bor    = _l("return function(...) local r=0 for i=1,select('#',...)do r=r|select(i,...)end return r end")(),
+		bxor   = _f("a~b"),
+		lshift = _f("a<<b"),
+		rshift = _f("a>>b"),
 	}
 end)()
 -- socket is lazy-loaded inside http_post/run so the module can be required

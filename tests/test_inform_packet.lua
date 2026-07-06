@@ -12,8 +12,8 @@ local inform = dofile("openuf/inform.lua")
 inform._state._state_file = "/tmp/openuf_test_inform.json"
 
 -- Deterministic IV for reproducible packets
-local FIXED_IV = string.rep("\x00", 16)
-crypto._random_bytes = function(n) return string.rep("\x00", n) end
+local FIXED_IV = string.rep("\0", 16)
+crypto._random_bytes = function(n) return string.rep("\0", n) end
 
 -- Minimal state for packet building
 local function sample_state(overrides)
@@ -101,7 +101,7 @@ return {
 		fn = function()
 			local pkt = inform.build_packet('{"_type":"state"}', sample_state())
 			local h = parse_header(pkt)
-			assert_true(h.flags & 0x01 ~= 0, "encrypted flag set")
+			assert_true(h.flags % 2 ~= 0, "encrypted flag set")
 		end
 	},
 	{
@@ -158,7 +158,7 @@ return {
 		name = "inform packet: parse raises error on short packet",
 		fn = function()
 			assert_error(function()
-				inform.parse_packet("TNBU\x00\x00\x00", sample_state())
+				inform.parse_packet("TNBU\0\0\0", sample_state())
 			end, "short packet raises error")
 		end
 	},

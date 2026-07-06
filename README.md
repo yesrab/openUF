@@ -1,5 +1,9 @@
 # openUF
 
+[![Tests](https://github.com/jonasevcik/openUF/actions/workflows/test.yml/badge.svg)](https://github.com/jonasevcik/openUF/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Lua 5.1+](https://img.shields.io/badge/Lua-5.1%2B-blue.svg)](https://www.lua.org/)
+
 openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi U6-InWall** (or other UniFi AP models) to a UniFi Network Application controller.  The controller can then adopt the device, push SSID configuration, and display client statistics — all without genuine Ubiquiti hardware.
 
 ## What it does
@@ -83,13 +87,6 @@ Key reference material:
 - [jeffreykog/unifi-inform-protocol](https://github.com/jeffreykog/unifi-inform-protocol)
 - [fxkr/unifi-protocol-reverse-engineering](https://github.com/fxkr/unifi-protocol-reverse-engineering)
 
-## Differences from Coll147/OpenUniFi
-
-The [Coll147/OpenUniFi](https://github.com/Coll147/OpenUniFi) C-language fork carried two bugs not present here:
-
-1. **authkey injection via setparam** — the controller's `setparam` response should never update the authkey; only `set-adopt` (SSH) can do that.  The C port updated the key from JSON, which allows key substitution attacks.
-2. **Announce packet length off-by-one** — the original Lua code and the C port both wrote only the low byte of the 16-bit packet length field.  Packets > 255 bytes were misreported.  Both bugs are fixed in this version.
-
 ## License
 
-MIT — see LICENSE file (or add one if absent).
+MIT — see [LICENSE](LICENSE).

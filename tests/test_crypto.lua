@@ -5,7 +5,7 @@
 local crypto = dofile("openuf/crypto.lua")
 
 -- Fixed IV for deterministic tests
-local FIXED_IV = string.rep("\x00", 16)
+local FIXED_IV = string.rep("\0", 16)
 
 -- NIST AES-128-CBC test vector (from NIST SP 800-38A, F.2.1):
 -- Key:  2b7e151628aed2a6abf7158809cf4f3c
@@ -63,12 +63,12 @@ return {
 			local called = false
 			crypto._random_bytes = function(n)
 				called = true
-				return string.rep("\x42", n)
+				return string.rep("\66", n)
 			end
 			local iv = crypto.random_iv(16)
 			crypto._random_bytes = nil
 			assert_true(called, "override was called")
-			assert_eq(iv, string.rep("\x42", 16), "returned injected value")
+			assert_eq(iv, string.rep("\66", 16), "returned injected value")
 		end
 	},
 	{
@@ -127,7 +127,7 @@ return {
 		fn = function()
 			local key = crypto.DEFAULT_KEY
 			local pt = "same plaintext!!"
-			local iv2 = string.rep("\xff", 16)
+			local iv2 = string.rep("\255", 16)
 			local ct1 = crypto.aes_cbc_encrypt(key, FIXED_IV, pt)
 			local ct2 = crypto.aes_cbc_encrypt(key, iv2, pt)
 			assert_neq(ct1, ct2, "different IVs produce different ciphertext")

@@ -14,12 +14,9 @@ local bit = (function()
 	if ok then return b end
 	ok, b = pcall(require, "bit32")
 	if ok then return b end
-	return {
-		band   = function(a, b) return a & b  end,
-		bor    = function(a, b) return a | b  end,
-		lshift = function(a, b) return a << b end,
-		rshift = function(a, b) return a >> b end,
-	}
+	local _l = load or loadstring
+	local function _f(e) return _l("return function(a,b) return "..e.." end")() end
+	return {band=_f("a&b"), bor=_f("a|b"), lshift=_f("a<<b"), rshift=_f("a>>b")}
 end)()
 
 local M = {}
