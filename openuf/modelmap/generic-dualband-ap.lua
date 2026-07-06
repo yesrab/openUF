@@ -1,0 +1,59 @@
+--[[
+	Generic dual-band OpenWrt AP hardware profile.
+	Tested with: TP-Link WDR3500, TP-Link Archer C5 v1.
+
+	Adjust radio names if your device uses different UCI radio identifiers.
+	Run `uci show wireless` on the device to confirm interface names.
+]]--
+
+local dev = {}
+dev.conf = {}
+
+-- OpenWrt network layout
+dev.conf.net = {
+	lan_name	= "lan",
+	lan_cpueth	= "eth1",
+	lan_vlanid	= 1,
+	wan_name	= "wan",
+	wan_cpueth	= "eth0",
+	wan_vlanid	= 4090,
+}
+
+-- No dedicated LED entry by default; set to nil or a sysfs path if available
+dev.conf.led = nil
+
+-- Switch layout (common for both target devices)
+dev.conf.vlan = {
+	cpu_lan	= 0,
+	cpu_wan	= 6,
+	ports	= {
+		lan1	= 1,
+		lan2	= 2,
+		lan3	= 3,
+		lan4	= 4,
+		wan		= 5,
+	}
+}
+
+-- UniFi configuration
+dev.openuf = {}
+
+dev.openuf.uap = {
+	ufmodel		= "u6iw",
+	hwassign	= {"radio0", "radio1"},	-- radio0 = 2.4 GHz, radio1 = 5 GHz
+}
+
+dev.openuf.usg = {
+	umodel	= "usg3",
+	bootver	= "",
+	firmver	= "",
+	rulepre	= "uf_",
+	descpre	= "UF Controller - ",
+}
+
+dev.openuf.usw = {
+	switch		= "switch0",
+	mirror_type	= "single",
+}
+
+return dev

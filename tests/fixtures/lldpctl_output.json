@@ -1,0 +1,43 @@
+{
+  "lldp": {
+    "interface": [
+      {
+        "name": "eth0",
+        "via": "LLDP",
+        "rid": "1",
+        "age": "0 day, 00:01:23",
+        "neighbor": {
+          "chassis": {
+            "id": {
+              "type": "mac",
+              "value": "aa:bb:cc:dd:ee:01"
+            },
+            "name": {
+              "value": "switch01"
+            },
+            "descr": {
+              "value": "Ubiquiti UniFi Switch 8 60W"
+            },
+            "mgmt-ip": "192.168.1.2",
+            "capability": [
+              {"type": "Bridge", "enabled": true},
+              {"type": "Router", "enabled": false}
+            ]
+          },
+          "port": {
+            "id": {
+              "type": "ifname",
+              "value": "GigabitEthernet0/1"
+            },
+            "descr": {
+              "value": "Uplink port"
+            }
+          },
+          "ttl": {
+            "ttl": "120"
+          }
+        }
+      }
+    ]
+  }
+}

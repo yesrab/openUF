@@ -4,7 +4,22 @@
 ]]--
 
 -- load global libraries
-local bit = require("bit")
+-- Lua 5.1 (OpenWrt): luabitop via require("bit")
+-- Lua 5.3+ (dev): native bitwise operators via fallback table
+local bit = (function()
+	local ok, b = pcall(require, "bit")
+	if ok then return b end
+	ok, b = pcall(require, "bit32")
+	if ok then return b end
+	return {
+		band   = function(a, b) return a & b  end,
+		bor    = function(a, b) return a | b  end,
+		bxor   = function(a, b) return a ~ b  end,
+		bnot   = function(a)    return ~a     end,
+		lshift = function(a, b) return a << b end,
+		rshift = function(a, b) return a >> b end,
+	}
+end)()
 
 
 -- global helpers

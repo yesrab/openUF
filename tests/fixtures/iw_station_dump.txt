@@ -1,0 +1,32 @@
+Station aa:bb:cc:dd:ee:ff (on wlan0)
+	inactive time:	120 ms
+	rx bytes:	45678
+	rx packets:	312
+	tx bytes:	98765
+	tx packets:	287
+	tx retries:	4
+	tx failed:	0
+	signal:  	-62 dBm
+	signal avg:	-63 dBm
+	tx bitrate:	144.4 MBit/s MCS 15 short GI
+	rx bitrate:	72.2 MBit/s MCS 7 short GI
+	authorized:	yes
+	authenticated:	yes
+	associated:	yes
+	preamble:	long
+	WMM/WME:	yes
+Station 11:22:33:44:55:66 (on wlan0)
+	inactive time:	500 ms
+	rx bytes:	1024
+	rx packets:	8
+	tx bytes:	2048
+	tx packets:	12
+	tx retries:	0
+	tx failed:	0
+	signal:  	-75 dBm
+	signal avg:	-74 dBm
+	tx bitrate:	65.0 MBit/s MCS 6 short GI
+	rx bitrate:	54.0 MBit/s MCS 5
+	authorized:	yes
+	authenticated:	yes
+	associated:	yes
