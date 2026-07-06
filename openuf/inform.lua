@@ -54,8 +54,10 @@ local lldp    = _require_sibling("lldp")
 
 local M = {}
 
--- Injectable: expose internal state module so tests can redirect state._state_file
-M._state = state
+-- Injectable: expose internal modules so tests can inject fixtures
+M._state   = state
+M._sysinfo = sysinfo
+M._lldp    = lldp
 
 -- Packet constants
 local MAGIC        = "TNBU"
@@ -222,10 +224,10 @@ function M.build_json(st, cfg, ufhw)
 	local uap = ufhw and ufhw.uap or {}
 
 	-- Collect sysinfo
-	local uptime   = sysinfo.uptime()
-	local meminfo  = sysinfo.meminfo()
-	local ifaces   = sysinfo.interfaces()
-	local lldp_nbrs = lldp.neighbors()
+	local uptime    = M._sysinfo.uptime()
+	local meminfo   = M._sysinfo.meminfo()
+	local ifaces    = M._sysinfo.interfaces()
+	local lldp_nbrs = M._lldp.neighbors()
 
 	-- Build if_table
 	local if_table = {}
@@ -249,8 +251,10 @@ function M.build_json(st, cfg, ufhw)
 	-- Try to load ufuci if available for VAP/radio info
 	local ok_uci, ufuci = pcall(_require_sibling, "ucihelper")
 	if ok_uci and ufuci.get_vap_table then
-		vap_table   = ufuci.get_vap_table()
-		radio_table = ufuci.get_radio_table()
+		local ok_v, rv = pcall(ufuci.get_vap_table)
+		if ok_v then vap_table = rv end
+		local ok_r, rr = pcall(ufuci.get_radio_table)
+		if ok_r then radio_table = rr end
 	end
 
 	-- lldp_table

@@ -122,4 +122,40 @@ return {
 			end)
 		end
 	},
+	{
+		name = "sysinfo: radio_stats() parses survey dump in-use channel",
+		fn = function()
+			with_fixtures({}, {["survey dump"] = fixture("iw_survey_dump.txt")}, function()
+				local stats = sysinfo.radio_stats("wlan0")
+				-- Fixture has 2 frequency entries; the first is the in-use channel
+				assert_true(#stats >= 1, "at least one entry")
+				local active
+				for _, s in ipairs(stats) do
+					if s.freq == 2437 then active = s end
+				end
+				assert_not_nil(active, "2437 MHz entry found")
+				assert_eq(active.noise,             -95,  "noise dBm")
+				assert_eq(active.channel_time,      5000, "channel_time ms")
+				assert_eq(active.channel_time_busy, 1850, "channel_time_busy ms")
+				assert_eq(active.channel_time_rx,    900, "channel_time_rx ms")
+				assert_eq(active.channel_time_tx,    450, "channel_time_tx ms")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: radio_stats() returns empty table for empty output",
+		fn = function()
+			with_fixtures({}, {["survey dump"] = ""}, function()
+				assert_eq(#sysinfo.radio_stats("wlan0"), 0, "empty result")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: radio_stats() returns empty table for nil ifname",
+		fn = function()
+			with_fixtures({}, {}, function()
+				assert_eq(#sysinfo.radio_stats(nil), 0, "nil ifname safe")
+			end)
+		end
+	},
 }
