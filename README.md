@@ -63,7 +63,7 @@ brew install lua luarocks      # macOS
 # Install test dependencies
 luarocks install --local lua-cjson
 
-# Run unit tests (66 tests, all pure Lua)
+# Run unit tests (102 tests, all pure Lua)
 eval $(luarocks path --local)
 lua tests/run_tests.lua
 
@@ -84,6 +84,7 @@ openUF implements the **TNBU binary inform protocol**:
 - Adoption: controller SSHes in and calls `syswrapper.sh set-adopt <url> <newkey>`
 
 Key reference material:
+- [amd989/unifi-gateway](https://github.com/amd989/unifi-gateway) — primary protocol reference; live Python daemon tested against real controllers
 - [jeffreykog/unifi-inform-protocol](https://github.com/jeffreykog/unifi-inform-protocol)
 - [fxkr/unifi-protocol-reverse-engineering](https://github.com/fxkr/unifi-protocol-reverse-engineering)
 

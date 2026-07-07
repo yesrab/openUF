@@ -111,6 +111,19 @@ config = {
 
 ## 4. Adoption flow
 
+### SSH prerequisite
+
+The controller SSHes into the device as `root` to run `syswrapper.sh set-adopt` during adoption.  **SSH must be accessible and the root password must be set** before clicking Adopt:
+
+```sh
+# On the OpenWrt device — set a root password if not already done
+passwd root
+```
+
+Confirm SSH works from the controller's network before attempting adoption.  A fresh OpenWrt install often has a blank root password and SSH enabled; set the password first.
+
+> **Security note:** openUF intentionally ignores the `authkey` field inside the `mgmt_cfg` payload sent by the controller over HTTP.  Key rotation only happens via this SSH `set-adopt` path, matching how real UniFi hardware works.
+
 ### L2 adoption (device and controller on the same subnet)
 
 1. Start openUF (`/etc/init.d/openuf start` or `sh install.sh install`)
@@ -145,7 +158,8 @@ Persistent state is stored at `/etc/openuf/state.json`:
   "adopted":    false,
   "authkey":    "ba86f2bbe107c7c57eb5f2690775c712",
   "cfgversion": "",
-  "inform_url": "http://unifi:8080/inform"
+  "inform_url": "http://unifi:8080/inform",
+  "use_gcm":    false
 }
 ```
 
@@ -155,6 +169,7 @@ Persistent state is stored at `/etc/openuf/state.json`:
 | `authkey` | 32 hex chars (16-byte AES-128 key); default = pre-adoption key |
 | `cfgversion` | Opaque string the controller uses to push config updates |
 | `inform_url` | URL for the 10-second inform heartbeat |
+| `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
 
 To reset to factory defaults:
 ```sh
@@ -200,7 +215,7 @@ If `lldpd` is absent or returns no neighbors, `lldp.lua` returns an empty table 
 |---|---|
 | Device doesn't appear in UniFi Discover | `announce.lua` not running, or UDP port 10001 blocked |
 | Controller shows device as "Disconnected" | `inform.lua` not running, or wrong `inform_url` |
-| Adoption fails with SSH error | SSH daemon not running, or controller can't reach device |
+| Adoption fails with SSH error | SSH not reachable from controller, or root password not set — run `passwd root` on the device |
 | Controller rejects device ("firmware incompatible") | Adjust `fw.ver` in `ufmodel/u6iw.lua` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
 | SSID not appearing after adoption | Check `uci show wireless`, check `loglevel` in `/var/log/openuf.log` |
