@@ -148,33 +148,41 @@ function M.aes_cbc_decrypt(key_hex, iv, ciphertext)
 end
 
 -- AES-128-GCM encrypt (requires luacrypto with AEAD/GCM support)
+-- aad: optional binary string for authenticated additional data (the 40-byte
+--      TNBU header per amd989/unifi-gateway; nil = no AAD)
 -- Returns: ciphertext (binary string), auth_tag (16-byte binary string)
-function M.aes_gcm_encrypt(key_hex, iv, plaintext)
+function M.aes_gcm_encrypt(key_hex, iv, plaintext, aad)
 	if not _crypto_ok then
 		error("aes_gcm_encrypt: luacrypto not available; GCM requires it")
 	end
 	local key = M.hex_to_bin(key_hex)
-	-- Try EVP AEAD interface (luacrypto >= 2.x or lua-openssl)
 	if _lcrypto.aead then
 		local ctx = _lcrypto.aead("aes-128-gcm", key, iv, true)
+		-- Feed AAD if the luacrypto binding exposes updateAAD (version-dependent)
+		if aad and #aad > 0 and type(ctx.updateAAD) == "function" then
+			ctx:updateAAD(aad)
+		end
 		local ct = ctx:update(plaintext)
 		ct = ct .. ctx:final()
 		local tag = ctx:getTag(16)
 		return ct, tag
 	end
-	-- Alternative: use EVP directly
 	error("aes_gcm_encrypt: luacrypto version lacks GCM support; update luacrypto or use CBC")
 end
 
 -- AES-128-GCM decrypt
+-- aad: optional binary string for AAD verification (must match what was used to encrypt)
 -- Raises an error if authentication tag verification fails
-function M.aes_gcm_decrypt(key_hex, iv, ciphertext, tag)
+function M.aes_gcm_decrypt(key_hex, iv, ciphertext, tag, aad)
 	if not _crypto_ok then
 		error("aes_gcm_decrypt: luacrypto not available")
 	end
 	local key = M.hex_to_bin(key_hex)
 	if _lcrypto.aead then
 		local ctx = _lcrypto.aead("aes-128-gcm", key, iv, false)
+		if aad and #aad > 0 and type(ctx.updateAAD) == "function" then
+			ctx:updateAAD(aad)
+		end
 		ctx:setTag(tag)
 		local pt = ctx:update(ciphertext)
 		pt = pt .. ctx:final()  -- final() verifies the tag; throws on mismatch

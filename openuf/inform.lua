@@ -63,12 +63,13 @@ M._lldp    = lldp
 
 -- Packet constants
 local MAGIC        = "TNBU"
-local PKT_VERSION  = 0
+local PKT_VERSION  = 1   -- confirmed by amd989/unifi-gateway and fxkr reverse-engineering
 local DATA_VERSION = 1
 
 -- Inform flags
 local FLAG_ENCRYPTED  = 0x01
 local FLAG_COMPRESSED = 0x02
+local FLAG_SNAPPY     = 0x04  -- Snappy compression (amd989 prefers it; we send zlib only)
 local FLAG_GCM        = 0x08
 
 -- Injectable: override in tests to skip real HTTP
@@ -120,9 +121,10 @@ end
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 
 -- Build a TNBU binary packet from a JSON string.
--- st: state table (for authkey, adopted)
--- use_gcm: force GCM instead of CBC (auto-detected from controller hint otherwise)
-function M.build_packet(json_str, st, use_gcm)
+-- st: state table (authkey, mac, use_gcm)
+-- GCM AAD = first 40 bytes of the packet header (per amd989/unifi-gateway encode_inform)
+function M.build_packet(json_str, st)
+	local use_gcm = st.use_gcm and crypto.gcm_available()
 	local payload = json_str
 
 	-- Compress with zlib if available
@@ -135,31 +137,30 @@ function M.build_packet(json_str, st, use_gcm)
 			flags = bit.bor(flags, FLAG_COMPRESSED)
 		end
 	end
+	if use_gcm then flags = bit.bor(flags, FLAG_GCM) end
 
-	-- Choose encryption mode
-	local iv = crypto.random_iv(16)
-	local ciphertext
-	if use_gcm and crypto.gcm_available() then
-		local ct, tag = crypto.aes_gcm_encrypt(st.authkey, iv, payload)
-		-- Append 16-byte GCM auth tag to ciphertext
-		ciphertext = ct .. tag
-		flags = bit.bor(flags, FLAG_GCM)
-	else
-		ciphertext = crypto.aes_cbc_encrypt(st.authkey, iv, payload)
-	end
-
-	-- Get MAC from state or fall back to all-zeros
+	local iv      = crypto.random_iv(16)
 	local mac_bin = mac_bytes(st.mac or "00:00:00:00:00:00")
 
-	-- Assemble header + payload
-	return MAGIC
+	-- 36-byte fixed prefix (before payload_len field)
+	local prefix = MAGIC
 		.. uint32_be(PKT_VERSION)
 		.. mac_bin
 		.. uint16_be(flags)
 		.. iv
 		.. uint32_be(DATA_VERSION)
-		.. uint32_be(#ciphertext)
-		.. ciphertext
+
+	local ciphertext
+	if use_gcm then
+		-- GCM: payload len = compressed len + 16-byte tag; assemble full 40-byte AAD first
+		local aad = prefix .. uint32_be(#payload + 16)
+		local ct, tag = crypto.aes_gcm_encrypt(st.authkey, iv, payload, aad)
+		ciphertext = ct .. tag
+		return aad .. ciphertext
+	else
+		ciphertext = crypto.aes_cbc_encrypt(st.authkey, iv, payload)
+		return prefix .. uint32_be(#ciphertext) .. ciphertext
+	end
 end
 
 -- ─── Packet parser ───────────────────────────────────────────────────────────
@@ -194,22 +195,26 @@ function M.parse_packet(raw, st)
 	if bit.band(flags, FLAG_ENCRYPTED) ~= 0 then
 		local key = st.authkey
 		if bit.band(flags, FLAG_GCM) ~= 0 then
-			-- Last 16 bytes of payload are the GCM auth tag
+			-- AAD = full 40-byte packet header (per amd989/unifi-gateway decode_inform)
+			local aad = raw:sub(1, 40)
 			local ct  = payload:sub(1, #payload - 16)
 			local tag = payload:sub(#payload - 15)
-			payload = crypto.aes_gcm_decrypt(key, iv, ct, tag)
+			payload = crypto.aes_gcm_decrypt(key, iv, ct, tag, aad)
 		else
 			payload = crypto.aes_cbc_decrypt(key, iv, payload)
 		end
 	end
 
-	-- Decompress
+	-- Decompress — Snappy (0x04) is not supported; zlib (0x02) is.
+	if bit.band(flags, FLAG_SNAPPY) ~= 0 then
+		error("inform: controller sent snappy-compressed response; lua-snappy not supported")
+	end
 	if bit.band(flags, FLAG_COMPRESSED) ~= 0 then
 		local ok_zlib, zlib = pcall(require, "zlib")
 		if ok_zlib and zlib.decompress then
 			payload = zlib.decompress(payload)
 		else
-			error("inform: controller sent compressed response but lua-lzlib not installed")
+			error("inform: controller sent zlib-compressed response but lua-lzlib not installed")
 		end
 	end
 
@@ -275,7 +280,7 @@ function M.build_json(st, cfg, ufhw)
 	local payload = {
 		_type            = "state",
 		["default"]      = not st.adopted,
-		["state"]        = st.adopted and 1 or 0,
+		["state"]        = st.adopted and 2 or 0,  -- 2=connected, 0=unadopted (per amd989)
 		mac              = mac_str,
 		serial           = mac_str:gsub(":", ""),
 		model            = uap.model or "U6IW",
@@ -319,28 +324,48 @@ function M.handle_response(json_str, st)
 	end
 
 	if _type == "setparam" then
-		-- Handle mgmt sub-parameters from setparam response
-		local mgmt = resp.mgmt_cfg
-		if type(mgmt) == "table" then
-			-- Update inform_url if provided
-			if type(mgmt.server) == "string" and mgmt.server ~= "" then
-				local port = mgmt.port or "8080"
-				st.inform_url = "http://" .. mgmt.server .. ":" .. tostring(port) .. "/inform"
-			elseif type(mgmt.inform_url) == "string" and mgmt.inform_url ~= "" then
-				st.inform_url = mgmt.inform_url
+		-- mgmt_cfg is a newline-delimited key=value string (real controller format,
+		-- confirmed by amd989/unifi-gateway _parse_mgmt_cfg).
+		local mgmt_raw = resp.mgmt_cfg
+		if type(mgmt_raw) == "string" then
+			for line in (mgmt_raw .. "\n"):gmatch("([^\n]*)\n") do
+				local k, v = line:match("^([^=]+)=(.*)$")
+				if k and v then
+					if k == "mgmt_url" or k == "inform_url" then
+						if v ~= "" then st.inform_url = v end
+					elseif k == "use_aes_gcm" then
+						st.use_gcm = (v == "true")
+					elseif k == "cfgversion" then
+						if v ~= "" then st.cfgversion = v end
+					end
+					-- authkey: INTENTIONALLY IGNORED — only set-adopt (SSH) may do this.
+				end
 			end
-			-- NOTE: authkey is NEVER updated from setparam (Fix #1 from findings doc).
-			-- The only legitimate path for authkey is via the set-adopt shell command.
 		end
 		M._state.save(st)
 		return false
 	end
 
+	if _type == "setdefault" then
+		-- Controller requested factory reset.  Reset state on disk and in-memory.
+		io.stderr:write("inform: controller requested factory reset\n")
+		local fresh = M._state.reset()
+		for k in pairs(st) do st[k] = nil end
+		for k, v in pairs(fresh) do st[k] = v end
+		return false
+	end
+
+	if _type == "reboot" then
+		io.stderr:write("inform: controller requested reboot\n")
+		os.execute("reboot")
+		os.exit(0)
+	end
+
 	if _type == "cmd" then
-		local cmd = resp.cmd
-		if cmd == "reboot" then
-			os.execute("reboot")
-		end
+		local cmd = resp.cmd or ""
+		io.stderr:write("inform: cmd: " .. tostring(cmd) .. "\n")
+		-- set-locate / unset-locate: LED blink — log-only, no LED driver yet
+		-- speed-test, etc.: no-op
 		return false
 	end
 
@@ -458,11 +483,10 @@ function M.run(cfg, ufhw)
 	local socket   = require("socket")
 	local interval = 10
 	local backoff  = interval
-	local use_gcm  = false  -- updated based on controller response flags
 
 	while true do
 		local json_str = M.build_json(st, cfg, ufhw)
-		local pkt      = M.build_packet(json_str, st, use_gcm)
+		local pkt      = M.build_packet(json_str, st)  -- use_gcm read from st.use_gcm
 		local body, err = M.http_post(st.inform_url, pkt)
 
 		if not body then
@@ -471,13 +495,8 @@ function M.run(cfg, ufhw)
 			socket.select(nil, nil, backoff)
 		else
 			backoff = interval
-			-- pcall returns: status, first_return, second_return, ...
 			local parse_ok, json_body, resp_flags = pcall(M.parse_packet, body, st)
 			if parse_ok then
-				-- Auto-detect GCM from controller response flags
-				if resp_flags and bit.band(resp_flags, FLAG_GCM) ~= 0 then
-					use_gcm = true
-				end
 				local need_followup = M.handle_response(json_body, st)
 				if not need_followup then
 					socket.select(nil, nil, interval)

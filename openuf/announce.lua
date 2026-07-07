@@ -41,13 +41,17 @@ local PKT = {
 	FWVER_FACTORY  = 0x1b,
 }
 
--- Opaque blob for TLV types 0x17–0x1a (purpose unknown, replicates real firmware)
-local BLOB_17_1A = {
-	0x17, 0x00, 0x01, 0x01,
-	0x18, 0x00, 0x01, 0x00,
-	0x19, 0x00, 0x01, 0x01,
-	0x1a, 0x00, 0x01, 0x00,
-}
+-- Build TLV blob for types 0x17–0x1a.
+-- 0x17 = IsDefault (1 = unadopted, 0 = adopted) — must reflect actual adoption state.
+-- cfg.adopted controls the byte; defaults to unadopted (1) when not set.
+local function make_blob_17_1a(adopted)
+	return {
+		0x17, 0x00, 0x01, adopted and 0x00 or 0x01,
+		0x18, 0x00, 0x01, 0x00,
+		0x19, 0x00, 0x01, 0x01,
+		0x1a, 0x00, 0x01, 0x00,
+	}
+end
 
 -- Build a complete announce packet as a Lua binary string.
 --
@@ -114,8 +118,8 @@ function M.build_packet(cfg)
 	ufpkt.catstr(w, cfg.platform)
 	ufpkt.finish(w, packet)
 
-	-- Opaque blob 0x17–0x1a
-	ufpkt.cattbl(packet, BLOB_17_1A)
+	-- Opaque blob 0x17–0x1a (IsDefault reflects adoption state)
+	ufpkt.cattbl(packet, make_blob_17_1a(cfg.adopted))
 
 	-- 0x13: Hardware address 2
 	w = ufpkt.init(PKT.HW_ADDR2)

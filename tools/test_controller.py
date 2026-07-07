@@ -62,16 +62,22 @@ def aes_cbc_encrypt(key_hex: str, iv: bytes, plaintext: bytes) -> bytes:
     cipher = AES.new(key, AES.MODE_CBC, iv)
     return cipher.encrypt(plaintext)
 
-def aes_gcm_decrypt(key_hex: str, iv: bytes, ciphertext: bytes, tag: bytes) -> bytes:
+def aes_gcm_decrypt(key_hex: str, iv: bytes, ciphertext: bytes, tag: bytes,
+                    aad: Optional[bytes] = None) -> bytes:
     AES = _import_crypto()
     key = bytes.fromhex(key_hex)
     cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+    if aad:
+        cipher.update(aad)
     return cipher.decrypt_and_verify(ciphertext, tag)
 
-def aes_gcm_encrypt(key_hex: str, iv: bytes, plaintext: bytes) -> Tuple[bytes, bytes]:
+def aes_gcm_encrypt(key_hex: str, iv: bytes, plaintext: bytes,
+                    aad: Optional[bytes] = None) -> Tuple[bytes, bytes]:
     AES = _import_crypto()
     key = bytes.fromhex(key_hex)
     cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+    if aad:
+        cipher.update(aad)
     ciphertext, tag = cipher.encrypt_and_digest(plaintext)
     return ciphertext, tag
 
@@ -102,7 +108,8 @@ def decode_packet(raw: bytes, key_hex: str) -> Tuple[dict, int]:
     if flags & FLAG_ENCRYPTED:
         if flags & FLAG_GCM:
             ct, tag = payload[:-16], payload[-16:]
-            payload = aes_gcm_decrypt(key_hex, iv, ct, tag)
+            aad = raw[:40]  # first 40 bytes = AAD (per amd989/unifi-gateway)
+            payload = aes_gcm_decrypt(key_hex, iv, ct, tag, aad)
         else:
             payload = aes_cbc_decrypt(key_hex, iv, payload)
 
@@ -130,7 +137,7 @@ def encode_packet(payload_dict: dict, key_hex: str, mac: bytes = b"\x00" * 6) ->
 
     return (
         b"TNBU"
-        + struct.pack(">I", 0)    # pkt_version
+        + struct.pack(">I", 1)    # pkt_version = 1 (per amd989/fxkr)
         + mac
         + struct.pack(">H", flags)
         + iv
@@ -194,18 +201,27 @@ class InformHandler(BaseHTTPRequestHandler):
         # Build response
         if self.state.do_adopt and not self.state.adopted:
             new_key = secrets.token_hex(16)
-            self.state.current_key = new_key
-            self.state.adopted     = True
+            host, port = self.server.server_address
+            inform_url = f"http://{host}:{port}/inform"
+            # mgmt_cfg is a newline-delimited key=value string (real controller format,
+            # confirmed by amd989/unifi-gateway _parse_mgmt_cfg).
+            # NOTE: openUF intentionally ignores 'authkey' here for security hardening.
+            # Key rotation requires SSH: syswrapper.sh set-adopt <url> <key>
+            mgmt_cfg_str = (
+                f"mgmt_url={inform_url}\n"
+                f"authkey={new_key}\n"
+                f"use_aes_gcm=false\n"
+                f"cfgversion=1\n"
+            )
+            self.state.adopted = True
             resp = {
                 "_type":    "setparam",
-                "mgmt_cfg": {
-                    "inform_url": f"http://{self.server.server_address[0]}:"
-                                  f"{self.server.server_address[1]}/inform",
-                },
+                "mgmt_cfg": mgmt_cfg_str,
             }
-            print(f"  → ADOPTING with new authkey: {new_key}")
-            print("  NOTE: run this on the device to complete adoption:")
-            print(f"    syswrapper.sh set-adopt http://... {new_key}")
+            print(f"  → sent setparam with mgmt_cfg (new authkey: {new_key})")
+            print("  openUF ignores authkey from setparam (security hardening).")
+            print("  To rotate the key, SSH into the device and run:")
+            print(f"    syswrapper.sh set-adopt {inform_url} {new_key}")
         else:
             resp = {"_type": "noop"}
 

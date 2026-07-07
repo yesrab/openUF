@@ -22,10 +22,11 @@ M._state_file = "/etc/openuf/state.json"
 
 local function defaults()
 	return {
-		authkey		= M.DEFAULT_KEY,
-		adopted		= false,
-		cfgversion	= "",
-		inform_url	= "http://unifi:8080/inform",
+		authkey    = M.DEFAULT_KEY,
+		adopted    = false,
+		cfgversion = "",
+		inform_url = "http://unifi:8080/inform",
+		use_gcm    = false,
 	}
 end
 
@@ -49,6 +50,7 @@ function M.load()
 	if type(tbl.adopted)    == "boolean" then st.adopted    = tbl.adopted    end
 	if type(tbl.cfgversion) == "string"  then st.cfgversion = tbl.cfgversion end
 	if type(tbl.inform_url) == "string"  then st.inform_url = tbl.inform_url end
+	if type(tbl.use_gcm)    == "boolean" then st.use_gcm    = tbl.use_gcm    end
 
 	-- Security invariant: never use a custom key when not adopted
 	if not st.adopted then

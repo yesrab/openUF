@@ -105,6 +105,23 @@ return {
 		end
 	},
 	{
+		name = "state: use_gcm field defaults to false and round-trips",
+		fn = function()
+			with_tmp(function()
+				local st = state.load()
+				assert_false(st.use_gcm, "use_gcm defaults to false")
+				st.use_gcm = true
+				st.adopted = true  -- need adopted=true to keep custom authkey
+				state.save(st)
+				local loaded = state.load()
+				assert_true(loaded.use_gcm, "use_gcm round-trips as true")
+				-- reset() must also clear use_gcm
+				local fresh = state.reset()
+				assert_false(fresh.use_gcm, "use_gcm cleared by reset")
+			end)
+		end
+	},
+	{
 		name = "state: load from malformed JSON returns defaults",
 		fn = function()
 			with_tmp(function()

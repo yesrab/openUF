@@ -176,4 +176,22 @@ return {
 			assert_eq(val, "6.5.28", "factory version string")
 		end
 	},
+	{
+		name = "announce: TLV 0x17 (IsDefault) is 1 when not adopted",
+		fn = function()
+			local pkt = announce.build_packet(sample_cfg({adopted = false}))
+			local val = find_tlv(pkt, 0x17)
+			assert_not_nil(val, "TLV 0x17 present")
+			assert_eq(string.byte(val, 1), 0x01, "IsDefault=1 when not adopted")
+		end
+	},
+	{
+		name = "announce: TLV 0x17 (IsDefault) is 0 when adopted",
+		fn = function()
+			local pkt = announce.build_packet(sample_cfg({adopted = true}))
+			local val = find_tlv(pkt, 0x17)
+			assert_not_nil(val, "TLV 0x17 present")
+			assert_eq(string.byte(val, 1), 0x00, "IsDefault=0 when adopted")
+		end
+	},
 }

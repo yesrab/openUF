@@ -67,11 +67,11 @@ return {
 		end
 	},
 	{
-		name = "inform packet: packet version is 0",
+		name = "inform packet: packet version is 1",
 		fn = function()
 			local pkt = inform.build_packet('{"_type":"state"}', sample_state())
 			local h = parse_header(pkt)
-			assert_eq(h.pkt_version, 0, "packet version")
+			assert_eq(h.pkt_version, 1, "packet version")
 		end
 	},
 	{
@@ -183,12 +183,14 @@ return {
 		end
 	},
 	{
-		name = "inform packet: handle_response setparam updates inform_url",
+		name = "inform packet: handle_response setparam updates inform_url from key=value string",
 		fn = function()
 			local st = sample_state()
-			local resp = '{"_type":"setparam","mgmt_cfg":{"server":"1.2.3.4","port":"8080"}}'
+			-- Real controller sends mgmt_cfg as newline-delimited key=value string.
+			-- Use \\n so the Lua literal contains \n (JSON newline escape).
+			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://1.2.3.4:8080/inform\\nuse_aes_gcm=false\\ncfgversion=2\\n"}'
 			inform.handle_response(resp, st)
-			assert_contains(st.inform_url, "1.2.3.4", "inform_url updated with new server")
+			assert_contains(st.inform_url, "1.2.3.4", "inform_url updated from mgmt_url")
 		end
 	},
 	{
@@ -196,10 +198,53 @@ return {
 		fn = function()
 			local st = sample_state()
 			local orig_key = st.authkey
-			-- Attempt to inject a new authkey via setparam (should be ignored)
-			local resp = '{"_type":"setparam","mgmt_cfg":{"authkey":"deadbeefdeadbeefdeadbeefdeadbeef"}}'
+			-- authkey in mgmt_cfg must be ignored (security hardening)
+			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://x:8080/inform\\nauthkey=deadbeefdeadbeefdeadbeefdeadbeef\\n"}'
 			inform.handle_response(resp, st)
-			assert_eq(st.authkey, orig_key, "authkey NOT updated via setparam (Fix #1)")
+			assert_eq(st.authkey, orig_key, "authkey NOT updated via setparam (security hardening)")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam sets use_gcm from mgmt_cfg",
+		fn = function()
+			local st = sample_state()
+			assert_false(st.use_gcm or false, "use_gcm starts false")
+			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://x:8080/inform\\nuse_aes_gcm=true\\n"}'
+			inform.handle_response(resp, st)
+			assert_true(st.use_gcm, "use_gcm set to true from mgmt_cfg")
+		end
+	},
+	{
+		name = "inform packet: handle_response setdefault resets state",
+		fn = function()
+			local st = sample_state({
+				authkey  = "aabbccddeeff00112233445566778899",
+				adopted  = true,
+				use_gcm  = true,
+			})
+			inform.handle_response('{"_type":"setdefault"}', st)
+			assert_false(st.adopted,  "adopted reset to false")
+			assert_false(st.use_gcm, "use_gcm reset to false")
+			assert_eq(st.authkey, state.DEFAULT_KEY, "authkey reset to default")
+		end
+	},
+	{
+		name = "inform packet: parse_packet errors on snappy-compressed response",
+		fn = function()
+			-- Build a raw packet with FLAG_SNAPPY (0x04) set
+			local FLAG_SNAPPY = 0x04
+			local st = sample_state()
+			local pkt = inform.build_packet('{"_type":"state"}', st)
+			-- Patch byte 15-16 (flags, big-endian) to set FLAG_SNAPPY
+			local flags_byte = string.byte(pkt, 15) * 256 + string.byte(pkt, 16)
+			flags_byte = flags_byte + FLAG_SNAPPY
+			local patched = pkt:sub(1, 14)
+				.. string.char(math.floor(flags_byte / 256))
+				.. string.char(flags_byte % 256)
+				.. pkt:sub(17)
+			assert_error(function()
+				inform.parse_packet(patched, st)
+			end, "snappy flag raises error")
 		end
 	},
 }
