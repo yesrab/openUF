@@ -25,7 +25,26 @@ opkg install lua lua-cjson lua-lzlib luacrypto luasocket iw lldpd
 
 ## 2. Installation
 
-Transfer the project to the device and run the installer:
+Download the latest release directly on the device over SSH — no git client or scp required:
+
+```sh
+# On the OpenWrt device
+mkdir openuf-install && cd openuf-install
+wget https://github.com/jonasevcik/openUF/releases/latest/download/openuf.tar.gz
+tar xzf openuf.tar.gz
+sh install.sh install
+```
+
+Optionally verify the download before installing:
+
+```sh
+wget https://github.com/jonasevcik/openUF/releases/latest/download/openuf.tar.gz.sha256
+sha256sum -c openuf.tar.gz.sha256
+```
+
+Releases are tagged `vX.Y.Z`; each tag push builds and publishes a new `openuf.tar.gz` via
+GitHub Actions. If you're working from a git checkout instead (e.g. for development), the old
+transfer-then-install flow still works:
 
 ```sh
 # From your development machine

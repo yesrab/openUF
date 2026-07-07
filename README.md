@@ -38,13 +38,15 @@ Any OpenWrt device with at least 8 MB flash and a dual-band wireless chipset.  K
 ## Quick start
 
 ```sh
-# 1. Install dependencies on the OpenWrt device
+# 1. SSH into the OpenWrt device, install dependencies
 opkg update
 opkg install lua lua-cjson lua-lzlib luacrypto iw lldpd
 
-# 2. Transfer files and install
-scp -r openuf/ install.sh root@<device>:/tmp/openuf-install/
-ssh root@<device> "cd /tmp/openuf-install && sh install.sh install"
+# 2. Download and install the latest release (no git client or scp needed)
+mkdir openuf-install && cd openuf-install
+wget https://github.com/jonasevcik/openUF/releases/latest/download/openuf.tar.gz
+tar xzf openuf.tar.gz
+sh install.sh install
 
 # 3a. L2 adoption (device and controller on same subnet)
 #     — The device will appear in UniFi Discover automatically.
@@ -55,6 +57,9 @@ ssh root@<device> syswrapper.sh set-inform http://<controller-ip>:8080/inform
 #     — The device will appear as pending in the controller.
 #     — Click Adopt.
 ```
+
+Installing from a git checkout instead (for contributors/dev builds) still works — `scp -r
+openuf/ install.sh root@<device>:/tmp/openuf/` and run `install.sh` from there.
 
 See [USAGE.md](USAGE.md) for full dependency details, configuration reference, and troubleshooting.
 
