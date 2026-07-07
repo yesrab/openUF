@@ -49,17 +49,21 @@ local function _require_sibling(name)
 	error("cannot find module: " .. name)
 end
 
-local crypto  = _require_sibling("crypto")
-local state   = _require_sibling("state")
-local sysinfo = _require_sibling("sysinfo")
-local lldp    = _require_sibling("lldp")
+local crypto    = _require_sibling("crypto")
+local state     = _require_sibling("state")
+local sysinfo   = _require_sibling("sysinfo")
+local lldp      = _require_sibling("lldp")
+local ucihelper = _require_sibling("ucihelper")
+local led       = _require_sibling("led")
 
 local M = {}
 
 -- Injectable: expose internal modules so tests can inject fixtures
-M._state   = state
-M._sysinfo = sysinfo
-M._lldp    = lldp
+M._state     = state
+M._sysinfo   = sysinfo
+M._ucihelper = ucihelper
+M._lldp      = lldp
+M._led       = led
 
 -- Packet constants
 local MAGIC        = "TNBU"
@@ -232,6 +236,7 @@ function M.build_json(st, cfg, ufhw)
 
 	-- Collect sysinfo
 	local uptime    = M._sysinfo.uptime()
+	local loadavg   = M._sysinfo.loadavg()
 	local meminfo   = M._sysinfo.meminfo()
 	local ifaces    = M._sysinfo.interfaces()
 	local lldp_nbrs = M._lldp.neighbors()
@@ -252,16 +257,69 @@ function M.build_json(st, cfg, ufhw)
 	end
 
 	-- radio_table and vap_table require UCI (not available in test context)
-	local radio_table = {}
-	local vap_table   = {}
+	local radio_table       = {}
+	local radio_table_stats = {}
+	local vap_table         = {}
+	local user_table        = {}
 
-	-- Try to load ufuci if available for VAP/radio info
-	local ok_uci, ufuci = pcall(_require_sibling, "ucihelper")
-	if ok_uci and ufuci.get_vap_table then
+	local mac_str = st.mac or "00:00:00:00:00:00"
+
+	-- ufuci: VAP/radio info (require("uci") calls inside it can legitimately
+	-- fail off-target, so individual calls are still pcall-wrapped below)
+	local ufuci = M._ucihelper
+	if ufuci and ufuci.get_vap_table then
 		local ok_v, rv = pcall(ufuci.get_vap_table)
 		if ok_v then vap_table = rv end
 		local ok_r, rr = pcall(ufuci.get_radio_table)
 		if ok_r then radio_table = rr end
+
+		-- Live per-radio channel utilization, parallel to radio_table (matches
+		-- real UniFi's split of static config vs. live stats).
+		for _, radio in ipairs(radio_table) do
+			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+			if ok_if and ifname then
+				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
+				if ok_rs and stats[1] then
+					local s     = stats[1]  -- in-use channel's survey entry
+					local total = s.channel_time or 0
+					local busy  = s.channel_time_busy or 0
+					radio_table_stats[#radio_table_stats + 1] = {
+						name     = radio.name,
+						channel  = radio.channel,
+						cu_total = total > 0 and math.floor(busy * 100 / total) or 0,
+						cu_self  = total > 0 and math.floor(
+							((s.channel_time_rx or 0) + (s.channel_time_tx or 0)) * 100 / total
+						) or 0,
+					}
+				end
+			end
+		end
+
+		-- Live connected-client counts, attached per-vap, and flattened into a
+		-- top-level user_table (matches real UAP mca-dump output convention --
+		-- verify field name/shape against a live controller capture).
+		for _, vap in ipairs(vap_table) do
+			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, vap.radio)
+			local stas = {}
+			if ok_if and ifname then
+				local ok_sta, rv2 = pcall(M._sysinfo.sta_table, ifname)
+				if ok_sta then stas = rv2 end
+			end
+			vap.num_sta = #stas
+			for _, sta in ipairs(stas) do
+				user_table[#user_table + 1] = {
+					mac        = sta.mac,
+					ap_mac     = mac_str,
+					essid      = vap.ssid,
+					radio      = vap.radio,
+					signal     = sta.signal,
+					rx_bytes   = sta.rx_bytes,
+					tx_bytes   = sta.tx_bytes,
+					rx_packets = sta.rx_packets,
+					tx_packets = sta.tx_packets,
+				}
+			end
+		end
 	end
 
 	-- lldp_table
@@ -275,12 +333,11 @@ function M.build_json(st, cfg, ufhw)
 		}
 	end
 
-	local mac_str = st.mac or "00:00:00:00:00:00"
-
 	local payload = {
 		_type            = "state",
 		["default"]      = not st.adopted,
 		["state"]        = st.adopted and 2 or 0,  -- 2=connected, 0=unadopted (per amd989)
+		locating         = st.locating or false,
 		mac              = mac_str,
 		serial           = mac_str:gsub(":", ""),
 		model            = uap.model or "U6IW",
@@ -298,9 +355,16 @@ function M.build_json(st, cfg, ufhw)
 		country_code     = st.country_code or 840,
 		mem_total        = meminfo.total_kb * 1024,
 		mem_free         = meminfo.free_kb  * 1024,
+		sys_stats        = {
+			loadavg_1  = loadavg.one,
+			loadavg_5  = loadavg.five,
+			loadavg_15 = loadavg.fifteen,
+		},
 		if_table         = if_table,
 		radio_table      = radio_table,
+		radio_table_stats = radio_table_stats,
 		vap_table        = vap_table,
+		user_table       = user_table,
 		lldp_table       = lldp_table,
 	}
 
@@ -310,8 +374,11 @@ end
 -- ─── Response dispatcher ─────────────────────────────────────────────────────
 
 -- Handle a parsed controller response JSON string.
+-- st:  current state table
+-- cfg: device configuration (from conf.lua; optional -- nil in tests, LED
+--      control becomes a no-op without cfg.led)
 -- Returns true if config was applied (caller should send follow-up inform).
-function M.handle_response(json_str, st)
+function M.handle_response(json_str, st, cfg)
 	local ok, resp = pcall(cjson.decode, json_str)
 	if not ok or type(resp) ~= "table" then
 		return false
@@ -361,25 +428,63 @@ function M.handle_response(json_str, st)
 		os.exit(0)
 	end
 
+	if _type == "upgrade" then
+		-- Store only -- never download/verify/flash/reboot. A real controller's
+		-- upgrade URL targets genuine Ubiquiti firmware; applying it to this
+		-- (non-Ubiquiti) hardware would brick it. See amd989/unifi-gateway,
+		-- which handles this identically (log + store, no real upgrade path).
+		st.upgrade_requested_version = tostring(resp.version or "")
+		st.upgrade_requested_url     = tostring(resp.url or "")
+		io.stderr:write("inform: upgrade requested (version=" .. st.upgrade_requested_version
+			.. ") -- stored only, not applying\n")
+		M._state.save(st)
+		return false
+	end
+
 	if _type == "cmd" then
 		local cmd = resp.cmd or ""
 		io.stderr:write("inform: cmd: " .. tostring(cmd) .. "\n")
-		-- set-locate / unset-locate: LED blink — log-only, no LED driver yet
-		-- speed-test, etc.: no-op
+
+		if cmd == "set-locate" or cmd == "unset-locate" then
+			local led_path = cfg and cfg.led
+			if cmd == "set-locate" then M._led.locate_start(led_path)
+			else M._led.locate_stop(led_path) end
+			st.locating = (cmd == "set-locate")
+			M._state.save(st)
+		elseif cmd == "spectrum-scan" then
+			-- Best-effort: trigger a scan per radio and stash raw iw output.
+			-- NOTE: the wire format for reporting scan results back to the
+			-- controller is unconfirmed against any public source found during
+			-- research -- verify against a live controller capture before
+			-- treating this as complete.
+			local ufuci = M._ucihelper
+			if ufuci and ufuci.get_radio_table then
+				local ok_r, radios = pcall(ufuci.get_radio_table)
+				if ok_r then
+					for _, radio in ipairs(radios) do
+						local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+						if ok_if and ifname then
+							ufuci._popen("iw dev " .. ifname .. " scan")
+						end
+					end
+				end
+			end
+		end
+		-- other cmd values (e.g. mfi-output, restart): no-op
 		return false
 	end
 
 	-- Config update: check cfgversion
 	if type(resp.cfgversion) == "string" and resp.cfgversion ~= st.cfgversion then
-		local ok_uci, ufuci = pcall(_require_sibling, "ucihelper")
-		if ok_uci and resp.network_table then
-			local ok_apply = pcall(ufuci.apply_config, resp)
+		local ufuci = M._ucihelper
+		if ufuci and resp.network_table then
+			local ok_apply = pcall(ufuci.apply_config, resp, cfg)
 			if ok_apply then
 				st.cfgversion = resp.cfgversion
 				M._state.save(st)
 				return true  -- signal: send follow-up inform immediately
 			end
-		elseif ok_uci and resp.cfgversion then
+		elseif ufuci and resp.cfgversion then
 			st.cfgversion = resp.cfgversion
 			M._state.save(st)
 			return true
@@ -497,8 +602,8 @@ function M.run(cfg, ufhw)
 			backoff = interval
 			local parse_ok, json_body, resp_flags = pcall(M.parse_packet, body, st)
 			if parse_ok then
-				local need_followup = M.handle_response(json_body, st)
-				if not need_followup then
+				local config_applied = M.handle_response(json_body, st, cfg)
+				if not config_applied then
 					socket.select(nil, nil, interval)
 				end
 			else

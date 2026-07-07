@@ -3,7 +3,8 @@
 
 	Reads and writes /etc/openuf/state.json (configurable via M._state_file).
 	Fields: authkey (32-char hex), adopted (bool), cfgversion (string),
-	        inform_url (string).
+	        inform_url (string), use_gcm (bool), upgrade_requested_version
+	        (string), upgrade_requested_url (string).
 
 	Security invariant: if adopted == false, authkey is always reset to the
 	default key on load, regardless of what the file contains. This prevents a
@@ -22,11 +23,13 @@ M._state_file = "/etc/openuf/state.json"
 
 local function defaults()
 	return {
-		authkey    = M.DEFAULT_KEY,
-		adopted    = false,
-		cfgversion = "",
-		inform_url = "http://unifi:8080/inform",
-		use_gcm    = false,
+		authkey                  = M.DEFAULT_KEY,
+		adopted                  = false,
+		cfgversion               = "",
+		inform_url               = "http://unifi:8080/inform",
+		use_gcm                  = false,
+		upgrade_requested_version = "",
+		upgrade_requested_url     = "",
 	}
 end
 
@@ -51,6 +54,12 @@ function M.load()
 	if type(tbl.cfgversion) == "string"  then st.cfgversion = tbl.cfgversion end
 	if type(tbl.inform_url) == "string"  then st.inform_url = tbl.inform_url end
 	if type(tbl.use_gcm)    == "boolean" then st.use_gcm    = tbl.use_gcm    end
+	if type(tbl.upgrade_requested_version) == "string" then
+		st.upgrade_requested_version = tbl.upgrade_requested_version
+	end
+	if type(tbl.upgrade_requested_url) == "string" then
+		st.upgrade_requested_url = tbl.upgrade_requested_url
+	end
 
 	-- Security invariant: never use a custom key when not adopted
 	if not st.adopted then

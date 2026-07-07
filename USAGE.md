@@ -63,9 +63,12 @@ dev = dofile("modelmap/tl-wr1043ndv2.lua")
 ```
 
 The modelmap sets:
-- `dev.conf.net.lan_cpueth` — LAN CPU ethernet port (e.g. `eth1`)
+- `dev.conf.net.lan_cpueth` — LAN CPU ethernet port (e.g. `eth1`); also the trunk port
+  used to create VLAN-tagged sub-interfaces (`eth1.<vlanid>`) for controller-pushed VLAN SSIDs
 - `dev.conf.net.wan_iface`  — WAN interface (e.g. `eth0`)
 - `dev.conf.switch`         — Switch device name (e.g. `switch0`)
+- `dev.conf.led`            — sysfs LED path (e.g. `/sys/class/leds/tp-link:green:wlan`) driven by
+  the controller's Locate action; `nil` by default — set it per board to enable Locate
 - `dev.openuf.uap.ufmodel`  — Which ufmodel file to load (e.g. `"u6iw"`)
 - `dev.openuf.uap.hwassign` — Radio names (e.g. `{"radio0", "radio1"}`)
 
@@ -93,7 +96,8 @@ uap = {
 
 ```lua
 enable = {
-    led = true,   -- status LED (slow blink = unconfigured, solid = connected)
+    led = true,   -- status LED (slow blink = unconfigured, solid = connected);
+                  -- also gates the controller-triggered Locate blink (openuf/led.lua)
     uap = true,   -- AP emulation
     usg = false,  -- USG mode (not implemented)
     usw = false,  -- USW mode (not implemented)
@@ -159,7 +163,9 @@ Persistent state is stored at `/etc/openuf/state.json`:
   "authkey":    "ba86f2bbe107c7c57eb5f2690775c712",
   "cfgversion": "",
   "inform_url": "http://unifi:8080/inform",
-  "use_gcm":    false
+  "use_gcm":    false,
+  "upgrade_requested_version": "",
+  "upgrade_requested_url":     ""
 }
 ```
 
@@ -168,6 +174,7 @@ Persistent state is stored at `/etc/openuf/state.json`:
 | `adopted` | `true` after successful adoption; `false` resets `authkey` to default on load |
 | `authkey` | 32 hex chars (16-byte AES-128 key); default = pre-adoption key |
 | `cfgversion` | Opaque string the controller uses to push config updates |
+| `upgrade_requested_version` / `upgrade_requested_url` | Set when the controller sends an `upgrade` command; stored for visibility only — openUF never downloads or flashes firmware (see below) |
 | `inform_url` | URL for the 10-second inform heartbeat |
 | `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
 

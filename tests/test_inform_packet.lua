@@ -229,6 +229,58 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response upgrade stores version/url only",
+		fn = function()
+			local st = sample_state()
+			local resp = '{"_type":"upgrade","version":"6.6.99","url":"http://unifi/fw.bin"}'
+			local result = inform.handle_response(resp, st)
+			assert_eq(st.upgrade_requested_version, "6.6.99", "version stored")
+			assert_eq(st.upgrade_requested_url, "http://unifi/fw.bin", "url stored")
+			assert_false(result, "upgrade does not trigger a follow-up inform")
+		end
+	},
+	{
+		name = "inform packet: handle_response upgrade never flashes/reboots",
+		fn = function()
+			-- state.save() legitimately calls os.execute("mkdir -p ...") --
+			-- what must NEVER happen is a sysupgrade/reboot/download command.
+			local st = sample_state()
+			local orig_execute = os.execute
+			local commands = {}
+			os.execute = function(cmd, ...)
+				commands[#commands + 1] = cmd
+				return orig_execute(cmd, ...)
+			end
+			local ok = pcall(inform.handle_response,
+				'{"_type":"upgrade","version":"6.6.99","url":"http://unifi/fw.bin"}', st)
+			os.execute = orig_execute
+			assert_true(ok, "handle_response did not error")
+			for _, cmd in ipairs(commands) do
+				assert_true(type(cmd) == "string", "command is a string")
+				assert_false(cmd:find("sysupgrade") ~= nil, "no sysupgrade: " .. cmd)
+				assert_false(cmd:find("reboot") ~= nil, "no reboot: " .. cmd)
+				assert_false(cmd:find("wget") ~= nil or cmd:find("curl") ~= nil,
+					"no download command: " .. cmd)
+			end
+		end
+	},
+	{
+		name = "inform packet: handle_response cmd set-locate sets st.locating",
+		fn = function()
+			local st = sample_state()
+			inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st)
+			assert_true(st.locating, "locating true after set-locate")
+		end
+	},
+	{
+		name = "inform packet: handle_response cmd unset-locate clears st.locating",
+		fn = function()
+			local st = sample_state({locating = true})
+			inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st)
+			assert_false(st.locating, "locating false after unset-locate")
+		end
+	},
+	{
 		name = "inform packet: parse_packet errors on snappy-compressed response",
 		fn = function()
 			-- Build a raw packet with FLAG_SNAPPY (0x04) set

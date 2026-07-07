@@ -15,9 +15,14 @@ openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi
 | Adoption via `syswrapper.sh set-adopt` | ✅ Working |
 | L3 inform (`set-inform` before adoption) | ✅ Working |
 | Controller-pushed SSID provisioning | ✅ Working (UCI) |
-| Client & radio statistics in payload | ✅ Working |
+| VLAN-tagged SSIDs (`network_table` join) | ✅ Working — field shapes unverified against a live capture |
+| Client & radio statistics in payload | ✅ Working (`user_table`, `num_sta`, `radio_table_stats`) |
+| Locate (LED identify) | ✅ Working — requires `dev.conf.led` sysfs path set per board |
+| RF/spectrum scan | Best-effort trigger only — result-reporting wire format unconfirmed |
+| Firmware upgrade requests | Stored (version/url), never applied — flashing controller-supplied firmware onto non-Ubiquiti hardware would brick it |
 | LLDP topology announcement | ✅ Working (via lldpd) |
 | AES-128-GCM (newer firmware flag) | Implemented, untested |
+| Speed test | Not applicable — gateway-only feature in current UniFi Network, doesn't apply to APs |
 | USG / USW emulation | Not implemented |
 
 Tested against **UniFi Network Application 10.4.57**.  The device identity presented is **U6-InWall** (model `U6IW`).
@@ -63,7 +68,7 @@ brew install lua luarocks      # macOS
 # Install test dependencies
 luarocks install --local lua-cjson
 
-# Run unit tests (102 tests, all pure Lua)
+# Run unit tests (127 tests, all pure Lua)
 eval $(luarocks path --local)
 lua tests/run_tests.lua
 

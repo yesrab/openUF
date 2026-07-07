@@ -9,14 +9,17 @@ local cjson  = require("cjson")
 local state  = dofile("openuf/state.lua")
 local inform = dofile("openuf/inform.lua")
 
+local function fixture(name)
+	local f = io.open("tests/fixtures/" .. name, "r")
+	if not f then return "" end
+	local s = f:read("*a"); f:close(); return s
+end
+
 -- Inject sysinfo fixtures via inform's exposed _sysinfo reference
 -- (inform.lua loads its own sysinfo instance; M._sysinfo is that instance)
-local function inject_sysinfo()
-	local function fixture(name)
-		local f = io.open("tests/fixtures/" .. name, "r")
-		if not f then return "" end
-		local s = f:read("*a"); f:close(); return s
-	end
+-- with_clients: when true, sta_table()/radio_stats() return real fixture data
+-- (2 connected clients, one in-use channel survey entry) instead of empty.
+local function inject_sysinfo(with_clients)
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end
 		if path:find("loadavg") then return fixture("proc_loadavg.txt") end
@@ -25,11 +28,38 @@ local function inject_sysinfo()
 		return ""
 	end
 	inform._sysinfo._run_cmd = function(cmd)
-		if cmd:find("station dump") then return "" end
+		if with_clients and cmd:find("station dump") then
+			return fixture("iw_station_dump.txt")
+		end
+		if with_clients and cmd:find("survey dump") then
+			return fixture("iw_survey_dump.txt")
+		end
 		return ""
 	end
 	-- Return empty neighbor list (no lldpd on dev machine)
 	inform._lldp._run_cmd = function() return "" end
+end
+
+-- Inject a mock ucihelper so build_json's radio/vap/stats wiring can be
+-- exercised without a real UCI environment.
+local function inject_ucihelper()
+	inform._ucihelper = {
+		get_radio_table = function()
+			return {
+				{ name = "radio0", channel = "6", htmode = "HT20", txpower = "20",
+				  disabled = false, builtin_antenna = true, builtin_ant_gain = 3,
+				  max_txpower = 20 },
+			}
+		end,
+		get_vap_table = function()
+			return {
+				{ name = "openuf_test", ssid = "test", radio = "radio0",
+				  encryption = "psk2", disabled = false, bssid = "aa:bb:cc:00:00:01",
+				  channel = "6", tx_power = "20", usage = "user" },
+			}
+		end,
+		get_ifname_for_radio = function(radio) return "wlan0" end,
+	}
 end
 
 -- Minimal ufhw matching the u6iw model
@@ -44,7 +74,8 @@ local ufhw = {
 }
 
 local function build(opts)
-	inject_sysinfo()
+	inject_sysinfo(opts and opts.with_clients)
+	if opts and opts.with_uci then inject_ucihelper() end
 	local st = {
 		authkey    = state.DEFAULT_KEY,
 		adopted    = opts and opts.adopted or false,
@@ -53,6 +84,7 @@ local function build(opts)
 		mac        = "aa:bb:cc:dd:ee:ff",
 		ip         = "192.168.1.100",
 		hostname   = "testap",
+		locating   = opts and opts.locating,
 	}
 	local json_str = inform.build_json(st, nil, ufhw)
 	return cjson.decode(json_str), st
@@ -178,6 +210,71 @@ return {
 			local d = build()
 			assert_not_nil(d.lldp_table, "lldp_table present")
 			assert_true(type(d.lldp_table) == "table", "lldp_table is table")
+		end
+	},
+	{
+		name = "inform json: locating defaults to false",
+		fn = function()
+			local d = build()
+			assert_false(d.locating, "locating false by default")
+		end
+	},
+	{
+		name = "inform json: locating reflects state.locating",
+		fn = function()
+			local d = build({locating = true})
+			assert_true(d.locating, "locating true from state")
+		end
+	},
+	{
+		name = "inform json: sys_stats.loadavg populated from fixture",
+		fn = function()
+			local d = build()
+			assert_not_nil(d.sys_stats, "sys_stats present")
+			assert_eq(d.sys_stats.loadavg_1, 0.42, "loadavg_1 from fixture")
+		end
+	},
+	{
+		name = "inform json: vap_table num_sta reflects connected clients",
+		fn = function()
+			local d = build({with_uci = true, with_clients = true})
+			assert_eq(#d.vap_table, 1, "one vap")
+			assert_eq(d.vap_table[1].num_sta, 2, "two clients from fixture")
+		end
+	},
+	{
+		name = "inform json: vap_table num_sta is 0 with no clients",
+		fn = function()
+			local d = build({with_uci = true, with_clients = false})
+			assert_eq(d.vap_table[1].num_sta, 0, "no clients")
+		end
+	},
+	{
+		name = "inform json: user_table flattens per-vap clients",
+		fn = function()
+			local d = build({with_uci = true, with_clients = true})
+			assert_eq(#d.user_table, 2, "two entries in user_table")
+			assert_eq(d.user_table[1].mac, "aa:bb:cc:dd:ee:ff", "first client mac")
+			assert_eq(d.user_table[1].essid, "test", "essid attached from vap")
+			assert_eq(d.user_table[1].ap_mac, "aa:bb:cc:dd:ee:ff", "ap_mac from device mac")
+		end
+	},
+	{
+		name = "inform json: radio_table_stats derived from survey dump",
+		fn = function()
+			local d = build({with_uci = true, with_clients = true})
+			assert_eq(#d.radio_table_stats, 1, "one radio_table_stats entry")
+			assert_eq(d.radio_table_stats[1].name, "radio0", "keyed by radio name")
+			assert_eq(d.radio_table_stats[1].cu_total, 37, "cu_total = busy/total*100")
+			assert_eq(d.radio_table_stats[1].cu_self, 27, "cu_self = (rx+tx)/total*100")
+		end
+	},
+	{
+		name = "inform json: radio_table includes capability defaults",
+		fn = function()
+			local d = build({with_uci = true})
+			assert_eq(d.radio_table[1].builtin_ant_gain, 3, "builtin_ant_gain")
+			assert_eq(d.radio_table[1].max_txpower, 20, "max_txpower")
 		end
 	},
 }
