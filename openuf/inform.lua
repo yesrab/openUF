@@ -563,13 +563,21 @@ function M.http_post(url, body)
 
 	tcp:send(req)
 
-	-- Read response (HTTP/1.0 — server closes after response)
+	-- Read response (HTTP/1.0 — server closes after response). With a numeric
+	-- pattern LuaSocket reads *exactly* N bytes and, when the peer closes before
+	-- N arrive, returns (nil, "closed", partial). The inform response is almost
+	-- always smaller than one read, so the body lives entirely in that `partial`
+	-- third value — it must be captured or every response is silently lost
+	-- ("HTTP nil") and adoption never completes.
 	local response = {}
 	while true do
-		local chunk, recv_err = tcp:receive(4096)
+		local chunk, recv_err, partial = tcp:receive(4096)
 		if chunk then
 			response[#response + 1] = chunk
 		else
+			if partial and #partial > 0 then
+				response[#response + 1] = partial
+			end
 			if recv_err ~= "closed" then
 				tcp:close()
 				return nil, "recv error: " .. tostring(recv_err)
