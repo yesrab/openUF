@@ -69,15 +69,18 @@ function M.load()
 	return st
 end
 
--- Save state to disk. Creates the directory if needed.
+-- Save state to disk. Creates the parent directory only if the first write
+-- fails (avoids shelling out to `mkdir -p` on every heartbeat, since the
+-- directory almost always already exists).
 function M.save(st)
-	-- Ensure directory exists
-	local dir = M._state_file:match("^(.*)/[^/]+$")
-	if dir then os.execute("mkdir -p " .. dir) end
-
 	local f = io.open(M._state_file, "w")
 	if not f then
-		error("state.save: cannot write to " .. M._state_file)
+		local dir = M._state_file:match("^(.*)/[^/]+$")
+		if dir then os.execute("mkdir -p '" .. dir .. "'") end
+		f = io.open(M._state_file, "w")
+		if not f then
+			error("state.save: cannot write to " .. M._state_file)
+		end
 	end
 	f:write(cjson.encode(st))
 	f:close()

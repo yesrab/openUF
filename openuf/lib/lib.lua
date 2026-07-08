@@ -32,7 +32,7 @@ ufpkt = {}
 
 function ufpkt.init(const)
 	-- sets up a TLV packet header
-	t = {const, 0x00, 0x00}
+	local t = {const, 0x00, 0x00}
 	return t
 end
 
@@ -45,7 +45,7 @@ end
 
 function ufpkt.catstr(dst, src)
 	-- appends each character of string src as an element to the end of table dst
-	str = {}
+	local str = {}
 	for i = 1, #src, 1 do
 		str[#str+1] = string.byte(string.sub(src, i, i))
 	end
@@ -61,7 +61,7 @@ end
 
 function ufpkt.gen4(uptime)
 	-- generates a four-element table of the 32-bit value, most significant first
-	t = {
+	local t = {
 		bit.rshift(         uptime, 24),
 		bit.band(bit.rshift(uptime, 16), 0xff),
 		bit.band(bit.rshift(uptime,  8), 0xff),
