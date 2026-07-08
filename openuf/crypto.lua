@@ -1,11 +1,13 @@
 --[[
 	AES-128-CBC and AES-128-GCM wrappers.
 
-	Primary backend: luacrypto (OpenSSL bindings), available as opkg package
-	"luacrypto" on OpenWrt and via LuaRocks on development hosts.
-
-	Fallback backend: openssl(1) CLI — used when luacrypto is absent.
-	The CLI fallback supports CBC only; GCM requires luacrypto.
+	Backend selection (in priority order):
+	  1. lua-openssl (require "openssl") — preferred. apk package "lua-openssl"
+	     on OpenWrt 25.12+. In-process, supports both CBC and GCM.
+	  2. luacrypto  (require "crypto")   — legacy. Only on older OpenWrt where the
+	     "luacrypto" package still exists (dropped from the 25.12 feeds).
+	  3. openssl(1) CLI                  — last resort when neither binding is
+	     present. CBC only; GCM is unavailable on this path.
 
 	All keys and IVs are passed as 32-char hex strings (16 raw bytes).
 	Plaintext and ciphertext are Lua binary strings.
@@ -70,13 +72,24 @@ local function pkcs7_unpad(data)
 	return data:sub(1, #data - pad)
 end
 
--- Try loading luacrypto
+-- Backend detection. lua-openssl is preferred; luacrypto is a legacy fallback.
+local _ossl_ok,   _ossl    = pcall(require, "openssl")
 local _crypto_ok, _lcrypto = pcall(require, "crypto")
 
--- Internal: AES-128-CBC via openssl CLI (fallback when luacrypto absent)
+-- Internal: unpredictable temp path for the openssl(1) CLI fallback. Names in
+-- the old code were "/tmp/uf_cbc_in_<os.time()>" — guessable to any local user,
+-- inviting symlink pre-creation and disclosure of the plaintext inform payload
+-- written there. The normal path is now lua-openssl (in-process, no temp file);
+-- this CLI branch only runs when no binding is present at all.
+local function _tmp_path(tag)
+	local rnd = M.bin_to_hex(M.random_iv(8))
+	return "/tmp/uf_" .. tag .. "_" .. rnd
+end
+
+-- Internal: AES-128-CBC via openssl CLI (fallback when no Lua binding is present)
 local function _openssl_cbc(decrypt, key_hex, iv_hex, data)
-	local tmpIn  = "/tmp/uf_cbc_in_"  .. os.time()
-	local tmpOut = "/tmp/uf_cbc_out_" .. os.time()
+	local tmpIn  = _tmp_path("cbc_in")
+	local tmpOut = _tmp_path("cbc_out")
 	local fIn = io.open(tmpIn, "wb")
 	if not fIn then error("crypto: cannot write temp file") end
 	fIn:write(data)
@@ -108,8 +121,14 @@ end
 -- returns: ciphertext binary string (PKCS#7 padded)
 function M.aes_cbc_encrypt(key_hex, iv, plaintext)
 	local padded = pkcs7_pad(plaintext, 16)
-	if _crypto_ok then
-		local key = M.hex_to_bin(key_hex)
+	local key = M.hex_to_bin(key_hex)
+	if _ossl_ok then
+		-- lua-openssl: pad ourselves (padding(false)) so the wire format matches
+		-- the controller, which PKCS#7-pads then encrypts with no extra padding.
+		local ctx = _ossl.cipher.get("aes-128-cbc"):new(true, key, iv)
+		ctx:padding(false)
+		return ctx:update(padded) .. ctx:final()
+	elseif _crypto_ok then
 		-- luacrypto: encrypt(algo, data, key, iv[, raw])
 		-- Pass raw=true (or omit for raw binary output depending on version)
 		local ok, result = pcall(_lcrypto.encrypt, "aes-128-cbc", padded, key, iv, true)
@@ -134,8 +153,12 @@ end
 -- ciphertext: binary string
 -- returns: plaintext binary string (PKCS#7 stripped)
 function M.aes_cbc_decrypt(key_hex, iv, ciphertext)
-	if _crypto_ok then
-		local key = M.hex_to_bin(key_hex)
+	local key = M.hex_to_bin(key_hex)
+	if _ossl_ok then
+		local ctx = _ossl.cipher.get("aes-128-cbc"):new(false, key, iv)
+		ctx:padding(false)
+		return pkcs7_unpad(ctx:update(ciphertext) .. ctx:final())
+	elseif _crypto_ok then
 		local ok, result = pcall(_lcrypto.decrypt, "aes-128-cbc", ciphertext, key, iv, true)
 		if not ok then
 			result = _lcrypto.decrypt("aes-128-cbc", ciphertext, key, iv)
@@ -152,11 +175,20 @@ end
 --      TNBU header per amd989/unifi-gateway; nil = no AAD)
 -- Returns: ciphertext (binary string), auth_tag (16-byte binary string)
 function M.aes_gcm_encrypt(key_hex, iv, plaintext, aad)
-	if not _crypto_ok then
-		error("aes_gcm_encrypt: luacrypto not available; GCM requires it")
-	end
 	local key = M.hex_to_bin(key_hex)
-	if _lcrypto.aead then
+	if _ossl_ok then
+		-- The TNBU IV field is 16 bytes; OpenSSL GCM defaults to a 12-byte
+		-- nonce, so SET_IVLEN must precede init to accept the full IV.
+		local C   = _ossl.cipher
+		local ctx = C.get("aes-128-gcm"):encrypt_new()
+		ctx:ctrl(C.EVP_CTRL_GCM_SET_IVLEN, #iv)
+		ctx:init(key, iv)
+		ctx:padding(false)
+		if aad and #aad > 0 then ctx:update(aad, true) end  -- true = AAD, not plaintext
+		local ct  = ctx:update(plaintext) .. ctx:final()
+		local tag = ctx:ctrl(C.EVP_CTRL_GCM_GET_TAG, 16)
+		return ct, tag
+	elseif _crypto_ok and _lcrypto.aead then
 		local ctx = _lcrypto.aead("aes-128-gcm", key, iv, true)
 		-- Feed AAD if the luacrypto binding exposes updateAAD (version-dependent)
 		if aad and #aad > 0 and type(ctx.updateAAD) == "function" then
@@ -167,18 +199,27 @@ function M.aes_gcm_encrypt(key_hex, iv, plaintext, aad)
 		local tag = ctx:getTag(16)
 		return ct, tag
 	end
-	error("aes_gcm_encrypt: luacrypto version lacks GCM support; update luacrypto or use CBC")
+	error("aes_gcm_encrypt: no GCM backend (install lua-openssl); use CBC instead")
 end
 
 -- AES-128-GCM decrypt
 -- aad: optional binary string for AAD verification (must match what was used to encrypt)
 -- Raises an error if authentication tag verification fails
 function M.aes_gcm_decrypt(key_hex, iv, ciphertext, tag, aad)
-	if not _crypto_ok then
-		error("aes_gcm_decrypt: luacrypto not available")
-	end
 	local key = M.hex_to_bin(key_hex)
-	if _lcrypto.aead then
+	if _ossl_ok then
+		local C   = _ossl.cipher
+		local ctx = C.get("aes-128-gcm"):decrypt_new()
+		ctx:ctrl(C.EVP_CTRL_GCM_SET_IVLEN, #iv)
+		ctx:init(key, iv)
+		ctx:padding(false)
+		if aad and #aad > 0 then ctx:update(aad, true) end
+		local pt = ctx:update(ciphertext)
+		ctx:ctrl(C.EVP_CTRL_GCM_SET_TAG, tag)
+		local final = ctx:final()  -- verifies the tag; falsy on mismatch
+		if not final then error("aes_gcm_decrypt: authentication tag verification failed") end
+		return pt .. final
+	elseif _crypto_ok and _lcrypto.aead then
 		local ctx = _lcrypto.aead("aes-128-gcm", key, iv, false)
 		if aad and #aad > 0 and type(ctx.updateAAD) == "function" then
 			ctx:updateAAD(aad)
@@ -188,12 +229,13 @@ function M.aes_gcm_decrypt(key_hex, iv, ciphertext, tag, aad)
 		pt = pt .. ctx:final()  -- final() verifies the tag; throws on mismatch
 		return pt
 	end
-	error("aes_gcm_decrypt: luacrypto version lacks GCM support")
+	error("aes_gcm_decrypt: no GCM backend (install lua-openssl)")
 end
 
 -- Returns true if GCM is supported by the available backend
 function M.gcm_available()
-	return _crypto_ok and (_lcrypto.aead ~= nil)
+	return (_ossl_ok and _ossl.cipher ~= nil)
+		or (_crypto_ok and _lcrypto.aead ~= nil)
 end
 
 return M

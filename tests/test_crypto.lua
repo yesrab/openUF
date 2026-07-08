@@ -1,6 +1,6 @@
 -- Tests for openuf/crypto.lua (AES-128-CBC/GCM wrappers).
 -- Run from project root: lua tests/run_tests.lua
--- Requires: luacrypto (or openssl CLI for CBC fallback)
+-- Requires: lua-openssl or luacrypto (or the openssl CLI for CBC fallback)
 
 local crypto = dofile("openuf/crypto.lua")
 
@@ -145,6 +145,45 @@ return {
 				assert_neq(result, pt, "wrong key produces different result")
 			end
 			-- error path is also acceptable
+		end
+	},
+	{
+		-- GCM needs a Lua crypto binding (lua-openssl/luacrypto). When neither is
+		-- present (e.g. the CLI-only dev host) the round-trip is skipped, but the
+		-- no-backend contract is still asserted.
+		name = "crypto: GCM encrypt + decrypt round-trip with AAD (or errors cleanly)",
+		fn = function()
+			local key = crypto.DEFAULT_KEY
+			local pt  = "GCM secret body!"
+			local aad = string.rep("\1", 40)  -- 40-byte TNBU header, as on the wire
+			if not crypto.gcm_available() then
+				assert_error(function()
+					crypto.aes_gcm_encrypt(key, FIXED_IV, pt, aad)
+				end, "gcm_encrypt errors when no backend is available")
+				return
+			end
+			local ct, tag = crypto.aes_gcm_encrypt(key, FIXED_IV, pt, aad)
+			assert_eq(#tag, 16, "GCM tag is 16 bytes")
+			assert_neq(ct, pt, "ciphertext differs from plaintext")
+			local out = crypto.aes_gcm_decrypt(key, FIXED_IV, ct, tag, aad)
+			assert_eq(out, pt, "GCM round-trip plaintext")
+		end
+	},
+	{
+		name = "crypto: GCM decrypt fails on tampered AAD or tag",
+		fn = function()
+			if not crypto.gcm_available() then return end  -- covered by the test above
+			local key = crypto.DEFAULT_KEY
+			local pt  = "GCM secret body!"
+			local aad = string.rep("\1", 40)
+			local ct, tag = crypto.aes_gcm_encrypt(key, FIXED_IV, pt, aad)
+			assert_error(function()
+				crypto.aes_gcm_decrypt(key, FIXED_IV, ct, tag, string.rep("\2", 40))
+			end, "wrong AAD must fail verification")
+			local bad_tag = string.rep("\0", 16)
+			assert_error(function()
+				crypto.aes_gcm_decrypt(key, FIXED_IV, ct, bad_tag, aad)
+			end, "wrong tag must fail verification")
 		end
 	},
 }
