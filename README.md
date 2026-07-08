@@ -38,9 +38,9 @@ Any OpenWrt device with at least 8 MB flash and a dual-band wireless chipset.  K
 ## Quick start
 
 ```sh
-# 1. SSH into the OpenWrt device, install dependencies
-opkg update
-opkg install lua lua-cjson lua-lzlib luacrypto iw lldpd
+# 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk)
+apk update
+apk add lua lua-cjson luasocket lua-openssl iw lldpd openssl-util
 
 # 2. Download and install the latest release (no git client or scp needed)
 mkdir openuf-install && cd openuf-install

@@ -20,16 +20,19 @@ case "$1" in
 	install)
 		echo "Installing openUF to $INSTALL_DIR ..."
 
-		# Check required opkg packages
+		# Check required apk packages (OpenWrt 25.12+ uses apk, not opkg).
+		# lua-openssl provides AES-128-CBC/GCM (luacrypto was dropped from the feeds);
+		# there is no Lua zlib binding in 25.12, so inform-response decompression is
+		# handled in-tree by openuf/inflate.lua and no zlib package is required.
 		MISSING=""
-		for pkg in lua lua-cjson lua-lzlib luacrypto iw lldpd; do
-			if ! opkg list-installed 2>/dev/null | grep -q "^$pkg "; then
+		for pkg in lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util; do
+			if ! apk info -e "$pkg" >/dev/null 2>&1; then
 				MISSING="$MISSING $pkg"
 			fi
 		done
 		if [ -n "$MISSING" ]; then
-			echo "WARNING: missing opkg packages:$MISSING"
-			echo "  Install them with: opkg update && opkg install$MISSING"
+			echo "WARNING: missing apk packages:$MISSING"
+			echo "  Install them with: apk update && apk add$MISSING"
 		fi
 
 		# Copy Lua source

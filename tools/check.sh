@@ -30,32 +30,35 @@ for pkg in cjson; do
 	if lua -e "require('$pkg')" 2>/dev/null; then
 		ok "lua require('$pkg')"
 	else
-		fail "lua require('$pkg') — install: opkg install lua-$pkg"
+		fail "lua require('$pkg') — install: apk add lua-$pkg"
 	fi
 done
 
+# zlib is optional: OpenWrt 25.12 has no Lua zlib binding. openUF sends
+# uncompressed and decompresses controller responses with the in-tree
+# pure-Lua inflate (openuf/inflate.lua), so this is informational only.
 if lua -e "require('zlib')" 2>/dev/null; then
-	ok "lua require('zlib')"
+	ok "lua require('zlib') (optional; enables outbound compression)"
 else
-	fail "lua require('zlib') — install: opkg install lua-lzlib"
+	info "lua require('zlib') absent — using in-tree inflate (no package needed)"
 fi
 
-if lua -e "require('crypto')" 2>/dev/null; then
-	ok "lua require('crypto')"
+if lua -e "require('openssl')" 2>/dev/null; then
+	ok "lua require('openssl')"
 else
-	fail "lua require('crypto') — install: opkg install luacrypto"
+	fail "lua require('openssl') — install: apk add lua-openssl"
 fi
 
 if lua -e "require('socket')" 2>/dev/null; then
 	ok "lua require('socket')"
 else
-	fail "lua require('socket') — install: opkg install luasocket"
+	fail "lua require('socket') — install: apk add luasocket"
 fi
 
 if lua -e "require('bit')" 2>/dev/null; then
 	ok "lua require('bit')"
 else
-	fail "lua require('bit') — install: opkg install luabitop"
+	fail "lua require('bit') — install: apk add luabitop"
 fi
 echo ""
 
@@ -85,7 +88,7 @@ if command -v lldpd > /dev/null 2>&1; then
 		fail "lldpctl not found (usually bundled with lldpd)"
 	fi
 else
-	fail "lldpd not installed — opkg install lldpd"
+	fail "lldpd not installed — apk add lldpd"
 fi
 echo ""
 

@@ -2,24 +2,30 @@
 
 ## 1. Dependencies
 
-Install the following opkg packages on the OpenWrt device before running openUF:
+Install the following apk packages on the OpenWrt device before running openUF.
+OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
+`opkg update` / `opkg install`.
 
 ```sh
-opkg update
-opkg install lua lua-cjson lua-lzlib luacrypto luasocket iw lldpd
+apk update
+apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util
 ```
 
 | Package | Purpose |
 |---|---|
 | `lua` | Lua 5.1 runtime |
 | `lua-cjson` | Fast JSON encode/decode |
-| `lua-lzlib` | zlib compression for inform payloads |
-| `luacrypto` | AES-128-CBC/GCM via OpenSSL |
 | `luasocket` | TCP client for HTTP POST to controller |
+| `lua-openssl` | AES-128-CBC/GCM (replaces `luacrypto`, which was dropped from the 25.12 feeds) |
+| `luabitop` | bit operations for Lua 5.1 |
 | `iw` | Radio and station statistics |
 | `lldpd` | LLDP topology announcement and neighbor discovery |
+| `openssl-util` | `openssl` CLI — last-resort AES-CBC fallback if `lua-openssl` is unavailable |
 
-`luabitop` (bit operations for Lua 5.1) is available in standard OpenWrt builds and is typically already installed.
+There is no Lua zlib binding in the OpenWrt 25.12 feeds. openUF therefore sends
+inform payloads uncompressed and decompresses zlib-compressed controller
+responses with a bundled pure-Lua inflater (`openuf/inflate.lua`), so no zlib
+package is required.
 
 ---
 
