@@ -73,14 +73,20 @@ brew install lua luarocks      # macOS
 # Install test dependencies
 luarocks install --local lua-cjson
 
-# Run unit tests (127 tests, all pure Lua)
+# Run unit tests (all pure Lua)
 eval $(luarocks path --local)
 lua tests/run_tests.lua
 
-# Run the Python controller stub (simulates adoption handshake)
+# Full end-to-end adoption round-trip against the Python controller stub
+# (needs pycryptodome, luasocket and lua-cjson):
+sh tools/simulate.sh --adopt
+
+# Or drive it manually:
 pip install pycryptodome
 python3 tools/test_controller.py --adopt --verbose
-# In another terminal: lua openuf/inform.lua  (needs luasocket on dev machine)
+# In another terminal, run from inside the openuf/ dir (the scripts load
+# conf.lua and the modelmap with cwd-relative paths):
+cd openuf && lua inform.lua
 ```
 
 ## Protocol notes
