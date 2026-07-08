@@ -27,6 +27,10 @@ inform payloads uncompressed and decompresses zlib-compressed controller
 responses with a bundled pure-Lua inflater (`openuf/inflate.lua`), so no zlib
 package is required.
 
+Only required if your inform URL uses `https://` (uncommon — the UniFi default
+is `http://…:8080/inform`): `apk add luasec` for the TLS client. Without it, an
+`https://` URL fails with a clear error instead of connecting in cleartext.
+
 ---
 
 ## 2. Installation

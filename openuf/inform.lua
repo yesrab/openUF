@@ -511,9 +511,10 @@ function M.http_post(url, body)
 	end
 
 	-- Parse URL
-	local host, port, path = url:match("^https?://([^:/]+):?(%d*)(.*)")
+	local scheme, host, port, path = url:match("^(https?)://([^:/]+):?(%d*)(.*)")
 	if not host then return nil, "invalid URL: " .. tostring(url) end
-	port = tonumber(port) or 8080
+	local is_tls = (scheme == "https")
+	port = tonumber(port) or (is_tls and 8443 or 8080)
 	if path == "" then path = "/inform" end
 
 	local socket = require("socket")
@@ -523,6 +524,32 @@ function M.http_post(url, body)
 	if not ok then
 		tcp:close()
 		return nil, "connect failed: " .. tostring(err)
+	end
+
+	-- For https, wrap the socket in TLS. Previously the scheme was accepted but
+	-- ignored, so an https:// URL sent the inform in cleartext to a TLS port and
+	-- failed opaquely. Controllers use self-signed certs, so verification is off.
+	if is_tls then
+		local ok_ssl, ssl = pcall(require, "ssl")
+		if not ok_ssl then
+			tcp:close()
+			return nil, "https inform URL requires luasec (apk add luasec); " ..
+				"install it or use an http:// URL"
+		end
+		local wrapped, werr = ssl.wrap(tcp, {
+			mode = "client", protocol = "any", verify = "none", options = "all",
+		})
+		if not wrapped then
+			tcp:close()
+			return nil, "TLS wrap failed: " .. tostring(werr)
+		end
+		tcp = wrapped
+		tcp:settimeout(10)
+		local ok_h, herr = tcp:dohandshake()
+		if not ok_h then
+			tcp:close()
+			return nil, "TLS handshake failed: " .. tostring(herr)
+		end
 	end
 
 	local req = table.concat({
