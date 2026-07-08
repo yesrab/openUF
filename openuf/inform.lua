@@ -214,11 +214,18 @@ function M.parse_packet(raw, st)
 		error("inform: controller sent snappy-compressed response; lua-snappy not supported")
 	end
 	if bit.band(flags, FLAG_COMPRESSED) ~= 0 then
+		local done = false
+		-- Prefer a native zlib binding if the host happens to have one...
 		local ok_zlib, zlib = pcall(require, "zlib")
-		if ok_zlib and zlib.decompress then
-			payload = zlib.decompress(payload)
-		else
-			error("inform: controller sent zlib-compressed response but lua-lzlib not installed")
+		if ok_zlib and type(zlib) == "table" and zlib.decompress then
+			local ok_d, out = pcall(zlib.decompress, payload)
+			if ok_d and out then payload = out; done = true end
+		end
+		-- ...otherwise fall back to the in-tree pure-Lua inflater (OpenWrt 25.12
+		-- ships no Lua zlib binding, so this is the normal path there).
+		if not done then
+			local inflate = _require_sibling("inflate")
+			payload = inflate.zlib_decompress(payload)
 		end
 	end
 

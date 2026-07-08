@@ -281,6 +281,38 @@ return {
 		end
 	},
 	{
+		name = "inform packet: parse_packet inflates a zlib-compressed response",
+		fn = function()
+			-- OpenWrt 25.12 has no Lua zlib binding, so this exercises the in-tree
+			-- pure-Lua inflater on the parse path. The fixture is a real zlib stream
+			-- (tests/fixtures/zlib_response.bin) whose plaintext is asserted below.
+			-- The mgmt_cfg newlines are JSON-escaped (\n), so the decompressed bytes
+			-- contain literal backslash-n, written here as \\n.
+			local expected = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://unifi:8080/inform\\n'
+				.. 'use_aes_gcm=false\\ncfgversion=7\\n","note":"padding to ensure zlib actually '
+				.. 'shrinks this payload below its original size aaaaaaaaaaaaaaaaaaaa"}'
+			local ff = io.open("tests/fixtures/zlib_response.bin", "rb")
+			assert_not_nil(ff, "fixture present")
+			local compressed = ff:read("*a"); ff:close()
+
+			local st = sample_state()
+			-- Encrypt the compressed bytes exactly as a controller would, then frame.
+			local iv = FIXED_IV
+			local ct = crypto.aes_cbc_encrypt(st.authkey, iv, compressed)
+			local FLAG_ENCRYPTED, FLAG_COMPRESSED = 0x01, 0x02
+			local flags = FLAG_ENCRYPTED + FLAG_COMPRESSED
+			local function u32(n)
+				return string.char(math.floor(n/16777216)%256, math.floor(n/65536)%256,
+					math.floor(n/256)%256, n%256)
+			end
+			local pkt = MAGIC .. u32(1) .. "\170\187\204\221\238\255"
+				.. string.char(math.floor(flags/256), flags%256)
+				.. iv .. u32(1) .. u32(#ct) .. ct
+			local recovered = inform.parse_packet(pkt, st)
+			assert_eq(recovered, expected, "compressed response inflated to original JSON")
+		end
+	},
+	{
 		name = "inform packet: parse_packet errors on snappy-compressed response",
 		fn = function()
 			-- Build a raw packet with FLAG_SNAPPY (0x04) set
