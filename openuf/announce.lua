@@ -99,7 +99,7 @@ function M.build_packet(cfg)
 	ufpkt.finish(w, packet)
 
 	-- 0x03: Firmware version verbose
-	local suffix = cfg.version_suffix or "-openUF-0.1"
+	local suffix = cfg.version_suffix or "-openUF-0.2"
 	w = ufpkt.init(PKT.FWVER_VERBOSE)
 	ufpkt.catstr(w, cfg.fw_pre)
 	ufpkt.catstr(w, cfg.fw_ver)
@@ -236,7 +236,7 @@ if not OPENUF_TEST_MODE then
 			fw_ver        = ufhw.uap.fw.ver,
 			fw_buildtime  = ufhw.uap.fw.buildtime,
 			fw_factoryver = ufhw.uap.fw.factoryver,
-			version_suffix = "-openUF-0.1",
+			version_suffix = "-openUF-0.2",
 		})
 	end)
 	if not ok then
