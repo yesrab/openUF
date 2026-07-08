@@ -34,10 +34,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y lua5.1 liblua5.1-dev lua-bitop luarocks openssl python3-pip
           sudo ln -sf /usr/bin/lua5.1 /usr/local/bin/lua
-          sudo luarocks --lua-version 5.1 install lua-cjson
-          sudo luarocks --lua-version 5.1 install luasocket
-          pip3 install --break-system-packages pycryptodome \
-            || pip3 install pycryptodome
+          # LUA_INCDIR must be given explicitly or luarocks fails with
+          # "Failed finding Lua header files" on a clean runner.
+          sudo luarocks --lua-version 5.1 install lua-cjson LUA_INCDIR=/usr/include/lua5.1
+          sudo luarocks --lua-version 5.1 install luasocket LUA_INCDIR=/usr/include/lua5.1
+          # pip (not apt python3-pycryptodome, which ships the Cryptodome namespace)
+          # so the controller's `import Crypto` resolves.
+          pip3 install --break-system-packages pycryptodome
 
       # Drives crypto (openssl-CLI CBC), TCP/HTTP POST, the http_post partial-read
       # path, and TNBU parse — i.e. the integration a device performs at adoption.
