@@ -170,6 +170,78 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config derives mobility_domain from fast_roaming_enabled",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", networkconf_id = "net-1",
+						 fast_roaming_enabled = true},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_corp
+				assert_eq(s.ieee80211r, "1", "FT enabled")
+				assert_eq(s.mobility_domain, ucihelper.derive_mobility_domain("net-1"),
+					"mobility_domain derived from networkconf_id")
+				assert_eq(#s.mobility_domain, 4, "mobility_domain is 4 hex chars")
+				assert_eq(s.ft_psk_generate_local, "1", "local PMK generation enabled")
+				assert_eq(s.ft_over_ds, "0", "over-DS disabled by default")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: derive_mobility_domain is stable across independent APs",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp1 = {
+					radio_table = {}, network_table = {},
+					vap_table = {{ssid = "corp", radio = "radio0", security = "wpa2",
+						x_passphrase = "hunter22", networkconf_id = "net-1",
+						fast_roaming_enabled = true}},
+				}
+				ucihelper.apply_config(resp1, nil)
+				local first = db.wireless.openuf_corp.mobility_domain
+
+				local resp2 = {
+					radio_table = {}, network_table = {},
+					vap_table = {{ssid = "corp", radio = "radio1", security = "wpa2",
+						x_passphrase = "hunter22", networkconf_id = "net-1",
+						fast_roaming_enabled = true}},
+				}
+				ucihelper.apply_config(resp2, nil)
+				local second = db.wireless.openuf_corp.mobility_domain
+
+				assert_eq(first, second,
+					"same networkconf_id yields same mobility_domain regardless of radio")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config lets controller-sent FT fields override derived defaults",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", networkconf_id = "net-1",
+						 fast_roaming_enabled = true,
+						 mobility_domain = "abcd", ft_over_ds = "1"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_corp
+				assert_eq(s.mobility_domain, "abcd", "explicit mobility_domain wins")
+				assert_eq(s.ft_over_ds, "1", "explicit ft_over_ds wins")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_vap_table round-trips networkconf_id",
 		fn = function()
 			with_ucihelper(function(db)

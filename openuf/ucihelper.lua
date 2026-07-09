@@ -59,6 +59,21 @@ local SECURITY_MAP = {
 	["wpa-enterprise"] = "wpa2+ccmp",
 }
 
+-- Deterministic 16-bit id from a string, formatted as 4 hex chars (802.11r
+-- mobility domain is a 2-octet field). Used as a stopgap mobility_domain
+-- when the controller only sends the high-level fast_roaming_enabled toggle
+-- and no raw mobility_domain/r0kh/r1kh (UniFi's admin API has no such fields
+-- -- it computes and syncs them internally across all APs on a site). Same
+-- seed always yields the same domain, so every openUF-emulated AP on the
+-- same network computes it identically without needing to coordinate.
+function M.derive_mobility_domain(seed)
+	local hash = 0
+	for i = 1, #seed do
+		hash = (hash * 31 + seed:byte(i)) % 65536
+	end
+	return string.format("%04x", hash)
+end
+
 -- ─── VAP management ──────────────────────────────────────────────────────────
 
 -- Delete all openuf_* wifi-iface sections on the given radio (or all radios).
@@ -206,12 +221,21 @@ function M.apply_config(resp, cfg)
 	for _, vap in ipairs(vap_table) do
 		if vap.ssid and vap.radio then
 			local extra = {}
-			if vap.ieee80211r then extra.ieee80211r = vap.ieee80211r end
+			local fast_roaming = vap.fast_roaming_enabled or vap.ieee80211r
+			if fast_roaming then
+				extra.ieee80211r = "1"
+				extra.mobility_domain = M.derive_mobility_domain(vap.networkconf_id or vap.ssid)
+				extra.ft_psk_generate_local = "1"
+				extra.ft_over_ds = "0"
+			end
 			if vap.ieee80211k then extra.ieee80211k = vap.ieee80211k end
 			if vap.ieee80211v then extra.ieee80211v = vap.ieee80211v end
+			-- Controller-sent values win over the derived/default stopgap ones above.
+			if vap.mobility_domain then extra.mobility_domain = vap.mobility_domain end
 			if vap.ft_psk_generate_local then
 				extra.ft_psk_generate_local = vap.ft_psk_generate_local
 			end
+			if vap.ft_over_ds then extra.ft_over_ds = vap.ft_over_ds end
 
 			-- Resolve VLAN: prefer the linked network_table entry, fall back
 			-- to a vlan/vlan_enabled set directly on the vap itself.
