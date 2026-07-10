@@ -510,7 +510,13 @@ function M.handle_response(json_str, st, cfg)
 			end
 		end
 		-- other cmd values (e.g. mfi-output, restart): no-op
-		return false
+		--
+		-- Per fxkr/unifi-protocol-reverse-engineering's documented inform
+		-- semantics: "Upon receiving a command message, an AP will execute a
+		-- command and then send another inform immediately" -- regardless of
+		-- which cmd it was, including ones we treat as a no-op. Matches the
+		-- cfgversion branch below, which already does this correctly.
+		return true
 	end
 
 	-- Config update: check cfgversion

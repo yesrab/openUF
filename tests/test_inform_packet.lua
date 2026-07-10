@@ -295,16 +295,26 @@ return {
 		name = "inform packet: handle_response cmd set-locate sets st.locating",
 		fn = function()
 			local st = sample_state()
-			inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st)
+			local result = inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st)
 			assert_true(st.locating, "locating true after set-locate")
+			assert_true(result, "re-inform immediately after executing a command (fxkr protocol notes)")
 		end
 	},
 	{
 		name = "inform packet: handle_response cmd unset-locate clears st.locating",
 		fn = function()
 			local st = sample_state({locating = true})
-			inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st)
+			local result = inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st)
 			assert_false(st.locating, "locating false after unset-locate")
+			assert_true(result, "re-inform immediately after executing a command")
+		end
+	},
+	{
+		name = "inform packet: handle_response cmd re-informs immediately even for unhandled commands",
+		fn = function()
+			local st = sample_state()
+			local result = inform.handle_response('{"_type":"cmd","cmd":"mfi-output"}', st)
+			assert_true(result, "re-inform immediately regardless of which command was received")
 		end
 	},
 	{

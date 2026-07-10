@@ -70,6 +70,41 @@ internal-microservice dependency in newer controller builds (an unrelated
 both `latest` and the pinned `10.4.57` image — a background licensing/manifest
 fetch, present regardless of version, not the cause).
 
+### Cross-check against fxkr/unifi-protocol-reverse-engineering's "Inform" docs
+
+Header layout, flags (0x01 encrypted, 0x02 compressed), zlib-before-encrypt
+ordering, AES-128-CBC+PKCS#7, and the default `http://unifi:8080/inform` URL all
+match openUF's implementation exactly — no divergence there (fxkr's doc predates
+GCM/Snappy, which `amd989`'s docs cover instead; not a conflict, just an older/
+simpler snapshot of the protocol).
+
+One real divergence found: fxkr's doc states *"Upon receiving a command message, an
+AP will execute a command and then send another inform immediately."* openUF's
+`_type == "cmd"` dispatch (`inform.lua`, the `cmd` branch) unconditionally
+`return false`d regardless of which command ran (`set-locate`, `spectrum-scan`, or
+an unhandled command) — meaning it never re-informed immediately after executing a
+command, unlike the `cfgversion` branch just below it, which already did this
+correctly. Fixed: the `cmd` branch now always `return true`s, matching the
+documented behavior and matching how the `cfgversion` branch already worked. Not
+verified against a live controller in this session (no adopted device to receive
+`cmd` responses against, given the L3 deadlock above) — a genuine protocol-shape
+fix based on independent published documentation, same standard as the `mgmt_cfg`
+work.
+
+**Methodology note on how this whole investigation's findings were verified**:
+every earlier "raw response" observation in this document came from decrypting
+*inside* the client process itself (openUF, or a one-shot script, or `amd989`'s own
+code) — valid since we always control the client and already have the key, but it
+only shows what that client's own logging chose to surface. Cross-checked this
+independently with a minimal raw TCP relay (same purpose as fxkr's own
+mitmproxy-based capture technique — observe bytes on the wire, independent of any
+client-side code — just a plain byte-logging relay rather than an HTTP/TNBU-aware
+mitmproxy extension, since tampering wasn't needed, only observation). Captured
+both the 404 and 400 cases at the wire level through it: confirms the `100
+Continue` handshake completes normally and the final response genuinely has
+`Content-Length: 0` in both cases — nothing hidden that the client-side logs had
+been suppressing or misreporting.
+
 ### L3 adoption never completes in this environment — contradicts current USAGE.md
 
 `USAGE.md` §4 currently states, for L3 adoption: *"Click Adopt — the controller
