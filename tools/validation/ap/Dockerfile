@@ -28,7 +28,18 @@ RUN ssh-keygen -A \
 COPY openuf/ /opt/openuf/
 RUN ln -sf /opt/openuf/hook/syswrapper.sh /usr/bin/syswrapper.sh \
     && chmod +x /usr/bin/syswrapper.sh /opt/openuf/hook/syswrapper.sh \
-    && mkdir -p /etc/openuf /var/log
+    && mkdir -p /etc/openuf /var/log \
+    && sed -i 's/debug_dump_file = nil/debug_dump_file = "\/var\/log\/openuf-informs.log"/' \
+        /opt/openuf/conf.lua \
+    && sed -i 's/lan_cpueth\t= "eth1"/lan_cpueth\t= "eth0"/' \
+        /opt/openuf/modelmap/generic-dualband-ap.lua
+
+# generic-dualband-ap.lua assumes real hardware's switch topology (eth0=WAN,
+# eth1=LAN via VLANs) -- this single-NIC container only has eth0. Without
+# this override, announce.get_mac/get_ip (used by inform.lua's
+# _populate_net_info) silently fail to find "eth1", leaving st.mac/st.ip
+# unset -- informs then report MAC 00:00:00:00:00:00 and IP 0.0.0.0, which
+# the controller cannot adopt (it has no address to SSH the device at).
 
 WORKDIR /opt/openuf
 EXPOSE 22
