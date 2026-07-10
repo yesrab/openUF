@@ -100,6 +100,7 @@ openUF implements the **TNBU binary inform protocol**:
 - Adoption: controller SSHes in and calls `syswrapper.sh set-adopt <url> <newkey>`
 
 Key reference material:
+- [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md) — this project's own findings from running openUF against a real self-hosted UniFi controller; supersedes the below where they disagree
 - [amd989/unifi-gateway](https://github.com/amd989/unifi-gateway) — primary protocol reference; live Python daemon tested against real controllers
 - [jeffreykog/unifi-inform-protocol](https://github.com/jeffreykog/unifi-inform-protocol)
 - [fxkr/unifi-protocol-reverse-engineering](https://github.com/fxkr/unifi-protocol-reverse-engineering)
