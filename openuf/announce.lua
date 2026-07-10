@@ -189,6 +189,12 @@ function M.run(cfg)
 	local socket = require("socket")
 
 	local udpb = socket.udp()
+	-- luasocket creates the underlying OS socket lazily on first real use
+	-- (bind/connect/send), not in socket.udp() itself. setoption() before
+	-- that point silently no-ops against fd -1, so SO_BROADCAST never
+	-- actually gets set and the later setpeername() to a broadcast address
+	-- fails with EACCES. Force real socket creation first via a bind.
+	udpb:setsockname("*", 0)
 	udpb:setoption("broadcast", true)
 	udpb:setpeername(M.BROADCAST_ADDR, M.PORT)
 
