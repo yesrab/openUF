@@ -1,0 +1,71 @@
+# Disposable environment for validating openUF's controller-pushed payload
+# assumptions against a real UniFi Network Application controller.
+# See PROTOCOL-VALIDATION.md for the validation matrix and findings, and
+# this directory's README.md for how to run through it.
+#
+# Run from the repo root:
+#   docker compose -f tools/validation/docker-compose.yml up -d --build
+
+services:
+  unifi-db:
+    image: docker.io/mongo:4.4
+    container_name: openuf-validation-db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=root
+      - MONGO_INITDB_ROOT_PASSWORD=openuf
+      - MONGO_USER=unifi
+      - MONGO_PASS=openuf
+      - MONGO_DBNAME=unifi
+      - MONGO_AUTHSOURCE=admin
+    volumes:
+      - unifi-db-data:/data/db
+      - ./init-mongo.sh:/docker-entrypoint-initdb.d/init-mongo.sh:ro
+    networks:
+      - validation
+    restart: unless-stopped
+
+  controller:
+    image: lscr.io/linuxserver/unifi-network-application:latest
+    container_name: openuf-validation-controller
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - MONGO_USER=unifi
+      - MONGO_PASS=openuf
+      - MONGO_HOST=unifi-db
+      - MONGO_PORT=27017
+      - MONGO_DBNAME=unifi
+      - MONGO_AUTHSOURCE=admin
+    volumes:
+      - unifi-controller-config:/config
+    ports:
+      - "8443:8443"       # web admin UI
+      - "8080:8080"       # AP inform traffic
+      - "10001:10001/udp" # AP L2 discovery
+      - "3478:3478/udp"   # STUN
+    networks:
+      - validation
+    depends_on:
+      - unifi-db
+    restart: unless-stopped
+
+  ap:
+    build:
+      context: ../..
+      dockerfile: tools/validation/ap/Dockerfile
+    container_name: openuf-validation-ap
+    hostname: openuf-ap
+    networks:
+      - validation
+    # Not exposed to the host on purpose -- the controller reaches this
+    # container's sshd over the internal `validation` network only, same
+    # as it would reach real hardware on its own subnet.
+
+networks:
+  validation:
+    driver: bridge
+
+volumes:
+  unifi-db-data:
+  unifi-controller-config:
