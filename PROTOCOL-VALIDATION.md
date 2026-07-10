@@ -105,6 +105,39 @@ Continue` handshake completes normally and the final response genuinely has
 `Content-Length: 0` in both cases — nothing hidden that the client-side logs had
 been suppressing or misreporting.
 
+### Cross-check against a real captured USG inform payload — `sys_stats` was wrong
+
+`stephanlascar/unifi-gateway`'s `poc/real_inform_payload_exemple.json` is a genuine
+captured inform payload from a real UniFi Security Gateway (model `UGW3`), not an
+AP — so gateway-only fields (WAN config, routing, DPI, VPN, speedtest, port table)
+don't apply to openUF's AP emulation and aren't a divergence. But diffing the
+common envelope fields against openUF's `build_json` output found a real,
+two-part bug:
+
+- **Wrong key**: the real capture reports live CPU/memory/uptime under the
+  hyphenated key `"system-stats"`. openUF sent `"sys_stats"` (underscore) — a real
+  controller would never recognize this key at all, silently ignoring it (matching
+  this whole investigation's pattern of unrecognized fields producing no error, just
+  quiet non-functionality).
+- **Wrong shape**: even the key were right, the *content* didn't match. Real
+  devices send `{cpu: "<percent>", mem: "<percent>", uptime: "<seconds>"}` (all
+  three as strings). openUF sent `{loadavg_1, loadavg_5, loadavg_15}` — Unix load
+  averages, a completely different metric real devices don't report under this
+  field at all.
+
+Fixed: renamed to `["system-stats"]`, restructured to `{cpu, mem, uptime}`.
+`mem` is computed correctly from existing `meminfo()` data. `uptime` reuses the
+existing `M.uptime()` value, stringified. `cpu` needed a genuinely new capability —
+added `sysinfo.cpu_percent()`, delta-sampling the aggregate `cpu` line in
+`/proc/stat` between successive calls (returns `0` on the first call, since there's
+no prior sample to diff against yet — this means the very first inform after
+startup always reports `cpu: "0"`, which is expected and harmless). The pre-existing
+top-level `mem_total`/`mem_free` (raw byte counts) fields were left alone — not
+seen in this gateway capture either, but unconfirmed whether real *AP* payloads
+include them, so removing them isn't justified by this evidence alone (unlike the
+`system-stats` key, which is a documented, cross-referenced device-type-agnostic
+field this capture and `amd989`'s `_create_complete_inform` both confirm).
+
 ### L3 adoption never completes in this environment — contradicts current USAGE.md
 
 `USAGE.md` §4 currently states, for L3 adoption: *"Click Adopt — the controller

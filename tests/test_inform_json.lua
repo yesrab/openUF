@@ -227,11 +227,17 @@ return {
 		end
 	},
 	{
-		name = "inform json: sys_stats.loadavg populated from fixture",
+		name = "inform json: system-stats present with cpu/mem/uptime (real capture key/shape)",
 		fn = function()
 			local d = build()
-			assert_not_nil(d.sys_stats, "sys_stats present")
-			assert_eq(d.sys_stats.loadavg_1, 0.42, "loadavg_1 from fixture")
+			-- Real devices report this under the hyphenated key "system-stats"
+			-- (verified against a real captured USG payload) -- not "sys_stats".
+			local stats = d["system-stats"]
+			assert_not_nil(stats, "system-stats present")
+			assert_not_nil(stats.cpu, "cpu field present")
+			assert_not_nil(stats.uptime, "uptime field present")
+			-- meminfo fixture: total=131072kB, free=65536kB -> 50% used
+			assert_eq(stats.mem, "50", "mem percent computed from meminfo fixture")
 		end
 	},
 	{

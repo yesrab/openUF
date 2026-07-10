@@ -57,6 +57,45 @@ function M.meminfo()
 	}
 end
 
+-- Previous /proc/stat sample for delta-based CPU% (see M.cpu_percent).
+-- Exposed for tests to reset/inspect between calls.
+M._prev_cpu = nil
+
+-- Returns CPU usage percent (0-100) since the previous call, by delta-
+-- sampling the aggregate "cpu" line in /proc/stat (matches the real
+-- inform payload's system-stats.cpu, which is a live percentage -- not to
+-- be confused with M.loadavg(), a different metric real devices don't
+-- report under this field). Returns 0 on the first call, since there's no
+-- prior sample to diff against yet.
+function M.cpu_percent()
+	local s = M._read_file("/proc/stat")
+	if not s then return 0 end
+	local cpu_line = s:match("^cpu%s+([^\n]+)")
+	if not cpu_line then return 0 end
+
+	local fields = {}
+	for n in cpu_line:gmatch("%d+") do
+		fields[#fields + 1] = tonumber(n)
+	end
+	if #fields < 4 then return 0 end
+
+	-- Fields: user nice system idle iowait irq softirq [steal guest guest_nice]
+	local idle = fields[4] + (fields[5] or 0)
+	local total = 0
+	for _, v in ipairs(fields) do total = total + v end
+
+	local pct = 0
+	if M._prev_cpu then
+		local total_delta = total - M._prev_cpu.total
+		local idle_delta  = idle  - M._prev_cpu.idle
+		if total_delta > 0 then
+			pct = math.floor((total_delta - idle_delta) * 100 / total_delta + 0.5)
+		end
+	end
+	M._prev_cpu = {total = total, idle = idle}
+	return pct
+end
+
 -- Returns a table of interface stats from /proc/net/dev.
 -- Each entry: {name, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors}
 function M.interfaces()

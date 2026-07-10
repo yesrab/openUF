@@ -247,9 +247,12 @@ function M.build_json(st, cfg, ufhw)
 	local uap = ufhw and ufhw.uap or {}
 
 	-- Collect sysinfo
-	local uptime    = M._sysinfo.uptime()
-	local loadavg   = M._sysinfo.loadavg()
-	local meminfo   = M._sysinfo.meminfo()
+	local uptime     = M._sysinfo.uptime()
+	local meminfo    = M._sysinfo.meminfo()
+	local cpu_pct    = M._sysinfo.cpu_percent()
+	local mem_pct    = meminfo.total_kb > 0
+	                    and math.floor((meminfo.total_kb - meminfo.free_kb) * 100 / meminfo.total_kb + 0.5)
+	                    or 0
 	local ifaces    = M._sysinfo.interfaces()
 	local lldp_nbrs = M._lldp.neighbors()
 
@@ -367,10 +370,16 @@ function M.build_json(st, cfg, ufhw)
 		country_code     = st.country_code or 840,
 		mem_total        = meminfo.total_kb * 1024,
 		mem_free         = meminfo.free_kb  * 1024,
-		sys_stats        = {
-			loadavg_1  = loadavg.one,
-			loadavg_5  = loadavg.five,
-			loadavg_15 = loadavg.fifteen,
+		-- Real devices report this under the hyphenated key "system-stats"
+		-- with {cpu, mem, uptime} as percentage/uptime strings -- confirmed
+		-- against a real captured USG inform payload (stephanlascar/
+		-- unifi-gateway, poc/real_inform_payload_exemple.json). Previously
+		-- sent as "sys_stats" (underscore) with raw loadavg_1/5/15 fields,
+		-- which the controller would not have recognized at all.
+		["system-stats"] = {
+			cpu    = tostring(cpu_pct),
+			mem    = tostring(mem_pct),
+			uptime = tostring(uptime),
 		},
 		if_table         = if_table,
 		radio_table      = radio_table,

@@ -158,4 +158,41 @@ return {
 			end)
 		end
 	},
+	{
+		name = "sysinfo: cpu_percent() returns 0 on the first call (no prior sample)",
+		fn = function()
+			local prev = sysinfo._prev_cpu
+			sysinfo._prev_cpu = nil
+			with_fixtures({["/proc/stat"] = fixture("proc_stat_1.txt")}, {}, function()
+				assert_eq(sysinfo.cpu_percent(), 0, "no prior sample to diff against")
+			end)
+			sysinfo._prev_cpu = prev
+		end
+	},
+	{
+		name = "sysinfo: cpu_percent() computes delta-based usage between two samples",
+		fn = function()
+			local prev = sysinfo._prev_cpu
+			sysinfo._prev_cpu = nil
+			with_fixtures({["/proc/stat"] = fixture("proc_stat_1.txt")}, {}, function()
+				sysinfo.cpu_percent()  -- prime the first sample
+			end)
+			with_fixtures({["/proc/stat"] = fixture("proc_stat_2.txt")}, {}, function()
+				-- total delta = 200, idle delta = 100 -> 50% busy
+				assert_eq(sysinfo.cpu_percent(), 50, "delta-based CPU percent")
+			end)
+			sysinfo._prev_cpu = prev
+		end
+	},
+	{
+		name = "sysinfo: cpu_percent() returns 0 when /proc/stat is unavailable",
+		fn = function()
+			local prev = sysinfo._prev_cpu
+			sysinfo._prev_cpu = nil
+			with_fixtures({}, {}, function()
+				assert_eq(sysinfo.cpu_percent(), 0, "missing /proc/stat is safe")
+			end)
+			sysinfo._prev_cpu = prev
+		end
+	},
 }
