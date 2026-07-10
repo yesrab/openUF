@@ -612,28 +612,44 @@ end
 
 -- ─── Main loop ───────────────────────────────────────────────────────────────
 
+-- Populate st.mac / st.ip using announce.lua's get_mac/get_ip helpers.
+--
+-- _require_sibling dofile()s announce.lua fresh every call (dofile, unlike
+-- require, never caches), which re-runs its self-executing "script entry
+-- point" block at the bottom -- that block is guarded by
+-- `if not OPENUF_TEST_MODE`, so outside of tests (where it's already true)
+-- this would spawn announce.lua's own *infinite* L2 broadcast loop nested
+-- inside inform.lua's own M.run, or -- if the broadcast send errors, as it
+-- does e.g. on a docker bridge network that disallows UDP broadcast -- call
+-- os.exit(1) and kill the whole inform process before the actual inform loop
+-- ever runs. Suppress it for the duration of just this reuse-only dofile.
+function M._populate_net_info(st, cfg)
+	local prev_test_mode = OPENUF_TEST_MODE
+	OPENUF_TEST_MODE = true
+	local ok_ann, announce = pcall(_require_sibling, "announce")
+	OPENUF_TEST_MODE = prev_test_mode
+	if not ok_ann then return end
+
+	local iface = cfg and cfg.net and cfg.net.lan_cpueth or "eth1"
+	local mac_tbl = announce.get_mac(iface)
+	if mac_tbl then
+		-- Format as "xx:xx:xx:xx:xx:xx"
+		st.mac = string.format("%02x:%02x:%02x:%02x:%02x:%02x",
+			mac_tbl[1], mac_tbl[2], mac_tbl[3],
+			mac_tbl[4], mac_tbl[5], mac_tbl[6])
+	end
+	local ip_tbl = announce.get_ip(iface)
+	if ip_tbl then
+		st.ip = string.format("%d.%d.%d.%d",
+			ip_tbl[1], ip_tbl[2], ip_tbl[3], ip_tbl[4])
+	end
+end
+
 -- Start the inform heartbeat loop (blocks forever).
 -- cfg, ufhw: passed through to build_json()
 function M.run(cfg, ufhw)
 	local st = state.load()
-
-	-- Populate MAC and IP into state for JSON builder
-	local ok_ann, announce = pcall(_require_sibling, "announce")
-	if ok_ann then
-		local iface = cfg and cfg.net and cfg.net.lan_cpueth or "eth1"
-		local mac_tbl = announce.get_mac(iface)
-		if mac_tbl then
-			-- Format as "xx:xx:xx:xx:xx:xx"
-			st.mac = string.format("%02x:%02x:%02x:%02x:%02x:%02x",
-				mac_tbl[1], mac_tbl[2], mac_tbl[3],
-				mac_tbl[4], mac_tbl[5], mac_tbl[6])
-		end
-		local ip_tbl = announce.get_ip(iface)
-		if ip_tbl then
-			st.ip = string.format("%d.%d.%d.%d",
-				ip_tbl[1], ip_tbl[2], ip_tbl[3], ip_tbl[4])
-		end
-	end
+	M._populate_net_info(st, cfg)
 
 	local socket   = require("socket")
 	local interval = 10

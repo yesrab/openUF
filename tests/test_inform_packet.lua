@@ -281,6 +281,27 @@ return {
 		end
 	},
 	{
+		name = "inform: _populate_net_info does not trigger announce.lua's self-executing entry point outside test mode",
+		fn = function()
+			-- Regression test: _populate_net_info dofile()s announce.lua to
+			-- reuse get_mac/get_ip. Outside of test mode, announce.lua's own
+			-- bottom "script entry point" block would otherwise fire (it's
+			-- only guarded by `if not OPENUF_TEST_MODE`), spawning an
+			-- infinite broadcast loop nested inside the caller, or calling
+			-- os.exit(1) on this test process if the broadcast send errors --
+			-- either way this test would visibly hang or the whole suite
+			-- would abort if the suppression regresses.
+			local prev = OPENUF_TEST_MODE
+			OPENUF_TEST_MODE = nil  -- simulate real (non-test) execution
+			local st = {}
+			local ok = pcall(inform._populate_net_info, st, nil)
+			local restored = OPENUF_TEST_MODE
+			OPENUF_TEST_MODE = prev
+			assert_true(ok, "_populate_net_info did not error/exit with OPENUF_TEST_MODE unset")
+			assert_true(restored == nil, "OPENUF_TEST_MODE restored to its prior (unset) value after the call")
+		end
+	},
+	{
 		name = "inform packet: handle_response dumps raw JSON when debug_dump_file set",
 		fn = function()
 			local st = sample_state()
