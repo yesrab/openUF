@@ -137,8 +137,16 @@ config = {
     inform_url  = "http://unifi:8080/inform",   -- default URL (overwritten at adoption)
     state_file  = "/etc/openuf/state.json",
     log_file    = "/var/log/openuf.log",
+    debug_dump_file = nil,       -- see below
 }
 ```
+
+`debug_dump_file` — opt-in, off by default. When set to a path (e.g.
+`"/var/log/openuf-informs.log"`), every decrypted controller inform response is
+appended verbatim, with a UTC timestamp, before it's dispatched. Used to capture
+ground-truth payload shapes when validating field assumptions (`vap_table`,
+`network_table`, `cmd` dispatch, etc.) against a real UniFi controller — see
+[PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md).
 
 ---
 

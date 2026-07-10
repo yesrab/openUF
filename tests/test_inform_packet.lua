@@ -281,6 +281,34 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response dumps raw JSON when debug_dump_file set",
+		fn = function()
+			local st = sample_state()
+			local path = "/tmp/openuf_test_dump.log"
+			os.remove(path)
+			local cfg = { config = { debug_dump_file = path } }
+			inform.handle_response('{"_type":"noop"}', st, cfg)
+			local f = io.open(path, "r")
+			assert_true(f ~= nil, "dump file was created")
+			local contents = f:read("*a")
+			f:close()
+			os.remove(path)
+			assert_true(contents:find('{"_type":"noop"}', 1, true) ~= nil,
+				"dump file contains the raw response JSON")
+		end
+	},
+	{
+		name = "inform packet: handle_response does not dump when debug_dump_file unset",
+		fn = function()
+			local st = sample_state()
+			local path = "/tmp/openuf_test_dump_unset.log"
+			os.remove(path)
+			inform.handle_response('{"_type":"noop"}', st, { config = {} })
+			local f = io.open(path, "r")
+			assert_true(f == nil, "no dump file created when flag is unset")
+		end
+	},
+	{
 		name = "inform packet: parse_packet inflates a zlib-compressed response",
 		fn = function()
 			-- OpenWrt 25.12 has no Lua zlib binding, so this exercises the in-tree

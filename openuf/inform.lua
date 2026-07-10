@@ -386,6 +386,14 @@ end
 --      control becomes a no-op without cfg.led)
 -- Returns true if config was applied (caller should send follow-up inform).
 function M.handle_response(json_str, st, cfg)
+	if cfg and cfg.config and cfg.config.debug_dump_file then
+		local f = io.open(cfg.config.debug_dump_file, "a")
+		if f then
+			f:write(os.date("!%Y-%m-%dT%H:%M:%SZ") .. " " .. json_str .. "\n")
+			f:close()
+		end
+	end
+
 	local ok, resp = pcall(cjson.decode, json_str)
 	if not ok or type(resp) ~= "table" then
 		return false
