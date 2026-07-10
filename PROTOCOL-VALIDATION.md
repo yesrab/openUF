@@ -100,26 +100,56 @@ between (every response was non-200 and thus never reached `handle_response`/the
 Reproduced identically on a fully clean run (fresh mongo + fresh AP container),
 ruling out leftover state from earlier attempts.
 
-**Working hypothesis:** real L3 adoption may deliver the new key via `mgmt_cfg` in
-a `setparam` response on the *very first* default-key-encrypted inform after the
-Adopt click — a response openUF's own code is built to explicitly ignore:
-`inform.lua`'s `setparam` handler (~line 415) never applies `mgmt_cfg.authkey`,
-documented as intentional "security hardening" (only SSH `set-adopt` may set a new
-key). **If that hypothesis is right, this policy is specifically incompatible with
-L3 adoption against real controllers, since real controllers skip SSH entirely for
-L3-discovered devices.** This needs either (a) a packet capture from genuine
-hardware doing real L3 adoption to confirm the mechanism, or (b) a deliberate
-product decision on whether to accept `mgmt_cfg.authkey` for L3-discovered/not-yet-
-adopted devices specifically (a real security tradeoff — flagged for the user, not
-changed unilaterally here).
+**Hypothesis 1 (tested, implemented, did not resolve it):** real L3 adoption might
+deliver the new key via `mgmt_cfg` in a `setparam` response on the inform right
+after the Adopt click — `inform.lua`'s `setparam` handler previously ignored
+`mgmt_cfg.authkey` entirely as intentional "security hardening" (only SSH
+`set-adopt` could set a new key). Cross-checked against three independent reference
+implementations — `amd989/unifi-gateway` (this project's own primary reference)
+applies `mgmt_cfg.authkey` unconditionally with no SSH mechanism anywhere in its
+codebase; `jeffreykog/unifi-inform-protocol`'s docs describe controller-initiated
+SSH only for the L2 case. Implemented in `5bf6c5e`: accept a hex32 `authkey` from
+`mgmt_cfg` while `st.adopted == false`, matching the reference behavior. **Live
+re-test (with a tight 1-second-interval probe loop, no backoff, spanning the exact
+Adopt-click moment) found this doesn't fix it**: the client never receives a `200`
+response at all, at any polling interval — the transition from `404` to `400`
+(decrypt-fail) happens between two consecutive 1-second-apart polls with zero
+`200`/`setparam` response ever observed in between. So the fix is inert in this
+environment specifically because there's no response body to apply it to. Kept the
+code change regardless — it's strictly safer than before (only weakens the
+already-public-key pre-adoption case) and matches the reference implementations
+independently of whether it resolves this particular deadlock.
+
+**Hypothesis 2 (tested, did not resolve it):** Docker deployments of the UniFi
+Network Application require **Settings → System → Advanced → Device SSH Settings
+→ Inform Host Override** to be explicitly set (a well-documented requirement per
+linuxserver.io's own docs and community threads — without it the controller
+doesn't know its own externally-reachable address). Configured `Inform Host =
+controller` (this stack's Docker Compose service name) and matching SSH
+credentials (`root`/AP container's real sshd password) from a **fully clean
+first-contact** (fresh mongo, fresh AP, setting applied before the AP ever sent an
+inform) — same exact `invalid inform_ip controller` / `defaultAuthKey=false`
+failure sequence, unchanged. Still documented as a required setting in
+`tools/validation/README.md` (real, independently-verified Docker requirement,
+worth having correctly configured as a baseline) but ruled out as *the* cause of
+this specific deadlock.
+
+**Both hypotheses now ruled out by direct testing.** The `invalid inform_ip
+controller` log line's exact meaning remains unconfirmed — likely a static
+log-context tag rather than a substituted value (all observed instances end in the
+literal word "controller" regardless of scenario), but that's inference, not
+verified against source. What real L3 adoption's key-delivery mechanism actually
+is remains unknown without either a packet capture from genuine UBNT hardware
+doing real L3 adoption, or deeper access to this controller's internals (DEBUG-level
+Java logging, a decompile, etc.) than this environment provides.
 
 L2 discovery (which *would* use real SSH `set-adopt`, avoiding this whole issue) was
 attempted as a fallback but `announce.lua`'s UDP broadcast fails on this Docker
 bridge network (`calling 'send' on bad self` — broadcast likely unsupported/blocked
-at the network level here); this is a environment limitation, not an openUF bug.
+at the network level here); this is an environment limitation, not an openUF bug.
 **Completing the rest of the validation matrix requires either a network where L2
-broadcast actually works (e.g. macvlan instead of bridge, or real hardware), or
-resolving the L3 authkey-delivery question above.**
+broadcast actually works (e.g. macvlan instead of bridge, or real hardware), or a
+genuine breakthrough on the L3 mechanism above.**
 
 ---
 
