@@ -13,7 +13,7 @@ openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi
 | L2 UDP discovery (port 10001) | ✅ Working |
 | TNBU inform protocol (AES-128-CBC) | ✅ Working |
 | Adoption via `syswrapper.sh set-adopt` | ✅ Working |
-| L3 inform (`set-inform` before adoption) | ✅ Working |
+| L3 inform (`set-inform` before adoption) | Sends informs and appears Pending, but adoption does not complete against a real controller (see [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md)) — use L2 adoption |
 | Controller-pushed SSID provisioning | ✅ Working (UCI) |
 | VLAN-tagged SSIDs (`network_table` join) | ✅ Working — field shapes unverified against a live capture |
 | Client & radio statistics in payload | ✅ Working (`user_table`, `num_sta`, `radio_table_stats`) |

@@ -186,7 +186,16 @@ Confirm SSH works from the controller's network before attempting adoption.  A f
    ```
 2. The device starts sending inform packets to the controller
 3. It appears as **Pending** in the controller
-4. Click **Adopt** — the controller SSHes in and completes the handshake
+4. Click **Adopt**
+
+> **Known gap (2026-07-10):** live testing against a real controller
+> (`linuxserver/unifi-network-application:10.4.57`) found that for **L3-discovered**
+> devices the controller explicitly logs `discovered via L3 inform, skip SSH
+> adoption` and never attempts SSH at all — contradicting the SSH-based flow
+> documented above for L2. The real key-delivery mechanism for L3 adoption is not
+> yet confirmed; adoption does not currently complete end-to-end over L3 against a
+> real controller. See [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md) for details.
+> **L2 adoption (SSH-based) is unaffected by this and is the more reliable path.**
 
 ---
 
