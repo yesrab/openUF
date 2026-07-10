@@ -20,10 +20,29 @@ RUN apk add --no-cache \
 
 # Root SSH login with a fixed password -- fine here, this is a disposable
 # validation container on an isolated docker network, not real hardware.
+#
+# HostKeyAlgorithms/PubkeyAcceptedAlgorithms: the real controller's SSH
+# client (sshj) only offers the legacy "ssh-rsa" (SHA-1) signature scheme
+# when adopting -- matching genuine UBNT firmware's old SSH stack. OpenSSH
+# has disabled ssh-rsa from its default algorithm list since 8.8 (this
+# image ships 9.7), which fails adoption's SSH handshake with "Unable to
+# reach a settlement of HostKeyAlgorithms" even though an RSA host key
+# exists. Re-enabling it here is what makes real SSH-based adoption work.
+#
+# The controller's SSH adopt flow doesn't use the admin-configured "Device SSH
+# Authentication" credentials for a device announcing itself as unadopted
+# (IsDefault=1 in the L2 discovery packet, see announce.lua) -- it tries the
+# real Ubiquiti factory-default account, "ubnt"/"ubnt", exactly like it would
+# against genuine out-of-box hardware. Add that account (UID 0, so it's
+# root-equivalent like real UBNT firmware's ubnt account) so SSH adopt
+# actually succeeds here.
 RUN ssh-keygen -A \
     && echo 'root:openuf' | chpasswd \
+    && echo 'ubnt:x:0:0:ubnt:/root:/bin/sh' >> /etc/passwd \
+    && echo 'ubnt:ubnt' | chpasswd \
     && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
-    && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
+    && printf '\nHostKeyAlgorithms +ssh-rsa\nPubkeyAcceptedAlgorithms +ssh-rsa\n' >> /etc/ssh/sshd_config
 
 COPY openuf/ /opt/openuf/
 RUN ln -sf /opt/openuf/hook/syswrapper.sh /usr/bin/syswrapper.sh \
