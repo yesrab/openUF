@@ -170,14 +170,48 @@ failure sequence, unchanged. Still documented as a required setting in
 worth having correctly configured as a baseline) but ruled out as *the* cause of
 this specific deadlock.
 
-**Both hypotheses now ruled out by direct testing.** The `invalid inform_ip
-controller` log line's exact meaning remains unconfirmed — likely a static
-log-context tag rather than a substituted value (all observed instances end in the
-literal word "controller" regardless of scenario), but that's inference, not
-verified against source. What real L3 adoption's key-delivery mechanism actually
-is remains unknown without either a packet capture from genuine UBNT hardware
-doing real L3 adoption, or deeper access to this controller's internals (DEBUG-level
-Java logging, a decompile, etc.) than this environment provides.
+**Hypothesis 3 (tested with amd989/unifi-gateway's actual upstream code, not a
+re-implementation — did not resolve it, and is the most conclusive result of the
+three):** cloned `amd989/unifi-gateway` and ran its real, documented adoption
+procedure verbatim (`README.md#3-adopt-to-controller`): `set-adopt -s <url>`
+(404, "adopt from GUI and re-run this command") → click Adopt in the UI → re-run
+the *same* one-shot `set-adopt` command immediately. This differs architecturally
+from openUF's own loop: `amd989`'s daemon never repeatedly POSTs `/inform` while
+unadopted at all (its main loop only sends L2 broadcast while unadopted — the only
+pre-adoption inform is this one-shot CLI call), so this ruled out both "continuous
+retry loop confuses the server's per-device state" and "wrong request timing" as
+explanations. (Hit and fixed one unrelated bug along the way: `amd989`'s own
+`BaseCollector._get_interface_macs()` returns the literal string
+`'00:00:00:00:00:00'` instead of `None` when it can't resolve an interface's MAC,
+which defeats its own `_resolve_lan_identity()` config-fallback check — pointed
+`realif` at a real macOS interface, `en0`, to get a correct identity and eliminate
+this as a confound.) **Result: identical failure.** Server log:
+```
+INFO  adopt  -    device[46:fc:f2:aa:ef:ea] discovered via L3 inform, skip SSH adoption
+WARN  inform - dev[46-FC-F2-AA-EF-EA] inform decryption failed with defaultAuthKey=false, ... DataFormatException
+ERROR inform - dev[46:fc:f2:aa:ef:ea] invalid inform_ip localhost
+```
+(`DataFormatException` here instead of `invalid JSON` because `amd989` zlib-compresses
+its payload, so garbage-decrypted bytes fail differently downstream than openUF's
+uncompressed case — same root cause, different visible symptom.) This also
+corrects an earlier guess in this doc: `invalid inform_ip <value>` **is dynamic**,
+not a static log-context tag — it read `controller` when reached via the Docker
+Compose hostname and `localhost` here when reached from the host machine directly,
+confirming it reflects whatever inform-host value the request context resolves to.
+
+**Conclusion: this is very likely a genuine controller-version incompatibility, not
+a client bug in either project.** `amd989/unifi-gateway`'s own actual code,
+run exactly as its README documents, fails against this controller
+(`10.4.57`) in the identical way openUF does. Given the controller's own
+"Upgrade to UniFi OS Server" push, the `ucore`-microservice log noise from an
+earlier finding, and the `UNKNOWN`/`INFORM_ERROR` circuit-breaker state machine
+found in this investigation, this controller generation appears to have changed
+internal L3-adoption behavior in ways that predate-and-break every third-party
+reference implementation checked so far. Confirming this would need either a
+packet capture from genuine UBNT hardware doing real L3 adoption against a
+*matching* controller version, or testing against an older pinned controller
+release (`10.1.x`/`10.3.x` tags exist on Docker Hub) to see if the older behavior
+differs.
 
 L2 discovery (which *would* use real SSH `set-adopt`, avoiding this whole issue) was
 attempted as a fallback but `announce.lua`'s UDP broadcast fails on this Docker
