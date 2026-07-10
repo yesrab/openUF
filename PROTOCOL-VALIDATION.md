@@ -96,9 +96,45 @@ ERROR inform - Inform Invalid for Device[...], Invalid
 *non-default* key for this device — but there was no successful round-trip in
 between (every response was non-200 and thus never reached `handle_response`/the
 `debug_dump_file` dump) in which a new key could plausibly have been delivered via
-`mgmt_cfg` either. The device is permanently stuck in "Adopting" from this point.
-Reproduced identically on a fully clean run (fresh mongo + fresh AP container),
-ruling out leftover state from earlier attempts.
+`mgmt_cfg` either. Reproduced identically on a fully clean run (fresh mongo + fresh
+AP container), ruling out leftover state from earlier attempts.
+
+**Full state machine (only visible if you let it run ~10+ minutes — every earlier
+test in this doc's history ran under 90 seconds and never saw this)**: letting the
+AP's normal 10s-interval inform loop retry continuously after the Adopt click
+(no artificial probing) reveals a real internal device lifecycle, confirmed via the
+*unfiltered* `server.log` (grep `-i inform|adopt|ssh` had been silently swallowing
+the key transition line because of how the earlier greps were scoped/timed, not
+because the line doesn't exist):
+
+```
+20:06:06  webapi  adopt   device[<mac>] discovered via L3 inform, skip SSH adoption
+20:06:41  \
+20:07:40   | inform decryption failed with defaultAuthKey=false ... invalid JSON
+20:08:39   | invalid inform_ip controller                                        } x6, ~1 min apart
+20:09:38   |
+20:10:37   |
+20:11:36  /
+20:12:35  inform  dev[<mac>] used default key in UNKNOWN state, reject it!        <- state flips
+20:13:34  inform  dev[<mac>] used default key in INFORM_ERROR state, reject it!   <- and settles
+20:14:33  ... (repeats indefinitely from here)
+```
+
+So: ~6 failed decrypt attempts over ~5–6 minutes, then the device transitions
+`(adopting) → UNKNOWN → INFORM_ERROR` and the server stops even trying to validate
+`inform_ip` — it now rejects default-key informs outright, unconditionally, every
+time. This looks like a deliberate circuit-breaker: after enough failures the
+server gives up on the normal recovery path entirely.
+
+**This explains the UI status you'll see if you leave a device long enough**: once
+in `INFORM_ERROR`/`UNKNOWN`, the **Status** column shows a bare `-` (this
+controller build's frontend has no display string for those two states) while the
+**status dot stays orange** (never told otherwise) — easy to misread as "still
+pending" when it's actually a dead end. The device detail panel's Settings tab
+still shows a full set of controls (Remove, Disable, Set Replacement Device, Load
+Configuration) — the server hasn't discarded the device record, it's just
+unreachable from this state via any inform-protocol retry. **Removing (forgetting)
+the device via the UI and re-adopting from scratch is the only observed way out.**
 
 **Hypothesis 1 (tested, implemented, did not resolve it):** real L3 adoption might
 deliver the new key via `mgmt_cfg` in a `setparam` response on the inform right
