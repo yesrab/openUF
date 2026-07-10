@@ -186,4 +186,21 @@ return {
 			end, "wrong tag must fail verification")
 		end
 	},
+	{
+		name = "crypto: module table has no top-level encrypt field (require self-collision guard)",
+		fn = function()
+			-- crypto.lua does pcall(require, "crypto") to detect a luacrypto
+			-- binding. Lua's default package.path includes "./?.lua", so when
+			-- this file runs from its own directory (e.g. /opt/openuf, exactly
+			-- how install.sh deploys it) with neither lua-openssl nor
+			-- luacrypto installed, require("crypto") can resolve right back to
+			-- this same crypto.lua instead of failing. The fix checks the
+			-- returned table has luacrypto's shape (an `encrypt` function)
+			-- before trusting it, so a self-match falls through to the
+			-- openssl(1) CLI backend instead of erroring. That guard only
+			-- works because this module's own public API has no top-level
+			-- `encrypt` field -- assert that invariant holds.
+			assert_true(crypto.encrypt == nil, "module has no top-level encrypt field")
+		end
+	},
 }

@@ -73,8 +73,18 @@ local function pkcs7_unpad(data)
 end
 
 -- Backend detection. lua-openssl is preferred; luacrypto is a legacy fallback.
+--
+-- Lua's default package.path includes "./?.lua", so when this file is run
+-- from its own directory (e.g. /opt/openuf, exactly how install.sh deploys
+-- it) require("crypto") can resolve right back to this same crypto.lua file
+-- instead of failing -- there's no real luacrypto binding installed, but the
+-- name collides. Guard against that by checking the returned module actually
+-- has luacrypto's shape (an `encrypt` function); this module's own table
+-- doesn't, so the false-positive match now correctly falls through to the
+-- openssl(1) CLI backend instead of erroring on a missing method.
 local _ossl_ok,   _ossl    = pcall(require, "openssl")
 local _crypto_ok, _lcrypto = pcall(require, "crypto")
+_crypto_ok = _crypto_ok and type(_lcrypto) == "table" and type(_lcrypto.encrypt) == "function"
 
 -- Internal: unpredictable temp path for the openssl(1) CLI fallback. Names in
 -- the old code were "/tmp/uf_cbc_in_<os.time()>" — guessable to any local user,
