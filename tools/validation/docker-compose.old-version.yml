@@ -1,0 +1,16 @@
+# Override to test against an older controller version, to check whether
+# the L3-adoption deadlock documented in PROTOCOL-VALIDATION.md is a
+# version regression rather than something all versions share.
+#
+# Usage (from repo root):
+#   docker compose -f tools/validation/docker-compose.yml \
+#                   -f tools/validation/docker-compose.old-version.yml \
+#                   up -d --build
+#
+# Requires a full reset first if you've already got the default (10.4.57)
+# stack running, since mongo schema/state may not be cross-compatible:
+#   docker compose -f tools/validation/docker-compose.yml down -v
+
+services:
+  controller:
+    image: lscr.io/linuxserver/unifi-network-application:10.1.84

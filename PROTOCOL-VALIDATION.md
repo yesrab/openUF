@@ -289,6 +289,74 @@ at the network level here); this is an environment limitation, not an openUF bug
 broadcast actually works (e.g. macvlan instead of bridge, or real hardware), or a
 genuine breakthrough on the L3 mechanism above.**
 
+### Re-tested against an older controller (`10.1.84`) — identical deadlock, and the real root cause
+
+Ran the exact same `amd989/unifi-gateway` one-shot procedure
+(`docker-compose.old-version.yml`, pinning
+`lscr.io/linuxserver/unifi-network-application:10.1.84` against a fully fresh
+mongo/AP stack) to test the leading hypothesis from the previous section — that this
+is a controller-version regression. **Result: identical deadlock.** This makes it
+two independent controller generations (`10.4.57` and `10.1.84`) failing the same
+way, which rules out "version regression" as the explanation.
+
+Inspecting the controller's own device record directly in Mongo after clicking Adopt
+(`db.device.find(...)` in the `unifi` database) showed:
+
+```json
+{ "mac": "46:fc:f2:aa:ef:ea", "adopted": true, "x_authkey": "b9fd6298283fe1f1a4f59e5de221307c" }
+```
+
+So the controller *does* commit to adoption server-side (`adopted: true`, a real new
+`x_authkey` generated) — it just never delivers that key to the device over any
+channel the device can observe. `server.log` confirms only a single relevant line
+for the entire session, logged *before* the UI Adopt click:
+
+```
+INFO  adopt  -    device[46:fc:f2:aa:ef:ea] discovered via L3 inform, skip SSH adoption
+```
+
+No further adopt/inform log lines appear afterward — not even the `defaultAuthKey`
+decrypt-failure noise seen on `10.4.57`. `inform_request.log` (a dedicated request
+logger declared at startup) stayed at 0 bytes for the whole session: post-adopt
+informs from the client aren't being rejected with an explicit error, they're being
+silently dropped before reaching any logged code path. The UI reflects this too —
+the device sits at status **"Adopting"** indefinitely rather than surfacing the
+`INFORM_ERROR`/`UNKNOWN` state `10.4.57` eventually showed.
+
+Tried manually forcing the issue: re-ran `set-adopt -k b9fd6298283fe1f1a4f59e5de221307c`
+(amd989's CLI does accept an explicit key argument) — still 404, no change. Reading
+`unifi_protocol.py:30-39` (`encode_inform`) explains why this couldn't have worked
+regardless of what the controller does: it only switches encryption to
+`config.get('gateway', 'key')` when `config.getboolean('gateway', 'is_adopted')` is
+already `True`. `set_adopt()` stores the passed-in key into that same config slot but
+never flips `is_adopted`, so the retry re-encrypts with `MASTER_KEY` (the hardcoded
+default) regardless of `-k`. This is a genuine bug in `amd989`'s own CLI tooling —
+worth knowing, but it's a red herring for the controller-side question: even a
+perfectly-encrypted inform using the real key would still need the controller to
+*attempt* SSH or *respond* to it, and the log shows the controller decided
+`skip SSH adoption` before that retry ever happened.
+
+**Conclusion — this supersedes the "version incompatibility" theory from the
+`10.4.57` section above:** the deadlock is not version-specific and not a decrypt
+mismatch. It is the controller's adopt logic itself: when a device is discovered via
+L3 inform (as opposed to L2 broadcast + mDNS), the controller explicitly decides not
+to *attempt* SSH at all — the `skip SSH adoption` log line fires unconditionally, with
+no credential check or connection attempt logged either way. (This run's **Device SSH
+Authentication** was left at the panel's prefilled `admin`/placeholder value, which
+doesn't match the AP container's real `root` sshd user per §3 above — but that's
+irrelevant here precisely because the skip happens before credentials would ever be
+checked.) The controller provides no alternative channel to hand the device its new
+key once it's made this decision. This reads as an intentional real-hardware
+assumption baked into the controller (an L3-only-visible device is presumed to be
+behind NAT/remote and therefore not SSH-reachable, so don't bother trying), not a
+Docker-deployment or version quirk. **Practically, this means: this Docker Compose
+validation environment cannot complete inform-protocol-only (SSH-less) adoption end
+to end, full stop — not because of a bug in openUF, amd989, or this controller
+version, but because that adoption path apparently requires the controller to
+successfully reach the device via L2 discovery in the first place**, which brings us
+back to the still-unresolved `announce.lua` UDP broadcast failure on this Docker
+bridge network as the actual blocker to unblocking the rest of the validation matrix.
+
 ---
 
 ## 1. Initial adopt handshake
