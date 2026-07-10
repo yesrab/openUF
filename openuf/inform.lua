@@ -122,6 +122,11 @@ local function mac_bytes(mac_str)
 	return table.concat(bytes)
 end
 
+-- 32 hex chars = 16 bytes = a valid AES-128 key (matches syswrapper.lua's check)
+local function is_hex32(s)
+	return type(s) == "string" and #s == 32 and s:match("^[0-9a-fA-F]+$") ~= nil
+end
+
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 
 -- Build a TNBU binary packet from a JSON string.
@@ -409,6 +414,7 @@ function M.handle_response(json_str, st, cfg)
 		-- mgmt_cfg is a newline-delimited key=value string (real controller format,
 		-- confirmed by amd989/unifi-gateway _parse_mgmt_cfg).
 		local mgmt_raw = resp.mgmt_cfg
+		local newly_adopted = false
 		if type(mgmt_raw) == "string" then
 			for line in (mgmt_raw .. "\n"):gmatch("([^\n]*)\n") do
 				local k, v = line:match("^([^=]+)=(.*)$")
@@ -419,13 +425,31 @@ function M.handle_response(json_str, st, cfg)
 						st.use_gcm = (v == "true")
 					elseif k == "cfgversion" then
 						if v ~= "" then st.cfgversion = v end
+					elseif k == "authkey" then
+						-- Only trusted pre-adoption. Real L3 adoption has no SSH
+						-- step at all (controller logs "skip SSH adoption" for
+						-- L3-discovered devices) and delivers the new key this
+						-- way instead -- confirmed against amd989/unifi-gateway's
+						-- _parse_mgmt_cfg (which does exactly this, no SSH
+						-- anywhere in that codebase) and live testing against a
+						-- real controller. See PROTOCOL-VALIDATION.md. Restricted
+						-- to the unadopted case: while unadopted the device is
+						-- still using the well-known DEFAULT_KEY, so this
+						-- exchange carries no less confidentiality than the rest
+						-- of L3 provisioning already assumes. Once adopted, only
+						-- SSH set-adopt may rotate the key (matches real L2
+						-- hardware behavior).
+						if not st.adopted and is_hex32(v) then
+							st.authkey = v
+							st.adopted = true
+							newly_adopted = true
+						end
 					end
-					-- authkey: INTENTIONALLY IGNORED — only set-adopt (SSH) may do this.
 				end
 			end
 		end
 		M._state.save(st)
-		return false
+		return newly_adopted  -- re-inform immediately with the new key if adopted
 	end
 
 	if _type == "setdefault" then

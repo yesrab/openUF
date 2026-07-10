@@ -163,7 +163,11 @@ passwd root
 
 Confirm SSH works from the controller's network before attempting adoption.  A fresh OpenWrt install often has a blank root password and SSH enabled; set the password first.
 
-> **Security note:** openUF intentionally ignores the `authkey` field inside the `mgmt_cfg` payload sent by the controller over HTTP.  Key rotation only happens via this SSH `set-adopt` path, matching how real UniFi hardware works.
+> **Security note:** openUF accepts a new `authkey` from the `mgmt_cfg` payload
+> only while **not yet adopted** (needed for L3 adoption to complete at all — see
+> the L3 section below and [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md)).
+> Once adopted, that field is ignored — key rotation only happens via the SSH
+> `set-adopt` path from that point on, matching real L2 hardware behavior.
 
 ### L2 adoption (device and controller on the same subnet)
 

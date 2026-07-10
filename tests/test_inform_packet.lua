@@ -194,14 +194,41 @@ return {
 		end
 	},
 	{
-		name = "inform packet: handle_response setparam never updates authkey",
+		name = "inform packet: handle_response setparam applies authkey and adopts when not yet adopted",
 		fn = function()
-			local st = sample_state()
+			-- Real L3 adoption has no SSH step at all -- the controller delivers
+			-- the new key via mgmt_cfg.authkey instead (confirmed against
+			-- amd989/unifi-gateway and live testing; see PROTOCOL-VALIDATION.md).
+			local st = sample_state({adopted = false})
+			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://x:8080/inform\\nauthkey=deadbeefdeadbeefdeadbeefdeadbeef\\n"}'
+			local result = inform.handle_response(resp, st)
+			assert_eq(st.authkey, "deadbeefdeadbeefdeadbeefdeadbeef", "authkey updated from mgmt_cfg")
+			assert_true(st.adopted, "adopted set to true")
+			assert_true(result, "re-inform triggered immediately with the new key")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam ignores authkey once already adopted",
+		fn = function()
+			-- Once adopted, only SSH set-adopt may rotate the key -- matches
+			-- real L2 hardware behavior and preserves the original security
+			-- invariant for already-adopted devices.
+			local st = sample_state({adopted = true})
 			local orig_key = st.authkey
-			-- authkey in mgmt_cfg must be ignored (security hardening)
 			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://x:8080/inform\\nauthkey=deadbeefdeadbeefdeadbeefdeadbeef\\n"}'
 			inform.handle_response(resp, st)
-			assert_eq(st.authkey, orig_key, "authkey NOT updated via setparam (security hardening)")
+			assert_eq(st.authkey, orig_key, "authkey NOT updated via setparam once adopted")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam ignores malformed authkey",
+		fn = function()
+			local st = sample_state({adopted = false})
+			local orig_key = st.authkey
+			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://x:8080/inform\\nauthkey=not-32-hex-chars\\n"}'
+			inform.handle_response(resp, st)
+			assert_eq(st.authkey, orig_key, "malformed authkey rejected, key unchanged")
+			assert_false(st.adopted, "not marked adopted on malformed authkey")
 		end
 	},
 	{
