@@ -8,9 +8,13 @@ flag used to capture responses.
 
 No target OpenWrt hardware or real Ubiquiti device needed — the controller is a
 plain Docker container, and the "AP" is a disposable Alpine container reachable via
-SSH. For L2 (broadcast) adoption, the controller's real adopt flow (SSH in, run
-`syswrapper.sh set-adopt`) completes exactly as it would against genuine hardware.
-L3 adoption currently does not complete — see PROTOCOL-VALIDATION.md.
+SSH. **L2 (broadcast) adoption works end-to-end** in this environment: the
+controller's real adopt flow (SSH in, run `syswrapper.sh set-adopt`) completes
+exactly as it would against genuine hardware, once the setup below is followed
+exactly (three separate real bugs had to be fixed to get here — see
+PROTOCOL-VALIDATION.md's "L2 discovery + real SSH adoption now works end-to-end"
+section for what they were and why). L3-only adoption (`set-inform` with no L2
+broadcast) still does not complete — see PROTOCOL-VALIDATION.md.
 
 ## 1. Start the environment
 
@@ -39,46 +43,59 @@ setting lives in the controller's own database, so it's wiped by
 In the controller UI: **Devices → Device Updates and Settings → Device SSH
 Settings** (or search "inform" in the settings search box) →
 
-- Check **Inform Host Override**, set the value to `controller` (this stack's
-  Docker Compose service name — what the AP container resolves to reach the
-  controller).
+- Check **Inform Host Override**. **Use the controller container's real IP
+  address, not the `controller` hostname** — get it with `docker inspect
+  openuf-validation-controller --format '{{range .NetworkSettings.Networks}}
+  {{.IPAddress}}{{end}}'`. A bare hostname here produces `invalid inform_ip
+  <hostname>` in `server.log` once informs start flowing (this is what the value
+  in that log line actually is — the AP's own configured `inform_url` host,
+  echoed back — not, as an earlier version of this doc guessed, the override
+  setting itself).
 - Check **Device SSH Authentication**, username `root`, password matching the AP
   container's real sshd password (`openuf` by default per `ap/Dockerfile` — the
   controller's own password-strength validator requires ≥10 chars + uppercase +
   symbol, so if you change it here, `docker exec openuf-validation-ap sh -c "echo
-  'root:<newpassword>' | chpasswd"` to match on the AP side too).
+  'root:<newpassword>' | chpasswd"` to match on the AP side too). **These
+  credentials are only used for already-adopted devices** — see step 4.
 - Apply Changes.
 
-**Note:** as of 2026-07-10, configuring this did *not* resolve the L3-adoption
-deadlock documented in PROTOCOL-VALIDATION.md — the same `invalid inform_ip
-controller` line still appears even with the override correctly set from a clean
-first contact. Still worth doing, since it's a genuine, independently-documented
-Docker requirement (see linuxserver.io docs) and rules out one variable — just
-don't expect it alone to unblock adoption.
-
-## 4. Start openUF inside the AP container
+## 4. Start openUF inside the AP container (L2 / broadcast adoption)
 
 `debug_dump_file` and the `eth0` interface override are already baked into the
-image (`ap/Dockerfile`) — no manual `sed` step needed.
+image (`ap/Dockerfile`), along with the real Ubiquiti factory-default `ubnt`/`ubnt`
+SSH account (see below for why) and the `ssh-rsa` host key algorithm re-enable
+`sshd` needs to negotiate with the controller's SSH client — no manual setup step
+needed for any of that.
 
 ```sh
 docker exec -it openuf-validation-ap sh
 cd /opt/openuf
 
-# Point at the controller (L3 adoption -- different docker networks/subnets
-# than a real LAN, so use set-inform rather than relying on L2 discovery):
-syswrapper.sh set-inform http://controller:8080/inform
+# Broadcast discovery (real UDP broadcast on port 10001 -- works genuinely in
+# this Docker bridge network as of the announce.lua socket-creation-order fix):
+lua announce.lua &
 
 # Start the inform loop (foreground, so you can watch it live)
 lua inform.lua
 ```
 
-In the controller UI, the device should appear under **Devices** as **Pending**.
-Click **Adopt** — for an L3-discovered device the controller currently does *not*
-SSH in (`discovered via L3 inform, skip SSH adoption` in `server.log`), and
-adoption does not complete — see PROTOCOL-VALIDATION.md for the current state of
-that investigation. The SSH credentials above are still relevant for testing L2
-(broadcast) adoption, which does use them.
+The device appears in the controller UI as a new **Access Point** entry (distinct
+from any L3-only "Gateway" entry) with **Click to Adopt**. Click it — for an
+L2-discovered device the controller genuinely SSHes in this time. It tries the real
+Ubiquiti factory-default account, `ubnt`/`ubnt` (not the **Device SSH
+Authentication** credentials from step 3 — those only apply once a device is
+already adopted and reports itself as non-default), which is why the image bakes in
+a `ubnt` user (UID 0) with that exact password. If adoption still fails, check
+`docker exec openuf-validation-controller tail -f /config/logs/server.log` for the
+`SSH adopt failed ip[...],msg[...]` line — `msg[unreachable]` with a
+`HostKeyAlgorithms` complaint means the ssh-rsa fix isn't active; `msg[loginfail]`
+means a credentials mismatch.
+
+Once SSH adopt succeeds, `syswrapper.sh set-adopt` runs for real on the AP
+container and writes `/etc/openuf/state.json` with a controller-issued `authkey`.
+**If `inform.lua` was already running before the adopt (e.g. from an earlier L3
+attempt), restart it** so it picks up the new state — it does not currently
+hot-reload `state.json` mid-run.
 
 ## 5. Work through the validation matrix
 
@@ -93,6 +110,13 @@ Copy the relevant raw JSON into the corresponding section of
 `PROTOCOL-VALIDATION.md`, diff it against the current code's assumptions, and note
 the verdict (confirmed / corrected). Any field-name corrections get their own commit
 in the main codebase, per the project's usual per-finding commit cadence.
+
+**Note:** the device currently never settles out of "Adopting" in the UI, even
+though `server.log` shows a completed adopt and a continuous stream of successful,
+decrypted informs (confirmed via `tcpdump` and `debug_dump_file`) — see the "Open
+item" at the end of PROTOCOL-VALIDATION.md's L2 section. This doesn't block
+capturing responses via `debug_dump_file` for the matrix above, since the
+controller keeps actively pushing `setparam` every cycle regardless.
 
 ## 6. Tear down / reset
 

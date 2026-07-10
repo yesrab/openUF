@@ -354,28 +354,145 @@ validation environment cannot complete inform-protocol-only (SSH-less) adoption 
 to end, full stop — not because of a bug in openUF, amd989, or this controller
 version, but because that adoption path apparently requires the controller to
 successfully reach the device via L2 discovery in the first place**, which brings us
-back to the still-unresolved `announce.lua` UDP broadcast failure on this Docker
-bridge network as the actual blocker to unblocking the rest of the validation matrix.
+back to the `announce.lua` UDP broadcast failure on this Docker bridge network as
+the actual blocker to unblocking the rest of the validation matrix.
+
+### L2 discovery + real SSH adoption now works end-to-end — four real bugs found and fixed
+
+The broadcast failure above (`calling 'send' on bad self`) turned out to be fixable,
+not a fundamental Docker-network limitation — `strace` on the actual syscalls showed
+why: `socket.udp()` in luasocket creates its underlying OS socket **lazily**, on
+first real use (bind/connect/send), not at `socket.udp()` call time. `announce.lua`
+called `setoption("broadcast", true)` before anything else had touched the socket,
+so that call silently no-op'd against file descriptor `-1` (`setsockopt(-1, ...)  =
+-1 EBADF`), meaning `SO_BROADCAST` never actually got set. The later
+`setpeername(BROADCAST_ADDR, PORT)` *did* create the real socket, but without
+`SO_BROADCAST` its `connect()` to `255.255.255.255` failed with `EACCES` — standard
+POSIX behavior, not a container restriction. **Fix (`announce.lua`):** call
+`setsockname("*", 0)` first to force real socket creation before `setoption()`.
+Verified with a raw `nc -u -l` listener on the loopback that broadcast packets are
+now genuinely transmitted — no faking/unicast workaround needed.
+
+With real broadcast working, the controller picked up the announced device
+immediately as a new "U6 IW" / Access Point entry (distinct from the USG's L3-only
+"Gateway" entry) and, critically, **did attempt real SSH** on the resulting Adopt
+click — `server.log` showed actual `sshCommand exec` / `sshj` transport activity
+against the AP container's real sshd, something the L3-only path above never did.
+Getting all the way to a completed adopt took three more real, unrelated fixes:
+
+1. **SSH host key algorithm mismatch.** First attempts failed with `Unable to reach
+   a settlement of HostKeyAlgorithms: [ssh-rsa] and [rsa-sha2-512, rsa-sha2-256,
+   ecdsa-sha2-nistp256, ssh-ed25519]`. The controller's SSH client (`sshj`) only
+   offers the legacy `ssh-rsa` (SHA-1) signature scheme — matching genuine aging
+   UBNT firmware's SSH stack — but OpenSSH has excluded `ssh-rsa` from its default
+   algorithm list since 8.8, and this image ships 9.7. **Fix (`ap/Dockerfile`):**
+   `HostKeyAlgorithms +ssh-rsa` / `PubkeyAcceptedAlgorithms +ssh-rsa` in
+   `sshd_config`. An RSA host key already existed; it just wasn't being offered.
+2. **Wrong SSH account.** With the algorithm fixed, SSH negotiated but auth failed
+   (`msg[loginfail]`). Bumping `sshd`'s `LogLevel` to `DEBUG3` and routing it through
+   a manually-started `busybox syslogd` (the image ships no syslog daemon, so
+   `LogLevel DEBUG3` output was being silently dropped, not written anywhere) showed
+   the real cause: `userauth-request for user ubnt`. The controller wasn't trying
+   the admin-configured **Device SSH Authentication** credentials at all — it tried
+   the genuine Ubiquiti factory-default account, `ubnt`/`ubnt`. This is *correct*
+   behavior, not a bug: our announce packet's `IsDefault` byte (`0x17` in the TLV
+   blob, see `announce.lua`'s `make_blob_17_1a`) correctly declared the device
+   unadopted/default, so the controller rightly tried real hardware's factory
+   defaults instead of custom creds. **Fix (`ap/Dockerfile`):** added a `ubnt` user
+   (UID 0, so it's root-equivalent like real UBNT firmware's `ubnt` account),
+   password `ubnt`.
+3. **`invalid inform_ip <host>` after a successful decrypt.** Once SSH auth
+   succeeded, `syswrapper.sh set-adopt` genuinely ran over real SSH and wrote a real
+   `/etc/openuf/state.json` with a controller-issued `authkey` — direct proof the
+   full real adopt flow (SSH in, run `syswrapper.sh set-adopt <url> <key>`) works
+   exactly as `USAGE.md` describes for L2. But the resulting inform loop then hit
+   the same `invalid inform_ip <value>` error documented above, now provably
+   *not* about the Inform Host Override setting (confirmed correctly applied via a
+   direct Mongo read of `super_mgmt.override_inform_host_location`) — the value in
+   the error is the AP's own `inform_url` host, echoed back. `state.json` had
+   `inform_url: "http://controller:8080/inform"` (the Docker Compose service name,
+   matching this repo's own documented convention), and the controller rejects a
+   bare hostname there — it wants a literal IP. **Fix (validation-only, not a code
+   change):** rewriting `state.json`'s `inform_url` to the controller container's
+   real IP (`http://172.19.0.4:8080/inform`) and restarting `inform.lua` immediately
+   produced `Device[...] adoption - completed` in `server.log`, genuine `HTTP/1.1
+   200` responses on the wire (confirmed via `tcpdump`), and real decrypted
+   `setparam` responses in the `debug_dump_file` capture (see §1 below) — the first
+   real captured controller→AP payloads this project has ever obtained.
+
+**A fourth, unrelated bug surfaced once real setparam responses started flowing:**
+`debug_dump_file` (added in an earlier session for exactly this validation work) had
+never actually fired, in any test in this document, ever — including the L3
+attempts above. `handle_response` checks `cfg.config.debug_dump_file`, but the
+production entry point called `M.run(dev.conf, ufhw)`, and `dev.conf` (network/LED/
+VLAN hardware layout, from the modelmap file) has no `.config` sub-table — the
+global `config` table (`debug_dump_file`, `state_file`, `inform_url` defaults,
+declared separately in `conf.lua`) was never threaded through. The condition's `and`
+short-circuit meant this was a silent no-op, not a crash, so it went unnoticed
+through every prior real-controller test in this document. **Fix (`inform.lua`):**
+`dev.conf.config = config` before calling `M.run`, matching the shape
+`tests/test_inform_packet.lua` already asserts (`cfg = { config = { debug_dump_file
+= path } }`) — the test coverage was correct all along; only the real entry point's
+wiring was wrong.
+
+**Open item — device never leaves "Adopting" in the UI despite a completed adopt and
+a continuous stream of successful, decrypted informs:** with all four fixes applied,
+`server.log` shows genuine `Device[...] adoption - completed`, `tcpdump` confirms
+real `HTTP/1.1 200` responses roughly every 10s, and `debug_dump_file` captures real
+`_type: "setparam"` responses each cycle — but the device's Mongo record never gets
+a `last_seen` field and keeps `wait_for_initial_inform: true` indefinitely, and the
+controller sends a **freshly different `cfgversion` on every single cycle** (not a
+stable value settling once applied) even though this device's own `state.json`
+correctly tracks and echoes back whatever `cfgversion` it was last given. Also
+observed: the controller told the device to switch on `use_aes_gcm=true` via
+`mgmt_cfg`, the device did (`state.json`'s `use_gcm` flips to `true`, and subsequent
+GCM-encrypted informs continue to decrypt successfully server-side, so the switch
+itself works) — yet the device's own Mongo record still shows `x_aes_gcm: false`.
+Not yet root-caused; noted here as the next concrete thread rather than something
+resolved by the four fixes above. Does not block the matrix rows below, since a real
+`setparam` payload was captured regardless of the device settling to "Connected".
 
 ---
 
 ## 1. Initial adopt handshake
 
-- **Status:** 🟡 partially captured, blocked — see "L3 adoption never completes" above
+- **Status:** ✅ captured via real L2 (SSH) adoption — see "L2 discovery + real SSH
+  adoption now works end-to-end" above. L3-only adoption (no SSH) remains blocked as
+  documented above.
 - **Compare against:** `mgmt_cfg` key=value string format, `set-adopt` invocation
   shape (`openuf/hook/syswrapper.lua`)
-- **Findings:** for L3-discovered devices, no SSH `set-adopt` is ever attempted
-  (contradicts current `USAGE.md`). The `mgmt_cfg` key=value format itself is still
-  unverified — no `setparam` response was ever successfully captured.
-- **Code changes:** none yet — pending resolution of the authkey-delivery question.
+- **Findings:** `syswrapper.sh set-adopt <url> <key>` ran for real over genuine SSH
+  and wrote a real `/etc/openuf/state.json` — the actual shape openUF already
+  produces matches what real SSH adoption expects (`adopted`, `authkey`,
+  `inform_url`, `cfgversion`, `use_gcm` keys). No code changes needed here; this
+  confirms the existing `syswrapper.lua`/`state.lua` shape is correct.
+- **Code changes:** none — existing implementation confirmed correct by a real SSH
+  adopt round-trip.
 
 ## 2. Baseline post-adopt inform response
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** ✅ captured (real, via `debug_dump_file`)
 - **Compare against:** top-level `_type` field name/values (`noop`/`config`/`cmd`)
   (`openuf/inform.lua:388-490`)
-- **Findings:**
-- **Code changes:**
+- **Findings:** real captured response, repeated every ~10s with a fresh
+  `cfgversion` each time (see "Open item" above):
+  ```json
+  {
+    "_type": "setparam",
+    "mgmt_cfg": "capability=notif,notif-assoc-stat\nselfrun_guest_mode=pass\ncfgversion=fe34084c2ffa1eeb\nled_enabled=true\nstun_url=stun://172.19.0.4:3478/\nmgmt_url=https://172.19.0.4:8443/manage/site/default\ninform_url=http://172.19.0.4:8080/inform\nuse_aes_gcm=true\nreport_crash=true\n",
+    "server_time_in_utc": "1783723586794"
+  }
+  ```
+  Confirms `_type: "setparam"` (not `"config"`) is the real response type for this
+  baseline case, and `mgmt_cfg` is genuinely a `key=value\n`-joined string (matching
+  this project's prior reference-material-derived assumption, now verified against
+  a real controller) — not JSON. Field names `stun_url`, `mgmt_url`, `inform_url`,
+  `use_aes_gcm`, `report_crash`, `selfrun_guest_mode`, `led_enabled`, `capability`
+  all confirmed real. No `vap_table`/`radio_table`/`network_table` present in this
+  baseline case (device has no WiFi config assigned yet in the controller UI).
+- **Code changes:** none — `inform.lua`'s existing `mgmt_cfg` key=value parser
+  (§ `setparam` handler) already handles this shape correctly, including the
+  `use_aes_gcm` → `st.use_gcm` and `cfgversion` fields seen here.
 
 ## 3. Default SSID push (no VLAN)
 
