@@ -729,6 +729,10 @@ if not OPENUF_TEST_MODE then
 		end
 		dofile("conf.lua")
 		local ufhw = {uap = dofile("ufmodel/" .. dev.openuf.uap.ufmodel .. ".lua")}
+		-- config (debug_dump_file, state_file, ...) is a separate global set by
+		-- conf.lua, not a field of dev.conf -- merge it in under .config so
+		-- handle_response's cfg.config.debug_dump_file check can see it.
+		dev.conf.config = config
 		M.run(dev.conf, ufhw)
 	end)
 	if not ok then
