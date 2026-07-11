@@ -543,6 +543,91 @@ resolved by the four fixes above. Does not block the matrix rows below, since a 
 - **Findings:**
 - **Code changes:**
 
+## Stage 2b findings (2026-07-11): spectrum-scan result shape, from the controller side
+
+**Result: high-confidence field names recovered. Implemented in
+`openuf/inform.lua` and `openuf/sysinfo.lua` — see "Code changes" below.**
+
+Stage 2 (static AP firmware analysis, above) hit a dead end because the
+U6-InWall's public firmware is a kernel-only OTA delta with an encrypted OS
+partition (see that section for the full writeup). The controller side turned
+out to be much more tractable: **UniFi Network Application is a Java app, and
+Java bytecode retains field-name string constants in the class-file constant
+pool even when ProGuard-style obfuscation has renamed the classes/methods
+themselves** — a fundamentally different (and much friendlier) analysis
+target than the AP's encrypted ARM firmware.
+
+- **Method:** pulled `lscr.io/linuxserver/unifi-network-application:10.4.57`
+  (the exact version already pinned for Stage 1 live-controller validation —
+  see `tools/validation/docker-compose.yml`), exported the container
+  filesystem with `docker create` + `docker export` (no need to actually run
+  it), and extracted `/usr/lib/unifi/lib/internal/internal-dependencies.jar`
+  (the real 29MB application jar — `ace.jar` itself is just a
+  license-protected bootstrap `Launcher`, not the app logic). Decompressed
+  every `.class` entry (`unzip -p ... '*.class'`) into one blob and extracted
+  printable-ASCII runs directly in Python (`strings` on macOS chokes on
+  concatenated class files because `0xCAFEBABE`, the Java class magic number,
+  also happens to be the Mach-O fat-binary magic number it tries to parse).
+- **Confirmed field names** (found repeatedly, clustered with unmistakable
+  neighbors like `radio`, `radio_name`, `radio_table_stats`,
+  `getRadioTableStats` — i.e. genuinely part of the per-radio stats object,
+  not coincidental string matches):
+  - `spectrum_table` — array, nested inside each `radio_table_stats` entry
+    (sibling of the already-implemented `cu_total`/`cu_self` fields, and of
+    `last_channel`/`last_interference_at`/`gain`/`tx_power` etc. — confirms
+    openUF's existing `radio_table_stats` shape is on the right track).
+  - `spectrum_table_time`, `spectrum_scan_timestamp` — sibling timestamp
+    fields alongside `spectrum_table`.
+  - `spectrum_scanning` (wire field; Java bean `isSpectrumScanning`/
+    `setIsSpectrumScanning`) — boolean, live scanning-in-progress state.
+  - `spectrum_enabled`, `spectrum_cfg` — a config-side toggle/cmd-payload key
+    (controller→AP), separate from the result-reporting direction.
+  - `supportSpectrumScan` — AP-declared capability flag.
+  - Per-entry fields inside `spectrum_table`, found in **two independent**
+    Lombok-generated (`Llombok/Generated;`) data-class constant pools, both
+    with the identical field set: **`channel`, `center_freq`, `width`,
+    `utilization`, `interference`**. One of the two classes additionally has
+    `radio`/`radio_name` fields (confirms per-radio, per-channel entries).
+  - A response-code enum in the same area: `SUCCESS`, `GENERAL_FAILURE`,
+    `INVALID_PARAM`, `INVALID_VALUE`, `MISSING_PARAM`, `DEVICE_DISALLOWED`,
+    `UNSUPPORTED_CHANNEL`, `UNSUPPORTED_SPECTRUM`, `VERSION_NOT_SUPPORTED` —
+    likely the controller's own pre-send capability-check result, not
+    something the AP returns; recorded for completeness, not acted on.
+  - **Adjacent, unrelated finding (not acted on this session):** the same
+    class shows `cu_self_rx`/`cu_self_tx` as two separate fields, whereas
+    openUF's existing `radio_table_stats` builder
+    (`openuf/inform.lua` build_json, ~line 333-340) combines rx+tx into one
+    `cu_self` field. Worth splitting in a future pass — flagged here so it
+    isn't lost, but out of scope for the spectrum-scan task.
+- **What's still a guess (field names are confirmed; exact semantics/units
+  are not):** `width` — no live-scan source gives per-channel width, so the
+  implementation uses the radio's own configured `htmode` (e.g. `HT40` → 40)
+  as a uniform approximation, not a true per-entry measurement.
+  `interference` — no equivalent metric exists in `iw survey dump` output;
+  implementation passes through the raw noise-floor dBm value as the closest
+  available proxy. Both are clearly commented as best-effort in the code.
+  `channel`/`center_freq`/`utilization` are derived directly and mechanically
+  from `iw dev <ifname> survey dump` (already-parsed by
+  `openuf/sysinfo.lua`'s `radio_stats()`) and are high-confidence.
+- **Code changes:**
+  - `openuf/sysinfo.lua`: added `M.channel_from_freq(freq)` (2.4/5/6GHz
+    frequency→channel helper).
+  - `openuf/inform.lua`: `spectrum-scan` cmd handler (~line 540) now builds
+    a `spectrum_table` per radio from `iw dev <ifname> survey dump` output
+    and caches it in the new module-level `M._spectrum_cache` (in-memory
+    only, not persisted to `state.json` — ephemeral like `radio_stats()`/
+    `sta_table()`). `build_json`'s `radio_table_stats` loop (~line 333)
+    attaches the cached `spectrum_table`/`spectrum_table_time`/
+    `spectrum_scan_timestamp`/`spectrum_scanning` fields when present.
+  - Tests: `tests/test_inform_packet.lua` (cmd handler builds the cache
+    correctly from survey-dump fixture data) and
+    `tests/test_inform_json.lua` (build_json surfaces/omits the cached
+    fields correctly).
+- **Not yet possible:** validating against a real captured wire payload
+  (Stage 1's L3-adoption blocker still applies) — this is a strong,
+  code-derived hypothesis, not a live-verified capture. Re-verify against a
+  real inform if/when L2 adoption or a live capture becomes possible.
+
 ## Stage 2 findings (2026-07-11): AP→controller spectrum-scan-result shape
 
 **Result: inconclusive — the JSON key names could not be recovered from the
@@ -623,15 +708,24 @@ angle (see "Possible follow-ups" below).**
 
 ---
 
-## Stage 2 (attempted 2026-07-11, inconclusive)
+## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)
 
-Static extraction of a real AP firmware image (`binwalk` + `strings`/`radare2`) to
-determine the AP→controller spectrum-scan-result reporting shape — the one item
-Stage 1's controller-only setup can't resolve, since it requires observing what a
-genuine AP sends up, not what the controller pushes down. **Attempted against the
-real, current U6-InWall firmware image — no usable result. See the "Stage 2
-findings" write-up under section 8 above for the full analysis and why this
-specific artifact doesn't contain the answer.** Don't re-run the same
-binwalk/strings pass against the same (or a same-generation) firmware build
-expecting a different outcome — see "Possible follow-ups" above for what might
-actually move this forward.
+Goal: determine the AP→controller spectrum-scan-result reporting shape — the
+one item Stage 1's controller-only setup can't resolve on its own, since it
+requires observing what a genuine AP sends up, not just what the controller
+pushes down.
+
+- **Stage 2 (AP firmware, static extraction via `binwalk`/`strings`/`radare2`):
+  inconclusive.** The real, current U6-InWall firmware image turned out to be
+  a kernel-only OTA delta with an encrypted OS partition — no usable result.
+  See "Stage 2 findings" under section 8 above for the full analysis. Don't
+  re-run the same binwalk/strings pass against the same (or a
+  same-generation) firmware build expecting a different outcome.
+- **Stage 2b (controller side, decompiling the real UniFi Network
+  Application's Java bytecode): succeeded.** Recovered high-confidence field
+  names (`spectrum_table`, `spectrum_table_time`, `spectrum_scan_timestamp`,
+  `spectrum_scanning`, and per-entry `channel`/`center_freq`/`width`/
+  `utilization`/`interference`) directly from the controller's own
+  constant-pool strings — see "Stage 2b findings" under section 8 above.
+  Implemented in `openuf/inform.lua`/`openuf/sysinfo.lua`, tested, not yet
+  live-verified against a real captured inform payload.
