@@ -272,7 +272,8 @@ return {
 			assert_eq(#d.radio_table_stats, 1, "one radio_table_stats entry")
 			assert_eq(d.radio_table_stats[1].name, "radio0", "keyed by radio name")
 			assert_eq(d.radio_table_stats[1].cu_total, 37, "cu_total = busy/total*100")
-			assert_eq(d.radio_table_stats[1].cu_self, 27, "cu_self = (rx+tx)/total*100")
+			assert_eq(d.radio_table_stats[1].cu_self_rx, 18, "cu_self_rx = channel_time_rx/total*100")
+			assert_eq(d.radio_table_stats[1].cu_self_tx, 9, "cu_self_tx = channel_time_tx/total*100")
 		end
 	},
 	{

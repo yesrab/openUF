@@ -573,9 +573,10 @@ target than the AP's encrypted ARM firmware.
   `getRadioTableStats` — i.e. genuinely part of the per-radio stats object,
   not coincidental string matches):
   - `spectrum_table` — array, nested inside each `radio_table_stats` entry
-    (sibling of the already-implemented `cu_total`/`cu_self` fields, and of
-    `last_channel`/`last_interference_at`/`gain`/`tx_power` etc. — confirms
-    openUF's existing `radio_table_stats` shape is on the right track).
+    (sibling of the already-implemented `cu_total`/`cu_self_rx`/`cu_self_tx`
+    fields, and of `last_channel`/`last_interference_at`/`gain`/`tx_power`
+    etc. — confirms openUF's existing `radio_table_stats` shape is on the
+    right track).
   - `spectrum_table_time`, `spectrum_scan_timestamp` — sibling timestamp
     fields alongside `spectrum_table`.
   - `spectrum_scanning` (wire field; Java bean `isSpectrumScanning`/
@@ -593,12 +594,12 @@ target than the AP's encrypted ARM firmware.
     `UNSUPPORTED_CHANNEL`, `UNSUPPORTED_SPECTRUM`, `VERSION_NOT_SUPPORTED` —
     likely the controller's own pre-send capability-check result, not
     something the AP returns; recorded for completeness, not acted on.
-  - **Adjacent, unrelated finding (not acted on this session):** the same
-    class shows `cu_self_rx`/`cu_self_tx` as two separate fields, whereas
-    openUF's existing `radio_table_stats` builder
-    (`openuf/inform.lua` build_json, ~line 333-340) combines rx+tx into one
-    `cu_self` field. Worth splitting in a future pass — flagged here so it
-    isn't lost, but out of scope for the spectrum-scan task.
+  - **Adjacent finding, now fixed:** the same class shows `cu_self_rx`/
+    `cu_self_tx` as two separate fields, whereas openUF's `radio_table_stats`
+    builder used to combine rx+tx into one `cu_self` field. Split into
+    `cu_self_rx`/`cu_self_tx` in `openuf/inform.lua` build_json (~line
+    338-343), each computed independently as `channel_time_rx` (or `_tx`)
+    over `channel_time`, matching the real controller's field names.
 - **What's still a guess (field names are confirmed; exact semantics/units
   are not):** `width` — no live-scan source gives per-channel width, so the
   implementation uses the radio's own configured `htmode` (e.g. `HT40` → 40)

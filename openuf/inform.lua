@@ -336,12 +336,11 @@ function M.build_json(st, cfg, ufhw)
 					local total = s.channel_time or 0
 					local busy  = s.channel_time_busy or 0
 					local entry = {
-						name     = radio.name,
-						channel  = radio.channel,
-						cu_total = total > 0 and math.floor(busy * 100 / total) or 0,
-						cu_self  = total > 0 and math.floor(
-							((s.channel_time_rx or 0) + (s.channel_time_tx or 0)) * 100 / total
-						) or 0,
+						name        = radio.name,
+						channel     = radio.channel,
+						cu_total    = total > 0 and math.floor(busy * 100 / total) or 0,
+						cu_self_rx  = total > 0 and math.floor((s.channel_time_rx or 0) * 100 / total) or 0,
+						cu_self_tx  = total > 0 and math.floor((s.channel_time_tx or 0) * 100 / total) or 0,
 					}
 					-- Cached spectrum-scan result, if a "spectrum-scan" cmd
 					-- was handled for this radio (see cmd dispatch below).
