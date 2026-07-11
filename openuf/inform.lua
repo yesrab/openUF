@@ -65,6 +65,38 @@ M._ucihelper = ucihelper
 M._lldp      = lldp
 M._led       = led
 
+-- Injectable: override in tests to return fixture command output
+M._run_cmd = function(cmd)
+	local h = io.popen(cmd .. " 2>/dev/null")
+	if not h then return "" end
+	local s = h:read("*a")
+	h:close()
+	return s or ""
+end
+
+-- Returns the mtime (seconds since epoch, as a number) of path, or nil if
+-- it can't be stat'd (missing, permission denied, stat unavailable, ...).
+function M._state_mtime(path)
+	local out = M._run_cmd("stat -c %Y '" .. path .. "'")
+	local n = tonumber((out:gsub("%s+$", "")))
+	return n
+end
+
+-- Locks or unlocks the temporary SSH bootstrap account (see conf.lua's
+-- bootstrap_adopt_user and USAGE.md's SSH prerequisite section) to match
+-- the device's current adopted state. No-op if user is nil/false (feature
+-- not enabled). Idempotent -- locking an already-locked account (or
+-- unlocking an already-unlocked one) is a harmless no-op on BusyBox/shadow
+-- passwd, so callers never need to track prior state themselves.
+function M._sync_bootstrap_account(adopted, user)
+	if not user then return end
+	if adopted then
+		M._run_cmd("passwd -l '" .. user .. "'")
+	else
+		M._run_cmd("passwd -u '" .. user .. "'")
+	end
+end
+
 -- Packet constants
 local MAGIC        = "TNBU"
 local PKT_VERSION  = 1   -- confirmed by amd989/unifi-gateway and fxkr reverse-engineering
@@ -464,9 +496,15 @@ function M.handle_response(json_str, st, cfg)
 	if _type == "setdefault" then
 		-- Controller requested factory reset.  Reset state on disk and in-memory.
 		io.stderr:write("inform: controller requested factory reset\n")
+		-- mac/ip/hostname are populated once at M.run() startup by
+		-- _populate_net_info and never persisted to state.json -- preserve them
+		-- across the reset rather than losing the device's identity mid-run.
+		local mac, ip, hostname = st.mac, st.ip, st.hostname
 		local fresh = M._state.reset()
 		for k in pairs(st) do st[k] = nil end
 		for k, v in pairs(fresh) do st[k] = v end
+		st.mac, st.ip, st.hostname = mac, ip, hostname
+		M._sync_bootstrap_account(false, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 		return false
 	end
 
@@ -684,17 +722,45 @@ function M._populate_net_info(st, cfg)
 	end
 end
 
+-- Detects an out-of-process change to the on-disk state file -- written by
+-- syswrapper.lua's set-adopt/reset-inform, invoked over SSH as a separate,
+-- short-lived process -- and reloads it into the in-memory st table this
+-- loop uses. Without this, a long-running inform.lua would never notice a
+-- fresh SSH-driven adoption (or a manual reset-inform) and would keep
+-- informing with stale credentials until restarted. Also keeps the SSH
+-- bootstrap account (if enabled) locked/unlocked to match the reloaded
+-- adopted state. Returns the current mtime (unchanged from last_mtime if
+-- the file didn't change).
+function M._reload_if_changed(st, cfg, last_mtime)
+	local mtime = M._state_mtime(M._state._state_file)
+	if mtime == nil or mtime == last_mtime then
+		return last_mtime
+	end
+	-- mac/ip/hostname are populated once at M.run() startup and never
+	-- persisted to state.json -- preserve them across the reload.
+	local mac, ip, hostname = st.mac, st.ip, st.hostname
+	local fresh = M._state.load()
+	for k in pairs(st) do st[k] = nil end
+	for k, v in pairs(fresh) do st[k] = v end
+	st.mac, st.ip, st.hostname = mac, ip, hostname
+	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
+	return mtime
+end
+
 -- Start the inform heartbeat loop (blocks forever).
 -- cfg, ufhw: passed through to build_json()
 function M.run(cfg, ufhw)
 	local st = state.load()
 	M._populate_net_info(st, cfg)
+	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 
 	local socket   = require("socket")
 	local interval = 10
 	local backoff  = interval
+	local last_mtime = M._state_mtime(M._state._state_file)
 
 	while true do
+		last_mtime = M._reload_if_changed(st, cfg, last_mtime)
 		local json_str = M.build_json(st, cfg, ufhw)
 		local pkt      = M.build_packet(json_str, st)  -- use_gcm read from st.use_gcm
 		local body, err = M.http_post(st.inform_url, pkt)

@@ -256,6 +256,45 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response setdefault preserves mac/ip/hostname",
+		fn = function()
+			-- mac/ip/hostname are populated once at M.run() startup and never
+			-- persisted to state.json -- a factory reset must not wipe the
+			-- device's live-detected identity mid-run.
+			local st = sample_state({adopted = true})
+			inform.handle_response('{"_type":"setdefault"}', st)
+			assert_eq(st.mac,      "aa:bb:cc:dd:ee:ff", "mac preserved across reset")
+			assert_eq(st.ip,       "192.168.1.100",     "ip preserved across reset")
+			assert_eq(st.hostname, "testap",            "hostname preserved across reset")
+		end
+	},
+	{
+		name = "inform packet: handle_response setdefault unlocks bootstrap account when configured",
+		fn = function()
+			local st = sample_state({adopted = true})
+			local calls = {}
+			local orig = inform._run_cmd
+			inform._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
+			inform.handle_response('{"_type":"setdefault"}', st, {config = {bootstrap_adopt_user = "ubnt"}})
+			inform._run_cmd = orig
+			assert_eq(#calls, 1, "exactly one passwd command issued")
+			assert_contains(calls[1], "passwd -u", "unlock command issued")
+			assert_contains(calls[1], "ubnt", "unlock command targets ubnt")
+		end
+	},
+	{
+		name = "inform packet: handle_response setdefault does nothing when bootstrap account not configured",
+		fn = function()
+			local st = sample_state({adopted = true})
+			local calls = {}
+			local orig = inform._run_cmd
+			inform._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
+			inform.handle_response('{"_type":"setdefault"}', st, {config = {}})
+			inform._run_cmd = orig
+			assert_eq(#calls, 0, "no passwd command issued when bootstrap_adopt_user unset")
+		end
+	},
+	{
 		name = "inform packet: handle_response upgrade stores version/url only",
 		fn = function()
 			local st = sample_state()
@@ -415,6 +454,121 @@ return {
 			assert_error(function()
 				inform.parse_packet(patched, st)
 			end, "snappy flag raises error")
+		end
+	},
+	{
+		name = "inform: _state_mtime parses stat output as a number",
+		fn = function()
+			local orig = inform._run_cmd
+			inform._run_cmd = function(cmd) return "1700000000\n" end
+			local mtime = inform._state_mtime("/tmp/whatever")
+			inform._run_cmd = orig
+			assert_eq(mtime, 1700000000, "mtime parsed as number")
+		end
+	},
+	{
+		name = "inform: _state_mtime returns nil when stat yields no output",
+		fn = function()
+			local orig = inform._run_cmd
+			inform._run_cmd = function(cmd) return "" end
+			local mtime = inform._state_mtime("/nonexistent")
+			inform._run_cmd = orig
+			assert_true(mtime == nil, "nil when file missing")
+		end
+	},
+	{
+		name = "inform: _sync_bootstrap_account is a no-op without a configured user",
+		fn = function()
+			local calls = {}
+			local orig = inform._run_cmd
+			inform._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
+			inform._sync_bootstrap_account(true, nil)
+			inform._run_cmd = orig
+			assert_eq(#calls, 0, "no shell-out without a configured user")
+		end
+	},
+	{
+		name = "inform: _sync_bootstrap_account locks the account when adopted",
+		fn = function()
+			local calls = {}
+			local orig = inform._run_cmd
+			inform._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
+			inform._sync_bootstrap_account(true, "ubnt")
+			inform._run_cmd = orig
+			assert_eq(#calls, 1, "one command issued")
+			assert_contains(calls[1], "passwd -l", "lock command issued")
+			assert_contains(calls[1], "ubnt", "targets ubnt")
+		end
+	},
+	{
+		name = "inform: _sync_bootstrap_account unlocks the account when not adopted",
+		fn = function()
+			local calls = {}
+			local orig = inform._run_cmd
+			inform._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
+			inform._sync_bootstrap_account(false, "ubnt")
+			inform._run_cmd = orig
+			assert_eq(#calls, 1, "one command issued")
+			assert_contains(calls[1], "passwd -u", "unlock command issued")
+		end
+	},
+	{
+		name = "inform: _reload_if_changed is a no-op when mtime is unchanged",
+		fn = function()
+			local orig_mtime = inform._state_mtime
+			inform._state_mtime = function(path) return 42 end
+			local st = sample_state({adopted = false})
+			local last = inform._reload_if_changed(st, {config = {}}, 42)
+			inform._state_mtime = orig_mtime
+			assert_eq(last, 42, "mtime unchanged")
+			assert_eq(st.mac, "aa:bb:cc:dd:ee:ff", "st left untouched")
+		end
+	},
+	{
+		name = "inform: _reload_if_changed reloads state and preserves mac/ip/hostname when mtime changes",
+		fn = function()
+			-- Write a real fixture to the redirected state file, distinct
+			-- from sample_state()'s in-memory values, so a genuine
+			-- state.load() picks it up -- exercises the real disk round-trip
+			-- rather than mocking state.load itself. Must go through
+			-- inform._state (not the test file's own `state` local) --
+			-- dofile never caches, so those are separate module instances
+			-- and only inform._state._state_file was redirected above.
+			inform._state.save({
+				authkey    = "11112222333344445555666677778888",
+				adopted    = true,
+				cfgversion = "abc123",
+				inform_url = "http://controller/inform",
+				use_gcm    = true,
+				upgrade_requested_version = "",
+				upgrade_requested_url     = "",
+			})
+
+			local orig_mtime = inform._state_mtime
+			inform._state_mtime = function(path) return 100 end
+
+			local calls = {}
+			local orig_run = inform._run_cmd
+			inform._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
+
+			local st = sample_state({adopted = false})
+			local last = inform._reload_if_changed(
+				st, {config = {bootstrap_adopt_user = "ubnt"}}, 1)
+
+			inform._state_mtime = orig_mtime
+			inform._run_cmd = orig_run
+
+			assert_eq(last, 100, "returns new mtime")
+			assert_true(st.adopted, "adopted reloaded from disk")
+			assert_eq(st.authkey, "11112222333344445555666677778888",
+				"authkey reloaded from disk")
+			assert_eq(st.cfgversion, "abc123", "cfgversion reloaded from disk")
+			assert_eq(st.mac,      "aa:bb:cc:dd:ee:ff", "mac preserved across reload")
+			assert_eq(st.ip,       "192.168.1.100",     "ip preserved across reload")
+			assert_eq(st.hostname, "testap",            "hostname preserved across reload")
+			assert_eq(#calls, 1, "bootstrap account synced")
+			assert_contains(calls[1], "passwd -l",
+				"locked since reloaded state is adopted")
 		end
 	},
 }
