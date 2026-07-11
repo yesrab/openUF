@@ -130,6 +130,18 @@ function M.interfaces()
 	return ifaces
 end
 
+-- Converts a WiFi frequency in MHz to its channel number (2.4/5/6GHz bands).
+-- Returns nil for frequencies outside all three ranges.
+function M.channel_from_freq(freq)
+	freq = tonumber(freq)
+	if not freq then return nil end
+	if freq == 2484 then return 14 end
+	if freq >= 2412 and freq <= 2472 then return math.floor((freq - 2407) / 5) end
+	if freq >= 5955 and freq <= 7115 then return math.floor((freq - 5950) / 5) end
+	if freq >= 5000 and freq <= 5895 then return math.floor((freq - 5000) / 5) end
+	return nil
+end
+
 -- Returns per-radio channel utilisation from `iw dev <ifname> survey dump`.
 -- Returns a table: {freq, noise, channel_time, channel_time_busy, channel_time_rx, channel_time_tx}
 function M.radio_stats(ifname)

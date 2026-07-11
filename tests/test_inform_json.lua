@@ -276,6 +276,35 @@ return {
 		end
 	},
 	{
+		name = "inform json: radio_table_stats includes spectrum_table when cached from a prior spectrum-scan cmd",
+		fn = function()
+			inform._spectrum_cache = {
+				radio0 = {
+					table = { { channel = 6, center_freq = 2437, width = 20, utilization = 37, interference = -95 } },
+					table_time = 111,
+					scan_timestamp = 222,
+				},
+			}
+			local d = build({with_uci = true, with_clients = true})
+			local rts = d.radio_table_stats[1]
+			assert_eq(rts.spectrum_scanning, false, "spectrum_scanning false once results are cached")
+			assert_eq(rts.spectrum_table_time, 111, "spectrum_table_time from cache")
+			assert_eq(rts.spectrum_scan_timestamp, 222, "spectrum_scan_timestamp from cache")
+			assert_eq(#rts.spectrum_table, 1, "one spectrum_table entry")
+			assert_eq(rts.spectrum_table[1].channel, 6, "spectrum_table entry channel")
+			inform._spectrum_cache = {}
+		end
+	},
+	{
+		name = "inform json: radio_table_stats omits spectrum_table without a prior spectrum-scan cmd",
+		fn = function()
+			inform._spectrum_cache = {}
+			local d = build({with_uci = true, with_clients = true})
+			assert_true(d.radio_table_stats[1].spectrum_table == nil,
+				"no spectrum_table until a spectrum-scan cmd has run")
+		end
+	},
+	{
 		name = "inform json: radio_table includes capability defaults",
 		fn = function()
 			local d = build({with_uci = true})

@@ -65,6 +65,11 @@ M._ucihelper = ucihelper
 M._lldp      = lldp
 M._led       = led
 
+-- In-memory only (not persisted to state.json): per-radio spectrum-scan
+-- results, keyed by radio name. Ephemeral live data, same category as
+-- radio_stats()/sta_table() which are also recomputed rather than stored.
+M._spectrum_cache = {}
+
 -- Injectable: override in tests to return fixture command output
 M._run_cmd = function(cmd)
 	local h = io.popen(cmd .. " 2>/dev/null")
@@ -330,7 +335,7 @@ function M.build_json(st, cfg, ufhw)
 					local s     = stats[1]  -- in-use channel's survey entry
 					local total = s.channel_time or 0
 					local busy  = s.channel_time_busy or 0
-					radio_table_stats[#radio_table_stats + 1] = {
+					local entry = {
 						name     = radio.name,
 						channel  = radio.channel,
 						cu_total = total > 0 and math.floor(busy * 100 / total) or 0,
@@ -338,6 +343,16 @@ function M.build_json(st, cfg, ufhw)
 							((s.channel_time_rx or 0) + (s.channel_time_tx or 0)) * 100 / total
 						) or 0,
 					}
+					-- Cached spectrum-scan result, if a "spectrum-scan" cmd
+					-- was handled for this radio (see cmd dispatch below).
+					local sscan = M._spectrum_cache[radio.name]
+					if sscan then
+						entry.spectrum_scanning       = false
+						entry.spectrum_table          = sscan.table
+						entry.spectrum_table_time     = sscan.table_time
+						entry.spectrum_scan_timestamp = sscan.scan_timestamp
+					end
+					radio_table_stats[#radio_table_stats + 1] = entry
 				end
 			end
 		end
@@ -422,6 +437,14 @@ function M.build_json(st, cfg, ufhw)
 	}
 
 	return cjson.encode(payload)
+end
+
+-- Maps an OpenWrt htmode ("HT20", "HT40+", "VHT80", "HE160", ...) to a
+-- channel width in MHz. Falls back to 20 for unrecognized/missing modes.
+local function _width_from_htmode(htmode)
+	if type(htmode) ~= "string" then return 20 end
+	local n = htmode:match("(%d+)")
+	return n and tonumber(n) or 20
 end
 
 -- ─── Response dispatcher ─────────────────────────────────────────────────────
@@ -538,19 +561,51 @@ function M.handle_response(json_str, st, cfg)
 			st.locating = (cmd == "set-locate")
 			M._state.save(st)
 		elseif cmd == "spectrum-scan" then
-			-- Best-effort: trigger a scan per radio and stash raw iw output.
-			-- NOTE: the wire format for reporting scan results back to the
-			-- controller is unconfirmed against any public source found during
-			-- research -- verify against a live controller capture before
-			-- treating this as complete.
+			-- Trigger a scan per radio (sweeps every channel), then read back
+			-- per-channel survey data and build a spectrum_table entry per
+			-- radio, cached for the next build_json() call.
+			--
+			-- Field names (spectrum_table/spectrum_table_time/
+			-- spectrum_scan_timestamp/channel/center_freq/width/utilization/
+			-- interference) are confirmed against the real UniFi Network
+			-- Application's own Java bytecode (10.4.57's ace.jar/
+			-- internal-dependencies.jar constant pool -- see
+			-- PROTOCOL-VALIDATION.md section 8 for the full derivation), not
+			-- guessed. The exact numeric semantics of `width` and
+			-- `interference` are still a best-effort approximation (radio's
+			-- configured htmode, and raw noise-floor dBm, respectively) --
+			-- verify against a live controller capture before trusting the
+			-- values, not just the key names.
 			local ufuci = M._ucihelper
 			if ufuci and ufuci.get_radio_table then
 				local ok_r, radios = pcall(ufuci.get_radio_table)
 				if ok_r then
+					local now = os.time()
 					for _, radio in ipairs(radios) do
 						local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
 						if ok_if and ifname then
 							ufuci._popen("iw dev " .. ifname .. " scan")
+							local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
+							if ok_rs then
+								local width = _width_from_htmode(radio.htmode)
+								local table_entries = {}
+								for _, s in ipairs(stats) do
+									local total = s.channel_time or 0
+									local busy  = s.channel_time_busy or 0
+									table_entries[#table_entries + 1] = {
+										channel     = M._sysinfo.channel_from_freq(s.freq),
+										center_freq = s.freq,
+										width       = width,
+										utilization = total > 0 and math.floor(busy * 100 / total) or 0,
+										interference = s.noise or 0,
+									}
+								end
+								M._spectrum_cache[radio.name] = {
+									table          = table_entries,
+									table_time     = now,
+									scan_timestamp = now,
+								}
+							end
 						end
 					end
 				end

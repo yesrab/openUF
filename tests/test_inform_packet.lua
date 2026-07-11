@@ -357,6 +357,38 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response cmd spectrum-scan builds spectrum_table from survey dump",
+		fn = function()
+			local st = sample_state()
+			inform._spectrum_cache = {}
+			inform._ucihelper = {
+				get_radio_table = function()
+					return { { name = "radio0", channel = "6", htmode = "HT40" } }
+				end,
+				get_ifname_for_radio = function() return "wlan0" end,
+				_popen = function() return "" end,
+			}
+			inform._sysinfo.radio_stats = function()
+				return {
+					{ freq = 2437, noise = -95, channel_time = 5000, channel_time_busy = 1850 },
+					{ freq = 2412, noise = -90, channel_time = 100,  channel_time_busy = 12 },
+				}
+			end
+
+			local result = inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
+			assert_true(result, "re-inform immediately after executing a command")
+
+			local cached = inform._spectrum_cache.radio0
+			assert_true(cached ~= nil, "spectrum-scan cmd populates _spectrum_cache for the radio")
+			assert_true(#cached.table == 2, "one spectrum_table entry per survey-dump frequency")
+			assert_true(cached.table[1].channel == 6, "channel derived from 2437MHz")
+			assert_true(cached.table[1].center_freq == 2437, "center_freq passed through from survey dump")
+			assert_true(cached.table[1].width == 40, "width derived from radio's HT40 htmode")
+			assert_true(cached.table[1].utilization == 37, "utilization = channel_time_busy/channel_time * 100")
+			assert_true(cached.table[1].interference == -95, "interference is best-effort noise-floor passthrough")
+		end
+	},
+	{
 		name = "inform: _populate_net_info does not trigger announce.lua's self-executing entry point outside test mode",
 		fn = function()
 			-- Regression test: _populate_net_info dofile()s announce.lua to
