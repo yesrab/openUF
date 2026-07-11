@@ -63,6 +63,77 @@ case "$1" in
 			echo "  /etc/init.d/lldpd enable && /etc/init.d/lldpd start"
 		fi
 
+		# ── Optional: --bootstrap-adopt ──────────────────────────────────
+		# Creates a temporary, non-root SSH account (ubnt/ubnt) matching real
+		# Ubiquiti hardware's factory-default login, so first adoption can
+		# complete without presetting a root password. Scoped to only ever
+		# run `syswrapper.sh set-adopt` (see hook/adopt-shell.sh) and only
+		# able to write $STATE_DIR -- no other privilege. Self-locks once the
+		# device is adopted and re-enables on factory reset (see
+		# inform.lua's M._sync_bootstrap_account). See USAGE.md.
+		if [ "$2" = "--bootstrap-adopt" ]; then
+			echo "Setting up SSH bootstrap adoption account (ubnt/ubnt) ..."
+
+			ALREADY_ADOPTED=0
+			if [ -f "$STATE_DIR/state.json" ] \
+				&& grep -q '"adopted":true' "$STATE_DIR/state.json"; then
+				ALREADY_ADOPTED=1
+			fi
+
+			if [ "$ALREADY_ADOPTED" = "1" ]; then
+				echo "  Device is already adopted -- skipping account creation."
+			elif grep -q "^ubnt:" /etc/passwd 2>/dev/null; then
+				echo "  ubnt account already exists -- leaving as-is."
+			else
+				# Dedicated group so $STATE_DIR can be made group-writable by
+				# the bootstrap account without granting it anything else.
+				BA_GID=900
+				while grep -q "^[^:]*:[^:]*:$BA_GID:" /etc/group 2>/dev/null; do
+					BA_GID=$((BA_GID + 1))
+				done
+				echo "openuf:x:$BA_GID:" >> /etc/group
+
+				BA_UID=900
+				while awk -F: -v id="$BA_UID" \
+					'$3==id{f=1} END{exit !f}' /etc/passwd 2>/dev/null; do
+					BA_UID=$((BA_UID + 1))
+				done
+
+				ADOPT_SHELL="$INSTALL_DIR/hook/adopt-shell.sh"
+				chmod +x "$ADOPT_SHELL"
+
+				echo "ubnt:x:$BA_UID:$BA_GID:openuf bootstrap adoption:$STATE_DIR:$ADOPT_SHELL" \
+					>> /etc/passwd
+				HASH=$(openssl passwd -6 ubnt)
+				echo "ubnt:$HASH:::::::" >> /etc/shadow
+
+				chgrp "$BA_GID" "$STATE_DIR"
+				chmod g+w "$STATE_DIR"
+
+				# Group-writable directory alone only covers *creating* a new
+				# state.json. If one somehow already exists owned by root
+				# (e.g. an admin ran `syswrapper.sh reset-inform` by hand
+				# before ever using this account), ubnt can't write to it --
+				# opening an existing file for writing needs permission on
+				# the file itself, not just the directory. Pre-create it
+				# group-writable so this works regardless of which side
+				# (root or ubnt) writes to it first and thereafter.
+				[ -f "$STATE_DIR/state.json" ] || : > "$STATE_DIR/state.json"
+				chgrp "$BA_GID" "$STATE_DIR/state.json"
+				chmod 664 "$STATE_DIR/state.json"
+
+				# Tell the running daemon this account exists and should be
+				# locked/unlocked to track adopted state.
+				sed -i 's/bootstrap_adopt_user = nil/bootstrap_adopt_user = "ubnt"/' \
+					"$INSTALL_DIR/conf.lua"
+
+				echo "  Created non-root 'ubnt' account (password: ubnt),"
+				echo "  restricted to running 'syswrapper.sh set-adopt' only."
+				echo "  It self-locks once the device is adopted and"
+				echo "  re-enables on factory reset."
+			fi
+		fi
+
 		echo "Done.  Check $LOG_FILE for status."
 		echo ""
 		echo "Next steps:"
@@ -85,6 +156,18 @@ case "$1" in
 		# Remove symlink
 		rm -f "$BIN_LINK"
 
+		# Remove the SSH bootstrap account/group if present (hygiene --
+		# symmetric with what install --bootstrap-adopt added, regardless of
+		# whether that flag is passed here).
+		if grep -q "^ubnt:" /etc/passwd 2>/dev/null; then
+			sed -i '/^ubnt:/d' /etc/passwd
+			sed -i '/^ubnt:/d' /etc/shadow
+			echo "Removed SSH bootstrap account 'ubnt'."
+		fi
+		if grep -q "^openuf:" /etc/group 2>/dev/null; then
+			sed -i '/^openuf:/d' /etc/group
+		fi
+
 		# Remove installed files (leave state dir so authkey is preserved)
 		rm -rf "$INSTALL_DIR"
 
@@ -94,13 +177,20 @@ case "$1" in
 	# ────────────────────────────────────────────────────────────────────────
 	*)
 		echo ""
-		echo "Usage: $0 <install|uninstall>"
+		echo "Usage: $0 <install|uninstall> [--bootstrap-adopt]"
 		echo ""
 		echo "  install    Copy files to $INSTALL_DIR, create init.d service,"
 		echo "             symlink syswrapper.sh to $BIN_LINK"
 		echo ""
+		echo "  install --bootstrap-adopt"
+		echo "             Also create a temporary, non-root SSH account"
+		echo "             (ubnt/ubnt) restricted to running 'set-adopt' only,"
+		echo "             so first adoption works without presetting a root"
+		echo "             password. Self-locks once adopted. See USAGE.md."
+		echo ""
 		echo "  uninstall  Remove installed files and service."
 		echo "             State directory ($STATE_DIR) is preserved."
+		echo "             Removes the bootstrap account if present."
 		echo ""
 		;;
 esac
