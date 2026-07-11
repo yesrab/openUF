@@ -70,6 +70,16 @@ M._led       = led
 -- radio_stats()/sta_table() which are also recomputed rather than stored.
 M._spectrum_cache = {}
 
+-- In-memory only: previous {rx_bytes, tx_bytes, time} sample per client MAC,
+-- used to delta-sample a throughput estimate the same way M._sysinfo's
+-- cpu_percent() delta-samples /proc/stat between calls (first sample for a
+-- given MAC has no prior delta, so throughput is reported as 0 that time).
+M._sta_stats_cache = {}
+
+-- Injectable: override in tests to control elapsed time deterministically
+-- (used by the sta_table throughput delta-sample below).
+M._time = os.time
+
 -- Injectable: override in tests to return fixture command output
 M._run_cmd = function(cmd)
 	local h = io.popen(cmd .. " 2>/dev/null")
@@ -312,7 +322,6 @@ function M.build_json(st, cfg, ufhw)
 	local radio_table       = {}
 	local radio_table_stats = {}
 	local vap_table         = {}
-	local user_table        = {}
 
 	local mac_str = st.mac or "00:00:00:00:00:00"
 
@@ -360,9 +369,12 @@ function M.build_json(st, cfg, ufhw)
 			end
 		end
 
-		-- Live connected-client counts, attached per-vap, and flattened into a
-		-- top-level user_table (matches real UAP mca-dump output convention --
-		-- verify field name/shape against a live controller capture).
+		-- Live connected-client counts, nested per-vap as sta_table -- matches
+		-- the real controller's vap-stats DTO, which nests connected clients
+		-- inside each vap_table entry rather than a flat top-level table
+		-- (confirmed against unifi-network-application:10.4.57's own
+		-- bytecode; see PROTOCOL-VALIDATION.md "Stage 2c").
+		local now = M._time()
 		for _, vap in ipairs(vap_table) do
 			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, vap.radio)
 			local stas = {}
@@ -371,30 +383,62 @@ function M.build_json(st, cfg, ufhw)
 				if ok_sta then stas = rv2 end
 			end
 			vap.num_sta = #stas
+			local sta_table = {}
 			for _, sta in ipairs(stas) do
-				user_table[#user_table + 1] = {
+				-- throughput: delta-sampled byte rate (bytes/sec), same
+				-- approach as M._sysinfo.cpu_percent()'s /proc/stat delta
+				-- sampling -- 0 on the first sample for a given MAC, since
+				-- there's no prior sample to diff against yet.
+				local throughput = 0
+				local prev = M._sta_stats_cache[sta.mac]
+				if prev then
+					local dt = now - prev.time
+					if dt > 0 then
+						throughput = math.floor(
+							((sta.rx_bytes or 0) - prev.rx_bytes + (sta.tx_bytes or 0) - prev.tx_bytes) / dt
+						)
+					end
+				end
+				M._sta_stats_cache[sta.mac] = {
+					rx_bytes = sta.rx_bytes or 0,
+					tx_bytes = sta.tx_bytes or 0,
+					time     = now,
+				}
+
+				sta_table[#sta_table + 1] = {
+					active     = true,
 					mac        = sta.mac,
 					ap_mac     = mac_str,
-					essid      = vap.essid,
+					channel    = vap.channel,
 					radio      = vap.radio,
 					signal     = sta.signal,
-					rx_bytes   = sta.rx_bytes,
-					tx_bytes   = sta.tx_bytes,
-					rx_packets = sta.rx_packets,
-					tx_packets = sta.tx_packets,
+					rssi       = sta.signal,
+					-- capacity: best-effort proxy from the negotiated PHY tx
+					-- rate (Mbps). linkscore/multicast: no local source
+					-- exists at all (not in iw output, not in any public
+					-- reference checked) -- placeholders, not measurements.
+					capacity   = sta.tx_bitrate and math.floor(sta.tx_bitrate) or 0,
+					throughput = throughput,
+					linkscore  = 0,
+					multicast  = 0,
 				}
 			end
+			vap.sta_table = sta_table
 		end
 	end
 
-	-- lldp_table
+	-- lldp_table (field names confirmed against the real controller's OXMua
+	-- DTO -- see PROTOCOL-VALIDATION.md "Stage 2c")
 	local lldp_table = {}
 	for _, nbr in ipairs(lldp_nbrs) do
 		lldp_table[#lldp_table + 1] = {
-			chassis_id  = nbr.chassis_id,
-			port_id     = nbr.port_id,
-			system_name = nbr.system_name,
-			port        = nbr.port,
+			chassis_descr   = nbr.system_desc,
+			chassis_id      = nbr.chassis_id,
+			local_port_name = nbr.port,
+			local_port_idx  = nbr.local_port_idx,
+			is_wired        = true,  -- LLDP is inherently a wired-link protocol
+			port_id         = nbr.port_id,
+			port_descr      = nbr.port_descr,
 		}
 	end
 
@@ -449,7 +493,6 @@ function M.build_json(st, cfg, ufhw)
 		radio_table      = radio_table,
 		radio_table_stats = radio_table_stats,
 		vap_table        = vap_table,
-		user_table       = user_table,
 		lldp_table       = lldp_table,
 	}
 

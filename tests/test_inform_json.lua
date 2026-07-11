@@ -213,6 +213,40 @@ return {
 		end
 	},
 	{
+		name = "inform json: lldp_table uses the real controller's field names",
+		fn = function()
+			-- Can't use build() here: inject_sysinfo() (which it always
+			-- calls first) resets _lldp._run_cmd to return "" every time,
+			-- so the lldpctl fixture override must be set after that and
+			-- build_json() called directly.
+			inject_sysinfo(false)
+			inform._lldp._run_cmd = function(cmd)
+				if cmd:find("lldpctl") then
+					local f = io.open("tests/fixtures/lldpctl_output.json", "r")
+					local s = f:read("*a"); f:close(); return s
+				end
+				return ""
+			end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			local nbr = d.lldp_table[1]
+			assert_eq(nbr.chassis_id, "aa:bb:cc:dd:ee:01", "chassis_id")
+			assert_eq(nbr.port_id, "GigabitEthernet0/1", "port_id")
+			assert_eq(nbr.local_port_name, "eth0", "local_port_name (was 'port')")
+			assert_eq(nbr.port_descr, "Uplink port", "port_descr")
+			assert_contains(nbr.chassis_descr, "UniFi Switch",
+				"chassis_descr comes from the System Description TLV (chassis.descr), not chassis.name")
+			assert_eq(nbr.is_wired, true, "is_wired always true for LLDP")
+			assert_true(nbr.system_name == nil, "system_name is not a real wire field")
+			assert_true(nbr.port == nil, "port is not a real wire field (renamed local_port_name)")
+			inform._lldp._run_cmd = function() return "" end
+		end
+	},
+	{
 		name = "inform json: locating defaults to false",
 		fn = function()
 			local d = build()
@@ -256,13 +290,58 @@ return {
 		end
 	},
 	{
-		name = "inform json: user_table flattens per-vap clients",
+		name = "inform json: vap_table nests connected clients as sta_table",
 		fn = function()
+			inform._sta_stats_cache = {}
 			local d = build({with_uci = true, with_clients = true})
-			assert_eq(#d.user_table, 2, "two entries in user_table")
-			assert_eq(d.user_table[1].mac, "aa:bb:cc:dd:ee:ff", "first client mac")
-			assert_eq(d.user_table[1].essid, "test", "essid attached from vap")
-			assert_eq(d.user_table[1].ap_mac, "aa:bb:cc:dd:ee:ff", "ap_mac from device mac")
+			local sta_table = d.vap_table[1].sta_table
+			assert_eq(#sta_table, 2, "two entries in sta_table")
+			assert_eq(sta_table[1].mac, "aa:bb:cc:dd:ee:ff", "first client mac")
+			assert_eq(sta_table[1].ap_mac, "aa:bb:cc:dd:ee:ff", "ap_mac from device mac")
+			assert_eq(sta_table[1].channel, "6", "channel from vap")
+			assert_eq(sta_table[1].radio, "radio0", "radio from vap")
+			assert_true(sta_table[1].active, "active true for a station iw actually lists")
+			assert_eq(sta_table[1].signal, -62, "signal from station dump")
+			assert_eq(sta_table[1].rssi, -62, "rssi aliases signal (iw doesn't distinguish them)")
+			assert_eq(sta_table[1].capacity, 144, "capacity from tx_bitrate floor(144.4)")
+			assert_eq(sta_table[1].throughput, 0, "throughput 0 on first sample (no prior delta)")
+			assert_eq(sta_table[1].linkscore, 0, "linkscore has no local source -- placeholder")
+			assert_eq(sta_table[1].multicast, 0, "multicast has no local source -- placeholder")
+		end
+	},
+	{
+		name = "inform json: sta_table throughput delta-samples between calls",
+		fn = function()
+			inform._sta_stats_cache = {}
+			local orig_time = inform._time
+			inform._time = function() return 1000 end
+			build({with_uci = true, with_clients = true})  -- first sample, seeds the cache
+
+			-- Bypass build()'s inject_sysinfo() (it would reset _run_cmd to
+			-- the standard fixture) so this call can use a custom fixture
+			-- with advanced byte counters for the same client.
+			inject_ucihelper()
+			inform._sysinfo._run_cmd = function(cmd)
+				if cmd:find("station dump") then
+					return "Station aa:bb:cc:dd:ee:ff (on wlan0)\n" ..
+						"\trx bytes:\t55678\n\ttx bytes:\t108765\n" ..
+						"\tsignal:  \t-62 dBm\n\ttx bitrate:\t144.4 MBit/s MCS 15 short GI\n"
+				end
+				return ""
+			end
+			inform._time = function() return 1010 end  -- 10s later
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			-- delta = (55678-45678) + (108765-98765) = 20000 bytes over 10s = 2000 B/s
+			assert_eq(d.vap_table[1].sta_table[1].throughput, 2000,
+				"throughput = byte delta / elapsed seconds")
+
+			inform._time = orig_time
+			inform._sta_stats_cache = {}
 		end
 	},
 	{

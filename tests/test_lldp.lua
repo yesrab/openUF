@@ -32,6 +32,31 @@ return {
 				assert_eq(nbrs[1].port_id,     "GigabitEthernet0/1",             "port_id")
 				assert_eq(nbrs[1].port,        "eth0",                           "local port")
 				assert_contains(nbrs[1].system_desc, "UniFi Switch",             "system_desc")
+				assert_eq(nbrs[1].port_descr,  "Uplink port",                    "port_descr")
+			end)
+		end
+	},
+	{
+		name = "lldp: neighbors() reads local_port_idx from /sys/class/net/<port>/ifindex",
+		fn = function()
+			local orig_read = lldp._read_file
+			lldp._read_file = function(path)
+				if path == "/sys/class/net/eth0/ifindex" then return "3\n" end
+				return nil
+			end
+			with_cmd(fixture("lldpctl_output.json"), function()
+				local nbrs = lldp.neighbors()
+				assert_eq(nbrs[1].local_port_idx, 3, "local_port_idx from sysfs")
+			end)
+			lldp._read_file = orig_read
+		end
+	},
+	{
+		name = "lldp: neighbors() local_port_idx is nil when sysfs is unavailable",
+		fn = function()
+			with_cmd(fixture("lldpctl_output.json"), function()
+				local nbrs = lldp.neighbors()
+				assert_true(nbrs[1].local_port_idx == nil, "nil without /sys access (e.g. dev machine)")
 			end)
 		end
 	},

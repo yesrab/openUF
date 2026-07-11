@@ -25,8 +25,25 @@ M._run_cmd = function(cmd)
 	return s or ""
 end
 
+-- Injectable: override in tests to return fixture file contents
+M._read_file = function(path)
+	local f = io.open(path, "r")
+	if not f then return nil end
+	local s = f:read("*a")
+	f:close()
+	return s
+end
+
+-- Returns the local port's kernel ifindex (an integer), or nil if the
+-- interface doesn't exist / /sys is unavailable (e.g. off-target tests).
+function M._local_port_idx(port_name)
+	local s = M._read_file("/sys/class/net/" .. port_name .. "/ifindex")
+	return s and tonumber(s:match("%d+")) or nil
+end
+
 -- Returns a table of LLDP neighbors, one entry per port/neighbor pair.
--- Each entry: {port, chassis_id, port_id, system_name, system_desc, capabilities}
+-- Each entry: {port, local_port_idx, chassis_id, port_id, port_descr,
+--              system_name, system_desc, capabilities}
 -- Returns {} if lldpctl is not available or has no neighbors.
 function M.neighbors()
 	local output = M._run_cmd("lldpctl -f json")
@@ -106,6 +123,13 @@ function M._parse_neighbor(port_name, nbr)
 		sys_desc = chassis.descr
 	end
 
+	local port_descr = ""
+	if type(port.descr) == "table" then
+		port_descr = port.descr.value or ""
+	elseif type(port.descr) == "string" then
+		port_descr = port.descr
+	end
+
 	-- Collect capability strings
 	local caps = {}
 	if type(chassis.capability) == "table" then
@@ -119,12 +143,14 @@ function M._parse_neighbor(port_name, nbr)
 	end
 
 	return {
-		port         = port_name,
-		chassis_id   = chassis_id,
-		port_id      = port_id,
-		system_name  = sys_name,
-		system_desc  = sys_desc,
-		capabilities = caps,
+		port          = port_name,
+		local_port_idx = M._local_port_idx(port_name),
+		chassis_id    = chassis_id,
+		port_id       = port_id,
+		port_descr    = port_descr,
+		system_name   = sys_name,
+		system_desc   = sys_desc,
+		capabilities  = caps,
 	}
 end
 
