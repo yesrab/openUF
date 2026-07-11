@@ -138,6 +138,7 @@ config = {
     state_file  = "/etc/openuf/state.json",
     log_file    = "/var/log/openuf.log",
     debug_dump_file = nil,       -- see below
+    bootstrap_adopt_user = nil,  -- see below
 }
 ```
 
@@ -147,6 +148,10 @@ appended verbatim, with a UTC timestamp, before it's dispatched. Used to capture
 ground-truth payload shapes when validating field assumptions (`vap_table`,
 `network_table`, `cmd` dispatch, etc.) against a real UniFi controller — see
 [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md).
+
+`bootstrap_adopt_user` — set by `install.sh install --bootstrap-adopt`, not by
+hand. Names the temporary SSH bootstrap account (see § SSH prerequisite below)
+that `inform.lua` should lock/unlock as the device's adopted state changes.
 
 ---
 
@@ -168,6 +173,39 @@ Confirm SSH works from the controller's network before attempting adoption.  A f
 > the L3 section below and [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md)).
 > Once adopted, that field is ignored — key rotation only happens via the SSH
 > `set-adopt` path from that point on, matching real L2 hardware behavior.
+
+#### Optional: zero-touch bootstrap adoption (`--bootstrap-adopt`)
+
+Real Ubiquiti hardware ships a factory-default `ubnt`/`ubnt` SSH account
+specifically so first adoption works without presetting anything — live testing
+against a real controller (see PROTOCOL-VALIDATION.md) confirmed the controller's
+SSH client tries exactly that account for L2-discovered, not-yet-adopted devices,
+regardless of any admin-configured "Device SSH Authentication" credentials.
+`install.sh install --bootstrap-adopt` sets up the same thing, scoped as tightly
+as this project can manage:
+
+```sh
+sh install.sh install --bootstrap-adopt
+```
+
+- The account is **non-root**, a member of a dedicated `openuf` group with
+  write access to `/etc/openuf` only — no other privilege, ever, even
+  transiently.
+- Its login shell (`openuf/hook/adopt-shell.sh`) is a forced-command wrapper
+  that permits exactly one thing: running `syswrapper.sh set-adopt <url>
+  <key>`. Any other command, or a plain interactive login attempt, is refused
+  outright — the account can never be used as a general-purpose shell.
+- Once the device is adopted, `inform.lua` locks the account (`passwd -l`) —
+  it detects this within one poll interval (~10s) of the SSH-driven
+  `set-adopt` writing new state. It re-enables the account automatically on
+  a factory reset (`reset-inform`, or a controller-initiated "Forget Device"),
+  so re-adoption after a reset works the same zero-touch way.
+- This is entirely opt-in: a plain `install.sh install` (no flag) never
+  creates this account and behaves exactly as documented above — the admin
+  sets their own root password.
+
+`uninstall` always removes the bootstrap account if present, regardless of
+whether `--bootstrap-adopt` is passed to it.
 
 ### L2 adoption (device and controller on the same subnet)
 
@@ -272,11 +310,12 @@ If `lldpd` is absent or returns no neighbors, `lldp.lua` returns an empty table 
 |---|---|
 | Device doesn't appear in UniFi Discover | `announce.lua` not running, or UDP port 10001 blocked |
 | Controller shows device as "Disconnected" | `inform.lua` not running, or wrong `inform_url` |
-| Adoption fails with SSH error | SSH not reachable from controller, or root password not set — run `passwd root` on the device |
+| Adoption fails with SSH error | SSH not reachable from controller, or root password not set — run `passwd root` on the device, or reinstall with `--bootstrap-adopt` |
 | Controller rejects device ("firmware incompatible") | Adjust `fw.ver` in `ufmodel/u6iw.lua` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
 | SSID not appearing after adoption | Check `uci show wireless`, check `loglevel` in `/var/log/openuf.log` |
 | `lldp_table` empty | `lldpd` not running — run `/etc/init.d/lldpd start` |
+| Bootstrap account (`ubnt`) doesn't lock after adoption, or doesn't re-enable after a factory reset | `inform.lua` must be running for this — it's what detects the state change and runs `passwd -l`/`-u` (see § SSH prerequisite). Check `/var/log/openuf.log`. |
 
 Log file: `/var/log/openuf.log`
 
