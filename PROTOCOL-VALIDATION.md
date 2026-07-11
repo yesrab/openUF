@@ -720,46 +720,71 @@ Code: `openuf/inform.lua` (mem_used, spectrum fields relocation),
 `tests/test_inform_json.lua`, `tests/test_inform_packet.lua`,
 `tests/test_ucihelper.lua`. All 156 tests pass.
 
-**Found, NOT yet fixed — needs a decision before implementing (bigger
-structural change, and/or requires inventing data with no local source):**
+**Fixed 2026-07-12 (both structural items, user asked to proceed on both):**
 
-- **`user_table` (flat, top-level) is likely structurally wrong.** The string
-  `sta_table` (not `user_table`) appears repeatedly, including nested inside
-  the vap-stats DTO itself (`QCtdvLKOBb` has a field `wJxjaSoY = "sta_table"`)
-  — i.e. the real per-client list is probably **nested inside each
-  `vap_table` entry**, not flattened into one top-level array. The per-client
-  entry DTO (`QCtdvLKOBb$KHUkYjHujLgFBD`) has fields `active`, `mac`,
-  `ap_mac`, `name`, `channel`, `radio`, `capacity`, `linkscore`, `signal`,
-  `throughput`, `rssi`, `multicast` — notably **no `rx_bytes`/`tx_bytes`/
-  `rx_packets`/`tx_packets`** (openUF's current `user_table` fields), and
-  four fields (`capacity`, `linkscore`, `throughput`, `multicast`) that have
-  no obvious source in `iw station dump` output — would need invented/
-  approximated values, same category of guess as spectrum's `width`/
-  `interference`.
-- **`lldp_table` entries are mostly wrong.** Real DTO (`OXMua`): `chassis_descr`,
+- **`user_table` (flat, top-level) → nested `sta_table` per `vap_table`
+  entry.** The string `sta_table` (not `user_table`) appears repeatedly,
+  including nested inside the vap-stats DTO itself (`QCtdvLKOBb` has a
+  field `wJxjaSoY = "sta_table"`) — the real per-client list is nested
+  inside each `vap_table` entry, not flattened into one top-level array.
+  `openuf/inform.lua`'s `build_json` now attaches `vap.sta_table` instead
+  of appending to a top-level `user_table` (removed from the payload
+  entirely); `vap.num_sta` is unchanged (the real DTO has both `num_sta`
+  and the nested `sta_table` side by side).
+  - Per-entry fields: `mac`, `ap_mac`, `channel`, `radio`, `signal` — direct,
+    high confidence. `rssi` — aliased to the same `signal` value from `iw
+    station dump` (that command doesn't expose a separately-measured RSSI).
+    `active` — always `true` (an entry only exists if `iw station dump`
+    currently lists it as associated). `name` — omitted (controller/admin
+    assigned, no local source; not invented).
+  - **`capacity`/`linkscore`/`throughput`/`multicast`: researched online
+    before implementing** (`paultyng/go-unifi`'s generated `User` REST model,
+    and `unpoller/unifi`'s `clients.go`, which models the live `/stat/sta`
+    REST client-stats object in detail — confirms `rssi`/`signal`/`noise`/
+    `tx_power`/`satisfaction`/`roam_count`/etc. as real UniFi client-stat
+    concepts, but **neither reference has `capacity`, `linkscore`,
+    `throughput`, or `multicast` at all**). Conclusion: these are likely
+    AP-native single-inform-snapshot concepts with no public documentation
+    anywhere (the REST client model is a richer, controller-side aggregate
+    across time/devices, not a 1:1 mirror of one inform's raw `sta_table`).
+    Implemented as best-effort, explicitly flagged in code:
+    `capacity` = negotiated `tx_bitrate` from `iw station dump` (Mbps,
+    floored) — closest available proxy for "available bandwidth to this
+    client". `throughput` = delta-sampled byte rate (bytes/sec), reusing
+    the same pattern as `sysinfo.cpu_percent()`'s `/proc/stat` delta
+    sampling (0 on the first sample for a given MAC, no prior sample to
+    diff against) — new module-level `M._sta_stats_cache` in
+    `openuf/inform.lua`, and a new injectable `M._time` (defaults to
+    `os.time`) so the delta can be tested deterministically.
+    `linkscore`/`multicast` = `0` placeholders — genuinely no local source
+    or public reference found for either; **still needs live-capture
+    verification**, unlike everything else in this document.
+- **`lldp_table` field names fixed.** Real DTO (`OXMua`): `chassis_descr`,
   `chassis_id`, `local_port_name`, `local_port_idx`, `is_wired`, `port_id`,
-  `port_descr`. openUF currently sends `chassis_id`, `port_id` (both
-  correct) plus `system_name`, `port` (neither matches — `port` should
-  likely be `local_port_name`, and `system_name`/`chassis_descr` are
-  probably two *different* LLDP TLVs — System Name vs. System Description —
-  not interchangeable, so mapping openUF's captured system-name value into a
-  field called `chassis_descr` would put the right-shaped but
-  wrong-*meaning* data under that key). Fixing this properly means extending
-  `openuf/lldp.lua`'s `_parse_neighbor` to also pull `chassis.descr`/
-  `port.descr` from `lldpctl -f json` output, which needs new fixture data,
-  not just a rename.
+  `port_descr`. `openuf/lldp.lua`'s `_parse_neighbor` already extracted
+  `chassis.descr` (as `system_desc`) but it wasn't wired into the payload;
+  added extraction of `port.descr` (`port_descr`, same dual table/string
+  handling as `chassis.descr` — the test fixture already contained a
+  `port.descr` value, proving lldpd emits it) and a new
+  `M._local_port_idx(port_name)` that reads
+  `/sys/class/net/<port>/ifindex` directly (this is *our own* local
+  interface, not something lldpctl reports about the neighbor, so it's a
+  local sysfs lookup, not a protocol field — nil/omitted off-target or in
+  tests without a real interface). `openuf/inform.lua`'s `lldp_table`
+  construction renamed `system_name`→`chassis_descr` (note: these are
+  **not the same underlying value** — System Name vs. System Description
+  are different LLDP TLVs; `chassis_descr` is now correctly sourced from
+  `chassis.descr`, not `chassis.name`) and `port`→`local_port_name`, and
+  added `is_wired = true` unconditionally (LLDP is inherently a wired-link
+  protocol, not a guess).
 - **`bootrom_version` has no confirmed replacement.** Searched the entire
   device schema (all ~90 nested classes) — no field resembling it exists at
   all (closest is `boot_time`, a timestamp, not a version string). Likely
   just an extraneous key the real controller ignores rather than a
-  misnamed one — no evidence for what, if anything, to rename it to.
+  misnamed one — left as-is, no evidence for what to rename it to.
 
-Not acted on without direction because the first item changes the payload's
-top-level shape (removes `user_table`, restructures `vap_table`) and the
-second requires extending a different module's data collection — both bigger
-than the mechanical renames above, and the "correct" values for
-capacity/linkscore/throughput/multicast aren't derivable from anything on a
-stock OpenWrt AP.
+Code: `openuf/inform.lua`, `openuf/lldp.lua`. Tests:
+`tests/test_inform_json.lua`, `tests/test_lldp.lua`. All 160 tests pass.
 
 ## 9. Firmware upgrade offer
 
