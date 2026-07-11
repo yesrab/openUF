@@ -138,6 +138,9 @@ include them, so removing them isn't justified by this evidence alone (unlike th
 `system-stats` key, which is a documented, cross-referenced device-type-agnostic
 field this capture and `amd989`'s `_create_complete_inform` both confirm).
 
+**Resolved 2026-07-11** (see "Stage 2c" section below): the real controller's own
+device schema has `mem_used`, not `mem_free`. Fixed — see Stage 2c.
+
 ### L3 adoption never completes in this environment — contradicts current USAGE.md
 
 `USAGE.md` §4 currently states, for L3 adoption: *"Click Adopt — the controller
@@ -683,6 +686,80 @@ angle (see "Possible follow-ups" below).**
   during a real scan on real hardware (packet capture on the LAN between a
   real AP and a real controller) rather than trying to derive the shape
   statically.
+
+## Stage 2c (2026-07-11): full-payload audit against the controller's device schema
+
+Prompted by "have you validated all payloads being sent?" — Stage 2b only
+checked the spectrum-scan fields. Since the same decompiled
+`internal-dependencies.jar` (see Stage 2b) turned out to contain the
+controller's **entire internal Device model** in one class,
+`com/ubnt/data/cVbZoFIZsWYaVCquTr` (plus ~90 nested classes, one per wire
+sub-object — vap stats, sta entries, radio config, lldp neighbors, sysinfo,
+LTE, PoE, PTP, etc.), it was cheap to cross-check every field name openUF
+sends against it, not just the spectrum ones. Decompiled with `jadx` this
+time (not just raw string extraction) to get properly-scoped classes instead
+of one flat string soup — much easier to confirm which fields belong
+together. Checked every outbound field name (`grep` against the full
+constant-pool string dump, ~1.2M lines) with high hit/no-hit confidence.
+
+**Confirmed and fixed (mechanical renames, unambiguous — implemented in this
+pass):**
+
+| Location | Was | Now | Evidence |
+|---|---|---|---|
+| top-level payload | `mem_free` | `mem_used` (= total − free) | found alongside `mem_total`/`mem_buffer`/`loadavg_1/5/15` in a Lombok sysinfo DTO |
+| `radio_table` entry | `htmode` | `ht` | found in the real radio-config DTO (`eWivisHeQsnaqDtx`), alongside `channel`/`tx_power`/`builtin_antenna`/`max_txpower` — confirms this is the right class |
+| `radio_table`/`vap_table` entry | `txpower` | `tx_power` | same DTO as above |
+| `vap_table` entry | `ssid` | `essid` | found in the real vap-stats DTO (`QCtdvLKOBb`), alongside `num_sta`/`is_guest`/`bssid`/`radio_name`/`rx_bytes` etc. |
+| `vap_table` entry | `networkconf_id` | `wlanconf_id` | same DTO as above (note: `apply_config`'s **inbound**, controller-pushed config parsing still correctly uses `ssid`/`networkconf_id` — that's a different direction/DTO, go-unifi's admin REST model, not touched) |
+| top-level payload | `spectrum_scanning`/`spectrum_scan_timestamp` nested in each `radio_table_stats` entry | moved to top-level (device-level) fields | found as flat fields on the outer `cVbZoFIZsWYaVCquTr` class itself, distinct from `spectrum_table`/`spectrum_table_time` which are confirmed inside the per-radio DTO |
+
+Code: `openuf/inform.lua` (mem_used, spectrum fields relocation),
+`openuf/ucihelper.lua` (`ht`/`tx_power`/`essid`/`wlanconf_id` in
+`get_radio_table`/`get_vap_table`). Tests updated to match in
+`tests/test_inform_json.lua`, `tests/test_inform_packet.lua`,
+`tests/test_ucihelper.lua`. All 156 tests pass.
+
+**Found, NOT yet fixed — needs a decision before implementing (bigger
+structural change, and/or requires inventing data with no local source):**
+
+- **`user_table` (flat, top-level) is likely structurally wrong.** The string
+  `sta_table` (not `user_table`) appears repeatedly, including nested inside
+  the vap-stats DTO itself (`QCtdvLKOBb` has a field `wJxjaSoY = "sta_table"`)
+  — i.e. the real per-client list is probably **nested inside each
+  `vap_table` entry**, not flattened into one top-level array. The per-client
+  entry DTO (`QCtdvLKOBb$KHUkYjHujLgFBD`) has fields `active`, `mac`,
+  `ap_mac`, `name`, `channel`, `radio`, `capacity`, `linkscore`, `signal`,
+  `throughput`, `rssi`, `multicast` — notably **no `rx_bytes`/`tx_bytes`/
+  `rx_packets`/`tx_packets`** (openUF's current `user_table` fields), and
+  four fields (`capacity`, `linkscore`, `throughput`, `multicast`) that have
+  no obvious source in `iw station dump` output — would need invented/
+  approximated values, same category of guess as spectrum's `width`/
+  `interference`.
+- **`lldp_table` entries are mostly wrong.** Real DTO (`OXMua`): `chassis_descr`,
+  `chassis_id`, `local_port_name`, `local_port_idx`, `is_wired`, `port_id`,
+  `port_descr`. openUF currently sends `chassis_id`, `port_id` (both
+  correct) plus `system_name`, `port` (neither matches — `port` should
+  likely be `local_port_name`, and `system_name`/`chassis_descr` are
+  probably two *different* LLDP TLVs — System Name vs. System Description —
+  not interchangeable, so mapping openUF's captured system-name value into a
+  field called `chassis_descr` would put the right-shaped but
+  wrong-*meaning* data under that key). Fixing this properly means extending
+  `openuf/lldp.lua`'s `_parse_neighbor` to also pull `chassis.descr`/
+  `port.descr` from `lldpctl -f json` output, which needs new fixture data,
+  not just a rename.
+- **`bootrom_version` has no confirmed replacement.** Searched the entire
+  device schema (all ~90 nested classes) — no field resembling it exists at
+  all (closest is `boot_time`, a timestamp, not a version string). Likely
+  just an extraneous key the real controller ignores rather than a
+  misnamed one — no evidence for what, if anything, to rename it to.
+
+Not acted on without direction because the first item changes the payload's
+top-level shape (removes `user_table`, restructures `vap_table`) and the
+second requires extending a different module's data collection — both bigger
+than the mechanical renames above, and the "correct" values for
+capacity/linkscore/throughput/multicast aren't derivable from anything on a
+stock OpenWrt AP.
 
 ## 9. Firmware upgrade offer
 

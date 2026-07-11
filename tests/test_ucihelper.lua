@@ -242,14 +242,14 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: get_vap_table round-trips networkconf_id",
+		name = "ucihelper: get_vap_table round-trips wlanconf_id",
 		fn = function()
 			with_ucihelper(function(db)
 				ucihelper.wlan_add("radio0", "corp", "wpa2", "hunter22", nil,
 					"openuf_vlan20", "net-1")
 				local vaps = ucihelper.get_vap_table()
 				assert_eq(#vaps, 1, "one vap")
-				assert_eq(vaps[1].networkconf_id, "net-1", "networkconf_id read back")
+				assert_eq(vaps[1].wlanconf_id, "net-1", "wlanconf_id read back")
 			end)
 		end
 	},

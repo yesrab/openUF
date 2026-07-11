@@ -268,8 +268,8 @@ function M.get_radio_table()
 		radios[#radios + 1] = {
 			name             = s[".name"],
 			channel          = s.channel,
-			htmode           = s.htmode,
-			txpower          = s.txpower,
+			ht               = s.htmode,
+			tx_power         = s.txpower,
 			disabled         = (s.disabled == "1"),
 			builtin_antenna  = M.RADIO_DEFAULTS.builtin_antenna,
 			builtin_ant_gain = M.RADIO_DEFAULTS.builtin_ant_gain,
@@ -320,16 +320,16 @@ function M.get_vap_table()
 			if mac_raw then bssid = mac_raw:match("^([%x:]+)") or "" end
 		end
 		vaps[#vaps + 1] = {
-			name           = s[".name"],
-			ssid           = s.ssid,
-			radio          = s.device,
-			encryption     = s.encryption,
-			disabled       = (s.disabled == "1"),
-			bssid          = bssid,
-			channel        = radio and radio.channel,
-			tx_power       = radio and radio.txpower,
-			usage          = "user",
-			networkconf_id = s.openuf_networkconf_id,
+			name          = s[".name"],
+			essid         = s.ssid,
+			radio         = s.device,
+			encryption    = s.encryption,
+			disabled      = (s.disabled == "1"),
+			bssid         = bssid,
+			channel       = radio and radio.channel,
+			tx_power      = radio and radio.tx_power,
+			usage         = "user",
+			wlanconf_id   = s.openuf_networkconf_id,
 		}
 	end)
 	return vaps

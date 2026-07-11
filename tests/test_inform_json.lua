@@ -46,14 +46,14 @@ local function inject_ucihelper()
 	inform._ucihelper = {
 		get_radio_table = function()
 			return {
-				{ name = "radio0", channel = "6", htmode = "HT20", txpower = "20",
+				{ name = "radio0", channel = "6", ht = "HT20", tx_power = "20",
 				  disabled = false, builtin_antenna = true, builtin_ant_gain = 3,
 				  max_txpower = 20 },
 			}
 		end,
 		get_vap_table = function()
 			return {
-				{ name = "openuf_test", ssid = "test", radio = "radio0",
+				{ name = "openuf_test", essid = "test", radio = "radio0",
 				  encryption = "psk2", disabled = false, bssid = "aa:bb:cc:00:00:01",
 				  channel = "6", tx_power = "20", usage = "user" },
 			}
@@ -103,7 +103,7 @@ return {
 		fn = function()
 			local d = build()
 			for _, field in ipairs({"mac","serial","model","platform","hostname",
-				"ip","version","uptime","time","mem_total","mem_free"}) do
+				"ip","version","uptime","time","mem_total","mem_used"}) do
 				assert_not_nil(d[field], "field present: " .. field)
 			end
 		end
@@ -160,11 +160,11 @@ return {
 		end
 	},
 	{
-		name = "inform json: mem_total and mem_free from fixture (bytes)",
+		name = "inform json: mem_total and mem_used from fixture (bytes)",
 		fn = function()
 			local d = build()
 			assert_eq(d.mem_total, 131072 * 1024, "mem_total bytes")
-			assert_eq(d.mem_free,   65536 * 1024, "mem_free bytes")
+			assert_eq(d.mem_used, (131072 - 65536) * 1024, "mem_used = (total - free) bytes")
 		end
 	},
 	{
@@ -288,9 +288,11 @@ return {
 			}
 			local d = build({with_uci = true, with_clients = true})
 			local rts = d.radio_table_stats[1]
-			assert_eq(rts.spectrum_scanning, false, "spectrum_scanning false once results are cached")
+			-- spectrum_scanning/spectrum_scan_timestamp are device-level
+			-- (top-level payload) fields, not per-radio.
+			assert_eq(d.spectrum_scanning, false, "spectrum_scanning false once results are cached")
+			assert_eq(d.spectrum_scan_timestamp, 222, "spectrum_scan_timestamp from cache")
 			assert_eq(rts.spectrum_table_time, 111, "spectrum_table_time from cache")
-			assert_eq(rts.spectrum_scan_timestamp, 222, "spectrum_scan_timestamp from cache")
 			assert_eq(#rts.spectrum_table, 1, "one spectrum_table entry")
 			assert_eq(rts.spectrum_table[1].channel, 6, "spectrum_table entry channel")
 			inform._spectrum_cache = {}
@@ -303,6 +305,8 @@ return {
 			local d = build({with_uci = true, with_clients = true})
 			assert_true(d.radio_table_stats[1].spectrum_table == nil,
 				"no spectrum_table until a spectrum-scan cmd has run")
+			assert_true(d.spectrum_scan_timestamp == nil,
+				"no spectrum_scan_timestamp until a spectrum-scan cmd has run")
 		end
 	},
 	{

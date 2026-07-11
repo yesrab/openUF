@@ -344,12 +344,16 @@ function M.build_json(st, cfg, ufhw)
 					}
 					-- Cached spectrum-scan result, if a "spectrum-scan" cmd
 					-- was handled for this radio (see cmd dispatch below).
+					-- NOTE: spectrum_scanning/spectrum_scan_timestamp are
+					-- device-level (top-level payload) fields, not per-radio
+					-- -- confirmed against the real controller's own device
+					-- schema, which has them at the top level while
+					-- spectrum_table/spectrum_table_time are the per-radio
+					-- fields (see PROTOCOL-VALIDATION.md section 8).
 					local sscan = M._spectrum_cache[radio.name]
 					if sscan then
-						entry.spectrum_scanning       = false
-						entry.spectrum_table          = sscan.table
-						entry.spectrum_table_time     = sscan.table_time
-						entry.spectrum_scan_timestamp = sscan.scan_timestamp
+						entry.spectrum_table      = sscan.table
+						entry.spectrum_table_time = sscan.table_time
 					end
 					radio_table_stats[#radio_table_stats + 1] = entry
 				end
@@ -371,7 +375,7 @@ function M.build_json(st, cfg, ufhw)
 				user_table[#user_table + 1] = {
 					mac        = sta.mac,
 					ap_mac     = mac_str,
-					essid      = vap.ssid,
+					essid      = vap.essid,
 					radio      = vap.radio,
 					signal     = sta.signal,
 					rx_bytes   = sta.rx_bytes,
@@ -392,6 +396,17 @@ function M.build_json(st, cfg, ufhw)
 			system_name = nbr.system_name,
 			port        = nbr.port,
 		}
+	end
+
+	-- Device-level spectrum-scan status, aggregated across all radios'
+	-- cached results (see radio_table_stats loop above for the per-radio
+	-- spectrum_table/spectrum_table_time fields).
+	local spectrum_scan_timestamp = nil
+	for _, sscan in pairs(M._spectrum_cache) do
+		if sscan.scan_timestamp and
+		   (not spectrum_scan_timestamp or sscan.scan_timestamp > spectrum_scan_timestamp) then
+			spectrum_scan_timestamp = sscan.scan_timestamp
+		end
 	end
 
 	local payload = {
@@ -415,7 +430,10 @@ function M.build_json(st, cfg, ufhw)
 		bootrom_version  = uap.bootver or "",
 		country_code     = st.country_code or 840,
 		mem_total        = meminfo.total_kb * 1024,
-		mem_free         = meminfo.free_kb  * 1024,
+		mem_used         = (meminfo.total_kb - meminfo.free_kb) * 1024,
+		-- Device-level (not per-radio -- see radio_table_stats above)
+		spectrum_scanning       = false,
+		spectrum_scan_timestamp = spectrum_scan_timestamp,
 		-- Real devices report this under the hyphenated key "system-stats"
 		-- with {cpu, mem, uptime} as percentage/uptime strings -- confirmed
 		-- against a real captured USG inform payload (stephanlascar/
@@ -586,7 +604,7 @@ function M.handle_response(json_str, st, cfg)
 							ufuci._popen("iw dev " .. ifname .. " scan")
 							local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 							if ok_rs then
-								local width = _width_from_htmode(radio.htmode)
+								local width = _width_from_htmode(radio.ht)
 								local table_entries = {}
 								for _, s in ipairs(stats) do
 									local total = s.channel_time or 0

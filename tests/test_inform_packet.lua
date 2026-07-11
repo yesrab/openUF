@@ -363,7 +363,7 @@ return {
 			inform._spectrum_cache = {}
 			inform._ucihelper = {
 				get_radio_table = function()
-					return { { name = "radio0", channel = "6", htmode = "HT40" } }
+					return { { name = "radio0", channel = "6", ht = "HT40" } }
 				end,
 				get_ifname_for_radio = function() return "wlan0" end,
 				_popen = function() return "" end,
