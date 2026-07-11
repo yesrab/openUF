@@ -49,4 +49,13 @@ config = {
 	-- default. Used to capture ground-truth payload shapes when validating
 	-- against a real UniFi controller -- see PROTOCOL-VALIDATION.md.
 	debug_dump_file = nil,
+
+	-- Set (by install.sh's --bootstrap-adopt, not by hand) to the name of a
+	-- temporary, non-root SSH bootstrap account matching real Ubiquiti
+	-- hardware's factory-default "ubnt" login -- lets first adoption succeed
+	-- without presetting a root password. nil unless that install flag was
+	-- used. When set, inform.lua locks the account once the device becomes
+	-- adopted and re-enables it on factory reset -- see USAGE.md's SSH
+	-- prerequisite section.
+	bootstrap_adopt_user = nil,
 }
