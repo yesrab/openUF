@@ -543,6 +543,61 @@ resolved by the four fixes above. Does not block the matrix rows below, since a 
 - **Findings:**
 - **Code changes:**
 
+## Stage 2 findings (2026-07-11): AP→controller spectrum-scan-result shape
+
+**Result: inconclusive — the JSON key names could not be recovered from the
+public firmware image. Do not re-attempt this exact approach without a new
+angle (see "Possible follow-ups" below).**
+
+- **Image analyzed:** official U6-InWall (`U6IW`) release firmware
+  `v6.8.2+15592`, pulled directly from Ubiquiti's own firmware API
+  (`fw-update.ubnt.com/api/firmware-latest`, `platform=U6IW`), file
+  `6bbe-U6IW-6.8.2-4640c65b-3bb0-4844-943b-b2103ecd4bf9.bin`, md5
+  `0fec04452cadd2d025777d36ab2974ea` — this is the exact image a real device
+  would pull, not a repackaged/third-party mirror.
+- **Container format:** `file` identifies it as "HIT archive data". `binwalk`
+  finds 5 small statically-linked ARM/ARM64 ELF binaries and an LZMA blob +
+  a gzip'd `dtb_combined.bin` before an EFI GPT partition table at
+  offset `0x131974`.
+- **GPT partitions (5 total, confirmed both via `binwalk`'s efigpt extractor
+  and a manual GPT header parse — `num_part_entries=5`):**
+  `HLOS` (~21.3MB, has data), `HLOS_1` (backup/inactive slot, **0 bytes**),
+  `bs` (**0 bytes**), `cfg` (**0 bytes**), `log` (**0 bytes**). **No
+  system/rootfs/application partition exists in this image at all.**
+- **`HLOS.img` is not readable plaintext:** true Shannon entropy is a flat
+  **8.0 bits/byte** (maximum) across ~95% of the file (computed per-1MB-block
+  in Python, not just eyeballing binwalk's entropy graph, which is easy to
+  misread), with no gzip/xz/lzma magic bytes anywhere in that region and zero
+  `strings` hits for a kernel version banner ("Linux version ..."), any
+  `ath11k`/driver strings, or any of `scan/spectrum/rssi/noise/channel/bssid`.
+  Only the last ~1.3MB (entropy drops to ~4.1) is plaintext — and that's just
+  device-tree blobs (`qcom,ipq5018-*` compatible strings), not application
+  code. **HLOS is therefore either encrypted or compressed with a scheme this
+  toolchain doesn't recognize** — consistent with Ubiquiti's newer
+  WiFi6/Qualcomm-IPQ line using verified/encrypted boot, unlike legacy
+  MIPS/AirOS-era squashfs firmware (which the community has always been able
+  to `binwalk`/`strings` freely — this device generation is different).
+- **The 5 early ELF binaries** (carved directly, all statically-linked,
+  no section headers — bootloader-stage, not userspace) contain no
+  scan/spectrum-related strings; one has generic PCI-bus-enumeration/VGA-mode
+  strings ("Scanning PCI devices...", "doublescan"), consistent with a
+  generic bootloader/firmware library, not AP-specific code.
+- **Conclusion:** the public OTA download for this device is a *kernel-only*
+  delta update — no separate userspace/application partition ships through
+  this channel at all, so the inform-client binary that would contain the
+  spectrum-scan JSON key strings simply isn't present in this artifact,
+  encrypted or not.
+- **Possible follow-ups (not attempted this session):** (a) an *older*
+  pre-2023 U6-IW firmware build might predate encrypted/kernel-only OTA
+  packaging and could still ship a full squashfs rootfs — untested; (b) SSH
+  into a real, owned U6-IW device directly (once/if L2 adoption is validated)
+  and pull the running inform-daemon binary or its `/proc/<pid>/maps`-mapped
+  file straight off the live filesystem, sidestepping the OTA-package
+  question entirely; (c) live-capture the actual wire bytes AP→controller
+  during a real scan on real hardware (packet capture on the LAN between a
+  real AP and a real controller) rather than trying to derive the shape
+  statically.
+
 ## 9. Firmware upgrade offer
 
 - **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
@@ -568,9 +623,15 @@ resolved by the four fixes above. Does not block the matrix rows below, since a 
 
 ---
 
-## Stage 2 (future, not started)
+## Stage 2 (attempted 2026-07-11, inconclusive)
 
-Static extraction of a real AP firmware image (`binwalk` + `strings`/Ghidra) to
+Static extraction of a real AP firmware image (`binwalk` + `strings`/`radare2`) to
 determine the AP→controller spectrum-scan-result reporting shape — the one item
 Stage 1's controller-only setup can't resolve, since it requires observing what a
-genuine AP sends up, not what the controller pushes down.
+genuine AP sends up, not what the controller pushes down. **Attempted against the
+real, current U6-InWall firmware image — no usable result. See the "Stage 2
+findings" write-up under section 8 above for the full analysis and why this
+specific artifact doesn't contain the answer.** Don't re-run the same
+binwalk/strings pass against the same (or a same-generation) firmware build
+expecting a different outcome — see "Possible follow-ups" above for what might
+actually move this forward.
