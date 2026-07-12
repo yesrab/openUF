@@ -652,22 +652,51 @@ question.
 
 ## 3. Default SSID push (no VLAN)
 
-- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
+- **Status:** 🛑 blocked — **new root cause found 2026-07-12** (device is now
+  Connected, so this is no longer blocked by adoption; it's blocked by a
+  separate, environmental limitation of the validation container — see
+  "RESOLVED-ish: no radios reported, environmental not a code bug" below).
 - **Compare against:** `vap_table` field names (`openuf/ucihelper.lua` `apply_config()`)
-- **Findings:**
-- **Code changes:**
+- **Findings:** created a real WiFi network ("openuf-test", Native Network,
+  broadcasting to "All APs") in the controller UI. The controller's pushed
+  `setparam` response contains a `system_cfg` blob (not `vap_table` JSON —
+  see below) with the literal line `# no wlan provisioned as no radio found` /
+  `radio.status=disabled` — the controller refuses to provision any SSID onto
+  this device because it believes the device has **zero physical radios**.
+  Root-caused: this disposable Alpine AP container has no `uci` binary/Lua
+  binding at all (`apk search uci` returns nothing), so
+  `openuf/inform.lua:334`'s `pcall(ufuci.get_radio_table)` always fails and
+  `radio_table` stays permanently `{}` (its default at `inform.lua:322`) in
+  every inform this container ever sends. Confirmed via `debug_dump_file`
+  that our own `radio_table` field really is present-but-empty (not
+  absent) — matching the controller's own "Missing radio_table" check
+  (`list3.isEmpty()`, decompiled, see below). **Real target hardware (WDR3500
+  / Archer C5 v1, genuine OpenWrt) has actual UCI with real `wifi-device`
+  sections and would not hit this** — this is a validation-*environment* gap,
+  not an openUF code bug. Testing this scenario for real would need either
+  building a `uci` Lua binding for Alpine (much larger effort than the
+  `lua-openssl` rock — `uci`/`libuci` is OpenWrt-specific, not in Alpine's
+  repos) or stubbing a fake `/etc/config/wireless` + a `uci`-compatible mock
+  module.
+- **Code changes:** none in this pass (environmental, not fixable in
+  `openuf/`) — `radio_table`'s empty-on-error fallback is itself correct
+  defensive behavior, not the bug.
 
 ## 4. VLAN-tagged network + SSID assignment
 
-- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
+- **Status:** 🛑 blocked — same root cause as section 3 (no radios reported by
+  this validation container; the controller won't push any WLAN config,
+  VLAN-tagged or not, onto a device it believes has zero radios).
 - **Compare against:** `network_table`/`networkconf_id` join shape
   (`openuf/ucihelper.lua`)
-- **Findings:**
+- **Findings:** not independently re-attempted — section 3 already
+  demonstrates the blocking condition applies before VLAN-specific logic is
+  ever reached.
 - **Code changes:**
 
 ## 5. Fast Roaming / WPA3 fast roaming toggle
 
-- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
+- **Status:** 🛑 blocked — same root cause as section 3.
 - **Compare against:** presence/absence and real field name of
   `mobility_domain`/`r0kh`/`r1kh`/`fast_roaming_enabled`
   (`openuf/ucihelper.lua` `derive_mobility_domain` stopgap)
@@ -676,7 +705,9 @@ question.
 
 ## 6. TX power (Low/Medium/High/Custom) per radio
 
-- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
+- **Status:** 🛑 blocked — same root cause as section 3 (no radios reported,
+  so there's no per-radio config surface for the controller to push TX power
+  onto).
 - **Compare against:** `radio_table` field name/value shape
   (`openuf/ucihelper.lua` `rf_config()`)
 - **Findings:**
@@ -684,20 +715,132 @@ question.
 
 ## 7. Locate trigger
 
-- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
+- **Status:** ✅ captured (real, via `debug_dump_file`) — 2026-07-12, first
+  scenario re-run against the now-Connected device.
 - **Compare against:** exact `cmd` string(s) (`openuf/inform.lua:455-460`)
-- **Findings:**
-- **Code changes:**
+- **Findings:** clicked "Locate" for real in the controller UI. Real captured
+  payload:
+  ```json
+  {"_type":"cmd","cmd":"set-locate","device_id":"...","time":...,"datetime":"...","_id":"...","server_time_in_utc":"..."}
+  ```
+  Confirms `cmd:"set-locate"` (not e.g. `"locate"` or `"identify"`) is the
+  real trigger string, matching `openuf/inform.lua`'s existing `cmd ==
+  "set-locate"` branch exactly — no code change needed. `inform.lua` logged
+  `cmd: set-locate`, and `state.json` correctly picked up `"locating":true`.
+  Also confirms the `cmd` branch's "always re-inform immediately" fix (see
+  the fxkr cross-check finding above): the controller's next response
+  (`noop`) landed in the same second as the `cmd` response, proving the
+  immediate re-inform after executing a command works. On this hardware-less
+  validation container `dev.conf.led` is `nil` (no real LED, only the real
+  target hardware's modelmap sets a real sysfs path), so
+  `led.locate_start(nil)` correctly no-ops per its own unit test — the LED
+  *hardware* interaction itself needs re-verification on real target
+  hardware, but the wire protocol and state-tracking are now fully confirmed.
+- **Code changes:** none — existing implementation confirmed correct.
 
 ## 8. RF/spectrum scan trigger (trigger only)
 
-- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
+- **Status:** 🛑 blocked — same root cause as section 3. The controller's
+  RF-scan trigger lives under a per-radio UI control that never renders at
+  all for a device it believes has zero radios (no "Radios" panel appears
+  anywhere in this device's Overview/Settings while `radio_table` is empty).
 - **Compare against:** exact `cmd` string for the scan trigger
   (`openuf/inform.lua:461-478`)
 - **Note:** result-reporting (AP→controller direction) is out of scope for this
-  stage — see Stage 2.
+  stage — see Stage 2b findings elsewhere in this doc.
 - **Findings:**
 - **Code changes:**
+
+## RESOLVED-ish: no radios reported — environmental, not a code bug (2026-07-12)
+
+Root cause for sections 3-6 and 8 all being blocked, and (very likely) a
+contributing factor to the CPU/stats-history investigation below. Confirmed
+via direct capture and code inspection, not guesswork:
+
+- The controller's pushed `setparam` response, captured live via
+  `debug_dump_file` after creating a real WiFi network and assigning it to
+  this AP, contains a `system_cfg` blob with the literal comment
+  `# no wlan provisioned as no radio found` and `radio.status=disabled`.
+- `openuf/inform.lua:322-334`: `radio_table` defaults to `{}` and is only
+  populated via `pcall(ufuci.get_radio_table)`. `openuf/ucihelper.lua`'s
+  `get_radio_table()` calls `require("uci")` and iterates real
+  `wifi-device` UCI sections — both genuinely absent on this validation
+  container (`apk search uci` returns nothing; no `/etc/config/` directory
+  exists at all). The `pcall` correctly swallows the resulting error and
+  `radio_table` stays `{}` — this is defensively-correct behavior, not a bug,
+  but it means **every inform this container has ever sent has an empty
+  `radio_table`**.
+- Decompiled the controller's own check (`internal-dependencies.jar`, CFR):
+  `com.ubnt.service.devmgr.tFhABnrHYJqvjaoEa` (and a near-duplicate,
+  `PGOcbDWlbnYQdFW`) reads `list3 = ekfCWfaSnrqscUb2.getList("radio_table")`
+  and does `if (list3.isEmpty()) { ... "Missing radio_table in inform..." }`
+  — confirms the controller received our `radio_table` field fine, it's just
+  empty, and that's exactly the "no radio found" condition.
+- **Real target hardware (WDR3500 / Archer C5 v1, genuine OpenWrt) has actual
+  UCI with real `wifi-device` sections populated by the wireless driver at
+  boot, independent of any configured SSID** — this whole class of blockage
+  is specific to this disposable Alpine validation container, not something
+  real deployments would hit. Porting a working `uci`/`libuci` Lua binding to
+  Alpine (unlike `lua-openssl`, not available as any Alpine package, and not
+  a generic luarocks package either — it's OpenWrt-specific) or hand-stubbing
+  a fake UCI config tree would be needed to test sections 3-6 and 8 for real
+  in this environment; out of scope for this pass.
+
+## CPU/memory stats history investigation (2026-07-12)
+
+The controller UI's Insights → Stats → "System Utilization" chart was
+completely empty (no data series at all, not just a flat 0% line) despite
+1+ day of continuous informs. `openuf/sysinfo.lua`'s `cpu_percent()` and
+`openuf/inform.lua`'s `system-stats.cpu`/`mem`/`uptime` construction were
+re-read and confirmed correct (delta-sampling `/proc/stat`, correctly wired
+into `build_json`) — this is not a `build_json` bug. Investigated further via
+direct MongoDB inspection and CFR decompilation of
+`internal-dependencies.jar`:
+
+- **`db.stat.count()` is `0` for the entire database** — not just this
+  device. This is the controller's own historical time-series collection
+  that backs the Insights charts.
+- Decompiled the controller's inform-time stats-recording path
+  (`com.ubnt.service.devmgr.tFhABnrHYJqvjaoEa` calling into
+  `com.ubnt.service.system.QDcGUYAmLvJwylXw`, which reads `system-stats.cpu`/
+  `mem` at several points across different device-type branches). Traced the
+  call site (`tFhABnrHYJqvjaoEa.java:1689`) that appears to cover our
+  device's case: it sits **unconditionally after** the `hasRadio("na")`
+  if/else block (not nested inside it), gated only by `inMeshMode`/
+  `inManagedShadowGatewayMode` — both false for a plain, non-mesh,
+  non-shadow-gateway device. This means the empty `radio_table` finding above
+  does **not** appear to gate this particular cpu/mem-recording call, unlike
+  `radio_table_stats` (which genuinely is skipped when `radio_table` is
+  empty, per the earlier "Missing radio_table" trace) — the two are separate
+  code paths.
+- Given the write call itself appears reachable, but zero documents exist in
+  `stat` **anywhere in the database**, this looks like a missing/disabled
+  background flush job in this specific minimal Docker deployment, not
+  something gated by what any individual device reports. Consistent with
+  other already-documented background-service gaps in this same environment
+  (the `127.0.0.1:9080/api/ucore/manifest` connection-refused error, the
+  `get-ulp-manifest` fetch failures — both present regardless of device
+  activity, both pre-existing/known-harmless per earlier sessions).
+- **Not fully conclusive** — this is as far as static bytecode tracing
+  reasonably goes without runtime instrumentation (matching the same limit
+  reached during the original `wait_for_initial_inform` investigation).
+  The proximate cause (empty `stat` collection database-wide) is solid,
+  directly-queried fact; the *reason* the flush job isn't running is
+  inferred, not proven. No evidence was found implicating openUF's own
+  output.
+- **Bonus finding, relevant to future Power/PoE work**: the same decompiled
+  method (`tFhABnrHYJqvjaoEa.java:1405`) copies these fields from the raw
+  inform directly onto the device doc if present: `power_source`,
+  `power_source_voltage`, `psu_table`, `power-monitor`, `total_max_power`,
+  `led_state`, `outlet_table` — confirming at least some power/PoE reporting
+  is genuinely self-reported by the device in its own inform, not solely
+  derived from an upstream PoE switch. See the Power/PoE section below.
+
+**Conclusion: not an openUF bug.** No code change made. If this needs to be
+proven conclusively, the next step would be JDWP runtime attach (as
+previously scoped but not needed for the AES-GCM investigation) to watch
+whether the stats-flush actually executes and where it stops, rather than
+further static tracing.
 
 ## Stage 2b findings (2026-07-11): spectrum-scan result shape, from the controller side
 
@@ -1078,10 +1221,34 @@ prefixed behavior as correct).
 
 ## 10. Forget device / factory reset
 
-- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
+- **Status:** ⚠️ attempted 2026-07-12 (real click via UI) — **the controller
+  never actually dispatched a `_type:"setdefault"` wire command in this test**,
+  so `openuf/inform.lua`'s handler itself remains unverified against a live
+  controller-issued command, though the admin-facing UI action and
+  server-side deletion do work.
 - **Compare against:** `_type:"setdefault"` shape (`openuf/inform.lua:423-430`)
-- **Findings:**
-- **Code changes:**
+- **Findings:** clicked "Remove" for real in the controller UI (confirmed the
+  real "The device will be restored to factory settings..." dialog) against
+  the Connected device. Result: the UI correctly flipped the device back to
+  "1 device is ready to adopt" (i.e. the controller genuinely deleted/reset
+  the device record server-side), but `debug_dump_file` captured **no**
+  `_type:"setdefault"` payload — only continuing `noop` responses — and
+  `state.json` still showed `adopted:true` with the *old* authkey afterward,
+  meaning openUF's own client-side state was never told to reset. `server.log`
+  has zero log lines mentioning forget/remove/setdefault for this device's MAC
+  around the removal timestamp either. This is consistent with the same
+  in-memory device-cache staleness documented in "wait_for_initial_inform:
+  what actually flips it" above (`SNMiFVJXxaonBOtqbJ`'s cache-then-DB-fallback
+  device lookup, populated once and never invalidated by an external write) —
+  informs kept decrypting successfully post-"removal" purely from a stale
+  cache entry, while the underlying Mongo doc was already gone and a fresh
+  "pending adoption" entry existed for the same MAC. Whether a real
+  `setdefault` command is sent under different circumstances (e.g. only via
+  SSH for L2-discovered devices, mirroring how initial adopt differs between
+  L2/SSH and L3/mgmt_cfg) is unconfirmed — not re-tested this pass.
+- **Code changes:** none — `openuf/inform.lua`'s `setdefault` handler is
+  unverified but no evidence found that it's wrong; the controller's own
+  dispatch behavior is the open question here, not the client code.
 
 ## 11. fw.ver acceptance (passive)
 
