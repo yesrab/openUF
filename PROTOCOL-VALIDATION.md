@@ -1230,6 +1230,67 @@ Code: `openuf/inform.lua` (mem_used, spectrum fields relocation),
 Code: `openuf/inform.lua`, `openuf/lldp.lua`. Tests:
 `tests/test_inform_json.lua`, `tests/test_lldp.lua`. All 160 tests pass.
 
+## RESOLVED: "Air Stats" panel always showed 0/0B, 0.0% (2026-07-12)
+
+User noticed the live controller UI's device detail panel had a whole
+section, "Air Stats" (per-band Tx/Rx Pkts/Bytes, Tx/Rx Retry/Dropped),
+that always showed zero regardless of anything else in this
+investigation. Two separate causes, both real:
+
+1. **Missing fields, all environments.** `vap_table` entries never sent
+   `rx_bytes`/`rx_packets`/`tx_bytes`/`tx_packets`/`tx_retries`/
+   `tx_dropped` at all. Confirmed real field names via a second nested
+   class in the same decompiled device-schema jar as Stage 2c above
+   (`com/ubnt/data/cVbZoFIZsWYaVCquTr$QCtdvLKOBb`, the actual vap-stats
+   DTO — note the *top-level* `com/ubnt/data/QCtdvLKOBb` is an unrelated
+   FirewallRule class; obfuscated short names collide across packages, so
+   always extract by full package path). `iw(8)` only exposes these as
+   per-station counters, not an already-aggregated per-VAP one, so
+   `build_json` now sums each connected station's counters while it
+   already iterates them to build `sta_table`. Added `tx_retries`/
+   `tx_failed` parsing to `sysinfo.sta_table()` (`iw`'s `"tx retries:"`/
+   `"tx failed:"` fields — TX-side only, 802.11 ARQ retries have no RX-side
+   equivalent). `rx_dropped`/`rx_errors`/`tx_errors`/`satisfaction` have no
+   source data anywhere in `iw`'s output — left unset, matching the
+   `linkscore`/`multicast` "no local source" precedent from Stage 2c.
+2. **Environment-only: `ubus`/`iw` don't work at all in this Alpine
+   container.** `get_ifname_for_radio()` shells out to `ubus call
+   network.wireless status`, then `radio_stats()`/`sta_table()` shell out
+   to `iw dev <ifname> survey/station dump` — none of which exist/work
+   here (no `ubus`/netifd, no real wireless netdevs), so both were always
+   silently empty regardless of item 1. Added `tools/validation/ap/
+   ubus-mock.sh` and `iw-mock.sh` (validation-only, same pattern as
+   `uci-mock.lua`), seeded with a static `radio0`→`wlan0`/`radio1`→`wlan1`
+   mapping and one fake connected station.
+3. **A third, genuinely separate bug found investigating item 1's
+   neighbor:** `sysinfo.radio_stats()`'s survey-dump parser expected
+   `"channel time:"`/`"channel time busy:"`/`"channel time rx:"`/
+   `"channel time tx:"`, but `strings /usr/sbin/iw` shows the real binary
+   prints `"channel active time:"`/`"channel busy time:"`/`"channel
+   receive time:"`/`"channel transmit time:"` — these patterns never
+   matched real `iw` output **on any hardware, ever**, going undetected
+   because the test fixture was itself fabricated with the same wrong
+   names rather than sourced from real `iw` output. Fixed and anchored to
+   line-start so `"channel busy time:"` doesn't also match inside the
+   separate `"extension channel busy time:"` field `iw` emits on wider
+   channels (a literal substring collision).
+
+**Verified live, end-to-end, twice:** first confirmed `build_json` sends
+correct non-zero absolute counters via a live one-off script — but the
+"Air Stats" UI widget still showed 0/0B. Root-caused: the widget reads as
+a rate/delta between informs, and the fake client's counters were static
+(same value every call) — a real client's counters only ever grow while
+associated, so a static value produces a zero delta even though the raw
+per-inform counter is genuinely non-zero. Made `iw-mock.sh`'s fake
+counters monotonically increase (persisted counter file); the UI then
+showed real traffic: **Tx Pkts/Bytes: 198/180 KB, Rx Pkts/Bytes: 132/90.1
+KB, Tx Retry/Dropped: 10.0%/0.0%** on both bands.
+
+**Code changes:** `openuf/inform.lua` (per-VAP aggregation),
+`openuf/sysinfo.lua` (`tx_retries`/`tx_failed` parsing, survey-dump field
+names), `tools/validation/ap/{ubus,iw}-mock.sh` (validation-only). Unit
+tests added in `tests/test_inform_json.lua`, `tests/test_sysinfo.lua`.
+
 ## 9. Firmware upgrade offer
 
 - **Status:** ✅ captured (real, via `debug_dump_file` + independent `tcpdump`
