@@ -455,6 +455,23 @@ Not yet root-caused; noted here as the next concrete thread rather than somethin
 resolved by the four fixes above. Does not block the matrix rows below, since a real
 `setparam` payload was captured regardless of the device settling to "Connected".
 
+**Reconfirmed 2026-07-12** on a from-scratch rebuild of this whole environment
+(`docker compose down -v` + `up -d --build`, fresh mongo/controller/AP, after this
+session's `sta_table`/`lldp_table`/`mem_used`/spectrum-scan payload changes): the exact
+same behavior reproduces — `adoption_completed: true`, `wait_for_initial_inform: true`
+stuck indefinitely, `x_aes_gcm: false` in Mongo despite the device's own `state.json`
+correctly tracking `use_gcm: true` and GCM decryption clearly succeeding every cycle,
+and `cfgversion` changing on literally every single `setparam` (`105777b8` →
+`02103d91` → `5c8972d9` → `4e6a0499` → `9c06e675` over five consecutive cycles, no
+stabilization). One difference from the original observation: `last_seen` **does**
+now populate and update on the Mongo device doc (`1783839075` and climbing) — the
+earlier claim that it "never gets a `last_seen` field" no longer holds, though this
+alone isn't enough to flip `wait_for_initial_inform`. Useful confirmation either way:
+none of this session's payload-shape changes broke anything (informs keep decrypting
+and updating `last_seen`/`cfgversion` cleanly, no new parse errors in `server.log`),
+and this stuck-adopting issue is clearly independent of them, reproducing identically
+before and after.
+
 ---
 
 ## 1. Initial adopt handshake
