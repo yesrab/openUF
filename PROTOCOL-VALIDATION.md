@@ -1291,6 +1291,60 @@ KB, Tx Retry/Dropped: 10.0%/0.0%** on both bands.
 names), `tools/validation/ap/{ubus,iw}-mock.sh` (validation-only). Unit
 tests added in `tests/test_inform_json.lua`, `tests/test_sysinfo.lua`.
 
+## RESOLVED (partially): vap_table's `radio` field was the UCI device name, not the band (2026-07-12)
+
+Continuing the Air Stats investigation: the fake client's traffic counters
+showed correctly, but the client never appeared in the Clients list. Found
+a second real bug while chasing this — decompiling the controller's stats
+pipeline (`com.ubnt.service.system.QDcGUYAmLvJwylXw`) showed `vap_table`'s
+`radio` field is parsed through the *exact same* band-parsing enum
+(`com.ubnt.g.f.e.rYtJfMBbtgWvku`, `"ng"`/`"na"`/`"ad"`/`"6e"`) already
+fixed for `radio_table`'s `radio` field earlier — but
+`ucihelper.get_vap_table()` was still sending the raw UCI device name
+(`"radio0"`/`"radio1"`). Confirmed live: `WARN stat - unexpected
+radio[radio0] while processing stats` logged on every single inform
+since the UCI mock started returning real VAPs — almost certainly also
+the (or a) cause of the CPU/stats-history graphs staying empty
+(documented earlier in this file).
+
+**Fixed:** `get_vap_table()` now derives `radio` from the matching
+`radio_table` entry's already-correct band field, and keeps the UCI
+device name in a separate `radio_name` field (confirmed as a distinct,
+real field on the same decompiled vap-stats DTO,
+`cVbZoFIZsWYaVCquTr$QCtdvLKOBb`, alongside `radio`). **Verified live,
+twice** (once against the accumulated dev environment, once against a
+fully fresh `docker compose down -v` rebuild): the `"unexpected radio"`
+warnings stopped completely in both runs. Unit test added in
+`tests/test_ucihelper.lua`.
+
+**Still open:** the client itself still never appears in the Clients
+list, on either run (confirmed against a *genuinely fresh* database too,
+ruling out stale cross-session cache as this specific cause). Traced the
+actual client-creation code path in full: `tFhABnrHYJqvjaoEa`'s per-VAP
+`sta_table` loop → `TtZhv.chgwykfBxZCAuEHPPQ(UCthhvfQNZ, KrlpWXOulbN,
+boolean)` → for a MAC with no existing record, a gate at the very top of
+that branch: `if (this.LmkhIDtPqt.rMxwXnPhhdotvjERKoA(site_id, mac)) {
+return; }`, where `LmkhIDtPqt` is a `SNMiFVJXxaonBOtqbJ` instance — **the
+exact same class** this document's earlier `wait_for_initial_inform`
+investigation already root-caused as having a "cache-then-DB-fallback...
+populated once and never invalidated by an external write" bug, and
+which that investigation explicitly concluded by "hitting the limit of
+static analysis." The check itself appears to mean "is this MAC already
+a known UniFi device" (guarding against double-counting a mesh AP as a
+client) — no MAC collision exists against any registered device in
+Mongo, so it's unclear why it would return `true` for a genuinely new
+MAC, and a fresh-database run didn't change the outcome. Ruled out along
+the way: `is_wep`-driven early skip (openUF never sets `is_wep` on the
+vap, defaults correctly to `false`), and MAC collision. Confirming the
+actual runtime boolean here would need live JVM debugging/instrumentation
+against the closed-source controller, which isn't available — documented
+as an open question rather than guessed at further, matching this
+project's established precedent for `SNMiFVJXxaonBOtqbJ`-related dead
+ends.
+
+**Code changes:** `openuf/ucihelper.lua` (`radio`/`radio_name` fields on
+`get_vap_table()`). Unit test added in `tests/test_ucihelper.lua`.
+
 ## 9. Firmware upgrade offer
 
 - **Status:** ✅ captured (real, via `debug_dump_file` + independent `tcpdump`
