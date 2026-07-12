@@ -805,11 +805,44 @@ Code: `openuf/inform.lua`, `openuf/lldp.lua`. Tests:
 
 ## 9. Firmware upgrade offer
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** ⚠️ attempted 2026-07-12 (real click via UI, real traffic capture) —
+  **no `_type:"upgrade"` payload obtainable in this environment**, root cause
+  identified (not a new bug — same underlying cause as the "stuck in Adopting"
+  open item above).
 - **Compare against:** `_type:"upgrade"` shape, `version`/`url` field names
   (`openuf/inform.lua:438-448`)
-- **Findings:**
-- **Code changes:**
+- **Findings:** Clicked the real "Update" button in the controller UI while
+  running `tcpdump` on the AP container's inform port (8080) plus the existing
+  `debug_dump_file` decrypted-response capture in parallel. **Result: nothing
+  was sent to the device at all.** `tcpdump` shows only the same-shaped,
+  same-size (2242-byte request / ~522-byte response) periodic inform/`setparam`
+  cycle before and after the click — no new connection, no larger response.
+  `debug_dump_file` never captured a `_type:"upgrade"` entry. The controller's
+  own `server.log` has zero mentions of "upgrade" anywhere. The only visible
+  effect was internal: the device's MongoDB record's `device_upgraded` flag
+  flipped to `true` with no corresponding wire traffic — the controller
+  appears to silently no-op the upgrade dispatch for a device stuck in
+  "Adopting" (never reaching "Connected") rather than queuing/sending it,
+  consistent with the other device-targeted actions (Locate, RF scan) already
+  known to be blocked by that same root issue.
+- **Separately, found and fixed the *cause* of the "1 device has an update"
+  offer in the first place:** the controller's own `autoupdate-check` log
+  states plainly `firmware[U6IW] new version (6.8.2.15592) is available` —
+  openUF's `openuf/ufmodel/u6iw.lua` `fw.ver` was still `"6.6.55"` (a stale
+  placeholder), which is exactly the real current U6IW release firmware
+  version independently confirmed via Ubiquiti's own firmware API during the
+  Stage 2 firmware-analysis research (`U6IW v6.8.2+15592`). Updated `fw.ver`
+  to `"6.8.2.15592"`; after restarting `inform.lua` with the change, the
+  device's Mongo record correctly updated (`version: "U6IW.6.8.2.15592"`,
+  `previous_firmware_version: "U6IW.6.6.55"`, confirming the controller
+  registered a real version transition from the new inform, not a fluke).
+  The sidebar "1 device has an update" banner didn't immediately clear after
+  this — likely a stale client-side notification left over from the earlier
+  manual "Update" click rather than a live re-evaluation; `upgradable` stayed
+  `undefined` (not `true`) at the DB level throughout, so the underlying
+  "needs update" condition does appear resolved.
+- **Code changes:** `openuf/ufmodel/u6iw.lua` (`fw.ver`/`buildtime` updated to
+  the real current release).
 
 ## 10. Forget device / factory reset
 
@@ -820,11 +853,24 @@ Code: `openuf/inform.lua`, `openuf/lldp.lua`. Tests:
 
 ## 11. fw.ver acceptance (passive)
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** ✅ answered 2026-07-12, as a side effect of the section 9 firmware
+  investigation above (didn't need "Connected" state for this one — the
+  device was still "Adopting" throughout).
 - **Compare against:** does the current `openuf/ufmodel/u6iw.lua` `fw.ver` get
   accepted by the real controller, or rejected?
-- **Findings:**
-- **Code changes:**
+- **Findings:** Accepted, not rejected — any `fw.ver` string of this shape is
+  simply stored as the device's reported `version` verbatim, no validation
+  beyond that observed. The real finding wasn't acceptance/rejection but a
+  *staleness* problem: the old placeholder `"6.6.55"` was old enough (versus
+  the real current U6IW release, `6.8.2.15592`) that the controller's own
+  `autoupdate-check` flagged it as needing an update — the spurious
+  "1 device has an update" UI notification came directly from this, not from
+  anything malformed. Bumping `fw.ver` to the real current version and
+  restarting `inform.lua` was immediately reflected correctly in the
+  device's Mongo record (`version`, `previous_firmware_version`), confirming
+  live acceptance of an updated value with no rejection or side effects.
+- **Code changes:** `openuf/ufmodel/u6iw.lua` (see section 9 above — same
+  fix answers both).
 
 ---
 
