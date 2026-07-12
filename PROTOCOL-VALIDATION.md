@@ -805,6 +805,58 @@ via direct capture and code inspection, not guesswork:
   a fake UCI config tree would be needed to test sections 3-6 and 8 for real
   in this environment; out of scope for this pass.
 
+## RESOLVED: hand-stubbed a UCI mock, and it immediately found a real bug (2026-07-12)
+
+The "out of scope for this pass" note above was revisited: hand-stubbing a
+fake UCI config tree turned out to be cheap (`ucihelper.lua` already has an
+`M._uci` injection seam built for unit tests, and the exact same in-memory
+cursor mock from `tests/test_ucihelper.lua`'s `new_mock_uci()` just needed
+exposing as a real requirable module). Added
+`tools/validation/ap/uci-mock.lua`, installed at
+`/usr/local/share/lua/5.1/uci.lua` in the validation-only AP image (not part
+of openUF proper — `ucihelper.lua`'s product code is untouched), seeded with
+two `wifi-device` sections (`radio0`/`radio1`) matching
+`generic-dualband-ap.lua`'s `hwassign`. `get_radio_table()` immediately
+returned real, non-empty entries.
+
+This unblocked sections 3-6 and 8 as intended, but also **found a real
+openUF bug that had been completely invisible until this exact moment**:
+every single inform after `radio_table` went non-empty caused the real
+controller to throw `java.lang.NullPointerException: Cannot invoke
+"String.toLowerCase()" because "<parameter1>" is null` inside
+`InformServlet` → `MiVjHefaf` (devmgr adopt processing) →
+`eWivisHeQsnaqDtx` (config service), on every single inform cycle. Live
+symptom: the device would reach `adopted:true` in Mongo (`last_seen`
+genuinely advancing) but the Devices list UI would show "No UniFi Devices
+Have Been Adopted" and Settings → WiFi would refuse to apply config
+("requires a UniFi Access Point to be adopted") — the exception was
+corrupting the controller's adopt/UI-facing device cache on every cycle,
+not the persistent Mongo doc.
+
+Root-caused by decompiling (CFR) the referenced classes out of
+`internal-dependencies.jar`: `com.ubnt.g.f.e.rYtJfMBbtgWvku` is the
+controller's own radio-band enum (`BAND_NG="ng"`, `BAND_NA="na"`,
+`BAND_AD="ad"`, `BAND_6E="6e"`), and its string-parsing factory
+(`chgwykfBxZCAuEHPPQ(String)`) is exactly `string.toLowerCase()` with no
+null guard. `eWivisHeQsnaqDtx.java` reads a `"radio"` field off each
+`radio_table` entry throughout (`getString("radio", "ng")` in most places,
+but at least one call site has no default) — and openUF's
+`ucihelper.get_radio_table()` never emitted a `"radio"` field at all. This
+was invisible for the entire project up to this point because
+`radio_table` was always `{}` (see the section above), so this code path
+never ran even once.
+
+**Fixed** in `openuf/ucihelper.lua`: added a `band_for_channel()` helper
+(channel 1-14 → `"ng"`, else → `"na"` — openUF only targets dual-band
+2.4/5GHz hardware, see `hwassign`; 60GHz/6GHz channel numbers overlap
+5GHz's and aren't disambiguable from channel number alone, so unsupported)
+and wired it into `get_radio_table()`'s `radio` field. Verified live: after
+rebuilding the AP image and re-adopting, zero NPEs across a full adopt
+cycle (previously one every ~10s, every inform), and the device reached
+"Up to date" (green, connected, `GbE` uplink) in the UI for the first time
+this session. Unit test added
+(`ucihelper: get_radio_table derives radio band from channel`).
+
 ## CPU/memory stats history investigation (2026-07-12)
 
 The controller UI's Insights → Stats → "System Utilization" chart was
