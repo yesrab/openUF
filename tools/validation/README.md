@@ -93,9 +93,16 @@ means a credentials mismatch.
 
 Once SSH adopt succeeds, `syswrapper.sh set-adopt` runs for real on the AP
 container and writes `/etc/openuf/state.json` with a controller-issued `authkey`.
-**If `inform.lua` was already running before the adopt (e.g. from an earlier L3
-attempt), restart it** so it picks up the new state — it does not currently
-hot-reload `state.json` mid-run.
+**No restart needed** — `inform.lua` reloads `state.json` on its own if the
+file's mtime changes between loop iterations (`M._reload_if_changed`, checked
+at the top of every ~10s cycle), so an already-running process picks up a
+fresh SSH-driven adoption within one cycle. (This note used to say the
+opposite — that was accurate before that reload logic was added, but got left
+stale afterward. Re-verified 2026-07-12: reset an already-running, already-
+adopted process's state via `reset-inform`, then re-ran `set-adopt` directly
+without touching the process, and it resumed informing successfully on its
+own — the only delay was the exponential backoff from the intervening failed
+attempts, not a missed reload.)
 
 ## 5. Work through the validation matrix
 
