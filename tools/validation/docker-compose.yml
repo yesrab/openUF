@@ -64,6 +64,15 @@ services:
       dockerfile: tools/validation/ap/Dockerfile
     container_name: openuf-validation-ap
     hostname: openuf-ap
+    cap_add:
+      # Real target hardware (a real Linux/OpenWrt device) has full kernel
+      # privileges; a plain Docker container -- even running as root --
+      # does NOT have CAP_NET_ADMIN by default, so `ip addr add`/`ip route`
+      # (used by openuf/netconfig.lua to apply controller-pushed static IP
+      # config) fail with "RTNETLINK answers: Operation not permitted".
+      # Needed only to validate that code path against this disposable
+      # container; not a requirement of openUF itself.
+      - NET_ADMIN
     networks:
       - validation
     # Not exposed to the host on purpose -- the controller reaches this

@@ -270,6 +270,88 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response setparam applies static IP from system_cfg",
+		fn = function()
+			local st = sample_state()
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			-- Real captured shape (PROTOCOL-VALIDATION.md): system_cfg is a
+			-- flat OpenWrt-UCI-style blob, separate from mgmt_cfg. Static is
+			-- signalled by the ABSENCE of dhcpc.1.* keys, not an explicit flag.
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.50\\n'
+				.. 'netconf.1.netmask=255.255.255.0\\nroute.1.gateway=172.19.0.1\\n"}'
+			inform.handle_response(resp, st, cfg)
+			inform._netconfig._exec = orig
+			assert_eq(st.ip_mode, "static", "ip_mode recorded as static")
+			assert_eq(st.static_ip, "172.19.0.50", "static_ip recorded")
+			assert_eq(st.static_gateway, "172.19.0.1", "static_gateway recorded")
+			assert_eq(st.ip, "172.19.0.50", "st.ip synced to the new static address")
+			assert_eq(#cmds, 3, "three shell commands (flush, add, route)")
+			assert_contains(cmds[2], "172.19.0.50/24 dev eth0", "correct interface and address")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam applies dhcp from system_cfg",
+		fn = function()
+			local st = sample_state({ip_mode = "static", static_ip = "172.19.0.50"})
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.2\\n'
+				.. 'dhcpc.1.status=enabled\\ndhcpc.1.devname=br0\\n"}'
+			inform.handle_response(resp, st, cfg)
+			inform._netconfig._exec = orig
+			assert_eq(st.ip_mode, "dhcp", "ip_mode recorded as dhcp")
+			assert_eq(st.static_ip, nil, "static_ip cleared on dhcp")
+			assert_contains(cmds[2], "udhcpc -i eth0", "udhcpc invoked on the right interface")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam does NOT flush dhcp on first contact",
+		fn = function()
+			-- A fresh device's very first system_cfg (and every steady-state
+			-- reaffirmation) also carries dhcpc.1.status=enabled, but there's
+			-- no prior static config to revert -- calling apply_dhcp here
+			-- would needlessly (and, without a real DHCP server to grant a
+			-- new lease, destructively) flush a working address. Confirmed
+			-- live: this exact scenario stranded the validation container.
+			local st = sample_state()  -- ip_mode starts nil, never "static"
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.2\\n'
+				.. 'dhcpc.1.status=enabled\\ndhcpc.1.devname=br0\\n"}'
+			inform.handle_response(resp, st, cfg)
+			inform._netconfig._exec = orig
+			assert_eq(st.ip_mode, "dhcp", "ip_mode still recorded as dhcp")
+			assert_eq(#cmds, 0, "apply_dhcp NOT called -- nothing to revert")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam ignores system_cfg without cfg.net",
+		fn = function()
+			-- Same nil-safety convention as cfg.led -- absent per-model
+			-- interface config means a safe no-op, not an error.
+			local st = sample_state()
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.50\\n"}'
+			local ok = pcall(inform.handle_response, resp, st, nil)
+			assert_true(ok, "no error without cfg")
+		end
+	},
+	{
 		name = "inform packet: handle_response setdefault resets state",
 		fn = function()
 			local st = sample_state({

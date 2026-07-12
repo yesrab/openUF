@@ -1329,6 +1329,93 @@ prefixed behavior as correct).
   (`setparam` handler). Tests: `tests/test_led.lua`,
   `tests/test_inform_packet.lua`. All 165 tests pass.
 
+## 14. IP Settings (DHCP/Static) + Port VLAN
+
+- **Status:** ✅ fixed and fully verified live (real controller UI → real
+  Linux network reconfiguration → real reported inform payload) — 2026-07-12.
+  A brand-new, previously entirely unimplemented protocol surface (grep for
+  `config_network`/`dhcp`/`netconf` across `openuf/` returned nothing before
+  this pass). **A real, live-fired regression was found and fixed during this
+  work — see the incident writeup below before reusing this pattern.**
+- **Compare against:** unknown going in — no prior assumption existed.
+- **Findings — the real wire shape:** toggling "Static" + entering an IP in
+  the controller UI's IP Settings panel does **not** produce a `vap_table`/
+  `network_table`-style typed JSON field. It arrives inside the *same*
+  `system_cfg` flat OpenWrt-UCI-style key=value blob already seen for initial
+  adoption and the "no radio found" finding (sections 3-8/CPU-stats above) —
+  confirmed via `debug_dump_file` before writing any code:
+  ```
+  netconf.1.devname=br0
+  netconf.1.ip=172.19.0.50
+  netconf.1.netmask=255.255.255.0
+  netconf.1.autoip.status=disabled
+  route.1.gateway=172.19.0.1
+  resolv.nameserver.1.ip=192.168.1.1
+  dhcpc.status=enabled        <- present when DHCP; dhcpc.1.* SUB-KEYS
+                                  (dhcpc.1.status, dhcpc.1.devname) are the
+                                  actual DHCP-vs-static signal, not an
+                                  explicit boolean flag
+  ```
+  "Port VLAN" (a plain checkbox with no VLAN ID input in this UI) produced
+  **no observable change** in `system_cfg` (`vlan.status` stayed `disabled`
+  both times tested) — inconclusive; likely needs a real VLAN network to
+  already exist site-wide, or additional UI not surfaced in this simplified
+  view. Not implemented — genuinely no confirmed field to implement against.
+- **Fix:** new `openuf/netconfig.lua` (`apply_static`/`apply_dhcp`, shelling
+  out to real `ip addr`/`ip route`/`udhcpc` — the same primitives real
+  OpenWrt hardware and this validation container both have, unlike UCI).
+  `inform.lua`'s `setparam` handler parses `system_cfg` and calls the right
+  one, using the existing `cfg.net.lan_cpueth` interface-resolution
+  convention already established by `announce.lua`'s `get_mac`/`get_ip`
+  (reused, not reinvented). Also syncs `st.ip` after a successful apply (it
+  was previously a boot-time-only snapshot, per `_populate_net_info` — see
+  the incident below for why this mattered).
+- **Live-fired incident, found and fixed mid-session:** the first live test
+  of `apply_dhcp` **stranded the AP container** — `ip -4 addr show`/
+  `ip route show` returned completely empty, `inform.lua` started logging
+  `connect failed: Network unreachable`. Root cause: a fresh device's
+  *very first* post-adopt `setparam` **always** carries `system_cfg` with
+  `dhcpc.1.status=enabled` (a brand-new device starts in DHCP by
+  definition), and the original code called `apply_dhcp` (flush + `udhcpc`)
+  on *every* dhcp-signalling `system_cfg`, not just genuine static→DHCP
+  reversions. This validation container's Docker bridge has no real DHCP
+  server to grant a fresh lease, so the flush succeeded but the re-lease
+  never did, leaving the interface with zero addresses. **Fixed**: `dhcp`
+  branch now only calls `apply_dhcp` when `st.ip_mode == "static"` already
+  (i.e. genuinely undoing our own prior static push) — first contact and
+  every steady-state DHCP reaffirmation are now a no-op, matching how real
+  hardware's own continuously-running DHCP client doesn't need us to
+  manually re-invoke it just because the controller confirmed the mode.
+  Added a regression test
+  (`test_inform_packet.lua`: "does NOT flush dhcp on first contact")
+  and recovered the stranded container via `docker exec` (works regardless
+  of the container's own network state) before re-testing.
+- **Separate environmental fix required:** `apply_static`'s real `ip addr
+  add`/`ip route replace` initially failed with
+  `RTNETLINK answers: Operation not permitted` — Docker containers lack
+  `CAP_NET_ADMIN` by default even running as root (confirmed by running the
+  identical command manually, same error). Added `cap_add: [NET_ADMIN]` to
+  `tools/validation/docker-compose.yml`'s `ap` service — needed only to
+  validate this code path in this disposable container; real target
+  hardware has full kernel privileges and would never hit this.
+- **Verified live, twice, with the corrected code**: adopted a device fresh,
+  confirmed the interface survived the initial-adopt DHCP-reaffirm cycle
+  intact (no flush), then pushed a real static IP (`172.19.0.88`,
+  gateway `172.19.0.1`) via the controller UI. Confirmed **all** of: the
+  real kernel interface actually changed (`ip addr show` →
+  `172.19.0.88/24`), the real default route was set, `inform.lua` kept
+  informing successfully *from the new address* (same-subnet traffic
+  doesn't need the gateway, so this was safe to test for real), `state.json`
+  recorded `ip_mode`/`static_ip`/`static_netmask`/`static_gateway` and the
+  synced `ip` field correctly, and — the full loop closed — the controller's
+  own Overview panel displayed the new `IP Address: 172.19.0.88` back to the
+  admin.
+- **Code changes:** `openuf/netconfig.lua` (new), `openuf/inform.lua`
+  (`setparam` handler), `tools/validation/docker-compose.yml`
+  (`cap_add: NET_ADMIN`, validation-env only). Tests:
+  `tests/test_netconfig.lua` (new), `tests/test_inform_packet.lua`. All 177
+  tests pass.
+
 ---
 
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)

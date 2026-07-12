@@ -55,6 +55,7 @@ local sysinfo   = _require_sibling("sysinfo")
 local lldp      = _require_sibling("lldp")
 local ucihelper = _require_sibling("ucihelper")
 local led       = _require_sibling("led")
+local netconfig = _require_sibling("netconfig")
 
 local M = {}
 
@@ -64,6 +65,7 @@ M._sysinfo   = sysinfo
 M._ucihelper = ucihelper
 M._lldp      = lldp
 M._led       = led
+M._netconfig = netconfig
 
 -- In-memory only (not persisted to state.json): per-radio spectrum-scan
 -- results, keyed by radio name. Ephemeral live data, same category as
@@ -583,6 +585,55 @@ function M.handle_response(json_str, st, cfg)
 				end
 			end
 		end
+
+		-- IP Settings (DHCP vs Static, in the real controller UI) arrive via
+		-- system_cfg, not mgmt_cfg -- a separate flat OpenWrt-UCI-style
+		-- key=value blob, confirmed live against a real controller (see
+		-- PROTOCOL-VALIDATION.md). Only present when the controller is
+		-- actually pushing a network-config change, not on every inform.
+		local sys_raw = resp.system_cfg
+		if type(sys_raw) == "string" then
+			local ip, netmask, gateway
+			local dhcp = false
+			for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
+				local k, v = line:match("^([^=]+)=(.*)$")
+				if k and v then
+					if k == "netconf.1.ip" then ip = v
+					elseif k == "netconf.1.netmask" then netmask = v
+					elseif k == "route.1.gateway" then gateway = v
+					elseif k == "dhcpc.1.status" then dhcp = true
+					end
+				end
+			end
+			if ip then
+				local iface = cfg and cfg.net and cfg.net.lan_cpueth
+				if dhcp then
+					-- Only genuinely ACT when reverting our own prior static
+					-- config -- a fresh device's first-ever system_cfg (and
+					-- every steady-state reaffirmation) also carries
+					-- dhcpc.1.status=enabled, but real hardware already runs
+					-- its own DHCP client continuously; flushing+re-leasing
+					-- on every "still DHCP" push is needless and, worse,
+					-- destructive wherever no DHCP server actually exists to
+					-- grant a new lease (confirmed live: this validation
+					-- container's Docker bridge has none -- udhcpc timed out
+					-- and left the interface with no address at all).
+					if st.ip_mode == "static" then
+						M._netconfig.apply_dhcp(iface)
+						M._populate_net_info(st, cfg)  -- re-read the freshly-leased address
+					end
+					st.ip_mode = "dhcp"
+					st.static_ip, st.static_netmask, st.static_gateway = nil, nil, nil
+				else
+					st.ip_mode = "static"
+					st.static_ip, st.static_netmask, st.static_gateway = ip, netmask, gateway
+					if M._netconfig.apply_static(iface, ip, netmask, gateway) then
+						st.ip = ip  -- known directly, no need to re-read the interface
+					end
+				end
+			end
+		end
+
 		M._state.save(st)
 		return newly_adopted  -- re-inform immediately with the new key if adopted
 	end
