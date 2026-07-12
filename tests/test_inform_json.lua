@@ -131,11 +131,14 @@ return {
 		end
 	},
 	{
-		name = "inform json: version contains fw prefix and version",
+		name = "inform json: version is the bare fw.ver, no model prefix",
 		fn = function()
+			-- Not model-prefixed: the controller compares this against its
+			-- firmware catalog's own bare "version" field with strict string
+			-- equality, so a "U6IW."-prefixed value never matches even when
+			-- the numeric version is identical (see openuf/inform.lua).
 			local d = build()
-			assert_contains(d.version, "U6IW.", "fw prefix in version")
-			assert_contains(d.version, "6.6.55", "fw ver in version")
+			assert_eq(d.version, "6.6.55", "version is bare fw.ver")
 		end
 	},
 	{

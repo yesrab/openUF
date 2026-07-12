@@ -468,8 +468,15 @@ function M.build_json(st, cfg, ufhw)
 		cfgversion       = st.cfgversion,
 		uptime           = uptime,
 		time             = os.time(),
-		version          = (uap.fw and uap.fw.pre or "U6IW.")
-		                   .. (uap.fw and uap.fw.ver or "6.6.55"),
+		-- Bare firmware version string only -- NOT model-prefixed. The
+		-- controller compares this against its firmware catalog's own
+		-- "version" field (e.g. "6.8.2.15592") with a strict, unnormalized
+		-- string equality check; a prefixed value like "U6IW.6.8.2.15592"
+		-- never matches even when the numeric version is identical, so the
+		-- device is permanently shown as needing an update. `fw.pre` (e.g.
+		-- "U6IW.") is a separate, correct field used only by announce.lua's
+		-- L2 discovery "firmware version verbose" TLV -- do not reuse it here.
+		version          = uap.fw and uap.fw.ver or "6.6.55",
 		required_version = uap.required_version or "6.0.0",
 		bootrom_version  = uap.bootver or "",
 		country_code     = st.country_code or 840,

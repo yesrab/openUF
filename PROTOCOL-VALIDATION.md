@@ -947,7 +947,74 @@ Code: `openuf/inform.lua`, `openuf/lldp.lua`. Tests:
   below (before the GCM fix) was correctly diagnosed as blocked by the same
   root cause as everything else in this matrix — confirmed here, since the
   identical action now produces a full real payload once the device is
-  actually Connected.
+  actually Connected. **The "intentional force-reinstall affordance" theory
+  further below is WRONG and superseded — see "RESOLVED: wrong `version`
+  field format" immediately below, found the same session by digging further
+  at the user's prompting ("I'm suspecting we're reporting the FW version
+  wrong").**
+
+### RESOLVED: outbound `version` field was wrongly model-prefixed
+
+Root cause of the *persistent* "1 device has an update" / "Update Available"
+banner (independent of the GCM/adoption blocker above — this one reproduces
+even on a fully Connected, fully up-to-date-firmware device). Decompiled
+`com.ubnt.service.devmgr.l.MiVjHefaf`'s upgrade-offer gate (CFR, same method as
+the AES-GCM investigation) and `com.ubnt.service.aF.AcrQJeJCScLn` (the
+controller's internal `ProductInfo`/firmware-catalog DTO, confirmed via its
+`toString()`):
+
+```java
+private boolean chgwykfBxZCAuEHPPQ(String string, String string2) {
+    return this.TgovGTpPRqBiOa(string) && !StringUtils.equals(string, string2);
+}
+// called as: chgwykfBxZCAuEHPPQ(object3, string)
+//   object3 = acrQJeJCScLn.ZpkRBEhhrxi()   -- ProductInfo.version, e.g. "6.8.2.15592" (bare)
+//   string  = ekfCWfaSnrqscUb2.getString("version")  -- the inform's raw "version" field
+```
+
+This is a **strict, unnormalized `StringUtils.equals`** — no prefix-stripping,
+no numeric parsing. Confirmed the catalog's `version` field is bare (no model
+prefix) via an independent second usage of the exact same `ProductInfo` DTO in
+`com.ubnt.service.af.VVyiC` (the `autoupdate-check` startup log,
+`"firmware[{}] new version ({}) is available"`, which literally logged
+`firmware[U6IW] new version (6.8.2.15592) is available` — no `"U6IW."`
+anywhere). Meanwhile `openuf/inform.lua`'s `build_json` was sending:
+```lua
+version = (uap.fw and uap.fw.pre or "U6IW.") .. (uap.fw and uap.fw.ver or "6.6.55")
+-- => "U6IW.6.8.2.15592"
+```
+`"U6IW.6.8.2.15592" != "6.8.2.15592"` under strict string equality — **so the
+upgrade-offer gate opens regardless of whether the numeric firmware version
+genuinely matches the catalog**, since the comparison never had a chance to
+pass. This is a real, permanent openUF bug, not intentional controller
+behavior; the earlier "force reinstall affordance" read on the confirmation
+dialog text ("Update U6 IW from 6.8.2 to 6.8.2?") was a red herring — the UI
+truncates to 3 version components, hiding that the two full strings never
+matched underneath.
+
+**Fix (`openuf/inform.lua`):** stop reusing `fw.pre` for the inform JSON's
+`version` field — send the bare `uap.fw.ver` only. `fw.pre` (`"U6IW."`) is
+still correct and untouched where it's actually used:
+`openuf/announce.lua`'s L2 discovery "firmware version verbose" TLV field, a
+different protocol surface with no evidence it's wrong. Updated
+`tests/test_inform_json.lua`'s assertion (it had been asserting the *buggy*
+prefixed behavior as correct).
+
+**Verified live, twice:**
+1. Live-patched the running (already-adopted) container's `fw.pre` to `""`
+   and restarted `inform.lua` — device flipped from "Update Available" to
+   **"Up to date"** in the UI within one inform cycle, `server.log`'s
+   `inform_stat` lines showed the bare `version - 6.8.2.15592;`, and Mongo's
+   `device.version` updated to the bare string. Reverted the hack afterward
+   (it also would have wrongly changed `announce.lua`'s field).
+2. Applied the real fix to `openuf/inform.lua`, rebuilt the AP image from
+   scratch, and adopted a **brand-new device from a clean SSH handshake**
+   (`ea:ac:9a:98:37:92`) — it went straight to **"Up to date"** on first
+   adoption, never showing "Update Available" at all. Confirms the fix, not
+   just the hack, and confirms it holds from a genuinely first-contact device.
+
+**Code changes:** `openuf/inform.lua` (`version` field no longer prefixed),
+`tests/test_inform_json.lua` (assertion corrected to expect the bare version).
 - **Compare against:** `_type:"upgrade"` shape, `version`/`url` field names
   (`openuf/inform.lua:438-448`)
 - **Findings (re-run against a Connected device):** started `tcpdump` on the AP
@@ -994,16 +1061,20 @@ Code: `openuf/inform.lua`, `openuf/lldp.lua`. Tests:
   `fw.ver` was still `"6.6.55"` (a stale placeholder), which is exactly the
   real current U6IW release firmware version independently confirmed via
   Ubiquiti's own firmware API during the Stage 2 firmware-analysis research
-  (`U6IW v6.8.2+15592`). Updated `fw.ver` to `"6.8.2.15592"`. Note: even after
-  this fix, the controller's manual "Update" button still offers to reinstall
-  the catalog version regardless of whether it matches the device's reported
-  version (the confirmation dialog literally read "from 6.8.2 to 6.8.2") — this
-  looks like an intentional "force reinstall" affordance distinct from the
-  auto-detected "new version available" banner, not a bug in either the
-  controller or openUF.
+  (`U6IW v6.8.2+15592`). Updated `fw.ver` to `"6.8.2.15592"`. **Correction:**
+  this alone did *not* fully resolve it — the banner persisted even with the
+  numerically-correct version, which turned out to be a second, independent
+  bug (the `version` field's wrongful `"U6IW."` model prefix — see "RESOLVED:
+  outbound `version` field was wrongly model-prefixed" above). The
+  "intentional force-reinstall affordance" read on the confirmation dialog
+  ("from 6.8.2 to 6.8.2") was wrong — that truncated UI text was masking a
+  real full-string mismatch (`"U6IW.6.8.2.15592"` vs `"6.8.2.15592"`), not an
+  intentional reinstall-regardless-of-version control.
 - **Code changes:** `openuf/ufmodel/u6iw.lua` (`fw.ver`/`buildtime` updated to
-  the real current release). No `inform.lua` changes — the upgrade handler was
-  already correct.
+  the real current release) **and** `openuf/inform.lua` (`version` field
+  de-prefixed — see "RESOLVED" section above for the actual fix that made
+  "Up to date" appear). The `_type:"upgrade"` handler itself needed no
+  changes — see the safety-mechanism verification above.
 
 ## 10. Forget device / factory reset
 
@@ -1021,17 +1092,16 @@ Code: `openuf/inform.lua`, `openuf/lldp.lua`. Tests:
   accepted by the real controller, or rejected?
 - **Findings:** Accepted, not rejected — any `fw.ver` string of this shape is
   simply stored as the device's reported `version` verbatim, no validation
-  beyond that observed. The real finding wasn't acceptance/rejection but a
-  *staleness* problem: the old placeholder `"6.6.55"` was old enough (versus
-  the real current U6IW release, `6.8.2.15592`) that the controller's own
-  `autoupdate-check` flagged it as needing an update — the spurious
-  "1 device has an update" UI notification came directly from this, not from
-  anything malformed. Bumping `fw.ver` to the real current version and
-  restarting `inform.lua` was immediately reflected correctly in the
-  device's Mongo record (`version`, `previous_firmware_version`), confirming
-  live acceptance of an updated value with no rejection or side effects.
-- **Code changes:** `openuf/ufmodel/u6iw.lua` (see section 9 above — same
-  fix answers both).
+  beyond that observed. The staleness half of the finding stands (the old
+  placeholder `"6.6.55"` was genuinely old versus the real current U6IW
+  release, `6.8.2.15592`), but bumping `fw.ver` alone did **not** fully clear
+  the spurious "1 device has an update" notification, as this section
+  originally concluded — see section 9's "RESOLVED: outbound `version` field
+  was wrongly model-prefixed" for the second, independent bug (a `"U6IW."`
+  prefix defeating the controller's strict string-equality catalog check)
+  that was the actual full cause.
+- **Code changes:** `openuf/ufmodel/u6iw.lua` and `openuf/inform.lua` (see
+  section 9 above — same investigation answers both).
 
 ---
 
