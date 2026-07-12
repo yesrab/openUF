@@ -6,10 +6,13 @@
 #     run `syswrapper.sh set-adopt <url> <key>`) completes exactly like it
 #     would against genuine OpenWrt hardware
 #
-# UCI-backed calls (ucihelper.lua) will error on this non-OpenWrt box --
-# that's fine, the goal is capturing the controller's pushed JSON via
-# debug_dump_file (openuf/conf.lua) before UCI apply, not exercising UCI
-# itself.
+# UCI-backed calls (ucihelper.lua) would error on this non-OpenWrt box with
+# no real `uci` binding -- fixed by installing uci-mock.lua below (a fake
+# `uci` module, validation-only, not part of openUF) so ucihelper.lua's
+# require("uci") fallback resolves to an in-memory backend instead of
+# failing. This unblocks capturing the SHAPE of controller-pushed WiFi/VLAN/
+# TX-power config (openUF's own real product code is untouched); actually
+# exercising real wireless hardware application is still out of scope here.
 #
 # AES-GCM is MANDATORY, not optional. This controller (10.4.57) puts
 # use_aes_gcm=true in every mgmt_cfg and will NOT provision a device until
@@ -62,6 +65,7 @@ RUN ssh-keygen -A \
     && printf '\nHostKeyAlgorithms +ssh-rsa\nPubkeyAcceptedAlgorithms +ssh-rsa\n' >> /etc/ssh/sshd_config
 
 COPY openuf/ /opt/openuf/
+COPY tools/validation/ap/uci-mock.lua /usr/local/share/lua/5.1/uci.lua
 RUN ln -sf /opt/openuf/hook/syswrapper.sh /usr/bin/syswrapper.sh \
     && chmod +x /usr/bin/syswrapper.sh /opt/openuf/hook/syswrapper.sh \
     && mkdir -p /etc/openuf /var/log \
