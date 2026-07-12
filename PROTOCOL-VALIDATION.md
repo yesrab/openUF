@@ -671,35 +671,47 @@ question.
 
 ## 3. Default SSID push (no VLAN)
 
-- **Status:** 🛑 blocked — **new root cause found 2026-07-12** (device is now
-  Connected, so this is no longer blocked by adoption; it's blocked by a
-  separate, environmental limitation of the validation container — see
-  "RESOLVED-ish: no radios reported, environmental not a code bug" below).
-- **Compare against:** `vap_table` field names (`openuf/ucihelper.lua` `apply_config()`)
+- **Status:** ✅ confirmed working end-to-end 2026-07-12, against a real
+  controller, after fixing three real bugs this exact test surfaced (see
+  the three commits/sections below: the missing radio `band` field, the
+  `system_cfg`-not-`vap_table` wire format, and the SSID-collision section
+  naming). Previously blocked purely by the validation container having no
+  real `uci` binding at all (see "RESOLVED: hand-stubbed a UCI mock" above)
+  — now unblocked by the hand-stubbed `uci-mock.lua`.
+- **Compare against:** originally assumed `vap_table` JSON field names
+  (`openuf/ucihelper.lua` `apply_config()`) — **wrong assumption**, see
+  next bullet.
 - **Findings:** created a real WiFi network ("openuf-test", Native Network,
-  broadcasting to "All APs") in the controller UI. The controller's pushed
-  `setparam` response contains a `system_cfg` blob (not `vap_table` JSON —
-  see below) with the literal line `# no wlan provisioned as no radio found` /
-  `radio.status=disabled` — the controller refuses to provision any SSID onto
-  this device because it believes the device has **zero physical radios**.
-  Root-caused: this disposable Alpine AP container has no `uci` binary/Lua
-  binding at all (`apk search uci` returns nothing), so
-  `openuf/inform.lua:334`'s `pcall(ufuci.get_radio_table)` always fails and
-  `radio_table` stays permanently `{}` (its default at `inform.lua:322`) in
-  every inform this container ever sends. Confirmed via `debug_dump_file`
-  that our own `radio_table` field really is present-but-empty (not
-  absent) — matching the controller's own "Missing radio_table" check
-  (`list3.isEmpty()`, decompiled, see below). **Real target hardware (WDR3500
-  / Archer C5 v1, genuine OpenWrt) has actual UCI with real `wifi-device`
-  sections and would not hit this** — this is a validation-*environment* gap,
-  not an openUF code bug. Testing this scenario for real would need either
-  building a `uci` Lua binding for Alpine (much larger effort than the
-  `lua-openssl` rock — `uci`/`libuci` is OpenWrt-specific, not in Alpine's
-  repos) or stubbing a fake `/etc/config/wireless` + a `uci`-compatible mock
-  module.
-- **Code changes:** none in this pass (environmental, not fixable in
-  `openuf/`) — `radio_table`'s empty-on-error fallback is itself correct
-  defensive behavior, not the bug.
+  broadcasting to "All APs", both 2.4GHz+5GHz radio bands) in the
+  controller UI. Two real, previously-invisible bugs found and fixed:
+  1. The controller's pushed `setparam` response carries the WiFi
+     config entirely inside the flat `system_cfg` UCI-style blob
+     (`aaa.<n>.ssid`, `aaa.<n>.wpa`, `aaa.<n>.wpa.psk`,
+     `wireless.<n>.parent`, `radio.<n>.phyname`, etc.) — **a real
+     controller never sends `resp.vap_table`/`radio_table`/`network_table`
+     as JSON at all**, so `ucihelper.apply_config()` (gated on
+     `resp.network_table`) never actually ran in practice despite being
+     fully unit-tested. Fixed: added `inform.lua`'s
+     `M._parse_wifi_system_cfg()` to translate the flat blob into the
+     shape `apply_config()` already expects, reusing its existing
+     VLAN-join/fast-roaming logic unchanged.
+  2. Broadcasting one SSID on both radios (the default) calls
+     `ucihelper.wlan_add()` twice with an identical `ssid` — UCI section
+     names keyed purely by SSID collapsed both calls into one section, so
+     the second radio's `wlan_add()` silently overwrote the first. Fixed:
+     section names now include the radio (`openuf_<radio>_<ssid>`).
+  Verified live via a debug-only commit hook added to
+  `tools/validation/ap/uci-mock.lua` (dumps mock state to a file, since a
+  fresh `lua -e` script can't see the long-running `inform.lua` process's
+  own in-memory mock instance) — confirmed both
+  `openuf_radio0_openuf-test` and `openuf_radio1_openuf-test` sections
+  exist independently, each with the correct `ssid`/`encryption: psk2`/
+  `key`/`device`.
+- **Code changes:** `openuf/inform.lua` (`M._parse_wifi_system_cfg`, wired
+  into the `setparam` handler), `openuf/ucihelper.lua` (radio-scoped
+  section naming in `wlan_add`), `tools/validation/ap/uci-mock.lua`
+  (debug dump-on-commit, validation-only). Unit tests added for both
+  fixes.
 
 ## 4. VLAN-tagged network + SSID assignment
 
