@@ -143,6 +143,26 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: radio_stats() does not match 'extension channel busy time' as channel_time_busy",
+		fn = function()
+			-- Real iw(8) emits a separate "extension channel busy time:"
+			-- field (secondary 20MHz segment of a wider channel) alongside
+			-- "channel busy time:" -- an unanchored pattern match would
+			-- wrongly pick up the extension field's value instead of (or as
+			-- well as) the primary one, since "channel busy time:" is a
+			-- literal substring of "extension channel busy time:".
+			local dump = "Survey data from wlan0 (on operating channel):\n"
+				.. "\tfrequency:\t\t\t2437 MHz [in use]\n"
+				.. "\tchannel busy time:\t\t1850 ms\n"
+				.. "\textension channel busy time:\t9999 ms\n"
+			with_fixtures({}, {["survey dump"] = dump}, function()
+				local stats = sysinfo.radio_stats("wlan0")
+				assert_eq(stats[1].channel_time_busy, 1850,
+					"picks the primary field, not the extension channel's value")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: radio_stats() returns empty table for empty output",
 		fn = function()
 			with_fixtures({}, {["survey dump"] = ""}, function()

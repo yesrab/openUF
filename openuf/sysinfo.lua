@@ -155,11 +155,20 @@ function M.radio_stats(ifname)
 			if current then result[#result + 1] = current end
 			current = {freq = tonumber(freq)}
 		elseif current then
+			-- Field names matched against the real iw(8) binary's own format
+			-- strings ("channel active/busy/receive/transmit time:", not
+			-- "channel time[/busy/rx/tx]:") -- confirmed via `strings
+			-- /usr/sbin/iw`; the previous patterns never matched any real
+			-- iw output on any hardware, so channel utilisation always
+			-- silently reported 0%/absent regardless of actual airtime.
+			-- Anchored to (whitespace-then-)start of line so "channel busy
+			-- time:" doesn't also match inside the separate "extension
+			-- channel busy time:" field iw emits on wider channels.
 			local noise   = line:match("noise:%s+(-?%d+)")
-			local ct      = line:match("channel time:%s+(%d+)")
-			local ct_busy = line:match("channel time busy:%s+(%d+)")
-			local ct_rx   = line:match("channel time rx:%s+(%d+)")
-			local ct_tx   = line:match("channel time tx:%s+(%d+)")
+			local ct      = line:match("^%s*channel active time:%s+(%d+)")
+			local ct_busy = line:match("^%s*channel busy time:%s+(%d+)")
+			local ct_rx   = line:match("^%s*channel receive time:%s+(%d+)")
+			local ct_tx   = line:match("^%s*channel transmit time:%s+(%d+)")
 			if noise   then current.noise              = tonumber(noise)   end
 			if ct      then current.channel_time       = tonumber(ct)      end
 			if ct_busy then current.channel_time_busy  = tonumber(ct_busy) end
