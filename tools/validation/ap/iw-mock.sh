@@ -28,9 +28,32 @@ EOF
 		exit 0
 		;;
 	"wlan0 station" | "wlan1 station")
-		# No real clients ever associate to this synthetic AP -- empty
-		# output is the correct, real `iw station dump` shape for a radio
-		# with zero connected stations.
+		# No real client can ever associate to this synthetic AP (no real
+		# wireless hardware in this container at all), which means the
+		# vap_table traffic/retry counters (openuf/inform.lua) can never be
+		# proven against real non-zero data without this: one fake
+		# connected station, same purpose as uci-mock.lua's seeded
+		# radio0/radio1 -- realistic synthetic data so the full live
+		# pipeline (this -> sysinfo.sta_table() -> build_json's per-VAP
+		# aggregation -> controller -> "Air Stats" UI) can be verified
+		# end-to-end instead of only via unit tests.
+		cat <<EOF
+Station de:ad:be:ef:00:01 (on $2)
+	inactive time:	50 ms
+	rx bytes:	123456
+	rx packets:	890
+	tx bytes:	654321
+	tx packets:	432
+	tx retries:	7
+	tx failed:	1
+	signal:  	-58 dBm
+	signal avg:	-59 dBm
+	tx bitrate:	144.4 MBit/s MCS 15 short GI
+	rx bitrate:	72.2 MBit/s MCS 7 short GI
+	authorized:	yes
+	authenticated:	yes
+	associated:	yes
+EOF
 		exit 0
 		;;
 esac
