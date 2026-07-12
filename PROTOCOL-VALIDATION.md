@@ -767,13 +767,22 @@ question.
 
 ## 6. TX power (Low/Medium/High/Custom) per radio
 
-- **Status:** 🛑 blocked — same root cause as section 3 (no radios reported,
-  so there's no per-radio config surface for the controller to push TX power
-  onto).
+- **Status:** ✅ confirmed working end-to-end 2026-07-12, against a real
+  controller — **no code changes needed**, section 3's `system_cfg` parser
+  already handled it correctly.
 - **Compare against:** `radio_table` field name/value shape
   (`openuf/ucihelper.lua` `rf_config()`)
-- **Findings:**
-- **Code changes:**
+- **Findings:** in the device's Settings → Radios panel, set the 2.4GHz
+  radio's channel to `6` (was Auto) and Transmit Power to Custom `15 dBm`
+  (was Auto). The pushed `system_cfg` carries this as plain
+  `radio.1.channel=6`/`radio.1.txpower=15`/`radio.1.txpower_mode=custom` —
+  already handled by `M._parse_wifi_system_cfg()`'s existing
+  `tonumber(r.channel)`/`tonumber(r.txpower)` parsing (added for section 3,
+  before any live TX-power-specific data existed to confirm the "auto"
+  case against). Verified live via the debug commit-hook dump: the mock's
+  `radio0` section shows `channel: "6"`, `txpower: "15"` (updated from the
+  prior default `20`).
+- **Code changes:** none — already correct from section 3's fix.
 
 ## 7. Locate trigger
 
