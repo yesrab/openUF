@@ -30,6 +30,25 @@ validation-tooling gap, **not an openUF product bug** — `install.sh` already
 installs `lua-openssl` on real OpenWrt hardware. The per-scenario matrix
 (sections 3–8, 10) is now unblocked.
 
+**2026-07-12, second pass — remaining UI-surfaced functionality verified.**
+With the device genuinely Connected, worked through every remaining
+controller-UI control: **Locate** (✅ confirmed, section 7), **Firmware
+upgrade** (✅ confirmed, section 9), **Restart** (✅ confirmed, section 12,
+`_type:"reboot"` — real container reboot observed), **Manage LED** (✅ real
+gap found and fixed, section 13), **IP Settings/Static IP** (✅ real gap
+found and fixed end-to-end including a live-fired regression, section 14).
+Root-caused (via CFR decompile again) why SSID push/TX power/RF-scan/VLAN
+(sections 3–6, 8) and the CPU/mem stats history graph are still blocked:
+this disposable Alpine validation container has no real `uci` binding at
+all, so `radio_table` is always empty — a validation-*environment* gap
+(real OpenWrt hardware has genuine UCI), not an openUF code bug — see
+"RESOLVED-ish: no radios reported" and the CPU-stats section below. Power/
+PoE (section 15) scoped and concluded environmental (no parent PoE switch
+in this setup). "Forget device" (section 10) partially confirmed — the
+controller doesn't appear to dispatch a live `setdefault` command in this
+environment, cache-staleness artifact, matching the earlier
+`wait_for_initial_inform` findings.
+
 ---
 
 ## General protocol findings (apply across the whole matrix)
@@ -1415,6 +1434,42 @@ prefixed behavior as correct).
   (`cap_add: NET_ADMIN`, validation-env only). Tests:
   `tests/test_netconfig.lua` (new), `tests/test_inform_packet.lua`. All 177
   tests pass.
+
+## 15. Power/PoE (Overview → Parent Device → "Power")
+
+- **Status:** 🔍 scoped, not implemented — **concluded environmental, not an
+  openUF gap** — 2026-07-12.
+- **Compare against:** none going in; no PoE/power field existed anywhere in
+  `openuf/` (confirmed via repo-wide grep during Stage 2's investigation).
+- **Findings:** the specific UI element flagged ("Power: -") lives inside
+  the **"Parent Device"** subsection of the Overview panel, directly
+  alongside "Experience" and the uplink's Down/Up Pkts/Bytes counters — all
+  of which are properties of the **upstream switch/gateway this AP connects
+  through** (LLDP-linked), not self-reported attributes of the AP itself.
+  Confirmed no separate self-power section exists anywhere else in the
+  Overview panel for the AP's own values. This disposable validation
+  environment has no real PoE-capable switch adopted as this AP's parent
+  (single AP, no switch container) — there is nothing to LLDP-link to and
+  report PoE delivery from, regardless of what openUF's own inform contains.
+  **This specific UI element cannot be made to show real data without adding
+  a real (or emulated) PoE switch to the validation environment** — out of
+  scope for this pass.
+- **Adjacent finding, for a future pass**: Stage 2's decompile of
+  `com.ubnt.service.devmgr.tFhABnrHYJqvjaoEa` (line ~1405) found
+  `uuvchZbWVhirD2.copyAttrsIfPresent(inform, "power_source",
+  "power_source_voltage", "psu_table", "power-monitor", "total_max_power",
+  "led_state", "outlet_table")` — these fields **are** copied directly from
+  a device's own raw inform payload when present, confirming at least some
+  power/PoE reporting genuinely is self-reportable, independent of any
+  parent switch. Field names are confirmed; nothing about their expected
+  values/format was researched (out of scope here, and openUF has no local
+  signal to determine a real PoE negotiation class in a generic Linux
+  environment — any value added now would be a speculative hardcoded
+  placeholder, unlike the well-evidenced best-effort fields elsewhere in
+  this document). Worth reopening if the validation environment ever gains
+  a real switch container, or if a different, non-Parent-Device UI surface
+  for these fields is found.
+- **Code changes:** none.
 
 ---
 
