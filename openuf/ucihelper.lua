@@ -129,7 +129,17 @@ end
 function M.wlan_add(radio, ssid, security, password, extra, network, networkconf_id)
 	local uci = get_uci()
 	local cursor = uci.cursor()
-	local section_name = OPENUF_PREFIX .. ssid:gsub("[^%w_-]", "_")
+	-- Section name includes the radio, not just the SSID: broadcasting the
+	-- same SSID on both radios simultaneously is the default, common case
+	-- (the controller UI's "Radio Band: 2.4 GHz + 5 GHz" checkboxes) and
+	-- produces one wlan_add() call per radio with an identical ssid. Keying
+	-- purely by SSID collapsed both calls into the same UCI section, so the
+	-- second call's "device" silently overwrote the first -- confirmed live
+	-- against a real controller: only the last-processed radio's VAP
+	-- survived. name:gsub("[^%w_-]", "_") sanitizes radio the same way ssid
+	-- already was, though UCI radio names ("radio0"/"radio1") never need it.
+	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_-]", "_")
+		.. "_" .. ssid:gsub("[^%w_-]", "_")
 	local enc = SECURITY_MAP[security] or "psk2"
 	cursor:set("wireless", section_name, "wifi-iface")
 	cursor:set("wireless", section_name, "device", radio)

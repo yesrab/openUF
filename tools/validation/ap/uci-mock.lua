@@ -80,7 +80,22 @@ function M.cursor()
 		end
 	end
 
-	function cursor:commit(config) end
+	-- Debug-only: dump this config's sections to a file on every commit, so
+	-- the long-running real `inform.lua` process's actual mock state (a
+	-- separate in-memory instance per-process -- a fresh `lua -e` script
+	-- always sees its own freshly-seeded mock, never the live process's) can
+	-- be inspected from outside that process. Not part of the real uci API.
+	function cursor:commit(config)
+		local ok_j, cjson = pcall(require, "cjson")
+		if not ok_j then return end
+		local ok_e, encoded = pcall(cjson.encode, db[config] or {})
+		if not ok_e then return end
+		local f = io.open("/var/log/openuf-uci-mock-" .. config .. ".json", "w")
+		if f then
+			f:write(encoded)
+			f:close()
+		end
+	end
 
 	return cursor
 end

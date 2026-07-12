@@ -68,7 +68,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				ucihelper.wlan_add("radio0", "myssid", "wpa2", "hunter22")
-				assert_eq(db.wireless.openuf_myssid.network, "lan", "defaults to lan")
+				assert_eq(db.wireless.openuf_radio0_myssid.network, "lan", "defaults to lan")
 			end)
 		end
 	},
@@ -78,9 +78,31 @@ return {
 			with_ucihelper(function(db)
 				ucihelper.wlan_add("radio0", "guest", "open", nil, nil,
 					"openuf_vlan20", "net-abc123")
-				local s = db.wireless.openuf_guest
+				local s = db.wireless.openuf_radio0_guest
 				assert_eq(s.network, "openuf_vlan20", "network set")
 				assert_eq(s.openuf_networkconf_id, "net-abc123", "networkconf_id stashed")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: wlan_add keeps the same SSID on two radios as separate sections",
+		fn = function()
+			-- Regression test: broadcasting one SSID on both 2.4GHz and 5GHz
+			-- simultaneously (the controller UI's default "Radio Band: 2.4 GHz
+			-- + 5 GHz") calls wlan_add() once per radio with an identical
+			-- ssid. Section names keyed purely by SSID collapsed both calls
+			-- into the same UCI section, so the second call's "device"
+			-- silently overwrote the first -- confirmed live against a real
+			-- controller: only the last-processed radio's VAP survived.
+			with_ucihelper(function(db)
+				ucihelper.wlan_add("radio0", "dualband", "wpa2", "hunter22")
+				ucihelper.wlan_add("radio1", "dualband", "wpa2", "hunter22")
+				local s0 = db.wireless.openuf_radio0_dualband
+				local s1 = db.wireless.openuf_radio1_dualband
+				assert_true(s0 ~= nil, "radio0 section survives")
+				assert_true(s1 ~= nil, "radio1 section survives")
+				assert_eq(s0.device, "radio0", "radio0 section bound to radio0")
+				assert_eq(s1.device, "radio1", "radio1 section bound to radio1")
 			end)
 		end
 	},
@@ -124,7 +146,7 @@ return {
 					},
 				}
 				ucihelper.apply_config(resp, {net = {lan_cpueth = "eth1"}})
-				local s = db.wireless.openuf_corp
+				local s = db.wireless.openuf_radio0_corp
 				assert_eq(s.network, "openuf_vlan20", "VAP bound to VLAN network")
 				assert_eq(db.network.openuf_vlan20.ifname, "eth1.20", "VLAN interface created")
 			end)
@@ -145,7 +167,7 @@ return {
 					},
 				}
 				ucihelper.apply_config(resp, {net = {lan_cpueth = "eth1"}})
-				assert_eq(db.wireless.openuf_corp.network, "lan", "falls back to lan")
+				assert_eq(db.wireless.openuf_radio0_corp.network, "lan", "falls back to lan")
 			end)
 		end
 	},
@@ -164,7 +186,7 @@ return {
 					},
 				}
 				ucihelper.apply_config(resp, nil)
-				assert_eq(db.wireless.openuf_corp.network, "lan",
+				assert_eq(db.wireless.openuf_radio0_corp.network, "lan",
 					"no cpueth available -- can't tag, falls back to lan")
 			end)
 		end
@@ -183,7 +205,7 @@ return {
 					},
 				}
 				ucihelper.apply_config(resp, nil)
-				local s = db.wireless.openuf_corp
+				local s = db.wireless.openuf_radio0_corp
 				assert_eq(s.ieee80211r, "1", "FT enabled")
 				assert_eq(s.mobility_domain, ucihelper.derive_mobility_domain("net-1"),
 					"mobility_domain derived from networkconf_id")
@@ -204,7 +226,7 @@ return {
 						fast_roaming_enabled = true}},
 				}
 				ucihelper.apply_config(resp1, nil)
-				local first = db.wireless.openuf_corp.mobility_domain
+				local first = db.wireless.openuf_radio0_corp.mobility_domain
 
 				local resp2 = {
 					radio_table = {}, network_table = {},
@@ -213,7 +235,7 @@ return {
 						fast_roaming_enabled = true}},
 				}
 				ucihelper.apply_config(resp2, nil)
-				local second = db.wireless.openuf_corp.mobility_domain
+				local second = db.wireless.openuf_radio1_corp.mobility_domain
 
 				assert_eq(first, second,
 					"same networkconf_id yields same mobility_domain regardless of radio")
@@ -235,7 +257,7 @@ return {
 					},
 				}
 				ucihelper.apply_config(resp, nil)
-				local s = db.wireless.openuf_corp
+				local s = db.wireless.openuf_radio0_corp
 				assert_eq(s.mobility_domain, "abcd", "explicit mobility_domain wins")
 				assert_eq(s.ft_over_ds, "1", "explicit ft_over_ds wins")
 			end)
