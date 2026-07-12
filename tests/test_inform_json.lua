@@ -313,6 +313,37 @@ return {
 		end
 	},
 	{
+		name = "inform json: vap_table aggregates per-VAP traffic/retry counters from connected stations",
+		fn = function()
+			-- Real field names confirmed via the decompiled vap-stats DTO
+			-- (cVbZoFIZsWYaVCquTr$QCtdvLKOBb) -- the controller UI's
+			-- per-device "Air Stats" panel (Tx/Rx Pkts/Bytes, Tx/Rx Retry/
+			-- Dropped) reads these. iw(8) only exposes per-station counters,
+			-- not an already-aggregated per-VAP one, so build_json sums
+			-- across sta_table. Fixture has two stations: rx_bytes
+			-- 45678+1024, tx_bytes 98765+2048, rx_packets 312+8, tx_packets
+			-- 287+12, tx_retries 4+0, tx_failed(->tx_dropped) 0+0.
+			local d = build({with_uci = true, with_clients = true})
+			local vap = d.vap_table[1]
+			assert_eq(vap.rx_bytes,   46702, "rx_bytes summed across stations")
+			assert_eq(vap.tx_bytes,  100813, "tx_bytes summed across stations")
+			assert_eq(vap.rx_packets,   320, "rx_packets summed across stations")
+			assert_eq(vap.tx_packets,   299, "tx_packets summed across stations")
+			assert_eq(vap.tx_retries,     4, "tx_retries summed across stations")
+			assert_eq(vap.tx_dropped,     0, "tx_dropped summed from tx_failed across stations")
+		end
+	},
+	{
+		name = "inform json: vap_table traffic/retry counters are 0 with no clients",
+		fn = function()
+			local d = build({with_uci = true, with_clients = false})
+			local vap = d.vap_table[1]
+			assert_eq(vap.rx_bytes, 0, "no clients -> zero rx_bytes")
+			assert_eq(vap.tx_bytes, 0, "no clients -> zero tx_bytes")
+			assert_eq(vap.tx_retries, 0, "no clients -> zero tx_retries")
+		end
+	},
+	{
 		name = "inform json: sta_table throughput delta-samples between calls",
 		fn = function()
 			inform._sta_stats_cache = {}

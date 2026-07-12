@@ -385,8 +385,28 @@ function M.build_json(st, cfg, ufhw)
 				if ok_sta then stas = rv2 end
 			end
 			vap.num_sta = #stas
+			-- Per-VAP traffic/retry counters ("Air Stats" in the controller
+			-- UI) -- confirmed real field names via the decompiled vap-stats
+			-- DTO (cVbZoFIZsWYaVCquTr$QCtdvLKOBb): rx_bytes/rx_packets/
+			-- tx_bytes/tx_packets/tx_retries/tx_dropped, aggregated here by
+			-- summing each connected station's own counters (iw(8) doesn't
+			-- expose a single already-aggregated per-radio/per-VAP counter,
+			-- only per-station ones). rx_dropped/rx_errors/tx_errors/
+			-- satisfaction have no source data anywhere in iw's output (ARQ
+			-- retry/failure counters are inherently TX-side only) -- left
+			-- unset rather than invented, matching sta_table's existing
+			-- linkscore/multicast precedent.
+			local vap_rx_bytes, vap_tx_bytes = 0, 0
+			local vap_rx_packets, vap_tx_packets = 0, 0
+			local vap_tx_retries, vap_tx_dropped = 0, 0
 			local sta_table = {}
 			for _, sta in ipairs(stas) do
+				vap_rx_bytes    = vap_rx_bytes    + (sta.rx_bytes or 0)
+				vap_tx_bytes    = vap_tx_bytes    + (sta.tx_bytes or 0)
+				vap_rx_packets  = vap_rx_packets  + (sta.rx_packets or 0)
+				vap_tx_packets  = vap_tx_packets  + (sta.tx_packets or 0)
+				vap_tx_retries  = vap_tx_retries  + (sta.tx_retries or 0)
+				vap_tx_dropped  = vap_tx_dropped  + (sta.tx_failed or 0)
 				-- throughput: delta-sampled byte rate (bytes/sec), same
 				-- approach as M._sysinfo.cpu_percent()'s /proc/stat delta
 				-- sampling -- 0 on the first sample for a given MAC, since
@@ -425,7 +445,13 @@ function M.build_json(st, cfg, ufhw)
 					multicast  = 0,
 				}
 			end
-			vap.sta_table = sta_table
+			vap.sta_table  = sta_table
+			vap.rx_bytes   = vap_rx_bytes
+			vap.tx_bytes   = vap_tx_bytes
+			vap.rx_packets = vap_rx_packets
+			vap.tx_packets = vap_tx_packets
+			vap.tx_retries = vap_tx_retries
+			vap.tx_dropped = vap_tx_dropped
 		end
 	end
 

@@ -182,7 +182,10 @@ end
 
 -- Returns a table of connected stations from `iw dev <ifname> station dump`.
 -- Each entry: {mac, signal, tx_bitrate, rx_bitrate, tx_bytes, rx_bytes,
---              tx_packets, rx_packets, inactive_ms}
+--              tx_packets, rx_packets, tx_retries, tx_failed, inactive_ms}
+-- tx_retries/tx_failed: iw(8) only exposes TX-side retry/failure counters
+-- (802.11 ARQ is TX-side by nature) -- there is no rx-side equivalent in
+-- `station dump` output, confirmed via `strings /usr/sbin/iw`.
 function M.sta_table(ifname)
 	if not ifname then return {} end
 	local output = M._run_cmd("iw dev " .. ifname .. " station dump")
@@ -194,22 +197,26 @@ function M.sta_table(ifname)
 			if cur then clients[#clients + 1] = cur end
 			cur = {mac = mac}
 		elseif cur then
-			local signal    = line:match("signal:%s+(-?%d+)")
-			local tx_rate   = line:match("tx bitrate:%s+(%S+)")
-			local rx_rate   = line:match("rx bitrate:%s+(%S+)")
-			local tx_bytes  = line:match("tx bytes:%s+(%d+)")
-			local rx_bytes  = line:match("rx bytes:%s+(%d+)")
-			local tx_pkts   = line:match("tx packets:%s+(%d+)")
-			local rx_pkts   = line:match("rx packets:%s+(%d+)")
-			local inactive  = line:match("inactive time:%s+(%d+)")
-			if signal   then cur.signal      = tonumber(signal)   end
-			if tx_rate  then cur.tx_bitrate  = tonumber(tx_rate)  end
-			if rx_rate  then cur.rx_bitrate  = tonumber(rx_rate)  end
-			if tx_bytes then cur.tx_bytes    = tonumber(tx_bytes) end
-			if rx_bytes then cur.rx_bytes    = tonumber(rx_bytes) end
-			if tx_pkts  then cur.tx_packets  = tonumber(tx_pkts)  end
-			if rx_pkts  then cur.rx_packets  = tonumber(rx_pkts)  end
-			if inactive then cur.inactive_ms = tonumber(inactive) end
+			local signal     = line:match("signal:%s+(-?%d+)")
+			local tx_rate    = line:match("tx bitrate:%s+(%S+)")
+			local rx_rate    = line:match("rx bitrate:%s+(%S+)")
+			local tx_bytes   = line:match("tx bytes:%s+(%d+)")
+			local rx_bytes   = line:match("rx bytes:%s+(%d+)")
+			local tx_pkts    = line:match("tx packets:%s+(%d+)")
+			local rx_pkts    = line:match("rx packets:%s+(%d+)")
+			local tx_retries = line:match("tx retries:%s+(%d+)")
+			local tx_failed  = line:match("tx failed:%s+(%d+)")
+			local inactive   = line:match("inactive time:%s+(%d+)")
+			if signal    then cur.signal      = tonumber(signal)     end
+			if tx_rate   then cur.tx_bitrate  = tonumber(tx_rate)    end
+			if rx_rate   then cur.rx_bitrate  = tonumber(rx_rate)    end
+			if tx_bytes  then cur.tx_bytes    = tonumber(tx_bytes)   end
+			if rx_bytes  then cur.rx_bytes    = tonumber(rx_bytes)   end
+			if tx_pkts   then cur.tx_packets  = tonumber(tx_pkts)    end
+			if rx_pkts   then cur.rx_packets  = tonumber(rx_pkts)    end
+			if tx_retries then cur.tx_retries = tonumber(tx_retries) end
+			if tx_failed  then cur.tx_failed  = tonumber(tx_failed)  end
+			if inactive  then cur.inactive_ms = tonumber(inactive)   end
 		end
 	end
 	if cur then clients[#clients + 1] = cur end

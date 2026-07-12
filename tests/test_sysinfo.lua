@@ -108,6 +108,8 @@ return {
 				assert_eq(stas[1].signal,   -62,                 "first client signal")
 				assert_eq(stas[1].rx_bytes, 45678,               "first client rx_bytes")
 				assert_eq(stas[1].tx_bytes, 98765,               "first client tx_bytes")
+				assert_eq(stas[1].tx_retries, 4,                 "first client tx_retries")
+				assert_eq(stas[1].tx_failed,  0,                 "first client tx_failed")
 				assert_eq(stas[2].mac,      "11:22:33:44:55:66", "second client MAC")
 				assert_eq(stas[2].signal,   -75,                 "second client signal")
 			end)
