@@ -37,14 +37,25 @@ EOF
 		# pipeline (this -> sysinfo.sta_table() -> build_json's per-VAP
 		# aggregation -> controller -> "Air Stats" UI) can be verified
 		# end-to-end instead of only via unit tests.
+		#
+		# Counters monotonically increase (persisted in a state file, one
+		# per radio) rather than staying static -- a real client's byte/
+		# packet counts only ever grow while associated, and the
+		# controller's own "Air Stats" widget reads as a rate/delta between
+		# informs, so static counters would always show 0 traffic there
+		# despite the raw per-inform counter value being genuinely non-zero.
+		COUNTER_FILE="/tmp/iw-mock-counter-$2"
+		N=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)
+		N=$((N + 1))
+		echo "$N" > "$COUNTER_FILE"
 		cat <<EOF
 Station de:ad:be:ef:00:01 (on $2)
 	inactive time:	50 ms
-	rx bytes:	123456
-	rx packets:	890
-	tx bytes:	654321
-	tx packets:	432
-	tx retries:	7
+	rx bytes:	$((123456 + N * 4096))
+	rx packets:	$((890 + N * 6))
+	tx bytes:	$((654321 + N * 8192))
+	tx packets:	$((432 + N * 9))
+	tx retries:	$((7 + N))
 	tx failed:	1
 	signal:  	-58 dBm
 	signal avg:	-59 dBm
