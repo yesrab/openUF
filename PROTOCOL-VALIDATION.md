@@ -743,12 +743,27 @@ question.
 
 ## 5. Fast Roaming / WPA3 fast roaming toggle
 
-- **Status:** 🛑 blocked — same root cause as section 3.
+- **Status:** ✅ confirmed working end-to-end 2026-07-12, against a real
+  controller — **no code changes needed**, section 3's `system_cfg` parser
+  already handled it correctly.
 - **Compare against:** presence/absence and real field name of
   `mobility_domain`/`r0kh`/`r1kh`/`fast_roaming_enabled`
   (`openuf/ucihelper.lua` `derive_mobility_domain` stopgap)
-- **Findings:**
-- **Code changes:**
+- **Findings:** enabled "Fast Roaming (802.11r)" on the "openuf-test" WiFi
+  network (only reachable via the Advanced panel's "Manual" mode — greyed
+  out under "Auto"). Confirms `ucihelper.lua`'s existing design assumption
+  exactly: the real controller sends **only** `aaa.<n>.ft.status=enabled`
+  — no `mobility_domain`, `r0kh`, or `r1kh` field anywhere in `system_cfg`,
+  matching the code comment that "UniFi's admin API has no such fields --
+  it computes and syncs them internally across all APs on a site."
+  `M._parse_wifi_system_cfg()` (added for section 3) already reads
+  `ft.status` into `vap.fast_roaming_enabled`, and `apply_config()`'s
+  existing `derive_mobility_domain()` stopgap took it from there. Verified
+  live via the debug commit-hook dump: both radio sections show
+  `ieee80211r: "1"`, `mobility_domain: "dcc4"` (same value on both,
+  confirming the derivation is stable per-SSID as designed),
+  `ft_psk_generate_local: "1"`, `ft_over_ds: "0"`.
+- **Code changes:** none — already correct from section 3's fix.
 
 ## 6. TX power (Low/Medium/High/Custom) per radio
 
