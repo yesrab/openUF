@@ -377,6 +377,24 @@ return {
 			assert_eq(vap_table[1].security, "wpa2", "security derived from aaa.1.wpa=2")
 			assert_eq(vap_table[1].x_passphrase, "TestPass123", "passphrase from aaa.1.wpa.psk")
 			assert_eq(vap_table[1].fast_roaming_enabled, false, "ft.status=disabled -> fast roaming off")
+			assert_eq(vap_table[1].vlan_enabled, false, "no br.devname suffix -> vlan not enabled")
+			assert_eq(vap_table[1].vlan, nil, "no vlan id without a tagged br.devname")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg extracts VLAN id from a tagged br.devname",
+		fn = function()
+			-- Real captured shape (PROTOCOL-VALIDATION.md section 4): assigning
+			-- a WiFi network to a VLAN-tagged network changes aaa.<n>.br.devname
+			-- from "br0" to "br0.<vlan>" -- the only field that carries the
+			-- VLAN id in this wire format (no separate vap->network join).
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.psk=TestPass123\n"
+				.. "aaa.1.br.devname=br0.20\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(#vap_table, 1, "one vap parsed")
+			assert_eq(vap_table[1].vlan_enabled, true, "tagged br.devname enables vlan")
+			assert_eq(vap_table[1].vlan, 20, "vlan id parsed from br0.20")
 		end
 	},
 	{

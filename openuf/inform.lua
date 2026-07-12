@@ -575,12 +575,24 @@ function M._parse_wifi_system_cfg(sys_raw)
 			if a.wpa == "2" then security = "wpa2"
 			elseif a.wpa == "3" then security = "wpa3"
 			end
+			-- VLAN-tagged SSIDs bridge onto a per-VLAN bridge device named
+			-- "br0.<vlan>" (vs. plain "br0" for untagged) -- confirmed live:
+			-- assigning a WiFi network to a VLAN-tagged network in the
+			-- controller UI changes aaa.<n>.br.devname from "br0" to
+			-- "br0.20" and adds companion vlan.*/bridge.*/netconf.* blocks
+			-- declaring the VLAN subinterface and its bridge (which
+			-- ucihelper.ensure_vlan_network() already creates on its own,
+			-- so only the VLAN id itself needs extracting here).
+			local vlan_id = tonumber((a["br.devname"] or ""):match("^br0%.(%d+)$"))
+
 			vap_table[#vap_table + 1] = {
 				ssid                  = w.ssid,
 				radio                 = w.parent,
 				security              = security,
 				x_passphrase          = a["wpa.psk"],
 				fast_roaming_enabled  = (a["ft.status"] == "enabled"),
+				vlan_enabled          = vlan_id ~= nil,
+				vlan                  = vlan_id,
 			}
 		end
 	end
