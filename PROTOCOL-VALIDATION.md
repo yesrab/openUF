@@ -345,37 +345,80 @@ chain-of-responsibility across several inner-class handlers
 (`MiVjHefaf$VVyiC`, `MiVjHefaf$MiVjHefaf` (site lookup), `MiVjHefaf$aeyOUcXIsMsQw`
 (encryption check), `MiVjHefaf$jRsSex` (device-cache lookup),
 `MiVjHefaf$rYtJfMBbtgWvku` (MAC consistency)), each of which can short-circuit
-with an early response before ever reaching the fallback. **The first handler
-in the chain, `MiVjHefaf$VVyiC`, short-circuits with a "doesn't belong to any
-site" response if the inform payload's internal `_devsiteid` field is
-`null`** — meaning the `wait_for_initial_inform`-clearing code is never
-reached at all in that case, regardless of `need_pre_provisioning`.
+with an early response before ever reaching the fallback, wrapped in a
+per-device lock (`deviceLockService`, a thin wrapper over a generic
+lock-by-string-key utility — ruled out as a stuck-lock explanation, since our
+informs complete quickly and normally end-to-end, not hanging).
 
-**High confidence (found the exact `.put()` call):** `_devsiteid` is set by
-`com.ubnt.net.InformServlet` (the actual `/inform` HTTP endpoint handler,
-found by scanning the whole jar for every class referencing the literal
-string `_devsiteid` — only 5 hits in ~19,000 classes) — but **only inside an
-`if (deviceRecord != null)` guard**, from `deviceRecord.getString("site_id")`.
-`deviceRecord` comes from an earlier `informHandler.getDeviceRecord(mac)`
-lookup call.
+**Traced further, then hit the real limit of static analysis:**
 
-**Not yet confirmed (the missing final link):** whether `getDeviceRecord(mac)`
-actually returns `null` for our specific test device on its ongoing informs.
-Our device demonstrably *does* have `site_id` set correctly in its Mongo
-record (confirmed by direct query earlier in this doc) — a naive "look up by
-MAC in the database" should find it. If `getDeviceRecord()` is backed by an
-in-memory cache rather than a live DB read, and that cache isn't populated/
-refreshed for devices adopted via this project's exact flow, that would
-explain everything observed: the device would keep informing successfully
-(explaining why `last_seen`/`cfgversion` update every cycle — those clearly
-happen elsewhere, upstream of this specific chain) while never reaching the
-one method that clears `wait_for_initial_inform`, get stuck at "Adopting"
-forever, on both L2 and L3 alike (this chain has no L2/L3-specific branching
-at all — consistent with the bug affecting both paths identically).
-**Next step, if pursued:** decompile `informHandler`'s concrete implementation
-class (the interface/class backing `getDeviceRecord`) to find its actual
-lookup semantics — not done in this pass, since the goal here was finding the
-gating condition, not shipping a fix.
+- **`getDeviceRecord(mac)` (the `informHandler.bLwwMKkr` interface method
+  called by `InformServlet`) is implemented by `MiVjHefaf` itself, which
+  delegates to `deviceManager.<lookup>(mac, dbCallback=true)`
+  (`com.ubnt.service.devmgr.SNMiFVJXxaonBOtqbJ`).** That method is a genuine
+  **cache-then-DB-fallback**: check an in-memory cache namespaced
+  `("global", "minidev", mac)` first; on a cache miss, if `dbCallback` is
+  true (it is, here), fall through to a real Mongo lookup by MAC, and — only
+  on a DB hit — build a small "minidev" summary record (`_id`, `site_id`,
+  `authkeys`, `x_aes_gcm`, `hash_id`) and cache it. So on paper this should
+  self-heal within one inform even after a cold cache: DB hit → cache
+  populated → every subsequent call cached. No negative-caching path exists
+  (a DB miss just returns `null` without writing anything to the cache).
+- **Checked empirically whether the early-exit paths were actually firing**:
+  none of the short-circuit log lines from any handler in the chain
+  (`"doesn't belong to any site"`, `"not found in cache, rejecting inform"`,
+  `"sent unencrypted inform, rejecting inform"`, `"invalid inform (mac
+  inconsistent...)"`) appear in `server.log` even once across hundreds of
+  real inform cycles. Initially assumed this meant the code wasn't running,
+  but this turned out to be a red herring the first time: **all of these
+  route through custom, *flat* logger names, not per-class/per-package
+  ones** — found by decompiling the shared logging helper,
+  `com.ubnt.service.system.HCKpgcBFPLu`, which does
+  `LoggerFactory.getLogger("inform")`, `getLogger("adopt")`, etc. (dozens of
+  hand-picked flat names, e.g. `"inform.uap"`, `"core.lock"`,
+  `"web.api"` — nothing resembling a Java package path). The default config
+  only sets `com.ubnt` (a real package prefix) to INFO, which does nothing
+  for these flat names, but they still default to the root logger's INFO
+  level, hiding the `.debug()` calls. **Fixed properly this time**: built a
+  custom `logback.xml` (extracted from `ace.jar`, this project's own
+  original) with explicit `<logger name="inform" level="DEBUG"/>` and
+  `<logger name="adopt" level="DEBUG"/>` entries, pointed the container at it
+  via `-Dlogback.configurationFile=` (added to
+  `/etc/s6-overlay/s6-rc.d/svc-unifi-network-application/run`), and
+  restarted. **Result: still zero messages from the "inform" logger** for
+  ongoing post-adopt informs (a single one-off `WARN` from *before* adoption
+  completed is the only hit in the whole log). Since several of the chain's
+  handlers only log on their *short-circuit* branch and silently pass
+  through on the normal/happy path (re-reading each one's source: `VVyiC` and
+  the site-lookup handler both return silently when `_devsiteid` is already
+  present; the encryption check returns silently when the inform is
+  correctly encrypted; the cache-lookup handler returns silently on a cache
+  hit) — **zero log output is actually consistent with everything passing
+  normally**, not proof that the chain is being skipped. This means the
+  `_devsiteid`-null hypothesis from the previous pass was likely a red
+  herring too, not a confirmed cause.
+- **The actual fallback method (`chgwykfBxZCAuEHPPQ(KHUkYjHujLgFBD)`, the one
+  containing the `wait_for_initial_inform` clear) is ~5,182 bytecode
+  instruction units long** (`jadx`'s own reported count when it gave up
+  decompiling it) — far too large to fully re-derive via manual `javap`
+  reading in reasonable time. The `need_pre_provisioning` check is roughly
+  60% of the way through it; there is a large amount of other logic before
+  that point whose branches haven't been individually mapped.
+
+**This is where static bytecode analysis stops being the right tool.**
+Everything traceable via decompilation/disassembly has been traced; the
+remaining question — which specific branch inside that one large method is
+being taken for our device, and why — needs either runtime instrumentation
+(attaching a Java debugger via JDWP, or patching in extra log statements and
+repackaging the jar) or a source-level report from Ubiquiti. Both are a
+meaningfully bigger undertaking than continuing to read disassembly, and
+would need explicit buy-in before spending more time on this specific thread.
+
+**Environment note:** the live validation controller currently has a
+DEBUG-level `custom-logback.xml` and a modified startup script (see above) —
+left in place since it's harmless and this environment gets rebuilt from
+scratch regularly anyway, but worth knowing if `server.log` looks chattier
+than expected in a future session.
 
 ---
 
