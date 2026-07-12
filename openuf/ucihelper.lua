@@ -352,7 +352,18 @@ function M.get_vap_table()
 		vaps[#vaps + 1] = {
 			name          = s[".name"],
 			essid         = s.ssid,
-			radio         = s.device,
+			-- "radio" must be the band identifier ("ng"/"na"), not the UCI
+			-- device name -- confirmed via the controller's own stats
+			-- pipeline (com.ubnt.service.system.QDcGUYAmLvJwylXw), which
+			-- feeds vap_table's "radio" field through the same band-parsing
+			-- enum (com.ubnt.g.f.e.rYtJfMBbtgWvku) already fixed for
+			-- radio_table -- sending "radio0" here instead of "ng" logs
+			-- "unexpected radio[radio0] while processing stats" on every
+			-- inform and silently drops that vap's per-station stats
+			-- aggregation. "radio_name" (the UCI device name) is a
+			-- separate, real field on the same DTO -- kept here unchanged.
+			radio         = radio and radio.radio,
+			radio_name    = s.device,
 			encryption    = s.encryption,
 			disabled      = (s.disabled == "1"),
 			bssid         = bssid,

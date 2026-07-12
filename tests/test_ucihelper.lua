@@ -276,6 +276,35 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: get_vap_table reports radio as the band, not the UCI device name",
+		fn = function()
+			-- Regression test: the controller's stats pipeline
+			-- (com.ubnt.service.system.QDcGUYAmLvJwylXw) parses vap_table's
+			-- "radio" field through the same band-parsing enum as
+			-- radio_table's "radio" field (com.ubnt.g.f.e.rYtJfMBbtgWvku:
+			-- "ng"/"na"/"ad"/"6e") -- sending the raw UCI device name
+			-- ("radio0") there instead logs "unexpected radio[radio0]
+			-- while processing stats" on every inform. "radio_name" is the
+			-- separate field that legitimately holds the UCI device name.
+			with_ucihelper(function(db)
+				local uci = ucihelper._uci
+				local cursor = uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "channel", "6")
+				cursor:set("wireless", "radio1", "wifi-device")
+				cursor:set("wireless", "radio1", "channel", "36")
+				ucihelper.wlan_add("radio0", "corp24", "wpa2", "hunter22")
+				ucihelper.wlan_add("radio1", "corp5", "wpa2", "hunter22")
+				local vaps = ucihelper.get_vap_table()
+				table.sort(vaps, function(a, b) return a.essid < b.essid end)
+				assert_eq(vaps[1].radio, "ng", "2.4GHz vap reports band ng")
+				assert_eq(vaps[1].radio_name, "radio0", "2.4GHz vap keeps UCI device name separately")
+				assert_eq(vaps[2].radio, "na", "5GHz vap reports band na")
+				assert_eq(vaps[2].radio_name, "radio1", "5GHz vap keeps UCI device name separately")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_radio_table includes capability defaults",
 		fn = function()
 			with_ucihelper(function(db)
