@@ -9,14 +9,31 @@
 # UCI-backed calls (ucihelper.lua) will error on this non-OpenWrt box --
 # that's fine, the goal is capturing the controller's pushed JSON via
 # debug_dump_file (openuf/conf.lua) before UCI apply, not exercising UCI
-# itself. There is no lua-openssl package in Alpine's repos, so crypto.lua
-# transparently falls back to shelling out to the openssl CLI.
+# itself.
+#
+# AES-GCM is MANDATORY, not optional. This controller (10.4.57) puts
+# use_aes_gcm=true in every mgmt_cfg and will NOT provision a device until
+# it has received a genuine GCM-encrypted inform: the inform handler
+# (com.ubnt.service.devmgr.l.MiVjHefaf) loops "mgmt config update before
+# provision" -- re-sending mgmt_cfg with a fresh random cfgversion every
+# cycle -- until the device's x_aes_gcm flag flips true, which only happens
+# when the InformServlet decrypts a GCM (not CBC) packet. Without a GCM
+# backend, openUF's crypto.lua silently downgrades to CBC (the openssl(1)
+# CLI cannot do GCM -- `enc` refuses AEAD ciphers), x_aes_gcm never flips,
+# and the device is stuck in "Adopting" forever. There is no prebuilt
+# lua-openssl apk, so build the zhaozg/lua-openssl rock (crypto.lua's
+# preferred backend) from source. See PROTOCOL-VALIDATION.md
+# "AES-GCM is mandatory for adoption".
 FROM alpine:3.20
 
 RUN apk add --no-cache \
         lua5.1 lua5.1-cjson lua5.1-socket lua5.1-bitop \
         openssh openssl iw \
-    && ln -sf /usr/bin/lua5.1 /usr/bin/lua
+    && ln -sf /usr/bin/lua5.1 /usr/bin/lua \
+    && apk add --no-cache --virtual .build-deps \
+        luarocks5.1 lua5.1-dev openssl-dev gcc musl-dev make \
+    && luarocks-5.1 install openssl \
+    && apk del .build-deps
 
 # Root SSH login with a fixed password -- fine here, this is a disposable
 # validation container on an isolated docker network, not real hardware.

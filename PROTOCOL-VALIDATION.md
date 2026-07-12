@@ -17,14 +17,18 @@ pinned — see rationale below), with openUF running as the AP inside a disposab
 Alpine Linux container on the same Docker network (see `tools/validation/`).
 
 **Status:** in progress — Stage 1 of the controller→AP validation plan. General
-findings below are confirmed; the per-scenario matrix is blocked on reaching a
-fully "Connected" device — the adoption *handshake* itself works fine (both
-L2/SSH and L3/`mgmt_cfg`-only, see "L3 adoption — confirmed working via
-mgmt_cfg" below), but every device gets stuck at "Adopting" indefinitely
-afterward (`wait_for_initial_inform: true` never clears) regardless of which
-adoption path was used — see "wait_for_initial_inform: what actually flips it"
-for the root-cause investigation into that, which is the current blocker for
-the rest of the matrix.
+findings below are confirmed. **The "stuck in Adopting" blocker is now RESOLVED**
+(2026-07-12): the root cause was that the disposable Alpine AP container had no
+AES-GCM backend, so openUF silently sent CBC informs, and this controller refuses
+to provision a device until it receives a genuine GCM-encrypted inform. Fixed by
+building `lua-openssl` into `tools/validation/ap/Dockerfile`. Once openUF sent
+GCM, the live device immediately flipped `x_aes_gcm: true`, `cfgversion`
+stabilised, `provisioned_at` was set, and `wait_for_initial_inform` cleared — the
+device provisioned. See **"RESOLVED: AES-GCM is mandatory for adoption"** below
+for the decompiled controller state machine that proves this. This was a
+validation-tooling gap, **not an openUF product bug** — `install.sh` already
+installs `lua-openssl` on real OpenWrt hardware. The per-scenario matrix
+(sections 3–8, 10) is now unblocked.
 
 ---
 
@@ -271,6 +275,9 @@ through every prior real-controller test in this document. **Fix (`inform.lua`):
 = path } }`) — the test coverage was correct all along; only the real entry point's
 wiring was wrong.
 
+**[RESOLVED 2026-07-12 — see "AES-GCM is mandatory for adoption" above. The cause
+was CBC-instead-of-GCM informs, not anything in the four fixes below.]**
+
 **Open item — device never leaves "Adopting" in the UI despite a completed adopt and
 a continuous stream of successful, decrypted informs:** with all four fixes applied,
 `server.log` shows genuine `Device[...] adoption - completed`, `tcpdump` confirms
@@ -305,7 +312,115 @@ and updating `last_seen`/`cfgversion` cleanly, no new parse errors in `server.lo
 and this stuck-adopting issue is clearly independent of them, reproducing identically
 before and after.
 
-## wait_for_initial_inform: what actually flips it
+## RESOLVED: AES-GCM is mandatory for adoption — the real root cause (2026-07-12)
+
+Everything below in "wait_for_initial_inform: what actually flips it" was
+chasing a *symptom*. The actual blocker, found by fully decompiling the
+controller's inform handler, is this: **on `unifi-network-application:10.4.57`,
+the controller will not provision a device until it has received a genuine
+AES-GCM-encrypted inform.** Our disposable AP container had no GCM backend, so
+openUF silently downgraded to CBC every cycle, and the controller held the
+device in a pre-provisioning loop forever.
+
+### How it was found
+
+`jadx` had silently dropped the one ~5,182-unit method that gates provisioning
+(`com.ubnt.service.devmgr.l.MiVjHefaf.chgwykfBxZCAuEHPPQ(...c.KHUkYjHujLgFBD)`).
+**CFR (`cfr.jar` 0.152) decompiled it cleanly** where jadx couldn't — a
+different control-flow reconstruction engine, and the right tool once jadx gives
+up on a large method. That recovered the full inform-handling state machine.
+
+### The decompiled state machine (per-inform, `MiVjHefaf`)
+
+- **Default-key inform** (unadopted, using the well-known default authkey
+  `ba86f2bbe107c7c57eb5f2690775c712`): controller returns `setparam` with the
+  adopt `mgmt_cfg`, and — unless the device is already in two-phase adoption —
+  **sets `cfgversion` to a fresh random 16-hex value each time**
+  (`kcUKRHuvLEpxrxxpLX.guoZiIiLhURleoJ("0123456789abcdef", 16)`). Logs
+  `"Device adoption - initial mgmt_cfg sent"`.
+- **First non-default inform**: logs `"Device[...] adoption - completed"`, sets
+  `adoption_completed=true`. Handshake done — but this is *not* "Connected".
+- **The provisioning gate** (the crux), roughly:
+  ```java
+  if (!(dev.isUnsupported() || dev.aesGcmInformEncryptionOnly() || <globalFlag>)) {
+      // "dev[..] : mgmt config update before provision"
+      resp = new setparam; resp.put("mgmt_cfg", ...);
+      dev.set("cfgversion", <fresh random 16-hex>);   // <-- rolls every cycle
+      return resp;                                     // <-- returns BEFORE provisioning
+  }
+  ```
+  `aesGcmInformEncryptionOnly()` just returns the device-doc boolean
+  `x_aes_gcm`. So while `x_aes_gcm` is false, **every** inform hits this branch,
+  gets a brand-new random `cfgversion`, and returns early — never reaching the
+  `cfgversion`-convergence provisioning, never reaching the
+  `wait_for_initial_inform` clear (`if (isWaitingForInitialInform() &&
+  !is("need_pre_provisioning", false)) set("wait_for_initial_inform", null)`).
+  This is exactly the observed "fresh cfgversion every cycle, stuck at Adopting"
+  behavior.
+- **How `x_aes_gcm` flips true**: only in the inform *decrypt* path.
+  `InformServlet` reads the packet's on-the-wire encryption flag
+  (`header.isGcm()`) and passes a GCM-vs-CBC enum to the handler; on GCM the
+  handler does `dev.set("x_aes_gcm", true)`. There is **no JSON/payload field**
+  that sets it — the packet itself must be GCM-encrypted. `InformServlet` even
+  rejects a GCM→CBC *downgrade* once `x_aes_gcm` is set
+  (`"tried to downgrade inform encryption from AES-GCM to AES-CBC, rejecting"`).
+  The controller always requests GCM: `config.GWoWvNEX` unconditionally writes
+  `use_aes_gcm=true` into every `mgmt_cfg`.
+
+### Why openUF was stuck
+
+`openuf/inform.lua` `build_packet` sets `use_gcm = st.use_gcm and
+crypto.gcm_available()`. In the Alpine AP container `crypto.gcm_available()` was
+**false** — no `lua-openssl`, no `luacrypto`, and the `openssl(1)` CLI fallback
+in `crypto.lua` cannot do GCM (`enc` refuses AEAD ciphers). So even though the
+controller set `use_aes_gcm=true` (and `state.json` correctly flipped
+`use_gcm=true`), openUF sent CBC every cycle. `x_aes_gcm` never flipped and the
+provisioning gate looped forever. The earlier note that "GCM silently downgrades
+to CBC ... nothing was lost" was wrong: on this controller the downgrade is the
+entire blocker.
+
+### The fix, and the live proof
+
+Built the `zhaozg/lua-openssl` rock into `tools/validation/ap/Dockerfile`
+(`luarocks-5.1 install openssl`, in a prunable `.build-deps` virtual group). No
+prebuilt apk exists; the rock links `libssl3`/`libcrypto3` (already present).
+`crypto.lua`'s existing GCM code (previously never executed) worked against this
+binding with **no changes** — encrypt/decrypt round-trips, and the 40-byte AAD
+is handled correctly. **No openUF product code change was needed.**
+
+Verified live on the running device the instant openUF started sending GCM
+(restarted `inform.lua` in the now-GCM-capable container):
+
+```
+x_aes_gcm:        false  ->  true
+cfgversion:       (fresh every cycle)  ->  stable at 981163ecdabb1b8f
+provisioned_at:   (absent)  ->  set
+wait_for_initial_inform / need_pre_provisioning: cleared / absent
+disconnected_at:  absent, last_seen current
+```
+
+**Not an openUF product bug.** `install.sh` already installs `lua-openssl` in
+its package list for real OpenWrt hardware (which has a prebuilt `lua-openssl`
+feed), so genuine deployments already send GCM and would adopt cleanly. This was
+purely a gap in the disposable validation container, whose Dockerfile even
+acknowledged "no lua-openssl ... falls back to openssl CLI" but wrongly assumed
+CBC was acceptable.
+
+**Methodology note:** the `internal-dependencies.jar` was re-extracted from the
+running controller and decompiled with both `jadx` (browsing) and **CFR**
+(the large gated method). CFR is the key addition over prior sessions — it read
+the method `jadx` had been silently dropping, which is what made the whole state
+machine legible.
+
+## wait_for_initial_inform: what actually flips it (SUPERSEDED — see the AES-GCM section above)
+
+**This entire section is now superseded.** It correctly located *where* the flag
+clears but never found *why* it wasn't clearing, because the real cause was one
+layer up: the provisioning gate returned early (device sending CBC, `x_aes_gcm`
+false) before execution ever reached the clear. With GCM sending, the gate
+passes and the flag clears normally. Kept below for the investigation trail.
+
+### wait_for_initial_inform: what actually flips it (original notes)
 
 Root-caused directly from the real controller's own decompiled logic (same
 `internal-dependencies.jar` from `unifi-network-application:10.4.57` used for
