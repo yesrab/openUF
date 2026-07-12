@@ -811,16 +811,41 @@ question.
 
 ## 8. RF/spectrum scan trigger (trigger only)
 
-- **Status:** 🛑 blocked — same root cause as section 3. The controller's
-  RF-scan trigger lives under a per-radio UI control that never renders at
-  all for a device it believes has zero radios (no "Radios" panel appears
-  anywhere in this device's Overview/Settings while `radio_table` is empty).
+- **Status:** ⚠️ inconclusive 2026-07-12 — the original blocker (empty
+  `radio_table`) is resolved (see the UCI mock section above), but **no
+  manual on-demand RF-scan trigger control was found anywhere in this
+  controller version's UI** (10.4.57), so the trigger itself was never
+  fired live.
 - **Compare against:** exact `cmd` string for the scan trigger
   (`openuf/inform.lua:461-478`)
 - **Note:** result-reporting (AP→controller direction) is out of scope for this
   stage — see Stage 2b findings elsewhere in this doc.
-- **Findings:**
-- **Code changes:**
+- **Findings:** searched thoroughly with a live, fully-adopted, Connected
+  device: the device's own Settings → Manage panel has Locate/Restart/
+  Disable/Remove but no scan action; the top-level **AirView** page (which
+  now shows real, non-empty per-radio data once the UCI mock made
+  `radio_table` non-empty — e.g. its "Radios" tab correctly lists this
+  device's live channel/6/15dBm settings from section 6's test) has three
+  tabs (Radios, Connectivity, Environment) and a "Radio Settings" side
+  panel, but none of them expose a "scan now"/"run RF scan" button —
+  every chart is populated passively from ongoing stats, not from a
+  one-shot trigger. Settings search for "spectrum" returns no results.
+  Waited ~2 minutes with AirView open to see whether the controller issues
+  a `cmd`-type inform on its own (continuous background monitoring
+  triggering a scan without a manual click) — zero `_type:"cmd"` responses
+  arrived in that window. This suggests that in this controller version,
+  spectrum/RF visibility is delivered entirely through passive,
+  continuously-collected stats (`radio_table_stats`, channel utilization)
+  rather than an admin-triggered one-shot scan command — plausibly a UI/
+  workflow change since whatever version the original `cmd:"spectrum-scan"`
+  UI affordance this doc's compare-against target was based on. Not
+  conclusive either way without decompiling the controller's own AirView
+  data-source logic (out of scope for this pass) — documenting as an open
+  question rather than guessing.
+- **Code changes:** none — `openuf/inform.lua`'s existing
+  `cmd:"spectrum-scan"` dispatch (already unit-tested per earlier stages of
+  this project) remains unverified against a live controller-issued
+  command, but nothing found here contradicts its correctness.
 
 ## RESOLVED-ish: no radios reported — environmental, not a code bug (2026-07-12)
 
