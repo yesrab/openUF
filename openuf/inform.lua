@@ -516,6 +516,78 @@ local function _width_from_htmode(htmode)
 	return n and tonumber(n) or 20
 end
 
+-- WiFi/radio config (SSID, security, per-radio channel/TX power) arrives via
+-- system_cfg as a flat, hostapd/OpenWrt-style key=value blob -- NOT as the
+-- resp.vap_table/radio_table/network_table JSON that ucihelper.apply_config()
+-- was originally built and unit-tested against. Confirmed live against a
+-- real controller (10.4.57): creating a WiFi network produces keys like
+-- "aaa.1.ssid", "aaa.1.wpa.psk", "aaa.1.wpa=2", "wireless.1.parent=radio0",
+-- "radio.1.phyname=radio0", "radio.1.channel=auto" -- a real controller
+-- never sends resp.vap_table/radio_table/network_table at all, which meant
+-- apply_config() (gated on resp.network_table) never actually ran against
+-- one. This translates the flat blob into the {radio_table, vap_table}
+-- shape apply_config() expects, so its already-correct, already-tested
+-- VLAN-join/fast-roaming/mobility-domain logic can be reused unchanged
+-- rather than reimplemented against the raw wire format.
+--
+-- Security derivation is confirmed only for the plain WPA2-PSK case seen
+-- live (aaa.<n>.wpa=2 + wpa.key.1.mgmt=WPA-PSK -> "wpa2"); WPA3/mixed/
+-- enterprise are best-effort guesses pending a live capture of those modes.
+function M._parse_wifi_system_cfg(sys_raw)
+	local aaa, wireless, radio = {}, {}, {}
+	for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
+		local section, idx, key, v = line:match("^(aaa)%.(%d+)%.(.+)=(.*)$")
+		if not section then section, idx, key, v = line:match("^(wireless)%.(%d+)%.(.+)=(.*)$") end
+		if not section then section, idx, key, v = line:match("^(radio)%.(%d+)%.(.+)=(.*)$") end
+		if section then
+			local tbl = (section == "aaa" and aaa) or (section == "wireless" and wireless) or radio
+			idx = tonumber(idx)
+			tbl[idx] = tbl[idx] or {}
+			tbl[idx][key] = v
+		end
+	end
+
+	local function sorted_indices(t)
+		local keys = {}
+		for k in pairs(t) do keys[#keys + 1] = k end
+		table.sort(keys)
+		return keys
+	end
+
+	local radio_table = {}
+	for _, idx in ipairs(sorted_indices(radio)) do
+		local r = radio[idx]
+		if r.phyname then
+			radio_table[#radio_table + 1] = {
+				name     = r.phyname,
+				channel  = tonumber(r.channel),   -- "auto" -> nil, leaves channel unchanged
+				tx_power = tonumber(r.txpower),   -- "auto" -> nil, leaves tx_power unchanged
+			}
+		end
+	end
+
+	local vap_table = {}
+	for _, idx in ipairs(sorted_indices(wireless)) do
+		local w = wireless[idx]
+		local a = aaa[idx] or {}
+		if w.ssid and w.parent then
+			local security = "open"
+			if a.wpa == "2" then security = "wpa2"
+			elseif a.wpa == "3" then security = "wpa3"
+			end
+			vap_table[#vap_table + 1] = {
+				ssid                  = w.ssid,
+				radio                 = w.parent,
+				security              = security,
+				x_passphrase          = a["wpa.psk"],
+				fast_roaming_enabled  = (a["ft.status"] == "enabled"),
+			}
+		end
+	end
+
+	return radio_table, vap_table
+end
+
 -- ─── Response dispatcher ─────────────────────────────────────────────────────
 
 -- Handle a parsed controller response JSON string.
@@ -630,6 +702,15 @@ function M.handle_response(json_str, st, cfg)
 					if M._netconfig.apply_static(iface, ip, netmask, gateway) then
 						st.ip = ip  -- known directly, no need to re-read the interface
 					end
+				end
+			end
+
+			local ufuci = M._ucihelper
+			if ufuci and ufuci.apply_config then
+				local radio_table, vap_table = M._parse_wifi_system_cfg(sys_raw)
+				if #radio_table > 0 or #vap_table > 0 then
+					pcall(ufuci.apply_config,
+						{radio_table = radio_table, vap_table = vap_table, network_table = {}}, cfg)
 				end
 			end
 		end

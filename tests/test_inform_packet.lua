@@ -352,6 +352,72 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg extracts vap_table and radio_table from a real captured blob",
+		fn = function()
+			-- Real captured shape (PROTOCOL-VALIDATION.md section 3): WiFi
+			-- config arrives as flat aaa.<n>.*/wireless.<n>.*/radio.<n>.*
+			-- keys, not resp.vap_table/radio_table JSON.
+			local sys_cfg = "radio.1.phyname=radio0\nradio.1.channel=auto\nradio.1.txpower=auto\n"
+				.. "radio.2.phyname=radio1\nradio.2.channel=36\nradio.2.txpower=17\n"
+				.. "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.psk=TestPass123\n"
+				.. "aaa.1.wpa.key.1.mgmt=WPA-PSK\naaa.1.ft.status=disabled\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\nwireless.1.security=none\n"
+			local radio_table, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+
+			assert_eq(#radio_table, 2, "two radios parsed")
+			assert_eq(radio_table[1].name, "radio0", "radio 1 name from phyname")
+			assert_eq(radio_table[1].channel, nil, "auto channel left unset")
+			assert_eq(radio_table[2].name, "radio1", "radio 2 name from phyname")
+			assert_eq(radio_table[2].channel, 36, "explicit channel parsed as a number")
+			assert_eq(radio_table[2].tx_power, 17, "explicit tx_power parsed as a number")
+
+			assert_eq(#vap_table, 1, "one vap parsed (only wireless.1.* present)")
+			assert_eq(vap_table[1].ssid, "openuf-test", "ssid from wireless.1.ssid")
+			assert_eq(vap_table[1].radio, "radio0", "radio from wireless.1.parent")
+			assert_eq(vap_table[1].security, "wpa2", "security derived from aaa.1.wpa=2")
+			assert_eq(vap_table[1].x_passphrase, "TestPass123", "passphrase from aaa.1.wpa.psk")
+			assert_eq(vap_table[1].fast_roaming_enabled, false, "ft.status=disabled -> fast roaming off")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam applies WiFi config from system_cfg via ucihelper",
+		fn = function()
+			local st = sample_state()
+			local applied_resp, applied_cfg
+			inform._ucihelper = {
+				apply_config = function(resp, cfg)
+					applied_resp, applied_cfg = resp, cfg
+				end,
+			}
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			local sys_cfg = "radio.1.phyname=radio0\nradio.1.channel=6\nradio.1.txpower=20\n"
+				.. "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.psk=TestPass123\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg:gsub("\n", "\\n"))
+			inform.handle_response(resp, st, cfg)
+			inform._ucihelper = nil
+			assert_true(applied_resp ~= nil, "ucihelper.apply_config was called")
+			assert_eq(#applied_resp.vap_table, 1, "one vap passed through")
+			assert_eq(applied_resp.vap_table[1].ssid, "openuf-test", "ssid passed through")
+			assert_eq(applied_cfg, cfg, "cfg passed through unchanged")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam skips ucihelper.apply_config when system_cfg has no WiFi keys",
+		fn = function()
+			local st = sample_state()
+			local called = false
+			inform._ucihelper = {
+				apply_config = function() called = true end,
+			}
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.2\\ndhcpc.1.status=enabled\\n"}'
+			inform.handle_response(resp, st, cfg)
+			inform._ucihelper = nil
+			assert_false(called, "apply_config not called without any aaa./wireless./radio. keys")
+		end
+	},
+	{
 		name = "inform packet: handle_response setdefault resets state",
 		fn = function()
 			local st = sample_state({
