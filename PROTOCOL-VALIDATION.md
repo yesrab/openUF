@@ -715,15 +715,31 @@ question.
 
 ## 4. VLAN-tagged network + SSID assignment
 
-- **Status:** 🛑 blocked — same root cause as section 3 (no radios reported by
-  this validation container; the controller won't push any WLAN config,
-  VLAN-tagged or not, onto a device it believes has zero radios).
-- **Compare against:** `network_table`/`networkconf_id` join shape
-  (`openuf/ucihelper.lua`)
-- **Findings:** not independently re-attempted — section 3 already
-  demonstrates the blocking condition applies before VLAN-specific logic is
-  ever reached.
-- **Code changes:**
+- **Status:** ✅ confirmed working end-to-end 2026-07-12, against a real
+  controller.
+- **Compare against:** originally assumed a `network_table`/`networkconf_id`
+  join shape (`openuf/ucihelper.lua`) — **wrong assumption**, see below (the
+  real wire format has no such join at all).
+- **Findings:** created a VLAN-tagged network ("openuf-vlan20", VLAN id 20)
+  in Settings → Networks, then reassigned the existing "openuf-test" WiFi
+  network from "Native Network" to it. There is **no `network_table`/
+  `networkconf_id` join in the real wire format** — the real controller
+  signals VLAN tagging purely by changing `aaa.<n>.br.devname` from `"br0"`
+  to `"br0.<vlan>"` (e.g. `br0.20`), and adds companion `vlan.*`
+  (`vlan.1.devname=eth0`, `vlan.1.id=20`), `bridge.*` (a new `br0.20`
+  bridge with the WiFi interfaces as members), and `netconf.*` blocks
+  declaring the VLAN subinterface — all of which openUF doesn't need to
+  reproduce, since real hardware's own OpenWrt network stack (not openUF)
+  would set those up from the UCI `network`/`wireless` config `ucihelper`
+  already writes. Fixed: `M._parse_wifi_system_cfg()` extracts the VLAN id
+  from the `br0.<vlan>` suffix and sets `vlan_enabled`/`vlan` on the parsed
+  vap, so `apply_config()`'s existing (already correct, already
+  unit-tested) `ensure_vlan_network()` join picks it up unchanged. Verified
+  live via the debug commit-hook dump: both radios' `openuf_radio<N>_
+  openuf-test` sections show `network: "openuf_vlan20"`, and a matching
+  `openuf_vlan20` interface section exists with `ifname: "eth0.20"`.
+- **Code changes:** `openuf/inform.lua` (`M._parse_wifi_system_cfg`'s VLAN
+  id extraction). Unit test added.
 
 ## 5. Fast Roaming / WPA3 fast roaming toggle
 
