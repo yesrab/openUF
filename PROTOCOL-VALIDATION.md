@@ -420,6 +420,56 @@ left in place since it's harmless and this environment gets rebuilt from
 scratch regularly anyway, but worth knowing if `server.log` looks chattier
 than expected in a future session.
 
+**Direct experiment: manually clearing the flag in Mongo does not change the
+UI status.** On a freshly, cleanly adopted device (no prior restart
+confound — `adopted: true`, `adoption_completed: true`, no `disconnected_at`),
+ran `db.device.updateOne({mac:...}, {$unset: {wait_for_initial_inform: ""}})`
+directly against the live Mongo instance while the controller kept running
+(no restart). Confirmed via direct query that the field stayed absent through
+at least one subsequent real inform cycle (`cfgversion` changed between
+checks, proving the AP's informs were still landing) — yet the device's UI
+status stayed on **"Adopting"**, unchanged. This is consistent with the
+cache-then-DB-fallback pattern found in `SNMiFVJXxaonBOtqbJ`: the in-memory
+"minidev" cache (keyed `("global","minidev",mac)`) is populated once on the
+first DB hit and is never invalidated by an external write — so a live
+controller process simply never observes a Mongo-only edit to an
+already-cached device's record. Restarting the controller is the only way
+found so far to force it to reload from Mongo.
+
+**Restarting the controller to force a fresh read surfaces a second,
+separate, reproducible artifact: the device flips to "Offline".** After
+restarting just the controller process (container restart, not a full
+environment rebuild) with the flag already cleared in Mongo beforehand, the
+device's UI status became **"Offline"** — even though `last_seen` continued
+updating to within ~15 seconds of "now" and `cfgversion` kept changing
+(informs were actively landing, confirmed by direct Mongo query immediately
+after the restart), and neither `disconnected_at` nor any other stale
+timestamp field was present in the record. Ruled out a stale-browser-cache
+explanation (hard-reloaded the page, same result). So "Offline" here isn't
+derived purely from `last_seen` recency at request time — it appears to
+depend on some other in-memory, per-connection session/handshake state that
+a process restart wipes and that isn't being rebuilt just from ordinary
+periodic informs landing. This reproduced identically to an earlier,
+initially-dismissed observation from a previous restart during this same
+investigation (previously assumed to be an unrelated one-off confound — it
+is not; it's a deterministic side effect of restarting the controller
+process on this device, independent of the `wait_for_initial_inform`
+experiment).
+
+**Net conclusion:** neither of the two most direct, practical levers
+(editing Mongo live, or editing Mongo + restarting to force a cache reload)
+actually got the device to "Connected" — the first because the running
+process never re-reads the edit, the second because restarting introduces
+its own distinct "Offline" state that ordinary informs don't seem to clear
+either (not observed to self-heal within the observation window). Both
+findings are new, concrete, and reproducible, but neither identifies the
+actual clearing trigger. Confirms the earlier assessment: further progress
+needs runtime instrumentation (JDWP attach, or jar-patched logging) rather
+than more black-box experimentation, since black-box experimentation has now
+been tried from two different angles and both dead-ended on
+infrastructure-level side effects rather than answering the original
+question.
+
 ---
 
 ## 1. Initial adopt handshake
