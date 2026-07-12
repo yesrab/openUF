@@ -270,4 +270,20 @@ return {
 			end)
 		end
 	},
+	{
+		name = "ucihelper: get_radio_table derives radio band from channel",
+		fn = function()
+			with_ucihelper(function(db)
+				local uci = ucihelper._uci
+				local cursor = uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "channel", "6")
+				cursor:set("wireless", "radio1", "wifi-device")
+				cursor:set("wireless", "radio1", "channel", "36")
+				local radios = ucihelper.get_radio_table()
+				assert_eq(radios[1].radio, "ng", "channel 6 is 2.4GHz")
+				assert_eq(radios[2].radio, "na", "channel 36 is 5GHz")
+			end)
+		end
+	},
 }

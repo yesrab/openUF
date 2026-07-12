@@ -47,6 +47,25 @@ local function get_uci()
 	return require("uci")
 end
 
+-- Map a UCI wifi-device's channel number to the controller's band identifier.
+-- The real controller's radio_table schema requires this "radio" field
+-- ("ng"/"na"/"ad"/"6e") on every entry -- confirmed via decompiling the
+-- controller's own radio-band enum (com.ubnt.g.f.e.rYtJfMBbtgWvku), whose
+-- string-to-enum parser unconditionally calls .toLowerCase() with no null
+-- guard. Omitting "radio" (as this function previously did) means that
+-- parser gets a null and throws, which corrupts the controller's adopt/UI
+-- state on every single inform -- invisible until now because radio_table
+-- was always empty (no target hardware to source it from) prior to the UCI
+-- mock. Only "ng"/"na" are handled -- openUF only targets dual-band 2.4/5GHz
+-- hardware (see modelmap/generic-dualband-ap.lua's hwassign); 60GHz/6GHz
+-- would need channel ranges that overlap 5GHz's numbering and can't be
+-- disambiguated by channel number alone.
+local function band_for_channel(channel)
+	local ch = tonumber(channel)
+	if ch and ch >= 1 and ch <= 14 then return "ng" end
+	return "na"
+end
+
 -- The UCI prefix applied to all openuf-managed wireless sections
 local OPENUF_PREFIX = "openuf_"
 
@@ -267,6 +286,7 @@ function M.get_radio_table()
 	cursor:foreach("wireless", "wifi-device", function(s)
 		radios[#radios + 1] = {
 			name             = s[".name"],
+			radio            = band_for_channel(s.channel),
 			channel          = s.channel,
 			ht               = s.htmode,
 			tx_power         = s.txpower,
