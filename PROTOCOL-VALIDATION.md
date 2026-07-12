@@ -17,9 +17,14 @@ pinned — see rationale below), with openUF running as the AP inside a disposab
 Alpine Linux container on the same Docker network (see `tools/validation/`).
 
 **Status:** in progress — Stage 1 of the controller→AP validation plan. General
-findings below are confirmed; the per-scenario matrix is blocked on completing
-adoption (see "L3 adoption never completes" below) — everything past the initial
-handshake requires an adopted device to receive config pushes at all.
+findings below are confirmed; the per-scenario matrix is blocked on reaching a
+fully "Connected" device — the adoption *handshake* itself now works (both L2/SSH
+and, as of 2026-07-12, L3/`mgmt_cfg`-only — see "L3 adoption reconfirmed
+2026-07-12" below, which supersedes the earlier "L3 adoption never completes"
+conclusion), but every device gets stuck at "Adopting" indefinitely afterward
+(`wait_for_initial_inform: true` never clears) regardless of which adoption path
+was used — everything past the initial handshake requires an adopted device to
+receive config pushes at all, and this is the current blocker for that.
 
 ---
 
@@ -142,6 +147,13 @@ field this capture and `amd989`'s `_create_complete_inform` both confirm).
 device schema has `mem_used`, not `mem_free`. Fixed — see Stage 2c.
 
 ### L3 adoption never completes in this environment — contradicts current USAGE.md
+
+**Superseded 2026-07-12 — see "L3 adoption reconfirmed 2026-07-12" further below,
+after "L2 discovery..." section.** This whole section's investigation was
+thorough and is kept for the record, but a clean re-test with the current
+codebase found L3 adoption *does* now complete via `mgmt_cfg`, no SSH needed.
+Read on for the historical investigation that led to (and, mostly, still
+explains) the "stuck in Adopting" issue that remains.
 
 `USAGE.md` §4 currently states, for L3 adoption: *"Click Adopt — the controller
 SSHes in and completes the handshake."* **This is confirmed wrong**, at least for
@@ -359,6 +371,67 @@ version, but because that adoption path apparently requires the controller to
 successfully reach the device via L2 discovery in the first place**, which brings us
 back to the `announce.lua` UDP broadcast failure on this Docker bridge network as
 the actual blocker to unblocking the rest of the validation matrix.
+
+### L3 adoption reconfirmed 2026-07-12 — now completes end-to-end, contradicting the conclusion above
+
+Prompted by comparing openUF's architecture against `amd989/unifi-gateway`'s
+directly (a single-process, sequential-CLI-invocation model with no SSH server at
+all — `set-adopt` runs as a short-lived process, writes config, exits; the
+persistent `run` loop only starts once adoption is already complete) versus
+openUF's own long-running `inform.lua` loop. That comparison raised the question of
+whether the "no alternative channel ever" conclusion just above still held, so it
+was re-tested from a fully clean rebuild (`docker compose down -v` + `up -d
+--build`, fresh mongo/controller/AP, current code as-is — `5bf6c5e`'s
+`mgmt_cfg.authkey`-while-unadopted acceptance was already in place, nothing new
+added for this test). Ran `announce.lua` **not at all** (pure L3, no broadcast, no
+SSH actor in the loop whatsoever) — only `syswrapper.sh set-inform <url>` to set
+the inform URL, then started `inform.lua`, then clicked Adopt in the UI.
+
+**Result: L3 adoption completed successfully, no SSH involved anywhere.**
+`server.log`:
+```
+INFO  adopt  -    device[c2:0b:bc:4c:3f:97] discovered via L3 inform, skip SSH adoption
+INFO  adopt  - Device adoption - initial mgmt_cfg sent for device[c2:0b:bc:4c:3f:97]
+INFO  adopt  - Device[c2:0b:bc:4c:3f:97] adoption - completed
+```
+The decrypted `debug_dump_file` capture shows the real `setparam` that delivered
+it:
+```json
+{"_type":"setparam","mgmt_cfg":"capability=notif,notif-assoc-stat\nselfrun_guest_mode=pass\ncfgversion=e07e7991b8c62b47\nled_enabled=true\nstun_url=stun://172.19.0.4:3478/\nmgmt_url=https://172.19.0.4:8443/manage/site/default\nauthkey=ccc32a3bbe40157773294de8ed683627\ninform_url=http://172.19.0.4:8080/inform\nuse_aes_gcm=true\nreport_crash=true\n","server_time_in_utc":"1783841863822"}
+```
+`inform.lua` correctly parsed `authkey` out of `mgmt_cfg`, set `adopted=true`, and
+re-informed immediately with the new key — `state.json` picked up the real
+controller-issued key (`ccc32a3bbe40157773294de8ed683627`), and every cycle since
+(8+ consecutive, ~10s apart, over 80+ seconds observed) decrypted successfully
+with zero new failures in `inform.lua`'s own stdout.
+
+**This directly contradicts the "no alternative channel ever" / "controller
+explicitly decides not to attempt SSH... and provides no alternative channel"
+conclusion two sections above**, which was reached after three separate
+hypotheses, cross-checking two controller versions (`10.4.57`, `10.1.84`), and
+running `amd989/unifi-gateway`'s actual real upstream code. That investigation is
+not being second-guessed lightly — it was thorough — but this result is
+concrete, reproducible (sustained across many cycles, not a one-off), and used
+the exact same current codebase.
+
+**Not yet root-caused which specific condition differs between the two runs.**
+One candidate the earlier investigation flagged but didn't fully pin down for its
+own failing runs: whether **Inform Host Override** (which lives in the
+controller's own database and is wiped by every `down -v`) was actually correctly
+re-applied before the device's very first inform, every time — the docs for one
+of the failing `10.1.84`/`amd989`-upstream runs don't explicitly reconfirm it, and
+this run configured it first, deliberately, before touching the AP container at
+all. Flagging as the leading candidate, not a confirmed cause — didn't deliberately
+try to reproduce the failure again to isolate it, since the priority was
+confirming current behavior, not re-diagnosing a now-superseded result.
+
+**Practical upshot: the L3-adoption blocker gating most of the validation matrix
+below no longer applies as of this test.** The remaining known issue is the
+already-documented "stuck in Adopting" bug (`wait_for_initial_inform: true`
+indefinitely, independent of L2 vs L3) — reproduces identically here too, so the
+matrix rows still can't reach a fully "Connected" device, but the adoption
+handshake itself (unadopted → real controller-issued key, no SSH) is confirmed
+working.
 
 ### L2 discovery + real SSH adoption now works end-to-end — four real bugs found and fixed
 

@@ -230,14 +230,18 @@ whether `--bootstrap-adopt` is passed to it.
 3. It appears as **Pending** in the controller
 4. Click **Adopt**
 
-> **Known gap (2026-07-10):** live testing against a real controller
-> (`linuxserver/unifi-network-application:10.4.57`) found that for **L3-discovered**
-> devices the controller explicitly logs `discovered via L3 inform, skip SSH
-> adoption` and never attempts SSH at all — contradicting the SSH-based flow
-> documented above for L2. The real key-delivery mechanism for L3 adoption is not
-> yet confirmed; adoption does not currently complete end-to-end over L3 against a
-> real controller. See [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md) for details.
-> **L2 adoption (SSH-based) is unaffected by this and is the more reliable path.**
+> **Updated (2026-07-12):** for **L3-discovered** devices the controller
+> explicitly logs `discovered via L3 inform, skip SSH adoption` and never
+> attempts SSH at all — contradicting the SSH-based flow documented above for L2.
+> Instead, it delivers the new `authkey` directly in the `mgmt_cfg` field of the
+> `setparam` response sent right after the Adopt click — confirmed against a
+> real controller (`linuxserver/unifi-network-application:10.4.57`), reproduced
+> from a clean environment. openUF's `inform.lua` already accepts this (only
+> while unadopted, matching `amd989/unifi-gateway`'s reference behavior — see
+> [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md)). Adoption completes without
+> any SSH involved; a separate, unrelated controller-side issue currently keeps
+> every newly-adopted device (L2 or L3) stuck at "Adopting" in the UI
+> indefinitely — see PROTOCOL-VALIDATION.md's "stuck in Adopting" notes.
 
 ---
 
