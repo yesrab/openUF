@@ -941,44 +941,69 @@ Code: `openuf/inform.lua`, `openuf/lldp.lua`. Tests:
 
 ## 9. Firmware upgrade offer
 
-- **Status:** ⚠️ attempted 2026-07-12 (real click via UI, real traffic capture) —
-  **no `_type:"upgrade"` payload obtainable in this environment**, root cause
-  identified (not a new bug — same underlying cause as the "stuck in Adopting"
-  open item above).
+- **Status:** ✅ captured (real, via `debug_dump_file` + independent `tcpdump`
+  wire capture) — **re-attempted 2026-07-12 on the now-Connected device** (see
+  "AES-GCM is mandatory for adoption" above). The original 2026-07-12 attempt
+  below (before the GCM fix) was correctly diagnosed as blocked by the same
+  root cause as everything else in this matrix — confirmed here, since the
+  identical action now produces a full real payload once the device is
+  actually Connected.
 - **Compare against:** `_type:"upgrade"` shape, `version`/`url` field names
   (`openuf/inform.lua:438-448`)
-- **Findings:** Clicked the real "Update" button in the controller UI while
-  running `tcpdump` on the AP container's inform port (8080) plus the existing
-  `debug_dump_file` decrypted-response capture in parallel. **Result: nothing
-  was sent to the device at all.** `tcpdump` shows only the same-shaped,
-  same-size (2242-byte request / ~522-byte response) periodic inform/`setparam`
-  cycle before and after the click — no new connection, no larger response.
-  `debug_dump_file` never captured a `_type:"upgrade"` entry. The controller's
-  own `server.log` has zero mentions of "upgrade" anywhere. The only visible
-  effect was internal: the device's MongoDB record's `device_upgraded` flag
-  flipped to `true` with no corresponding wire traffic — the controller
-  appears to silently no-op the upgrade dispatch for a device stuck in
-  "Adopting" (never reaching "Connected") rather than queuing/sending it,
-  consistent with the other device-targeted actions (Locate, RF scan) already
-  known to be blocked by that same root issue.
+- **Findings (re-run against a Connected device):** started `tcpdump` on the AP
+  container's inform port (8080) plus the existing `debug_dump_file` capture,
+  then clicked "Update" for real in the controller UI (confirmed the "Update
+  U6 IW from 6.8.2 to 6.8.2?" dialog — the truncated UI version string hides
+  that this is a full-build reassert of the catalog firmware, not a
+  no-op). **This time a real command was queued and delivered:**
+  ```json
+  {"_type":"upgrade","version":"6.8.2.15592","md5sum":"0fec04452cadd2d025777d36ab2974ea","url":"http://fw-download.ubnt.com/data/unifi-firmware/6bbe-U6IW-6.8.2-4640c65b-3bb0-4844-943b-b2103ecd4bf9.bin","server_time_in_utc":"1783859283572"}
+  ```
+  `server.log` logged it plainly: `Device U6IW[...] will be upgraded to
+  version: 6.8.2.15592, scheduled: [false], rolling: [false], external:
+  [false], wanAdoptedUmbb: [false]`. **Independent wire-level cross-check**:
+  the `tcpdump` capture shows this specific response was **423 bytes**, vs. the
+  steady ~293-byte responses for ordinary `noop`/`setparam` cycles immediately
+  before and after — confirms a real, larger payload hit the wire, not just a
+  client-side log artifact (same cross-validation principle as the earlier raw
+  TCP relay work, this time via a real packet capture on the container's own
+  interface). **Notable independent confirmation**: the pushed `md5sum` and
+  firmware filename are byte-for-byte identical to the genuine Ubiquiti
+  artifact pulled directly from `fw-update.ubnt.com` during the unrelated
+  Stage 2 firmware-analysis research above — the controller's real firmware
+  catalog matches Ubiquiti's real CDN, not a stub.
+  The controller sent this exactly once (fire-and-forget) and returned to
+  normal `noop`/`setparam` cycling — it does not retry or wait for
+  confirmation; it's up to the device to eventually self-report a new
+  `version` in a later inform.
+- **openUF's safety mechanism verified working as designed**: `inform.lua`'s
+  `upgrade` handler (`openuf/inform.lua`, `_type == "upgrade"` branch) never
+  downloads/verifies/flashes/reboots — it only stores `upgrade_requested_version`
+  / `upgrade_requested_url` in `state.json` and logs `"upgrade requested
+  (version=...) -- stored only, not applying"`. Confirmed live:
+  `state.json` picked up the exact real version/URL from the captured payload,
+  no other side effects, and the device stayed genuinely Connected in the UI
+  throughout and after (progress bar reverted to a plain "Update" button once
+  the controller stopped waiting). No code change needed — this is the design
+  amd989/unifi-gateway also uses (log + store, no real upgrade path), now
+  proven correct against a real controller-issued command.
 - **Separately, found and fixed the *cause* of the "1 device has an update"
-  offer in the first place:** the controller's own `autoupdate-check` log
-  states plainly `firmware[U6IW] new version (6.8.2.15592) is available` —
-  openUF's `openuf/ufmodel/u6iw.lua` `fw.ver` was still `"6.6.55"` (a stale
-  placeholder), which is exactly the real current U6IW release firmware
-  version independently confirmed via Ubiquiti's own firmware API during the
-  Stage 2 firmware-analysis research (`U6IW v6.8.2+15592`). Updated `fw.ver`
-  to `"6.8.2.15592"`; after restarting `inform.lua` with the change, the
-  device's Mongo record correctly updated (`version: "U6IW.6.8.2.15592"`,
-  `previous_firmware_version: "U6IW.6.6.55"`, confirming the controller
-  registered a real version transition from the new inform, not a fluke).
-  The sidebar "1 device has an update" banner didn't immediately clear after
-  this — likely a stale client-side notification left over from the earlier
-  manual "Update" click rather than a live re-evaluation; `upgradable` stayed
-  `undefined` (not `true`) at the DB level throughout, so the underlying
-  "needs update" condition does appear resolved.
+  offer in the first place (original 2026-07-12 finding, unchanged):** the
+  controller's own `autoupdate-check` log states plainly `firmware[U6IW] new
+  version (6.8.2.15592) is available` — openUF's `openuf/ufmodel/u6iw.lua`
+  `fw.ver` was still `"6.6.55"` (a stale placeholder), which is exactly the
+  real current U6IW release firmware version independently confirmed via
+  Ubiquiti's own firmware API during the Stage 2 firmware-analysis research
+  (`U6IW v6.8.2+15592`). Updated `fw.ver` to `"6.8.2.15592"`. Note: even after
+  this fix, the controller's manual "Update" button still offers to reinstall
+  the catalog version regardless of whether it matches the device's reported
+  version (the confirmation dialog literally read "from 6.8.2 to 6.8.2") — this
+  looks like an intentional "force reinstall" affordance distinct from the
+  auto-detected "new version available" banner, not a bug in either the
+  controller or openUF.
 - **Code changes:** `openuf/ufmodel/u6iw.lua` (`fw.ver`/`buildtime` updated to
-  the real current release).
+  the real current release). No `inform.lua` changes — the upgrade handler was
+  already correct.
 
 ## 10. Forget device / factory reset
 
