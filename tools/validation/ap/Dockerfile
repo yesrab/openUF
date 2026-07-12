@@ -66,8 +66,20 @@ RUN ssh-keygen -A \
 
 COPY openuf/ /opt/openuf/
 COPY tools/validation/ap/uci-mock.lua /usr/local/share/lua/5.1/uci.lua
+# ubus/iw mocks: get_ifname_for_radio() shells out to `ubus call
+# network.wireless status` to resolve a UCI radio name to its live wireless
+# netdev name, then radio_stats()/sta_table() shell out to `iw dev <ifname>
+# survey/station dump` -- none of which exist/work on this hardware-less
+# Alpine container (no ubus/netifd, no real wireless netdevs for the real
+# `iw` binary to introspect), so channel-utilization "Air Stats" and
+# connected-client data were always silently empty regardless of any other
+# fix. See PROTOCOL-VALIDATION.md for the live symptom and the separate
+# real openUF bug (wrong iw field names) this also surfaced.
+COPY tools/validation/ap/ubus-mock.sh /usr/local/bin/ubus
+COPY tools/validation/ap/iw-mock.sh /usr/local/bin/iw
 RUN ln -sf /opt/openuf/hook/syswrapper.sh /usr/bin/syswrapper.sh \
     && chmod +x /usr/bin/syswrapper.sh /opt/openuf/hook/syswrapper.sh \
+    && chmod +x /usr/local/bin/ubus /usr/local/bin/iw \
     && mkdir -p /etc/openuf /var/log \
     && sed -i 's/debug_dump_file = nil/debug_dump_file = "\/var\/log\/openuf-informs.log"/' \
         /opt/openuf/conf.lua \
