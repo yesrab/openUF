@@ -1270,6 +1270,34 @@ prefixed behavior as correct).
 - **Code changes:** `openuf/ufmodel/u6iw.lua` and `openuf/inform.lua` (see
   section 9 above — same investigation answers both).
 
+## 12. Restart / reboot
+
+- **Status:** ✅ captured (real, via `debug_dump_file`) — 2026-07-12, live-fired
+  for real against a freshly, cleanly adopted device.
+- **Compare against:** wire form ambiguity — top-level `_type:"reboot"`
+  (`openuf/inform.lua:601-605`, implemented) vs. `{"_type":"cmd","cmd":"restart"}`
+  (explicitly a no-op today, `openuf/inform.lua:681`).
+- **Findings:** clicked "Restart" for real in the controller UI (confirmed
+  the real "Devices cannot be managed while they restart..." tooltip and
+  "Restart U6 IW? Are you sure..." confirmation dialog first). Real captured
+  payload:
+  ```json
+  {"_type":"reboot","reboot_type":"soft","device_id":"...","time":...,"datetime":"...","_id":"...","server_time_in_utc":"..."}
+  ```
+  **Confirms the top-level `_type:"reboot"` form is correct** — the
+  `cmd:"restart"` no-op branch was never the relevant path for this action;
+  no code change needed, `openuf/inform.lua`'s existing handler already
+  matches exactly. `reboot_type:"soft"` is a field openUF doesn't currently
+  read or need to. The handler's `os.execute("reboot"); os.exit(0)` had a
+  real, complete effect in this environment: the entire AP **container**
+  exited (clean exit code 0, not a crash) — Alpine's `reboot` genuinely
+  invoked a system reboot inside the container's namespace, and with no
+  init/supervisor to survive it, the whole container went down, exactly the
+  destructive-but-correct behavior expected of a real device reboot. Recovered
+  the capture by `docker start`ing the stopped (not removed) container
+  afterward — the filesystem/log survived intact.
+- **Code changes:** none — existing implementation confirmed correct.
+
 ---
 
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)
