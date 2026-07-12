@@ -399,6 +399,29 @@ wait_for_initial_inform / need_pre_provisioning: cleared / absent
 disconnected_at:  absent, last_seen current
 ```
 
+**Re-confirmed 2026-07-12 on a fully from-scratch rebuild** (`docker compose down
+-v` + `up -d --build` with the fixed Dockerfile baked in, fresh setup wizard,
+fresh Inform Host Override + Device SSH Authentication, and — critically — no
+leftover `/etc/openuf/state.json` on the AP side, so this was a genuine
+never-before-seen device end to end, not the earlier manually-poked record).
+L2/SSH adoption completed for real (`server.log`: `[sshCommand exec] Execute SSH
+without host key verification!` then `Device[...] adoption - completed`), and
+**the controller UI itself was read directly** (not inferred from Mongo) to
+confirm this actually resolves the original complaint:
+
+- Device list: green status dot, bucketed under **"Online (1)"** (not "Pending
+  Adoption"/"Adopting").
+- Device detail panel: **"U6 IW — Connected To -"**, with live TX Retries,
+  uptime, and 60% memory usage streaming from real informs.
+- Mongo device doc: `x_aes_gcm: true`, `adoption_completed: true`,
+  `connected_at` set (a field the earlier contaminated device record never had
+  at all), `provisioned_at` set, `cfgversion` stable across samples 10s apart,
+  no `wait_for_initial_inform`/`need_pre_provisioning`, no `disconnected_at`.
+
+This closes the loop the earlier verification pass had left open (Mongo doesn't
+store the UI's computed `state` label, so that pass could only infer
+"Connected" from side effects) — the literal UI status is now confirmed.
+
 **Not an openUF product bug.** `install.sh` already installs `lua-openssl` in
 its package list for real OpenWrt hardware (which has a prebuilt `lua-openssl`
 feed), so genuine deployments already send GCM and would adopt cleanly. This was
