@@ -35,4 +35,15 @@ function M.locate_stop(led_path)
 	return true
 end
 
+-- Set the steady-state LED on/off, per the controller's "Manage > LED"
+-- toggle (mgmt_cfg's led_enabled key). Distinct from the locate blink above
+-- -- this is the device's normal/idle LED state, not a transient identify
+-- pattern.
+function M.set_enabled(led_path, enabled)
+	if not led_path then return false end
+	M._write_file(led_path .. "/trigger", "none")
+	M._write_file(led_path .. "/brightness", enabled and "1" or "0")
+	return true
+end
+
 return M

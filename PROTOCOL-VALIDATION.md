@@ -1298,6 +1298,37 @@ prefixed behavior as correct).
   afterward — the filesystem/log survived intact.
 - **Code changes:** none — existing implementation confirmed correct.
 
+## 13. Manage LED (steady on/off toggle)
+
+- **Status:** ✅ fixed and captured (real, via `debug_dump_file`) — 2026-07-12.
+  Genuine gap, not just an unverified feature: the controller already sent
+  `led_enabled=true` in every `mgmt_cfg` (visible since the very first
+  captured baseline inform, back in section 2), but `openuf/inform.lua`'s
+  `setparam` handler never parsed it, and `openuf/led.lua` only had
+  `locate_start`/`locate_stop` (the transient identify blink) — no
+  steady-state on/off API existed at all. The UI's "Manage → LED" checkbox
+  would have silently had zero effect on the device.
+- **Compare against:** `led_enabled` key in `mgmt_cfg` (confirmed live, both
+  `true` and `false` values captured via `debug_dump_file` before writing any
+  code).
+- **Findings:** unchecked the real "LED" checkbox in the controller UI against
+  the Connected device; captured `mgmt_cfg` containing `led_enabled=false`.
+  **Fix:** added `openuf/led.lua`'s `M.set_enabled(led_path, enabled)`
+  (`trigger=none` + `brightness=1`/`0`, distinct from the locate blink's timer
+  trigger), and a `led_enabled` branch in `inform.lua`'s `setparam` handler
+  that sets `st.led_enabled` and calls it. **Verified live with the actual
+  fix** (not a hack): rebuilt the AP image, adopted fresh — `state.json`
+  picked up `led_enabled:true` from the initial adopt `mgmt_cfg`
+  automatically, then toggling the real UI checkbox off flipped
+  `state.json`'s `led_enabled` to `false` end to end. This validation
+  container has no real LED hardware (`dev.conf.led` is `nil`, same as the
+  Locate scenario), so the actual sysfs writes are covered by
+  `tests/test_led.lua`'s mocked-write unit tests rather than a live sysfs
+  observation — matches how Locate's LED hardware interaction was verified.
+- **Code changes:** `openuf/led.lua` (`M.set_enabled`), `openuf/inform.lua`
+  (`setparam` handler). Tests: `tests/test_led.lua`,
+  `tests/test_inform_packet.lua`. All 165 tests pass.
+
 ---
 
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)

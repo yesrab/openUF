@@ -242,6 +242,34 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response setparam sets st.led_enabled from mgmt_cfg",
+		fn = function()
+			local st = sample_state()
+			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://x:8080/inform\\nled_enabled=false\\n"}'
+			inform.handle_response(resp, st)
+			assert_false(st.led_enabled, "led_enabled set to false from mgmt_cfg")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam led_enabled drives led.set_enabled",
+		fn = function()
+			local st = sample_state()
+			local writes = {}
+			local orig = inform._led._write_file
+			inform._led._write_file = function(path, contents)
+				writes[#writes + 1] = {path = path, contents = contents}
+				return true
+			end
+			local cfg = {led = "/sys/class/leds/test"}
+			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://x:8080/inform\\nled_enabled=false\\n"}'
+			inform.handle_response(resp, st, cfg)
+			inform._led._write_file = orig
+			assert_eq(#writes, 2, "two sysfs writes")
+			assert_eq(writes[2].path, "/sys/class/leds/test/brightness", "brightness path")
+			assert_eq(writes[2].contents, "0", "brightness off for led_enabled=false")
+		end
+	},
+	{
 		name = "inform packet: handle_response setdefault resets state",
 		fn = function()
 			local st = sample_state({

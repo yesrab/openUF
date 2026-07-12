@@ -53,4 +53,33 @@ return {
 			end)
 		end
 	},
+	{
+		name = "led: set_enabled returns false with nil led_path (no-op)",
+		fn = function()
+			assert_false(led.set_enabled(nil, true), "no-op without led_path")
+		end
+	},
+	{
+		name = "led: set_enabled(true) writes trigger=none and brightness=1",
+		fn = function()
+			with_capture(function(writes)
+				local ok = led.set_enabled("/sys/class/leds/test", true)
+				assert_true(ok, "set_enabled returns true")
+				assert_eq(#writes, 2, "two sysfs writes")
+				assert_eq(writes[1].path, "/sys/class/leds/test/trigger", "trigger path")
+				assert_eq(writes[1].contents, "none", "trigger cleared")
+				assert_eq(writes[2].path, "/sys/class/leds/test/brightness", "brightness path")
+				assert_eq(writes[2].contents, "1", "brightness on")
+			end)
+		end
+	},
+	{
+		name = "led: set_enabled(false) writes brightness=0",
+		fn = function()
+			with_capture(function(writes)
+				led.set_enabled("/sys/class/leds/test", false)
+				assert_eq(writes[2].contents, "0", "brightness off")
+			end)
+		end
+	},
 }

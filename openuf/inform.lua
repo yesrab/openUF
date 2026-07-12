@@ -556,6 +556,10 @@ function M.handle_response(json_str, st, cfg)
 						st.use_gcm = (v == "true")
 					elseif k == "cfgversion" then
 						if v ~= "" then st.cfgversion = v end
+					elseif k == "led_enabled" then
+						local enabled = (v == "true")
+						st.led_enabled = enabled
+						M._led.set_enabled(cfg and cfg.led, enabled)
 					elseif k == "authkey" then
 						-- Only trusted pre-adoption. Real L3 adoption has no SSH
 						-- step at all (controller logs "skip SSH adoption" for
