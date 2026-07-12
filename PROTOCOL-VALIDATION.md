@@ -18,13 +18,13 @@ Alpine Linux container on the same Docker network (see `tools/validation/`).
 
 **Status:** in progress — Stage 1 of the controller→AP validation plan. General
 findings below are confirmed; the per-scenario matrix is blocked on reaching a
-fully "Connected" device — the adoption *handshake* itself now works (both L2/SSH
-and, as of 2026-07-12, L3/`mgmt_cfg`-only — see "L3 adoption reconfirmed
-2026-07-12" below, which supersedes the earlier "L3 adoption never completes"
-conclusion), but every device gets stuck at "Adopting" indefinitely afterward
-(`wait_for_initial_inform: true` never clears) regardless of which adoption path
-was used — everything past the initial handshake requires an adopted device to
-receive config pushes at all, and this is the current blocker for that.
+fully "Connected" device — the adoption *handshake* itself works fine (both
+L2/SSH and L3/`mgmt_cfg`-only, see "L3 adoption — confirmed working via
+mgmt_cfg" below), but every device gets stuck at "Adopting" indefinitely
+afterward (`wait_for_initial_inform: true` never clears) regardless of which
+adoption path was used — see "wait_for_initial_inform: what actually flips it"
+for the root-cause investigation into that, which is the current blocker for
+the rest of the matrix.
 
 ---
 
@@ -146,292 +146,52 @@ field this capture and `amd989`'s `_create_complete_inform` both confirm).
 **Resolved 2026-07-11** (see "Stage 2c" section below): the real controller's own
 device schema has `mem_used`, not `mem_free`. Fixed — see Stage 2c.
 
-### L3 adoption never completes in this environment — contradicts current USAGE.md
+### L3 adoption — confirmed working via `mgmt_cfg` (no SSH)
 
-**Superseded 2026-07-12 — see "L3 adoption reconfirmed 2026-07-12" further below,
-after "L2 discovery..." section.** This whole section's investigation was
-thorough and is kept for the record, but a clean re-test with the current
-codebase found L3 adoption *does* now complete via `mgmt_cfg`, no SSH needed.
-Read on for the historical investigation that led to (and, mostly, still
-explains) the "stuck in Adopting" issue that remains.
-
-`USAGE.md` §4 currently states, for L3 adoption: *"Click Adopt — the controller
-SSHes in and completes the handshake."* **This is confirmed wrong**, at least for
-this controller version/deployment: clicking Adopt on an L3-discovered device
-produces this exact log line, immediately and every time (reproduced on two
-independent clean runs):
+For L3-discovered devices, the controller never SSHes in at all:
 
 ```
 INFO  adopt  -    device[<mac>] discovered via L3 inform, skip SSH adoption
 ```
 
-No SSH connection is ever attempted — confirmed both by this log line and by zero
-entries in the AP container's sshd for the entire session. Immediately after this,
-every subsequent inform from that device fails to decrypt:
+This is expected controller behavior, not an error — L3-discovered devices get
+their new `authkey` a different way: delivered directly in the `mgmt_cfg` field
+of the `setparam` response sent immediately after the Adopt click. Confirmed via
+a clean test (fresh `docker compose down -v` + `up -d --build`, `announce.lua`
+never started at all — pure L3, no broadcast, no SSH actor anywhere in the
+loop — just `syswrapper.sh set-inform <url>` then `inform.lua`, then Adopt
+clicked in the UI):
 
-```
-WARN  inform - dev[<mac>] inform decryption failed with defaultAuthKey=false, ... invalid JSON
-ERROR inform - dev[<mac>] invalid inform_ip controller
-ERROR inform - Inform Invalid for Device[...], Invalid
-```
-
-`defaultAuthKey=false` means the server has already committed to expecting a
-*non-default* key for this device — but there was no successful round-trip in
-between (every response was non-200 and thus never reached `handle_response`/the
-`debug_dump_file` dump) in which a new key could plausibly have been delivered via
-`mgmt_cfg` either. Reproduced identically on a fully clean run (fresh mongo + fresh
-AP container), ruling out leftover state from earlier attempts.
-
-**Full state machine (only visible if you let it run ~10+ minutes — every earlier
-test in this doc's history ran under 90 seconds and never saw this)**: letting the
-AP's normal 10s-interval inform loop retry continuously after the Adopt click
-(no artificial probing) reveals a real internal device lifecycle, confirmed via the
-*unfiltered* `server.log` (grep `-i inform|adopt|ssh` had been silently swallowing
-the key transition line because of how the earlier greps were scoped/timed, not
-because the line doesn't exist):
-
-```
-20:06:06  webapi  adopt   device[<mac>] discovered via L3 inform, skip SSH adoption
-20:06:41  \
-20:07:40   | inform decryption failed with defaultAuthKey=false ... invalid JSON
-20:08:39   | invalid inform_ip controller                                        } x6, ~1 min apart
-20:09:38   |
-20:10:37   |
-20:11:36  /
-20:12:35  inform  dev[<mac>] used default key in UNKNOWN state, reject it!        <- state flips
-20:13:34  inform  dev[<mac>] used default key in INFORM_ERROR state, reject it!   <- and settles
-20:14:33  ... (repeats indefinitely from here)
-```
-
-So: ~6 failed decrypt attempts over ~5–6 minutes, then the device transitions
-`(adopting) → UNKNOWN → INFORM_ERROR` and the server stops even trying to validate
-`inform_ip` — it now rejects default-key informs outright, unconditionally, every
-time. This looks like a deliberate circuit-breaker: after enough failures the
-server gives up on the normal recovery path entirely.
-
-**This explains the UI status you'll see if you leave a device long enough**: once
-in `INFORM_ERROR`/`UNKNOWN`, the **Status** column shows a bare `-` (this
-controller build's frontend has no display string for those two states) while the
-**status dot stays orange** (never told otherwise) — easy to misread as "still
-pending" when it's actually a dead end. The device detail panel's Settings tab
-still shows a full set of controls (Remove, Disable, Set Replacement Device, Load
-Configuration) — the server hasn't discarded the device record, it's just
-unreachable from this state via any inform-protocol retry. **Removing (forgetting)
-the device via the UI and re-adopting from scratch is the only observed way out.**
-
-**Hypothesis 1 (tested, implemented, did not resolve it):** real L3 adoption might
-deliver the new key via `mgmt_cfg` in a `setparam` response on the inform right
-after the Adopt click — `inform.lua`'s `setparam` handler previously ignored
-`mgmt_cfg.authkey` entirely as intentional "security hardening" (only SSH
-`set-adopt` could set a new key). Cross-checked against three independent reference
-implementations — `amd989/unifi-gateway` (this project's own primary reference)
-applies `mgmt_cfg.authkey` unconditionally with no SSH mechanism anywhere in its
-codebase; `jeffreykog/unifi-inform-protocol`'s docs describe controller-initiated
-SSH only for the L2 case. Implemented in `5bf6c5e`: accept a hex32 `authkey` from
-`mgmt_cfg` while `st.adopted == false`, matching the reference behavior. **Live
-re-test (with a tight 1-second-interval probe loop, no backoff, spanning the exact
-Adopt-click moment) found this doesn't fix it**: the client never receives a `200`
-response at all, at any polling interval — the transition from `404` to `400`
-(decrypt-fail) happens between two consecutive 1-second-apart polls with zero
-`200`/`setparam` response ever observed in between. So the fix is inert in this
-environment specifically because there's no response body to apply it to. Kept the
-code change regardless — it's strictly safer than before (only weakens the
-already-public-key pre-adoption case) and matches the reference implementations
-independently of whether it resolves this particular deadlock.
-
-**Hypothesis 2 (tested, did not resolve it):** Docker deployments of the UniFi
-Network Application require **Settings → System → Advanced → Device SSH Settings
-→ Inform Host Override** to be explicitly set (a well-documented requirement per
-linuxserver.io's own docs and community threads — without it the controller
-doesn't know its own externally-reachable address). Configured `Inform Host =
-controller` (this stack's Docker Compose service name) and matching SSH
-credentials (`root`/AP container's real sshd password) from a **fully clean
-first-contact** (fresh mongo, fresh AP, setting applied before the AP ever sent an
-inform) — same exact `invalid inform_ip controller` / `defaultAuthKey=false`
-failure sequence, unchanged. Still documented as a required setting in
-`tools/validation/README.md` (real, independently-verified Docker requirement,
-worth having correctly configured as a baseline) but ruled out as *the* cause of
-this specific deadlock.
-
-**Hypothesis 3 (tested with amd989/unifi-gateway's actual upstream code, not a
-re-implementation — did not resolve it, and is the most conclusive result of the
-three):** cloned `amd989/unifi-gateway` and ran its real, documented adoption
-procedure verbatim (`README.md#3-adopt-to-controller`): `set-adopt -s <url>`
-(404, "adopt from GUI and re-run this command") → click Adopt in the UI → re-run
-the *same* one-shot `set-adopt` command immediately. This differs architecturally
-from openUF's own loop: `amd989`'s daemon never repeatedly POSTs `/inform` while
-unadopted at all (its main loop only sends L2 broadcast while unadopted — the only
-pre-adoption inform is this one-shot CLI call), so this ruled out both "continuous
-retry loop confuses the server's per-device state" and "wrong request timing" as
-explanations. (Hit and fixed one unrelated bug along the way: `amd989`'s own
-`BaseCollector._get_interface_macs()` returns the literal string
-`'00:00:00:00:00:00'` instead of `None` when it can't resolve an interface's MAC,
-which defeats its own `_resolve_lan_identity()` config-fallback check — pointed
-`realif` at a real macOS interface, `en0`, to get a correct identity and eliminate
-this as a confound.) **Result: identical failure.** Server log:
-```
-INFO  adopt  -    device[46:fc:f2:aa:ef:ea] discovered via L3 inform, skip SSH adoption
-WARN  inform - dev[46-FC-F2-AA-EF-EA] inform decryption failed with defaultAuthKey=false, ... DataFormatException
-ERROR inform - dev[46:fc:f2:aa:ef:ea] invalid inform_ip localhost
-```
-(`DataFormatException` here instead of `invalid JSON` because `amd989` zlib-compresses
-its payload, so garbage-decrypted bytes fail differently downstream than openUF's
-uncompressed case — same root cause, different visible symptom.) This also
-corrects an earlier guess in this doc: `invalid inform_ip <value>` **is dynamic**,
-not a static log-context tag — it read `controller` when reached via the Docker
-Compose hostname and `localhost` here when reached from the host machine directly,
-confirming it reflects whatever inform-host value the request context resolves to.
-
-**Conclusion: this is very likely a genuine controller-version incompatibility, not
-a client bug in either project.** `amd989/unifi-gateway`'s own actual code,
-run exactly as its README documents, fails against this controller
-(`10.4.57`) in the identical way openUF does. Given the controller's own
-"Upgrade to UniFi OS Server" push, the `ucore`-microservice log noise from an
-earlier finding, and the `UNKNOWN`/`INFORM_ERROR` circuit-breaker state machine
-found in this investigation, this controller generation appears to have changed
-internal L3-adoption behavior in ways that predate-and-break every third-party
-reference implementation checked so far. Confirming this would need either a
-packet capture from genuine UBNT hardware doing real L3 adoption against a
-*matching* controller version, or testing against an older pinned controller
-release (`10.1.x`/`10.3.x` tags exist on Docker Hub) to see if the older behavior
-differs.
-
-L2 discovery (which *would* use real SSH `set-adopt`, avoiding this whole issue) was
-attempted as a fallback but `announce.lua`'s UDP broadcast fails on this Docker
-bridge network (`calling 'send' on bad self` — broadcast likely unsupported/blocked
-at the network level here); this is an environment limitation, not an openUF bug.
-**Completing the rest of the validation matrix requires either a network where L2
-broadcast actually works (e.g. macvlan instead of bridge, or real hardware), or a
-genuine breakthrough on the L3 mechanism above.**
-
-### Re-tested against an older controller (`10.1.84`) — identical deadlock, and the real root cause
-
-Ran the exact same `amd989/unifi-gateway` one-shot procedure
-(`docker-compose.old-version.yml`, pinning
-`lscr.io/linuxserver/unifi-network-application:10.1.84` against a fully fresh
-mongo/AP stack) to test the leading hypothesis from the previous section — that this
-is a controller-version regression. **Result: identical deadlock.** This makes it
-two independent controller generations (`10.4.57` and `10.1.84`) failing the same
-way, which rules out "version regression" as the explanation.
-
-Inspecting the controller's own device record directly in Mongo after clicking Adopt
-(`db.device.find(...)` in the `unifi` database) showed:
-
-```json
-{ "mac": "46:fc:f2:aa:ef:ea", "adopted": true, "x_authkey": "b9fd6298283fe1f1a4f59e5de221307c" }
-```
-
-So the controller *does* commit to adoption server-side (`adopted: true`, a real new
-`x_authkey` generated) — it just never delivers that key to the device over any
-channel the device can observe. `server.log` confirms only a single relevant line
-for the entire session, logged *before* the UI Adopt click:
-
-```
-INFO  adopt  -    device[46:fc:f2:aa:ef:ea] discovered via L3 inform, skip SSH adoption
-```
-
-No further adopt/inform log lines appear afterward — not even the `defaultAuthKey`
-decrypt-failure noise seen on `10.4.57`. `inform_request.log` (a dedicated request
-logger declared at startup) stayed at 0 bytes for the whole session: post-adopt
-informs from the client aren't being rejected with an explicit error, they're being
-silently dropped before reaching any logged code path. The UI reflects this too —
-the device sits at status **"Adopting"** indefinitely rather than surfacing the
-`INFORM_ERROR`/`UNKNOWN` state `10.4.57` eventually showed.
-
-Tried manually forcing the issue: re-ran `set-adopt -k b9fd6298283fe1f1a4f59e5de221307c`
-(amd989's CLI does accept an explicit key argument) — still 404, no change. Reading
-`unifi_protocol.py:30-39` (`encode_inform`) explains why this couldn't have worked
-regardless of what the controller does: it only switches encryption to
-`config.get('gateway', 'key')` when `config.getboolean('gateway', 'is_adopted')` is
-already `True`. `set_adopt()` stores the passed-in key into that same config slot but
-never flips `is_adopted`, so the retry re-encrypts with `MASTER_KEY` (the hardcoded
-default) regardless of `-k`. This is a genuine bug in `amd989`'s own CLI tooling —
-worth knowing, but it's a red herring for the controller-side question: even a
-perfectly-encrypted inform using the real key would still need the controller to
-*attempt* SSH or *respond* to it, and the log shows the controller decided
-`skip SSH adoption` before that retry ever happened.
-
-**Conclusion — this supersedes the "version incompatibility" theory from the
-`10.4.57` section above:** the deadlock is not version-specific and not a decrypt
-mismatch. It is the controller's adopt logic itself: when a device is discovered via
-L3 inform (as opposed to L2 broadcast + mDNS), the controller explicitly decides not
-to *attempt* SSH at all — the `skip SSH adoption` log line fires unconditionally, with
-no credential check or connection attempt logged either way. (This run's **Device SSH
-Authentication** was left at the panel's prefilled `admin`/placeholder value, which
-doesn't match the AP container's real `root` sshd user per §3 above — but that's
-irrelevant here precisely because the skip happens before credentials would ever be
-checked.) The controller provides no alternative channel to hand the device its new
-key once it's made this decision. This reads as an intentional real-hardware
-assumption baked into the controller (an L3-only-visible device is presumed to be
-behind NAT/remote and therefore not SSH-reachable, so don't bother trying), not a
-Docker-deployment or version quirk. **Practically, this means: this Docker Compose
-validation environment cannot complete inform-protocol-only (SSH-less) adoption end
-to end, full stop — not because of a bug in openUF, amd989, or this controller
-version, but because that adoption path apparently requires the controller to
-successfully reach the device via L2 discovery in the first place**, which brings us
-back to the `announce.lua` UDP broadcast failure on this Docker bridge network as
-the actual blocker to unblocking the rest of the validation matrix.
-
-### L3 adoption reconfirmed 2026-07-12 — now completes end-to-end, contradicting the conclusion above
-
-Prompted by comparing openUF's architecture against `amd989/unifi-gateway`'s
-directly (a single-process, sequential-CLI-invocation model with no SSH server at
-all — `set-adopt` runs as a short-lived process, writes config, exits; the
-persistent `run` loop only starts once adoption is already complete) versus
-openUF's own long-running `inform.lua` loop. That comparison raised the question of
-whether the "no alternative channel ever" conclusion just above still held, so it
-was re-tested from a fully clean rebuild (`docker compose down -v` + `up -d
---build`, fresh mongo/controller/AP, current code as-is — `5bf6c5e`'s
-`mgmt_cfg.authkey`-while-unadopted acceptance was already in place, nothing new
-added for this test). Ran `announce.lua` **not at all** (pure L3, no broadcast, no
-SSH actor in the loop whatsoever) — only `syswrapper.sh set-inform <url>` to set
-the inform URL, then started `inform.lua`, then clicked Adopt in the UI.
-
-**Result: L3 adoption completed successfully, no SSH involved anywhere.**
-`server.log`:
 ```
 INFO  adopt  -    device[c2:0b:bc:4c:3f:97] discovered via L3 inform, skip SSH adoption
 INFO  adopt  - Device adoption - initial mgmt_cfg sent for device[c2:0b:bc:4c:3f:97]
 INFO  adopt  - Device[c2:0b:bc:4c:3f:97] adoption - completed
 ```
+
 The decrypted `debug_dump_file` capture shows the real `setparam` that delivered
-it:
+the key:
+
 ```json
 {"_type":"setparam","mgmt_cfg":"capability=notif,notif-assoc-stat\nselfrun_guest_mode=pass\ncfgversion=e07e7991b8c62b47\nled_enabled=true\nstun_url=stun://172.19.0.4:3478/\nmgmt_url=https://172.19.0.4:8443/manage/site/default\nauthkey=ccc32a3bbe40157773294de8ed683627\ninform_url=http://172.19.0.4:8080/inform\nuse_aes_gcm=true\nreport_crash=true\n","server_time_in_utc":"1783841863822"}
 ```
-`inform.lua` correctly parsed `authkey` out of `mgmt_cfg`, set `adopted=true`, and
-re-informed immediately with the new key — `state.json` picked up the real
-controller-issued key (`ccc32a3bbe40157773294de8ed683627`), and every cycle since
-(8+ consecutive, ~10s apart, over 80+ seconds observed) decrypted successfully
-with zero new failures in `inform.lua`'s own stdout.
 
-**This directly contradicts the "no alternative channel ever" / "controller
-explicitly decides not to attempt SSH... and provides no alternative channel"
-conclusion two sections above**, which was reached after three separate
-hypotheses, cross-checking two controller versions (`10.4.57`, `10.1.84`), and
-running `amd989/unifi-gateway`'s actual real upstream code. That investigation is
-not being second-guessed lightly — it was thorough — but this result is
-concrete, reproducible (sustained across many cycles, not a one-off), and used
-the exact same current codebase.
+`inform.lua`'s `setparam` handler already accepts this correctly (`5bf6c5e`:
+accepts a hex32 `authkey` from `mgmt_cfg` only while `st.adopted == false`,
+matching `amd989/unifi-gateway`'s own unconditional acceptance — that project has
+no SSH mechanism anywhere in its codebase, since L3 is its only adoption path).
+`state.json` picked up the real controller-issued key
+(`ccc32a3bbe40157773294de8ed683627`) and every cycle since (8+ consecutive,
+~10s apart, over 80+ seconds observed) decrypted successfully with zero new
+failures.
 
-**Not yet root-caused which specific condition differs between the two runs.**
-One candidate the earlier investigation flagged but didn't fully pin down for its
-own failing runs: whether **Inform Host Override** (which lives in the
-controller's own database and is wiped by every `down -v`) was actually correctly
-re-applied before the device's very first inform, every time — the docs for one
-of the failing `10.1.84`/`amd989`-upstream runs don't explicitly reconfirm it, and
-this run configured it first, deliberately, before touching the AP container at
-all. Flagging as the leading candidate, not a confirmed cause — didn't deliberately
-try to reproduce the failure again to isolate it, since the priority was
-confirming current behavior, not re-diagnosing a now-superseded result.
+**The still-open issue is separate from the adoption handshake itself:** the
+device gets stuck at "Adopting" in the UI indefinitely afterward, for both L2
+and L3 alike — see "wait_for_initial_inform: what actually flips it" further
+below for the root-cause investigation into that.
 
-**Practical upshot: the L3-adoption blocker gating most of the validation matrix
-below no longer applies as of this test.** The remaining known issue is the
-already-documented "stuck in Adopting" bug (`wait_for_initial_inform: true`
-indefinitely, independent of L2 vs L3) — reproduces identically here too, so the
-matrix rows still can't reach a fully "Connected" device, but the adoption
-handshake itself (unadopted → real controller-issued key, no SSH) is confirmed
-working.
+L2 discovery requires `announce.lua`'s UDP broadcast to actually work on the
+network in use — see the next section for the real fixes that made that work on
+this Docker bridge network.
 
 ### L2 discovery + real SSH adoption now works end-to-end — four real bugs found and fixed
 
@@ -545,6 +305,78 @@ and updating `last_seen`/`cfgversion` cleanly, no new parse errors in `server.lo
 and this stuck-adopting issue is clearly independent of them, reproducing identically
 before and after.
 
+## wait_for_initial_inform: what actually flips it
+
+Root-caused directly from the real controller's own decompiled logic (same
+`internal-dependencies.jar` from `unifi-network-application:10.4.57` used for
+Stage 2b/2c — `jadx`-decompiled, cross-checked against raw `javap -v` bytecode
+disassembly where `jadx` silently failed to reconstruct readable Java for
+specific methods without any warning).
+
+**High confidence (exact bytecode, unambiguous):** `wait_for_initial_inform`
+only clears when the device's own `isWaitingForInitialInform()` is true *and*
+`need_pre_provisioning` is falsy. Found in
+`com.ubnt.service.devmgr.l.MiVjHefaf`'s fallback inform-handler method
+(`javap` bytecode, since `jadx`'s decompile of this exact method silently
+dropped its body — no warning marker, just absent from the output; the
+surrounding class decompiled fine everywhere else):
+
+```
+invokevirtual  uuvchZbWVhirD.isWaitingForInitialInform:()Z
+ifeq           <skip>
+aload          device
+ldc            "need_pre_provisioning"
+iconst_0
+invokevirtual  uuvchZbWVhirD.is:(Ljava/lang/String;Z)Z
+ifne           <skip>                 ; need_pre_provisioning == true -> skip clearing
+ldc            "wait_for_initial_inform"
+aconst_null
+invokevirtual  SNMiFVJXxaonBOtqbJ.<setDeviceField>:(...)V   ; clears it (sets null)
+```
+
+On our own test device, `need_pre_provisioning` is absent from the Mongo
+record at all (confirmed via direct query) — `.is(key, false)` returns the
+default (`false`) for an absent key, so this specific condition is already
+satisfied. The flag not clearing therefore isn't about this condition itself;
+it's about whether this code ever runs at all for our informs — see below.
+
+**High confidence:** this fallback method is the last stage of a
+chain-of-responsibility across several inner-class handlers
+(`MiVjHefaf$VVyiC`, `MiVjHefaf$MiVjHefaf` (site lookup), `MiVjHefaf$aeyOUcXIsMsQw`
+(encryption check), `MiVjHefaf$jRsSex` (device-cache lookup),
+`MiVjHefaf$rYtJfMBbtgWvku` (MAC consistency)), each of which can short-circuit
+with an early response before ever reaching the fallback. **The first handler
+in the chain, `MiVjHefaf$VVyiC`, short-circuits with a "doesn't belong to any
+site" response if the inform payload's internal `_devsiteid` field is
+`null`** — meaning the `wait_for_initial_inform`-clearing code is never
+reached at all in that case, regardless of `need_pre_provisioning`.
+
+**High confidence (found the exact `.put()` call):** `_devsiteid` is set by
+`com.ubnt.net.InformServlet` (the actual `/inform` HTTP endpoint handler,
+found by scanning the whole jar for every class referencing the literal
+string `_devsiteid` — only 5 hits in ~19,000 classes) — but **only inside an
+`if (deviceRecord != null)` guard**, from `deviceRecord.getString("site_id")`.
+`deviceRecord` comes from an earlier `informHandler.getDeviceRecord(mac)`
+lookup call.
+
+**Not yet confirmed (the missing final link):** whether `getDeviceRecord(mac)`
+actually returns `null` for our specific test device on its ongoing informs.
+Our device demonstrably *does* have `site_id` set correctly in its Mongo
+record (confirmed by direct query earlier in this doc) — a naive "look up by
+MAC in the database" should find it. If `getDeviceRecord()` is backed by an
+in-memory cache rather than a live DB read, and that cache isn't populated/
+refreshed for devices adopted via this project's exact flow, that would
+explain everything observed: the device would keep informing successfully
+(explaining why `last_seen`/`cfgversion` update every cycle — those clearly
+happen elsewhere, upstream of this specific chain) while never reaching the
+one method that clears `wait_for_initial_inform`, get stuck at "Adopting"
+forever, on both L2 and L3 alike (this chain has no L2/L3-specific branching
+at all — consistent with the bug affecting both paths identically).
+**Next step, if pursued:** decompile `informHandler`'s concrete implementation
+class (the interface/class backing `getDeviceRecord`) to find its actual
+lookup semantics — not done in this pass, since the goal here was finding the
+gating condition, not shipping a fix.
+
 ---
 
 ## 1. Initial adopt handshake
@@ -589,14 +421,14 @@ before and after.
 
 ## 3. Default SSID push (no VLAN)
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
 - **Compare against:** `vap_table` field names (`openuf/ucihelper.lua` `apply_config()`)
 - **Findings:**
 - **Code changes:**
 
 ## 4. VLAN-tagged network + SSID assignment
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
 - **Compare against:** `network_table`/`networkconf_id` join shape
   (`openuf/ucihelper.lua`)
 - **Findings:**
@@ -604,7 +436,7 @@ before and after.
 
 ## 5. Fast Roaming / WPA3 fast roaming toggle
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
 - **Compare against:** presence/absence and real field name of
   `mobility_domain`/`r0kh`/`r1kh`/`fast_roaming_enabled`
   (`openuf/ucihelper.lua` `derive_mobility_domain` stopgap)
@@ -613,7 +445,7 @@ before and after.
 
 ## 6. TX power (Low/Medium/High/Custom) per radio
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
 - **Compare against:** `radio_table` field name/value shape
   (`openuf/ucihelper.lua` `rf_config()`)
 - **Findings:**
@@ -621,14 +453,14 @@ before and after.
 
 ## 7. Locate trigger
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
 - **Compare against:** exact `cmd` string(s) (`openuf/inform.lua:455-460`)
 - **Findings:**
 - **Code changes:**
 
 ## 8. RF/spectrum scan trigger (trigger only)
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
 - **Compare against:** exact `cmd` string for the scan trigger
   (`openuf/inform.lua:461-478`)
 - **Note:** result-reporting (AP→controller direction) is out of scope for this
@@ -919,7 +751,7 @@ Code: `openuf/inform.lua`, `openuf/lldp.lua`. Tests:
 
 ## 10. Forget device / factory reset
 
-- **Status:** 🛑 blocked — requires adopted state, see "L3 adoption never completes" above
+- **Status:** 🛑 blocked — requires a fully "Connected" device, see "wait_for_initial_inform: what actually flips it" below
 - **Compare against:** `_type:"setdefault"` shape (`openuf/inform.lua:423-430`)
 - **Findings:**
 - **Code changes:**
