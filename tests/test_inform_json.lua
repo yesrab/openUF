@@ -329,10 +329,24 @@ return {
 			assert_eq(sta_table[1].rx_rate, 72200, "rx_rate converted to Kbps from 72.2 Mbit/s")
 			assert_eq(sta_table[1].uptime, 3600, "uptime from iw's connected time")
 			assert_eq(sta_table[1].idletime, 0, "idletime floored from inactive_ms (120ms -> 0s)")
-			-- tx_mcs_index: part of the same controller-side wifi-experience-
-			-- score input DTO (com.ubnt.g.q.AQODNNoMmBlFpWXX) as tx_rate/
-			-- rx_rate/signal above.
-			assert_eq(sta_table[1].tx_mcs_index, 15, "tx_mcs_index parsed from iw's 'MCS 15'")
+			-- tx_mcs/rx_mcs: part of the same controller-side wifi-experience-
+			-- score input DTO (com.ubnt.service.l.e.AQODNNoMmBlFpWXX) as
+			-- tx_rate/rx_rate/signal above. Real wire name is "tx_mcs", not
+			-- "tx_mcs_index" (that's only the ucore-message JSON name).
+			assert_eq(sta_table[1].tx_mcs, 15, "tx_mcs parsed from iw's 'MCS 15'")
+			assert_eq(sta_table[1].rx_mcs, 7, "rx_mcs parsed from iw's 'MCS 7'")
+			-- wifi_tx_attempts/wifi_tx_retries_percentage: tx_packets(287) +
+			-- tx_retries(4) = 291 attempts, 4 of them retried.
+			assert_eq(sta_table[1].wifi_tx_attempts, 291, "wifi_tx_attempts = tx_packets + tx_retries")
+			-- exact value round-trips through cjson's %.14g float encoding,
+			-- so compare with a tolerance rather than bit-for-bit equality
+			assert_true(math.abs(sta_table[1].wifi_tx_retries_percentage - 4 * 100 / 291) < 1e-10,
+				"wifi_tx_retries_percentage = retries as % of attempts")
+			-- satisfaction/satisfaction_now: best-effort estimate, worse of
+			-- signal-quality score (-62 dBm -> ~65.7 on a -85..-50 scale) and
+			-- retry-quality score (~98.6), floored.
+			assert_eq(sta_table[1].satisfaction, 65, "satisfaction estimated from signal+retries")
+			assert_eq(sta_table[1].satisfaction_now, 65, "satisfaction_now matches satisfaction")
 		end
 	},
 	{

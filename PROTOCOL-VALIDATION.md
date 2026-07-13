@@ -1464,6 +1464,65 @@ the graph has a visible slope). Tests updated in `tests/test_sysinfo.lua`
 and `tests/test_inform_json.lua`; fixture `tests/fixtures/
 iw_station_dump.txt` updated. All 187 tests pass.
 
+## RESOLVED: "WiFi Experience: No Experience" — score is a device-computed field, not controller math (2026-07-13)
+
+**Symptom:** with per-client traffic counters now flowing correctly (see the
+Traffic Activity section above), the client's Insights panel still showed
+"WiFi Experience: No Experience" instead of a percentage.
+
+**Root cause, found by decompiling the ucore client-JSON view** (`internal-
+dependencies.jar` from `unifi-network-application:10.4.57`, CFR): the
+controller's `wifi_experience_score` UI field is a straight passthrough of
+the client doc's **`satisfaction`** field —
+`com.ubnt.service.l.e.AcrQJeJCScLn`: `wifi_experience_score =
+doc.getOptionalInt("satisfaction")` for wireless clients (`rYtJfMBbtgWvku2
+== WIRELESS`). The wireless-client model
+(`com.ubnt.service.l.e.AQODNNoMmBlFpWXX`) reads `satisfaction`,
+`satisfaction_now`, `satisfaction_real`, `satisfaction_reason`,
+`wifi_tx_attempts`, `wifi_tx_retries_percentage`, `tx_mcs`, `ccq`, `noise`,
+`nss` as **plain data off the client doc** — the controller computes
+nothing itself, it only maintains a running `satisfaction_avg` accumulator
+(`{total, count}`, `com.ubnt.service.l.yaQAAsFQlixKuZ`). Real AP firmware
+computes `satisfaction` (0–100) on-device with a proprietary,
+undocumented formula; corroborated by community reports of `satisfaction_now=NN`
+appearing in AP-side wireless-anomaly log lines, and community.ui.com threads
+describing it as driven by signal quality and tx-retry ratio (a client with
+great signal but very low PHY rate/high retries still scores low — i.e. the
+worse factor dominates). Since openUF never sent a `satisfaction` value at
+all, "No Experience" was the correct rendering of missing data, not a
+controller-side bug.
+
+**Bug found in the prior session's fix:** the field is `tx_mcs`, not
+`tx_mcs_index` — `tx_mcs_index` is only the *ucore-message* JSON name
+(`com.ubnt.g.q.lhuvxd`, used for a different internal event), not the
+wire name the client-stat pipeline above reads. Corrected in this fix;
+`rx_mcs` added alongside it (same iw source, `rx bitrate:` line's `MCS N`
+suffix, previously unparsed).
+
+**`wifi_tx_attempts`** = total transmission attempts, i.e. `tx_packets +
+tx_retries` (both already parsed from `iw`) — confirmed via the decompiled
+model above and cross-checked against `unpoller/unifi`'s REST `Client`
+struct (`WifiTxAttempts` / `TxMcs` / `RxMcs` / `Ccq` fields, same shape).
+`wifi_tx_retries_percentage` is retries as a percentage of attempts.
+
+**Best-effort `satisfaction` estimate** (`estimate_satisfaction()` in
+`openuf/inform.lua`, new local helper): combines a signal-quality score
+(linear −85 dBm → 0, −50 dBm → 100) and a retry-quality score (`100 -
+wifi_tx_retries_percentage`), and takes the **worse** of the two — matching
+the community description above. This is explicitly a proxy for Ubiquiti's
+real, undocumented on-device formula, not a measured value; flagged in code
+the same way as the pre-existing `capacity`/`linkscore`/`multicast`
+placeholders. `satisfaction`/`satisfaction_now` are both sent (the UI reads
+`satisfaction`; the controller's own `satisfaction_avg` accumulator is fed
+from whichever field it reads server-side — sending both covers either).
+
+**Code changes:** `openuf/sysinfo.lua` (`M.sta_table()`: `tx_mcs_index` →
+`tx_mcs`, `rx_mcs` added); `openuf/inform.lua` (new `estimate_satisfaction()`
+helper; per-client `sta_table` entry: `tx_mcs`/`rx_mcs` rename+addition,
+`wifi_tx_attempts`, `wifi_tx_retries_percentage`, `satisfaction`,
+`satisfaction_now`). Tests updated in `tests/test_sysinfo.lua` and
+`tests/test_inform_json.lua`.
+
 ## 9. Firmware upgrade offer
 
 - **Status:** ✅ captured (real, via `debug_dump_file` + independent `tcpdump`

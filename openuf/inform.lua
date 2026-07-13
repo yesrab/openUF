@@ -286,6 +286,31 @@ function M.parse_packet(raw, st)
 	return payload, flags
 end
 
+-- Best-effort proxy for the "WiFi Experience" score a real AP computes
+-- on-device (proprietary/undocumented formula -- confirmed via decompiled
+-- controller 10.4.57 that the controller itself does no computation: it
+-- just reads "satisfaction" straight off the client doc, which is
+-- populated verbatim from whatever the AP sent in that sta_table entry).
+-- Community reports (community.ui.com) describe it as driven by signal
+-- quality and tx-retry ratio -- e.g. a client with great signal but very
+-- low PHY rate/high retries still scores low -- so this combines a
+-- signal-quality score and a retry-quality score and takes the worse of
+-- the two, matching that "worst factor wins" description. Not a measured
+-- value; flagged the same way as capacity/throughput above.
+-- signal: dBm (nil if iw reported none). retry_pct: 0-100.
+-- Returns an integer 0-100, or nil if signal is unavailable.
+local function estimate_satisfaction(signal, retry_pct)
+	if not signal then return nil end
+	local SIGNAL_FLOOR, SIGNAL_CEIL = -85, -50
+	local signal_score = (signal - SIGNAL_FLOOR) / (SIGNAL_CEIL - SIGNAL_FLOOR) * 100
+	if signal_score < 0 then signal_score = 0 end
+	if signal_score > 100 then signal_score = 100 end
+	local retry_score = 100 - (retry_pct or 0)
+	if retry_score < 0 then retry_score = 0 end
+	local score = math.min(signal_score, retry_score)
+	return math.floor(score)
+end
+
 -- ─── JSON payload builder ────────────────────────────────────────────────────
 
 -- Build the inform JSON payload.
@@ -433,6 +458,20 @@ function M.build_json(st, cfg, ufhw)
 					time     = now,
 				}
 
+				-- wifi_tx_attempts: total transmission attempts (successful +
+				-- retried), i.e. tx_packets + tx_retries -- both already
+				-- parsed from iw. wifi_tx_retries_percentage: retries as a
+				-- fraction of attempts. Confirmed real field names/semantics
+				-- via the decompiled wireless-client model
+				-- (com.ubnt.service.l.e.AQODNNoMmBlFpWXX) and unpoller/unifi's
+				-- REST client struct.
+				local wifi_tx_attempts = (sta.tx_packets or 0) + (sta.tx_retries or 0)
+				local wifi_tx_retries_pct = 0
+				if wifi_tx_attempts > 0 then
+					wifi_tx_retries_pct = (sta.tx_retries or 0) * 100 / wifi_tx_attempts
+				end
+				local satisfaction_now = estimate_satisfaction(sta.signal, wifi_tx_retries_pct)
+
 				sta_table[#sta_table + 1] = {
 					active     = true,
 					mac        = sta.mac,
@@ -474,14 +513,28 @@ function M.build_json(st, cfg, ufhw)
 					-- reports connected time (older iw builds omit it).
 					uptime     = sta.connected_sec,
 					idletime   = sta.inactive_ms and math.floor(sta.inactive_ms / 1000) or nil,
-					-- tx_mcs_index: confirmed real field, part of the same
-					-- controller-side wifi-experience-score input DTO
-					-- (com.ubnt.g.q.AQODNNoMmBlFpWXX) as rx_rate/tx_rate/
-					-- signal above. iw's tx bitrate line already prints this
-					-- ("144.4 MBit/s MCS 15 short GI"); only set when iw
-					-- actually reports an MCS-based rate (legacy pre-11n
-					-- rates have none).
-					tx_mcs_index = sta.tx_mcs_index,
+					-- tx_mcs/rx_mcs: confirmed real field names (not
+					-- "tx_mcs_index", which is only the ucore-message wire
+					-- name) via the decompiled wireless-client model
+					-- (com.ubnt.service.l.e.AQODNNoMmBlFpWXX) and unpoller/
+					-- unifi's REST client struct. iw's bitrate lines already
+					-- print this ("144.4 MBit/s MCS 15 short GI"); only set
+					-- when iw actually reports an MCS-based rate (legacy
+					-- pre-11n rates have none).
+					tx_mcs     = sta.tx_mcs,
+					rx_mcs     = sta.rx_mcs,
+					wifi_tx_attempts = wifi_tx_attempts,
+					wifi_tx_retries_percentage = wifi_tx_retries_pct,
+					-- satisfaction/satisfaction_now: see estimate_satisfaction()
+					-- above for the full provenance/caveat. The controller
+					-- does no computation of its own -- it only reads
+					-- "satisfaction" straight off whatever the AP sent here
+					-- (confirmed via decompile) and maintains a running
+					-- satisfaction_avg -- so a real device's on-device score
+					-- must be approximated here or the client's "WiFi
+					-- Experience" stays permanently blank.
+					satisfaction     = satisfaction_now,
+					satisfaction_now = satisfaction_now,
 				}
 			end
 			vap.sta_table  = sta_table
