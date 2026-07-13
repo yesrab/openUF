@@ -329,6 +329,10 @@ return {
 			assert_eq(sta_table[1].rx_rate, 72200, "rx_rate converted to Kbps from 72.2 Mbit/s")
 			assert_eq(sta_table[1].uptime, 3600, "uptime from iw's connected time")
 			assert_eq(sta_table[1].idletime, 0, "idletime floored from inactive_ms (120ms -> 0s)")
+			-- tx_mcs_index: part of the same controller-side wifi-experience-
+			-- score input DTO (com.ubnt.g.q.AQODNNoMmBlFpWXX) as tx_rate/
+			-- rx_rate/signal above.
+			assert_eq(sta_table[1].tx_mcs_index, 15, "tx_mcs_index parsed from iw's 'MCS 15'")
 		end
 	},
 	{

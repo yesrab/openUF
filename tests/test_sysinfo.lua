@@ -111,9 +111,11 @@ return {
 				assert_eq(stas[1].tx_retries, 4,                 "first client tx_retries")
 				assert_eq(stas[1].tx_failed,  0,                 "first client tx_failed")
 				assert_eq(stas[1].connected_sec, 3600,           "first client connected_sec")
+				assert_eq(stas[1].tx_mcs_index, 15,              "first client tx_mcs_index from 'MCS 15'")
 				assert_eq(stas[2].mac,      "11:22:33:44:55:66", "second client MAC")
 				assert_eq(stas[2].signal,   -75,                 "second client signal")
 				assert_eq(stas[2].connected_sec, 42,              "second client connected_sec")
+				assert_eq(stas[2].tx_mcs_index, 6,                "second client tx_mcs_index from 'MCS 6'")
 			end)
 		end
 	},

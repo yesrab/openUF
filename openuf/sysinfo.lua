@@ -181,9 +181,9 @@ function M.radio_stats(ifname)
 end
 
 -- Returns a table of connected stations from `iw dev <ifname> station dump`.
--- Each entry: {mac, signal, tx_bitrate, rx_bitrate, tx_bytes, rx_bytes,
---              tx_packets, rx_packets, tx_retries, tx_failed, inactive_ms,
---              connected_sec}
+-- Each entry: {mac, signal, tx_bitrate, rx_bitrate, tx_mcs_index, tx_bytes,
+--              rx_bytes, tx_packets, rx_packets, tx_retries, tx_failed,
+--              inactive_ms, connected_sec}
 -- tx_retries/tx_failed: iw(8) only exposes TX-side retry/failure counters
 -- (802.11 ARQ is TX-side by nature) -- there is no rx-side equivalent in
 -- `station dump` output, confirmed via `strings /usr/sbin/iw`.
@@ -201,6 +201,11 @@ function M.sta_table(ifname)
 			local signal     = line:match("signal:%s+(-?%d+)")
 			local tx_rate    = line:match("tx bitrate:%s+(%S+)")
 			local rx_rate    = line:match("rx bitrate:%s+(%S+)")
+			-- tx_mcs: only present on the "tx bitrate" line itself, and only
+			-- for 11n/ac/ax rates -- legacy (pre-MCS) rates have no "MCS N"
+			-- suffix, so this stays nil for those, same as other optional
+			-- fields below.
+			local tx_mcs     = line:match("tx bitrate:.*MCS%s+(%d+)")
 			local tx_bytes   = line:match("tx bytes:%s+(%d+)")
 			local rx_bytes   = line:match("rx bytes:%s+(%d+)")
 			local tx_pkts    = line:match("tx packets:%s+(%d+)")
@@ -212,6 +217,7 @@ function M.sta_table(ifname)
 			if signal    then cur.signal      = tonumber(signal)     end
 			if tx_rate   then cur.tx_bitrate  = tonumber(tx_rate)    end
 			if rx_rate   then cur.rx_bitrate  = tonumber(rx_rate)    end
+			if tx_mcs    then cur.tx_mcs_index = tonumber(tx_mcs)    end
 			if tx_bytes  then cur.tx_bytes    = tonumber(tx_bytes)   end
 			if rx_bytes  then cur.rx_bytes    = tonumber(rx_bytes)   end
 			if tx_pkts   then cur.tx_packets  = tonumber(tx_pkts)    end

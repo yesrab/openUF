@@ -474,6 +474,14 @@ function M.build_json(st, cfg, ufhw)
 					-- reports connected time (older iw builds omit it).
 					uptime     = sta.connected_sec,
 					idletime   = sta.inactive_ms and math.floor(sta.inactive_ms / 1000) or nil,
+					-- tx_mcs_index: confirmed real field, part of the same
+					-- controller-side wifi-experience-score input DTO
+					-- (com.ubnt.g.q.AQODNNoMmBlFpWXX) as rx_rate/tx_rate/
+					-- signal above. iw's tx bitrate line already prints this
+					-- ("144.4 MBit/s MCS 15 short GI"); only set when iw
+					-- actually reports an MCS-based rate (legacy pre-11n
+					-- rates have none).
+					tx_mcs_index = sta.tx_mcs_index,
 				}
 			end
 			vap.sta_table  = sta_table
