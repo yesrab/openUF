@@ -50,10 +50,11 @@ EOF
 		echo "$N" > "$COUNTER_FILE"
 		cat <<EOF
 Station de:ad:be:ef:00:01 (on $2)
+	connected time:	$((100 + N * 10)) sec
 	inactive time:	50 ms
-	rx bytes:	$((123456 + N * 4096))
+	rx bytes:	$((123456 + N * 262144))
 	rx packets:	$((890 + N * 6))
-	tx bytes:	$((654321 + N * 8192))
+	tx bytes:	$((654321 + N * 524288))
 	tx packets:	$((432 + N * 9))
 	tx retries:	$((7 + N))
 	tx failed:	1
