@@ -54,10 +54,18 @@ return {
 	{
 		name = "lldp: neighbors() local_port_idx is nil when sysfs is unavailable",
 		fn = function()
+			-- Explicitly mock sysfs as absent rather than relying on the
+			-- ambient environment actually lacking it: real Linux CI
+			-- runners/containers always have a genuine eth0 with a real
+			-- /sys/class/net/eth0/ifindex, so this only ever passed by
+			-- accident on a /sys-less macOS dev machine.
+			local orig_read = lldp._read_file
+			lldp._read_file = function() return nil end
 			with_cmd(fixture("lldpctl_output.json"), function()
 				local nbrs = lldp.neighbors()
-				assert_true(nbrs[1].local_port_idx == nil, "nil without /sys access (e.g. dev machine)")
+				assert_true(nbrs[1].local_port_idx == nil, "nil without /sys access")
 			end)
+			lldp._read_file = orig_read
 		end
 	},
 	{
