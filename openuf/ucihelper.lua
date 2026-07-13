@@ -126,7 +126,11 @@ end
 --           put the SSID on that VLAN.
 -- networkconf_id: optional controller-side network object id, stashed as a
 --           custom option so get_vap_table() can report it back unchanged.
-function M.wlan_add(radio, ssid, security, password, extra, network, networkconf_id)
+-- wlanconf_id: optional controller-side wlanconf object id (system_cfg's
+--           aaa.<n>.id), stashed the same way so get_vap_table() can echo it
+--           back as the vap's "id" -- required for the controller to accept
+--           the vap (and its sta_table) at all.
+function M.wlan_add(radio, ssid, security, password, extra, network, networkconf_id, wlanconf_id)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	-- Section name includes the radio, not just the SSID: broadcasting the
@@ -149,6 +153,9 @@ function M.wlan_add(radio, ssid, security, password, extra, network, networkconf
 	cursor:set("wireless", section_name, "network", network or "lan")
 	if networkconf_id then
 		cursor:set("wireless", section_name, "openuf_networkconf_id", networkconf_id)
+	end
+	if wlanconf_id then
+		cursor:set("wireless", section_name, "openuf_wlanconf_id", wlanconf_id)
 	end
 	if password and enc ~= "none" then
 		cursor:set("wireless", section_name, "key", password)
@@ -278,7 +285,7 @@ function M.apply_config(resp, cfg)
 			end
 
 			M.wlan_add(vap.radio, vap.ssid, vap.security, vap.x_passphrase, extra,
-				network, vap.networkconf_id)
+				network, vap.networkconf_id, vap.wlanconf_id)
 		end
 	end
 
@@ -370,7 +377,17 @@ function M.get_vap_table()
 			channel       = radio and radio.channel,
 			tx_power      = radio and radio.tx_power,
 			usage         = "user",
-			wlanconf_id   = s.openuf_networkconf_id,
+			-- "id" must echo the controller's wlanconf ObjectId (delivered in
+			-- system_cfg as aaa.<n>.id, stashed by wlan_add): the controller's
+			-- vapInformProcessor silently drops any usage=user vap whose "id"
+			-- is missing -- discarding the nested sta_table with it, which
+			-- kept every wireless client out of the Clients list. The
+			-- controller derives wlanconf_id itself from "id", but the real
+			-- DTO carries both, so send both. (Previously this sent the
+			-- *networkconf* id as wlanconf_id -- a different object; that id
+			-- stays in its own UCI option for the VLAN/mobility-domain logic.)
+			id            = s.openuf_wlanconf_id,
+			wlanconf_id   = s.openuf_wlanconf_id,
 		}
 	end)
 	return vaps

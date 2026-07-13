@@ -361,6 +361,7 @@ return {
 				.. "radio.2.phyname=radio1\nradio.2.channel=36\nradio.2.txpower=17\n"
 				.. "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.psk=TestPass123\n"
 				.. "aaa.1.wpa.key.1.mgmt=WPA-PSK\naaa.1.ft.status=disabled\n"
+				.. "aaa.1.id=6a540dd2ffb26b8537ec967d\n"
 				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\nwireless.1.security=none\n"
 			local radio_table, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
 
@@ -376,6 +377,8 @@ return {
 			assert_eq(vap_table[1].radio, "radio0", "radio from wireless.1.parent")
 			assert_eq(vap_table[1].security, "wpa2", "security derived from aaa.1.wpa=2")
 			assert_eq(vap_table[1].x_passphrase, "TestPass123", "passphrase from aaa.1.wpa.psk")
+			assert_eq(vap_table[1].wlanconf_id, "6a540dd2ffb26b8537ec967d",
+				"wlanconf id from aaa.1.id (echoed back as vap_table[].id; without it the controller drops the vap)")
 			assert_eq(vap_table[1].fast_roaming_enabled, false, "ft.status=disabled -> fast roaming off")
 			assert_eq(vap_table[1].vlan_enabled, false, "no br.devname suffix -> vlan not enabled")
 			assert_eq(vap_table[1].vlan, nil, "no vlan id without a tagged br.devname")

@@ -53,12 +53,17 @@ local function inject_ucihelper()
 		end,
 		get_vap_table = function()
 			return {
-				{ name = "openuf_test", essid = "test", radio = "radio0",
+				{ name = "openuf_test", essid = "test", radio = "ng", radio_name = "radio0",
 				  encryption = "psk2", disabled = false, bssid = "aa:bb:cc:00:00:01",
 				  channel = "6", tx_power = "20", usage = "user" },
 			}
 		end,
-		get_ifname_for_radio = function(radio) return "wlan0" end,
+		-- Strict on purpose: real get_ifname_for_radio() resolves a UCI
+		-- device name ("radio0"/"radio1"), not the band vap.radio reports
+		-- ("ng"/"na") -- returning nil for anything else catches a caller
+		-- that regresses back to passing vap.radio here (sta_table would
+		-- silently stay empty on every real inform).
+		get_ifname_for_radio = function(radio) if radio == "radio0" then return "wlan0" end return nil end,
 	}
 end
 
@@ -302,7 +307,7 @@ return {
 			assert_eq(sta_table[1].mac, "aa:bb:cc:dd:ee:ff", "first client mac")
 			assert_eq(sta_table[1].ap_mac, "aa:bb:cc:dd:ee:ff", "ap_mac from device mac")
 			assert_eq(sta_table[1].channel, "6", "channel from vap")
-			assert_eq(sta_table[1].radio, "radio0", "radio from vap")
+			assert_eq(sta_table[1].radio, "ng", "radio from vap (the band, matching vap.radio)")
 			assert_true(sta_table[1].active, "active true for a station iw actually lists")
 			assert_eq(sta_table[1].signal, -62, "signal from station dump")
 			assert_eq(sta_table[1].rssi, -62, "rssi aliases signal (iw doesn't distinguish them)")

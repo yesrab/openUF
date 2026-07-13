@@ -1317,30 +1317,86 @@ fully fresh `docker compose down -v` rebuild): the `"unexpected radio"`
 warnings stopped completely in both runs. Unit test added in
 `tests/test_ucihelper.lua`.
 
-**Still open:** the client itself still never appears in the Clients
-list, on either run (confirmed against a *genuinely fresh* database too,
-ruling out stale cross-session cache as this specific cause). Traced the
-actual client-creation code path in full: `tFhABnrHYJqvjaoEa`'s per-VAP
-`sta_table` loop → `TtZhv.chgwykfBxZCAuEHPPQ(UCthhvfQNZ, KrlpWXOulbN,
-boolean)` → for a MAC with no existing record, a gate at the very top of
-that branch: `if (this.LmkhIDtPqt.rMxwXnPhhdotvjERKoA(site_id, mac)) {
-return; }`, where `LmkhIDtPqt` is a `SNMiFVJXxaonBOtqbJ` instance — **the
-exact same class** this document's earlier `wait_for_initial_inform`
-investigation already root-caused as having a "cache-then-DB-fallback...
-populated once and never invalidated by an external write" bug, and
-which that investigation explicitly concluded by "hitting the limit of
-static analysis." The check itself appears to mean "is this MAC already
-a known UniFi device" (guarding against double-counting a mesh AP as a
-client) — no MAC collision exists against any registered device in
-Mongo, so it's unclear why it would return `true` for a genuinely new
-MAC, and a fresh-database run didn't change the outcome. Ruled out along
-the way: `is_wep`-driven early skip (openUF never sets `is_wep` on the
-vap, defaults correctly to `false`), and MAC collision. Confirming the
-actual runtime boolean here would need live JVM debugging/instrumentation
-against the closed-source controller, which isn't available — documented
-as an open question rather than guessed at further, matching this
-project's established precedent for `SNMiFVJXxaonBOtqbJ`-related dead
-ends.
+## RESOLVED: fake client never appeared in the Clients list (2026-07-13)
+
+The `SNMiFVJXxaonBOtqbJ`/`rMxwXnPhhdotvjERKoA` gate hypothesis above was
+**disproven** by fully decompiling it: it's a pure in-memory Caffeine
+`getIfPresent` existence check, keyed *only* by a device's primary `mac`
+field (no DB fallback on a miss, no BSSID/ethernet/uplink MACs in its key
+space). `de:ad:be:ef:00:01` never collided with anything in that cache,
+so this gate was never the cause — it just happened to be the last thing
+static analysis had reached before the previous investigation stopped.
+
+**Real root cause, found by tracing the actual client-creation call
+chain (`TtZhv.chgwykfBxZCAuEHPPQ`, the `sta_table`→client-record method)
+one level further back, into how `vap_table` itself reaches that method:**
+both inform processors populate `cachedDevice.vap_table` via a shared
+`vapInformProcessor` (`com.ubnt.service.devmgr.C.KHUkYjHujLgFBD`) that
+filters the inform's raw `vap_table` *before* any per-station processing
+ever runs. For a `usage=user` VAP (openUF's default and only usage), the
+filter requires a non-`"unknown"` `id` field — the wlanconf's Mongo
+ObjectId — and then re-looks it up via `configCache.get(siteId, id)` to
+attach `wlanconf_id`/`ap_mac`/`site_id`/`is_guest`/`is_wep` onto the vap.
+**openUF never sent `id`,** so every VAP (and everything nested inside
+it, including `sta_table`) was silently dropped before the client-creation
+code even ran — no log line, no error, consistent with the total log
+silence observed both here and in the `wait_for_initial_inform`
+investigation above (this filter's "Inconsistent vap"/"Invalid id" warn
+paths only fire on an actual lookup *failure*, not on a missing `id`
+being silently absent-checked via `!"unknown".equals(id)`).
+
+`id` is delivered by the controller in the pushed `system_cfg` blob as
+`aaa.<n>.id` — confirmed live (`aaa.1.id=<wlanconf ObjectId>`, matching
+`db.wlanconf`'s `_id` exactly) — but `openuf/inform.lua`'s
+`_parse_wifi_system_cfg` never extracted it, and `ucihelper.lua`'s
+`get_vap_table()` never echoed anything back as `id` (its `wlanconf_id`
+field was, at the time, wired to the *networkconf* id instead — a
+different object entirely, and nil in the real live-controller flow since
+the parser never populated it either).
+
+**A second, independent bug was found while verifying the fix live:**
+even after `vap_table` started reaching the controller with a valid `id`,
+the fake client's entry inside it still wasn't finding its way into
+`sta_table` — `openuf/inform.lua`'s `sta_table`-population loop resolves
+each vap's live network interface via `ufuci.get_ifname_for_radio(vap.radio)`,
+but `vap.radio` had already been repointed (by the earlier `radio`/`radio_name`
+fix in this document) to hold the *band* (`"ng"`/`"na"`), not the UCI
+device name `get_ifname_for_radio()` actually expects (`"radio0"`/
+`"radio1"`, now on the separate `vap.radio_name` field). This callsite was
+never updated when that split was made, so it always failed to resolve an
+ifname and `sta_table` stayed empty on every real inform, independent of
+the `id` fix above — a client could never have appeared even with `id`
+sent correctly.
+
+**Fixed:** `_parse_wifi_system_cfg` now extracts `wlanconf_id` from
+`aaa.<n>.id`; `ucihelper.wlan_add`/`apply_config`/`get_vap_table` carry it
+through end-to-end (new UCI option `openuf_wlanconf_id`, echoed back as
+both `id` and `wlanconf_id` — matching the real DTO, which carries both
+side by side); `inform.lua`'s ifname resolution now uses `vap.radio_name`.
+
+**Verified live, full chain, from a genuinely fresh `docker compose down
+-v` rebuild** (fresh controller setup wizard, fresh WLAN creation, fresh
+L2 broadcast discovery + real SSH adoption, per this file's own
+documented procedure — not a shortcut): outgoing inform payload confirmed
+(via temporary instrumentation, since `debug_dump_file` only captures
+*inbound* controller responses) to carry `vap_table[].id` =
+`vap_table[].wlanconf_id` = the real wlanconf ObjectId, and
+`vap_table[].sta_table` = `[{mac: "de:ad:be:ef:00:01", ...}]`. Confirmed
+by direct Mongo query: `db.user.findOne({mac:"de:ad:be:ef:00:01"})` now
+returns a real client record (`wlanconf_id`, `last_uplink_mac`,
+`last_radio`, `site_id` all correctly populated). Confirmed in the
+controller UI: the client appears in the Clients list, Online, connected
+via WiFi to `openuf-test` through the `U6 IW` access point.
+
+**Code changes:** `openuf/inform.lua` (`wlanconf_id` extraction in
+`_parse_wifi_system_cfg`; `vap.radio_name` fix in the `sta_table` ifname
+resolution), `openuf/ucihelper.lua` (`wlanconf_id` parameter on
+`wlan_add`/`apply_config`; `id`/`wlanconf_id` fields on `get_vap_table()`).
+Tests updated/added in `tests/test_inform_packet.lua`,
+`tests/test_ucihelper.lua`, `tests/test_inform_json.lua` (the latter's
+`get_ifname_for_radio` mock was previously argument-insensitive, which is
+why it didn't catch the `vap.radio`/`vap.radio_name` regression — made
+strict). All 187 tests pass.
 
 **Code changes:** `openuf/ucihelper.lua` (`radio`/`radio_name` fields on
 `get_vap_table()`). Unit test added in `tests/test_ucihelper.lua`.

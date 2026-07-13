@@ -73,14 +73,15 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: wlan_add sets explicit network and networkconf_id",
+		name = "ucihelper: wlan_add sets explicit network, networkconf_id and wlanconf_id",
 		fn = function()
 			with_ucihelper(function(db)
 				ucihelper.wlan_add("radio0", "guest", "open", nil, nil,
-					"openuf_vlan20", "net-abc123")
+					"openuf_vlan20", "net-abc123", "6a540dd2ffb26b8537ec967d")
 				local s = db.wireless.openuf_radio0_guest
 				assert_eq(s.network, "openuf_vlan20", "network set")
 				assert_eq(s.openuf_networkconf_id, "net-abc123", "networkconf_id stashed")
+				assert_eq(s.openuf_wlanconf_id, "6a540dd2ffb26b8537ec967d", "wlanconf_id stashed")
 			end)
 		end
 	},
@@ -264,14 +265,21 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: get_vap_table round-trips wlanconf_id",
+		name = "ucihelper: get_vap_table echoes the wlanconf id as both id and wlanconf_id",
 		fn = function()
+			-- Regression test: the controller's vapInformProcessor silently
+			-- drops any usage=user vap whose "id" (the wlanconf ObjectId,
+			-- pushed in system_cfg as aaa.<n>.id) is missing -- and the
+			-- nested sta_table goes with it, so no wireless client ever
+			-- reached the Clients list. Note "id" must be the *wlanconf* id,
+			-- not the networkconf id this field used to (mis)carry.
 			with_ucihelper(function(db)
 				ucihelper.wlan_add("radio0", "corp", "wpa2", "hunter22", nil,
-					"openuf_vlan20", "net-1")
+					"openuf_vlan20", "net-1", "wlan-1")
 				local vaps = ucihelper.get_vap_table()
 				assert_eq(#vaps, 1, "one vap")
-				assert_eq(vaps[1].wlanconf_id, "net-1", "wlanconf_id read back")
+				assert_eq(vaps[1].id, "wlan-1", "id echoes the wlanconf id")
+				assert_eq(vaps[1].wlanconf_id, "wlan-1", "wlanconf_id matches id")
 			end)
 		end
 	},

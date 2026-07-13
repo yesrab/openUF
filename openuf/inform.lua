@@ -378,7 +378,13 @@ function M.build_json(st, cfg, ufhw)
 		-- bytecode; see PROTOCOL-VALIDATION.md "Stage 2c").
 		local now = M._time()
 		for _, vap in ipairs(vap_table) do
-			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, vap.radio)
+			-- get_ifname_for_radio() resolves a UCI radio device name
+			-- ("radio0"/"radio1"), not the band vap.radio now reports
+			-- ("ng"/"na") -- using vap.radio here always missed, silently
+			-- leaving sta_table empty on every inform (no fake/real client
+			-- ever appeared in a vap's sta_table, regardless of the id/
+			-- wlanconf_id fix that lets vap_table itself through at all).
+			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, vap.radio_name)
 			local stas = {}
 			if ok_if and ifname then
 				local ok_sta, rv2 = pcall(M._sysinfo.sta_table, ifname)
@@ -615,6 +621,12 @@ function M._parse_wifi_system_cfg(sys_raw)
 				ssid                  = w.ssid,
 				radio                 = w.parent,
 				security              = security,
+				-- aaa.<n>.id is the controller's wlanconf ObjectId; the
+				-- controller only accepts a vap_table entry whose "id" echoes
+				-- it back (vapInformProcessor drops usage=user vaps without
+				-- one, taking the nested sta_table -- and thus every wireless
+				-- client -- with them).
+				wlanconf_id           = a.id,
 				x_passphrase          = a["wpa.psk"],
 				fast_roaming_enabled  = (a["ft.status"] == "enabled"),
 				vlan_enabled          = vlan_id ~= nil,
