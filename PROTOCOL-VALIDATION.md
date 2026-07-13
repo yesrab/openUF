@@ -1531,6 +1531,37 @@ Experience: Good (77%)"** instead of "No Experience". 77% matches
 77.1, floored, with the retry score not the limiting factor at this
 station's near-zero retry percentage.
 
+### Multi-client verification (2026-07-13)
+
+The above was only ever proven against a single synthetic client. Extended
+`tools/validation/ap/iw-mock.sh` to emit **three** stations instead of one —
+two on `wlan0` (`de:ad:be:ef:00:01` at −58 dBm, MCS-based rate; and
+`de:ad:be:ef:00:02` at −70 dBm, a **legacy pre-11n rate string with no "MCS"
+suffix**) and one on `wlan1` (`de:ad:be:ef:00:03` at −50 dBm) — each with its
+own counter file (keyed by ifname+MAC) so cumulative byte/packet counters and
+per-poll throughput deltas grow independently and distinctly per station. No
+`openuf/*.lua` changes were needed: `sysinfo.lua`'s `M.sta_table()` already
+parsed an arbitrary number of consecutive `Station ...` blocks, and
+`inform.lua`'s per-vap loop already summed/keyed everything by MAC.
+
+**Confirmed live end-to-end** (full `docker compose down -v` + rebuild, fresh
+adopt, WLAN `openuf-validate` created on both radios through the real UI):
+
+- All 3 clients appear as distinct entries in the controller's Clients list,
+  correctly split 2 on the 2.4 GHz radio / 1 on the 5 GHz radio (matches the
+  AP detail page's per-channel client counts and "Most Active Clients").
+- WiFi Experience matches `estimate_satisfaction()` for each configured
+  signal: **Good (77%)** at −58 dBm, **Poor (42%)** at −70 dBm, **Excellent
+  (99%)** at −50 dBm.
+- The legacy (no-MCS) client correctly renders as **WiFi 2**, vs **WiFi 3**
+  for the two MCS-based clients — `tx_mcs`/`rx_mcs` staying `nil` for one
+  station doesn't affect its neighbor in the same `station dump` output.
+- Per-client throughput (inform.lua's delta-sampled rate) is independent and
+  clearly distinct per station once each station's mock byte-counter step
+  was also varied, not just its base offset: ↓418/↑209 Kbps, ↓26/↑13 Kbps,
+  ↓1.24 Mbps/↑622 Kbps respectively — confirming `M._sta_stats_cache` doesn't
+  collide across MACs.
+
 ## 9. Firmware upgrade offer
 
 - **Status:** ✅ captured (real, via `debug_dump_file` + independent `tcpdump`
