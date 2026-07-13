@@ -1523,6 +1523,14 @@ helper; per-client `sta_table` entry: `tx_mcs`/`rx_mcs` rename+addition,
 `satisfaction_now`). Tests updated in `tests/test_sysinfo.lua` and
 `tests/test_inform_json.lua`.
 
+**Confirmed live end-to-end** (full `docker compose down -v` + rebuild,
+fresh adopt, WLAN created through the real UI, `iw-mock.sh`'s synthetic
+station at signal −58 dBm): client Insights panel now reads **"WiFi
+Experience: Good (77%)"** instead of "No Experience". 77% matches
+`estimate_satisfaction()`'s signal-score branch exactly — (85−58)/35×100 ≈
+77.1, floored, with the retry score not the limiting factor at this
+station's near-zero retry percentage.
+
 ## 9. Firmware upgrade offer
 
 - **Status:** ✅ captured (real, via `debug_dump_file` + independent `tcpdump`
