@@ -449,6 +449,31 @@ function M.build_json(st, cfg, ufhw)
 					throughput = throughput,
 					linkscore  = 0,
 					multicast  = 0,
+					-- Cumulative per-client counters -- confirmed real field
+					-- names via the decompiled vapInformProcessor
+					-- (com.ubnt.service.devmgr.c.KHUkYjHujLgFBD), which
+					-- copies exactly these names off each incoming sta_table
+					-- entry ("channel","radio","name","signal","rssi",
+					-- "tx_rate","rx_rate","tx_packets","rx_packets",
+					-- "tx_bytes","rx_bytes") and computes its own bytes-d/
+					-- rate-d deltas between informs -- so unlike throughput
+					-- above, these must be sent as raw cumulative counters,
+					-- not pre-computed rates.
+					rx_bytes   = sta.rx_bytes or 0,
+					tx_bytes   = sta.tx_bytes or 0,
+					rx_packets = sta.rx_packets or 0,
+					tx_packets = sta.tx_packets or 0,
+					-- tx_rate/rx_rate: controller's tx_rate/rx_rate are in
+					-- Kbps (matches real-device captures, e.g. tx_rate:
+					-- 39000 for a 39 Mbps MCS rate); iw reports Mbit/s.
+					tx_rate    = sta.tx_bitrate and math.floor(sta.tx_bitrate * 1000) or 0,
+					rx_rate    = sta.rx_bitrate and math.floor(sta.rx_bitrate * 1000) or 0,
+					-- uptime/idletime: iw's "connected time"/"inactive time"
+					-- are the same concepts: seconds associated, seconds
+					-- since last activity. Only set uptime when iw actually
+					-- reports connected time (older iw builds omit it).
+					uptime     = sta.connected_sec,
+					idletime   = sta.inactive_ms and math.floor(sta.inactive_ms / 1000) or nil,
 				}
 			end
 			vap.sta_table  = sta_table

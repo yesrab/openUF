@@ -1,4 +1,5 @@
 Station aa:bb:cc:dd:ee:ff (on wlan0)
+	connected time:	3600 sec
 	inactive time:	120 ms
 	rx bytes:	45678
 	rx packets:	312
@@ -16,6 +17,7 @@ Station aa:bb:cc:dd:ee:ff (on wlan0)
 	preamble:	long
 	WMM/WME:	yes
 Station 11:22:33:44:55:66 (on wlan0)
+	connected time:	42 sec
 	inactive time:	500 ms
 	rx bytes:	1024
 	rx packets:	8

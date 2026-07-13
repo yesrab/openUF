@@ -182,7 +182,8 @@ end
 
 -- Returns a table of connected stations from `iw dev <ifname> station dump`.
 -- Each entry: {mac, signal, tx_bitrate, rx_bitrate, tx_bytes, rx_bytes,
---              tx_packets, rx_packets, tx_retries, tx_failed, inactive_ms}
+--              tx_packets, rx_packets, tx_retries, tx_failed, inactive_ms,
+--              connected_sec}
 -- tx_retries/tx_failed: iw(8) only exposes TX-side retry/failure counters
 -- (802.11 ARQ is TX-side by nature) -- there is no rx-side equivalent in
 -- `station dump` output, confirmed via `strings /usr/sbin/iw`.
@@ -207,6 +208,7 @@ function M.sta_table(ifname)
 			local tx_retries = line:match("tx retries:%s+(%d+)")
 			local tx_failed  = line:match("tx failed:%s+(%d+)")
 			local inactive   = line:match("inactive time:%s+(%d+)")
+			local connected  = line:match("connected time:%s+(%d+)")
 			if signal    then cur.signal      = tonumber(signal)     end
 			if tx_rate   then cur.tx_bitrate  = tonumber(tx_rate)    end
 			if rx_rate   then cur.rx_bitrate  = tonumber(rx_rate)    end
@@ -217,6 +219,7 @@ function M.sta_table(ifname)
 			if tx_retries then cur.tx_retries = tonumber(tx_retries) end
 			if tx_failed  then cur.tx_failed  = tonumber(tx_failed)  end
 			if inactive  then cur.inactive_ms = tonumber(inactive)   end
+			if connected then cur.connected_sec = tonumber(connected) end
 		end
 	end
 	if cur then clients[#clients + 1] = cur end

@@ -315,6 +315,20 @@ return {
 			assert_eq(sta_table[1].throughput, 0, "throughput 0 on first sample (no prior delta)")
 			assert_eq(sta_table[1].linkscore, 0, "linkscore has no local source -- placeholder")
 			assert_eq(sta_table[1].multicast, 0, "multicast has no local source -- placeholder")
+			-- Cumulative per-client counters -- confirmed real field names via
+			-- the decompiled vapInformProcessor (com.ubnt.service.devmgr.c.
+			-- KHUkYjHujLgFBD), which copies these straight off each incoming
+			-- sta_table entry and computes its own deltas between informs
+			-- (unlike throughput, which openUF pre-computes).
+			assert_eq(sta_table[1].rx_bytes, 45678, "rx_bytes from station dump")
+			assert_eq(sta_table[1].tx_bytes, 98765, "tx_bytes from station dump")
+			assert_eq(sta_table[1].rx_packets, 312, "rx_packets from station dump")
+			assert_eq(sta_table[1].tx_packets, 287, "tx_packets from station dump")
+			-- tx_rate/rx_rate: controller expects Kbps, iw reports Mbit/s
+			assert_eq(sta_table[1].tx_rate, 144400, "tx_rate converted to Kbps from 144.4 Mbit/s")
+			assert_eq(sta_table[1].rx_rate, 72200, "rx_rate converted to Kbps from 72.2 Mbit/s")
+			assert_eq(sta_table[1].uptime, 3600, "uptime from iw's connected time")
+			assert_eq(sta_table[1].idletime, 0, "idletime floored from inactive_ms (120ms -> 0s)")
 		end
 	},
 	{
