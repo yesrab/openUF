@@ -31,7 +31,7 @@ FROM alpine:3.20
 
 RUN apk add --no-cache \
         lua5.1 lua5.1-cjson lua5.1-socket lua5.1-bitop \
-        openssh openssl iw \
+        openssh openssl iw iproute2 \
     && ln -sf /usr/bin/lua5.1 /usr/bin/lua \
     && apk add --no-cache --virtual .build-deps \
         luarocks5.1 lua5.1-dev openssl-dev gcc musl-dev make \
@@ -77,14 +77,23 @@ COPY tools/validation/ap/uci-mock.lua /usr/local/share/lua/5.1/uci.lua
 # real openUF bug (wrong iw field names) this also surfaced.
 COPY tools/validation/ap/ubus-mock.sh /usr/local/bin/ubus
 COPY tools/validation/ap/iw-mock.sh /usr/local/bin/iw
+# bridge-mock.sh fakes two wired hosts on this container's one downstream
+# port (see the ports override below and PROTOCOL-VALIDATION.md's wired-
+# client section) -- shadows the real iproute2 `bridge` the same way
+# iw-mock.sh shadows `iw`.
+COPY tools/validation/ap/bridge-mock.sh /usr/local/bin/bridge
+COPY tools/validation/ap/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN ln -sf /opt/openuf/hook/syswrapper.sh /usr/bin/syswrapper.sh \
     && chmod +x /usr/bin/syswrapper.sh /opt/openuf/hook/syswrapper.sh \
-    && chmod +x /usr/local/bin/ubus /usr/local/bin/iw \
+    && chmod +x /usr/local/bin/ubus /usr/local/bin/iw /usr/local/bin/bridge /usr/local/bin/entrypoint.sh \
     && mkdir -p /etc/openuf /var/log \
     && sed -i 's/debug_dump_file = nil/debug_dump_file = "\/var\/log\/openuf-informs.log"/' \
         /opt/openuf/conf.lua \
     && sed -i 's/lan_cpueth\t= "eth1"/lan_cpueth\t= "eth0"/' \
-        /opt/openuf/modelmap/generic-dualband-ap.lua
+        /opt/openuf/modelmap/generic-dualband-ap.lua \
+    && sed -i 's/{idx = 2, ifname = "eth1"}/{idx = 2, ifname = "eth0"}/' \
+        /opt/openuf/modelmap/generic-dualband-ap.lua \
+    && printf '1735689600 ca:fe:be:ef:00:01 192.168.1.101 printer *\n' > /tmp/dhcp.leases
 
 # generic-dualband-ap.lua assumes real hardware's switch topology (eth0=WAN,
 # eth1=LAN via VLANs) -- this single-NIC container only has eth0. Without
@@ -92,7 +101,19 @@ RUN ln -sf /opt/openuf/hook/syswrapper.sh /usr/bin/syswrapper.sh \
 # _populate_net_info) silently fail to find "eth1", leaving st.mac/st.ip
 # unset -- informs then report MAC 00:00:00:00:00:00 and IP 0.0.0.0, which
 # the controller cannot adopt (it has no address to SSH the device at).
+# The port_table ports list's LAN entry needs the same eth1->eth0 retarget
+# for the same reason (this container has no real second netdev), so both
+# ports report against the container's one real interface -- the uplink
+# and the fake-wired-clients port then share the same if_table counters,
+# which is an acceptable single-NIC-container artifact, not a real openUF
+# behavior (a real device has genuinely separate WAN/LAN netdevs).
+#
+# /tmp/dhcp.leases is only present for one of bridge-mock.sh's two fake
+# hosts, on purpose -- proves sysinfo.mac_table()'s hostname field stays
+# correctly optional (nil, not invented) for a host with no lease entry,
+# same as this project's unit tests already cover.
 
 WORKDIR /opt/openuf
 EXPOSE 22
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/usr/sbin/sshd", "-D"]

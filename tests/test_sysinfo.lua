@@ -223,4 +223,74 @@ return {
 			sysinfo._prev_cpu = prev
 		end
 	},
+	{
+		name = "sysinfo: mac_table() parses bridge fdb dynamic entries, joined with arp and dhcp leases",
+		fn = function()
+			sysinfo._mac_first_seen = {}
+			with_fixtures(
+				{
+					["/proc/net/arp"]   = fixture("proc_net_arp.txt"),
+					["/tmp/dhcp.leases"] = fixture("dhcp_leases.txt"),
+				},
+				{["bridge fdb show"] = fixture("bridge_fdb_dump.txt")},
+				function()
+					local hosts = sysinfo.mac_table("eth1")
+					assert_eq(#hosts, 2, "two dynamically-learned hosts")
+					assert_eq(hosts[1].mac, "aa:bb:cc:dd:ee:01", "first host mac")
+					assert_eq(hosts[1].ip,  "192.168.1.50", "first host ip from arp")
+					assert_eq(hosts[1].hostname, "laptop", "first host hostname from dhcp leases")
+					assert_eq(hosts[2].mac, "aa:bb:cc:dd:ee:02", "second host mac")
+					assert_eq(hosts[2].ip,  "192.168.1.51", "second host ip from arp")
+					assert_true(hosts[2].hostname == nil, "second host has no lease entry -- hostname stays nil")
+				end
+			)
+		end
+	},
+	{
+		name = "sysinfo: mac_table() excludes self/permanent and multicast/broadcast fdb entries",
+		fn = function()
+			-- Fixture's self/permanent lines (the bridge's own MAC, an IPv4
+			-- multicast group, and a broadcast address) must never surface as
+			-- hosts -- only the two dynamically-learned "master br-lan" lines
+			-- should (already asserted above); this pins the exclusion itself.
+			sysinfo._mac_first_seen = {}
+			with_fixtures({}, {["bridge fdb show"] = fixture("bridge_fdb_dump.txt")}, function()
+				local hosts = sysinfo.mac_table("eth1")
+				for _, h in ipairs(hosts) do
+					assert_true(h.mac ~= "de:ad:be:ef:00:01", "self-permanent entry excluded")
+					assert_true(h.mac ~= "33:33:00:00:00:01", "IPv6 multicast entry excluded")
+					assert_true(h.mac ~= "01:00:5e:00:00:01", "IPv4 multicast entry excluded")
+					assert_true(h.mac ~= "ff:ff:ff:ff:ff:ff", "broadcast entry excluded")
+				end
+			end)
+		end
+	},
+	{
+		name = "sysinfo: mac_table() returns empty table for nil ifname",
+		fn = function()
+			with_fixtures({}, {}, function()
+				assert_eq(#sysinfo.mac_table(nil), 0, "nil ifname safe")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: mac_table() age is 0 and uptime grows across calls for the same host",
+		fn = function()
+			sysinfo._mac_first_seen = {}
+			local orig_time = sysinfo._time
+			sysinfo._time = function() return 1000 end
+			with_fixtures({}, {["bridge fdb show"] = fixture("bridge_fdb_dump.txt")}, function()
+				local hosts = sysinfo.mac_table("eth1")
+				assert_eq(hosts[1].age, 0, "age is 0 -- freshly observed on this fdb dump")
+				assert_eq(hosts[1].uptime, 0, "uptime 0 on first observation")
+			end)
+			sysinfo._time = function() return 1100 end
+			with_fixtures({}, {["bridge fdb show"] = fixture("bridge_fdb_dump.txt")}, function()
+				local hosts = sysinfo.mac_table("eth1")
+				assert_eq(hosts[1].uptime, 100, "uptime grows from the first-seen cache")
+			end)
+			sysinfo._time = orig_time
+			sysinfo._mac_first_seen = {}
+		end
+	},
 }

@@ -1988,6 +1988,233 @@ prefixed behavior as correct).
 
 ---
 
+## 17. Wired clients (`port_table`/`mac_table`) — decompile + implementation (2026-07-13)
+
+- **Status:** ✅ implemented, unit-tested, and confirmed live end-to-end
+  against a real running controller: adopted, both fake wired hosts appear
+  in the client list as wired with the correct port, and the Ports view
+  renders them on the correct port. See "Confirmed live against the running
+  controller" below.
+- **Why this was investigated:** openUF had never simulated or reported
+  wired clients, and there was no wired-client code path anywhere in the
+  daemon. Extracted `internal-dependencies.jar` from the pinned controller
+  image (`lscr.io/linuxserver/unifi-network-application:10.4.57`,
+  `docker cp` + CFR 0.152, same tooling this doc's other decompile findings
+  used) to determine whether that's a real gap for the U6-InWall model
+  openUF impersonates, or genuinely out of scope for an AP.
+- **It is a real gap.** In the model registry
+  (`com.ubnt.data.dhdeXcHqLRBKMUZk`), the `U6IW` entry is constructed with
+  device type `uap`, **5 ethernet ports**, and feature set
+  `{MYeBKiwr.yojQKHv, MYeBKiwr.nJYYFGHEYoaNo}`. `Device.isSwitch()`
+  (`com.ubnt.data.uuvchZbWVhirD:4693`) is
+  `hasFeature(MYeBKiwr.UiHQyVmgX) || hasFeature(MYeBKiwr.yojQKHv)` — true
+  for U6IW (a plain AP like `U6MP` only gets `nJYYFGHEYoaNo` and is not a
+  switch). This matches reality: a U6-InWall has a 4-port downstream
+  switch built in.
+- **The AP inform processor runs the full wired-client path for such
+  devices.** `com.ubnt.service.devmgr.PGOcbDWlbnYQdFW` (the `uap`/`uacc`
+  state processor), guarded by exactly `if (device.isSwitch())`, iterates
+  incoming `port_table[]` entries with `port_idx > 0` and, per port, calls
+  `com.ubnt.service.devmgr.DyonYyyYJkiyv`, which reads that port's
+  **`mac_table[]`** (plus `mac_table_ipv6[]` when `fw2_caps` bit 32 is set)
+  and feeds each entry to the client updater `kdjMkHbtXkncIhL` → `TtZhv`.
+  `TtZhv` is what writes the client record: **`is_wired=true`, `sw_mac`**
+  (the reporting device's MAC), **`sw_port`** (`port_idx`), and `ip`/
+  `hostname`/`age`/`uptime`/`ipv6_addresses` off the mac_table entry. The
+  same pass builds `downlink_table` and each port's `last_connection`/
+  `last_connection_state`. Ports flagged `is_uplink: true` are skipped for
+  client creation. Since openUF sent no `port_table` at all, this loop
+  always iterated empty — zero wired clients could ever appear, and the
+  Ports view had nothing behind it, regardless of what was genuinely
+  bridged into a real device's `br-lan`.
+- **`fw_caps` bit `0x10` (16) is a separate, second gate**, only for the
+  Ports view's projection of `port_table` into the device DTO —
+  `Device.hasQCASwitch()` is exactly `hasFirmwareCapability(16)`. Client
+  ingestion itself is gated only on `isSwitch()` (a model-registry
+  property, not this bit), so wired clients can appear in the client list
+  without it; the Ports view needs it. openUF now sends both.
+- **Payload contract implemented** (`openuf/inform.lua`, `openuf/sysinfo.lua`):
+  a top-level `port_table`, one entry per `cfg.net.ports` entry (new
+  modelmap field: `{idx, ifname, uplink}, ...`, defaulting to
+  `{wan_cpueth=uplink, lan_cpueth=lan}` when a modelmap omits it), each
+  carrying `port_idx` (1-based), `name`, `media`, `up`, `enable`, `speed`,
+  `full_duplex`, `is_uplink`, `speed_caps`, `port_poe`, `poe_caps`, and
+  `rx_bytes`/`tx_bytes`/`rx_packets`/`tx_packets`/`rx_errors`/`tx_errors`
+  from the same `M._sysinfo.interfaces()` counters `if_table` already uses.
+  Non-uplink ports additionally carry `mac_table`, sourced from a new
+  `sysinfo.mac_table(ifname)` that joins `bridge fdb show dev <ifname>`
+  (authoritative MAC↔port map; dynamic "master br-lan" entries only —
+  "self"/"permanent" lines and multicast/broadcast MACs are filtered out)
+  with `/proc/net/arp` (MAC→IP) and `/tmp/dhcp.leases` when present
+  (MAC→hostname, optional — an AP is usually not the DHCP server). Two
+  exclusion filters in `inform.lua` prevent double-reporting: the device's
+  own MACs, and any MAC currently associated as a wireless station
+  (collected while building `vap_table`) — a wireless client bridged into
+  `br-lan` is genuinely visible in the bridge FDB too, so without this a
+  wireless client would also appear as a wired one.
+- **Environment:** `tools/validation/ap/bridge-mock.sh` (fakes two wired
+  hosts on the container's one downstream port, mirroring `iw-mock.sh`'s
+  established shadow-the-real-binary pattern) and
+  `tools/validation/ap/entrypoint.sh` (seeds `/proc/net/arp` with
+  `ip neigh replace ... nud permanent` for those two fake MACs — kernel
+  neighbor-table state can't be baked into an image layer, so this has to
+  run at container start; the `ap` compose service already has the
+  `NET_ADMIN` capability this needs, added earlier for `netconfig.lua`).
+  One of the two fake hosts has no `/tmp/dhcp.leases` entry, to prove
+  `hostname` stays correctly optional rather than invented.
+- **Verified directly inside the built container** (bypassing the
+  browser-blocked controller UI step): ran `entrypoint.sh` then
+  `inform.build_json()` by hand inside `openuf-validation-ap` and decoded
+  the resulting JSON —
+  ```
+  port_table entries: 2
+    port_idx=1 is_uplink=true  mac_table_count=0
+    port_idx=2 is_uplink=false mac_table_count=2
+      mac=ca:fe:be:ef:00:01 ip=192.168.1.101 hostname=printer age=0 uptime=0
+      mac=ca:fe:be:ef:00:02 ip=192.168.1.102 hostname=nil    age=0 uptime=0
+  fw_caps: 16
+  ```
+  Confirms the uplink port correctly carries no wired clients, the
+  downstream port correctly reports both fake hosts (one with, one
+  without a hostname), and `fw_caps` is set — end to end through the real
+  `bridge`/ARP mocks, not just fixture-driven unit tests.
+- **Confirmed live against the running controller:** ran the environment's
+  first-run setup (Advanced Setup → Skip, per this doc's existing
+  guidance), set the Inform Host Override to the controller container's
+  own IP and a compliant Device SSH Authentication password (both required
+  by the controller's own validators — the override rejects a hostname,
+  and the password field enforces ≥12 characters), then pointed the AP's
+  `inform_url` at the controller (`syswrapper.sh set-inform
+  http://controller:8080/inform` — the compose service name, not the
+  stale `unifi` hostname `conf.lua`'s in-repo default still has) and ran
+  `lua announce.lua &` + `lua inform.lua`. L2 discovery → **Click to
+  Adopt** → controller log showed `Device[...] adoption - completed`. Once
+  adopted:
+  - **Clients list:** both `bridge-mock.sh` hosts appear, filterable under
+    **Connection → Wired (2)**, each showing **Connection: "U6 IW Port
+    2"** — the LAN port, never the uplink (port 1). One shows as
+    **"printer 00:01"** (hostname from `/tmp/dhcp.leases`); the other as
+    its bare MAC **"ca:fe:be:ef:00:02"** (no lease entry) — confirming
+    `hostname` is genuinely optional, not invented, on the real client
+    detail view too (IP `192.168.1.101`, Network `Default`, Hostname
+    `printer` all matched the fixture exactly).
+  - **Ports view** (`/manage/default/ports`) renders correctly: port 1
+    shown as the uplink (separate icon, no client), port 2 shown as
+    "Data" with the connected wired client listed directly on the port
+    row — this is the `fw_caps` bit `0x10` projection working, not just
+    client-list ingestion.
+  - Not separately re-verified live in this session: the wireless/wired
+    double-report exclusion (no `iw-mock.sh` stations were running
+    alongside this run) — already covered with high confidence by the
+    dedicated unit tests in `tests/test_inform_json.lua`.
+  - **The Ports view's Bps/Bytes chart itself was flat/empty** when checked
+    a couple of minutes after adoption. **Not a bug** — same explanation as
+    the CPU/mem and wireless "Traffic Activity" gaps earlier in this doc:
+    decompiling confirms `port_table[].rx_bytes`/`tx_bytes` is read by
+    `com.ubnt.service.system.QDcGUYAmLvJwylXw` (internally labeled
+    `"stat-processor"`, the same class that handles CPU/mem and per-client
+    wireless stats), which archives into the separate `unifi_stat`
+    database (`stat_5minutes`/`stat_hourly`/`stat_archive`) on its own
+    schedule rather than rendering live inform data directly. The earlier
+    Traffic Activity fix needed ~15 minutes / a few 5-minute buckets before
+    its graph populated — this session's check came nowhere close to that
+    window, so the flat line is expected, not evidence of a problem with
+    the counters themselves.
+  - **Wired hosts will never show per-client traffic**, by design, not as
+    a gap: `TtZhv` (the `mac_table`-entry consumer) only reads `mac`/`ip`/
+    `hostname`/`age`/`uptime` off each entry — there is no per-client
+    byte-counter field anywhere in the real wired-client wire protocol,
+    unlike wireless `sta_table` entries (which do carry `rx_bytes`/
+    `tx_bytes`). A wired client's traffic is attributed via its switch
+    port's own counters, not a separate per-MAC one.
+- **Code changes:** `openuf/sysinfo.lua` (`mac_table()`), `openuf/inform.lua`
+  (`port_table`/`fw_caps` in `build_json()`), both modelmaps (new
+  `cfg.net.ports`), `tests/test_sysinfo.lua` + `tests/test_inform_json.lua`
+  (new fixtures/cases), `tools/validation/ap/bridge-mock.sh` +
+  `entrypoint.sh` + `Dockerfile` changes.
+
+## 18. Per-port VLAN assignment — RESOLVED: missing `fw_caps` bit 0x100 (`hasOWRTSwitch`) (2026-07-13)
+
+- **Status:** ✅ fixed and confirmed live end-to-end (real controller UI → real per-port VLAN
+  assignment saved → real `switch.vlan.*` config pushed back to the device).
+- **Trigger:** user noticed the Ports view's "Native VLAN Assignment" always showed `1` on both
+  ports and asked whether per-port VLAN tagging is actually supported/editable.
+- **Finding 1 — it's a real, gated UI feature.** The device settings panel's IP Settings section
+  has a **"Port VLAN"** checkbox (the same one section 14 above found produced no observable
+  `system_cfg` change back on 2026-07-12 — that test predates this session's `port_table`/
+  `isSwitch()` work, which is what makes the controller treat this device as switch-capable at
+  all). Enabling it and applying now genuinely does something new: the next `setparam` carries a
+  brand-new **`switch.*`** UCI-style block in `system_cfg`, never previously seen in this
+  project's captures (`switch.status`, `switch.vlan.status`, `switch.vlan.N.id/mode/status`,
+  `switch.port.N.name/opmode` — one entry per the U6IW model's 5 physical ports, derived from the
+  model registry, not from whatever `port_table` openUF actually reports). openUF does not parse
+  or apply this `switch.*` block at all (`M._parse_wifi_system_cfg`/the `setparam` handler only
+  understand `aaa.*`/`wireless.*`/`radio.*` and `netconf.*`/`dhcpc.*`/`route.*`) — a new, wholly
+  separate config domain, out of scope for this fix (nothing depends on openUF consuming it; the
+  controller manages VLAN membership purely server-side and only needs the device to *accept*
+  the port_overrides push, which is what was actually broken).
+- **Finding 2 — actually assigning a non-default VLAN to a port was rejected outright.** With
+  "Port VLAN" enabled, each port's settings panel exposes a genuinely editable **"Native VLAN /
+  Network"** dropdown and **"Tagged VLAN Management"** (Allow All / Block All / Custom). Creating
+  a second network ("IOT", VLAN 20) and assigning it as port 2's Native VLAN failed before any
+  `system_cfg` was ever generated — the controller's REST layer rejected the request outright:
+  ```
+  PUT /api/s/default/rest/device/<id>  ->  400
+  {"meta":{"rc":"error","port_idx":2,"msg":"api.err.VlanTaggingUnsupportedByDevice"},"data":[]}
+  ```
+  Captured directly from the browser (`window.fetch` monkey-patch on the request/response, not
+  inferred from logs).
+- **Root cause — traced through a genuine extraction pitfall.** The obfuscated class names
+  `com.ubnt.service.aa.*` and `com.ubnt.service.aA.*` (and ~55 other single/double-letter package
+  pairs differing only by case) are **distinct real packages** in the jar, but macOS's
+  case-insensitive filesystem silently folded them into one directory on `unzip`, corrupting the
+  first extraction this session used and producing a misleading read of the wrong class's method
+  body. Re-extracted the jar inside a Linux container (`docker cp` the jar into
+  `linuxserver/unifi-network-application:10.4.57` itself, which already has a JVM, then
+  `unzip`+CFR entirely on its own case-sensitive filesystem) to get a trustworthy decompile. This
+  only affected this section's investigation — section 17's wired-client work relied on
+  `com.ubnt.data.*`/`com.ubnt.service.devmgr.*`, real English package names with no case-collision
+  risk, so nothing there needed re-verification.
+  With the corrected extraction, the actual throw site is
+  `com.ubnt.ace.api.e.VVyiC`'s private per-port validator (called only when
+  `Device.hasQCASwitch()` — `hasFirmwareCapability(16)` — is true, which openUF's `fw_caps`
+  already satisfied):
+  ```java
+  private void chgwykfBxZCAuEHPPQ(UCthhvfQNZ port, boolean hasOWRTSwitch, boolean hasSwitchVlanCap8) {
+      nwTNVfYOnNbEWSoCkPq.guoZiIiLhURleoJ(port).ifPresent(forwardMode -> {
+          if (!((forwardMode != ALL && forwardMode != CUSTOMIZE) || hasOWRTSwitch)) {
+              throw new QnvUxbsXyAJZ(VLAN_TAGGING_UNSUPPORTED, ...);
+          }
+          if (hasSwitchVlanCap8 && forwardMode NOT IN {CUSTOMIZE, NATIVE, DISABLED}) {
+              throw new QnvUxbsXyAJZ(VLAN_TAGGING_UNSUPPORTED, ...);
+          }
+      });
+  }
+  ```
+  called as `this.chgwykfBxZCAuEHPPQ(portOverrides, device.hasOWRTSwitch(), device.hasSwitchVlanCapability(8))`.
+  For a port with no explicit `forward` override (the default, "all" mode — true for every port
+  we'd ever send), the first branch collapses to `!hasOWRTSwitch()`: **if the device doesn't
+  declare `hasOWRTSwitch()`, every default-mode port is unconditionally rejected**, regardless of
+  `vlan_caps` or anything port-specific (confirmed by sweeping `switch_caps.vlan_caps` through
+  0/3/4/5/6/7/15/31/255 directly in Mongo — bit 4 present vs. absent only changed *which* of two
+  near-identical errors fired, never fixed the underlying rejection). `hasOWRTSwitch()` is exactly
+  `hasFirmwareCapability(256)` (bit `0x100`) — literally "OpenWrt switch" as opposed to a genuine
+  QCA hardware switch ASIC, which is thematically exactly what openUF is.
+- **Fix, confirmed two ways:**
+  1. Directly against the REST endpoint (bypassing the UI, via `curl` with a session cookie):
+     `fw_caps=0x10` → `VlanTaggingUnsupportedByDevice`; `fw_caps=0x10|0x100=0x110` → `{"rc":"ok"}`.
+  2. End-to-end for real: updated `openuf/inform.lua`'s `fw_caps` to `0x110`, deployed it into the
+     running `openuf-validation-ap` container, confirmed the controller's own device doc picked up
+     `fw_caps: 272` from a genuine inform (not a Mongo edit), then reassigned port 2's Native
+     VLAN to "IOT (20)" through the actual controller UI — saved with no error, and the next
+     inform's `system_cfg` carried a **second** VLAN block it had never sent before:
+     `switch.vlan.2.id=20`, `switch.vlan.2.mode=tagged`, `switch.vlan.2.status=enabled`.
+- **Code changes:** `openuf/inform.lua` (`fw_caps` now `0x110` — bit `0x10` `hasQCASwitch` +
+  bit `0x100` `hasOWRTSwitch`), `tests/test_inform_json.lua` (updated assertion). All 199 tests
+  pass.
+
+---
+
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)
 
 Goal: determine the AP→controller spectrum-scan-result reporting shape — the

@@ -352,6 +352,19 @@ function M.build_json(st, cfg, ufhw)
 
 	local mac_str = st.mac or "00:00:00:00:00:00"
 
+	-- Wireless station MACs, collected below while building vap_table --
+	-- subtracted from port_table's mac_table entries further down so a
+	-- wireless client bridged into br-lan (and thus also visible in the
+	-- bridge FDB) is never double-reported as a wired client too.
+	local station_macs = {}
+	-- The device's own MACs (its netdevs) -- excluded from port_table's
+	-- mac_table for the same reason: without this, the AP would report
+	-- itself as a wired client of its own switch.
+	local self_macs = {[mac_str] = true}
+	for _, iface in ipairs(ifaces) do
+		if iface.mac and iface.mac ~= "" then self_macs[iface.mac] = true end
+	end
+
 	-- ufuci: VAP/radio info (require("uci") calls inside it can legitimately
 	-- fail off-target, so individual calls are still pcall-wrapped below)
 	local ufuci = M._ucihelper
@@ -432,6 +445,7 @@ function M.build_json(st, cfg, ufhw)
 			local vap_tx_retries, vap_tx_dropped = 0, 0
 			local sta_table = {}
 			for _, sta in ipairs(stas) do
+				station_macs[sta.mac] = true
 				vap_rx_bytes    = vap_rx_bytes    + (sta.rx_bytes or 0)
 				vap_tx_bytes    = vap_tx_bytes    + (sta.tx_bytes or 0)
 				vap_rx_packets  = vap_rx_packets  + (sta.rx_packets or 0)
@@ -547,6 +561,69 @@ function M.build_json(st, cfg, ufhw)
 		end
 	end
 
+	-- port_table: the device's own ethernet ports plus, per non-uplink port,
+	-- the wired hosts learned behind it. Confirmed via decompiled
+	-- controller 10.4.57 (com.ubnt.service.devmgr.PGOcbDWlbnYQdFW /
+	-- DyonYyyYJkiyv / TtZhv, see PROTOCOL-VALIDATION.md) that this is only
+	-- processed at all when Device.isSwitch() is true for the reported
+	-- model -- which it is for U6IW (registered in the controller's model
+	-- registry with 5 ports and a switch feature flag), so this is not
+	-- optional for that model: an empty/missing port_table means zero
+	-- wired clients can ever appear, and the device's Ports view stays
+	-- empty, regardless of what's actually bridged into br-lan.
+	local ports = (cfg and cfg.net and cfg.net.ports) or {
+		{idx = 1, ifname = (cfg and cfg.net and cfg.net.wan_cpueth) or "eth0", uplink = true},
+		{idx = 2, ifname = (cfg and cfg.net and cfg.net.lan_cpueth) or "eth1"},
+	}
+	local iface_by_name = {}
+	for _, iface in ipairs(ifaces) do iface_by_name[iface.name] = iface end
+	local port_table = {}
+	for _, p in ipairs(ports) do
+		local iface = iface_by_name[p.ifname]
+		local entry = {
+			port_idx    = p.idx,
+			name        = "Port " .. tostring(p.idx),
+			media       = "GE",
+			up          = iface ~= nil,
+			enable      = true,
+			speed       = 1000,
+			full_duplex = true,
+			is_uplink   = p.uplink or false,
+			speed_caps  = 0,
+			port_poe    = false,
+			poe_caps    = 0,
+			rx_bytes    = iface and iface.rx_bytes   or 0,
+			tx_bytes    = iface and iface.tx_bytes   or 0,
+			rx_packets  = iface and iface.rx_packets or 0,
+			tx_packets  = iface and iface.tx_packets or 0,
+			rx_errors   = iface and iface.rx_errors  or 0,
+			tx_errors   = iface and iface.tx_errors  or 0,
+		}
+		-- Wired clients are only reported on downstream (non-uplink) ports --
+		-- the controller itself skips client creation on ports flagged
+		-- is_uplink, since that port faces the controller's own network, not
+		-- an end host.
+		if not entry.is_uplink then
+			local mac_table = {}
+			local ok_mt, hosts = pcall(M._sysinfo.mac_table, p.ifname)
+			if ok_mt then
+				for _, host in ipairs(hosts) do
+					if not self_macs[host.mac] and not station_macs[host.mac] then
+						mac_table[#mac_table + 1] = {
+							mac      = host.mac,
+							ip       = host.ip,
+							hostname = host.hostname,
+							age      = host.age,
+							uptime   = host.uptime,
+						}
+					end
+				end
+			end
+			entry.mac_table = mac_table
+		end
+		port_table[#port_table + 1] = entry
+	end
+
 	-- lldp_table (field names confirmed against the real controller's OXMua
 	-- DTO -- see PROTOCOL-VALIDATION.md "Stage 2c")
 	local lldp_table = {}
@@ -602,6 +679,29 @@ function M.build_json(st, cfg, ufhw)
 		country_code     = st.country_code or 840,
 		mem_total        = meminfo.total_kb * 1024,
 		mem_used         = (meminfo.total_kb - meminfo.free_kb) * 1024,
+		-- Bit 0x10 (16): Device.hasQCASwitch() in the decompiled controller
+		-- is exactly hasFirmwareCapability(16), and PGOcbDWlbnYQdFW gates the
+		-- Ports view's projection of port_table into the device DTO on it.
+		-- Wired-client ingestion itself is gated only on isSwitch() (a
+		-- model-registry property, not this bit), so wired clients can
+		-- appear without this -- but the Ports view needs it.
+		-- Bit 0x100 (256): Device.hasOWRTSwitch() -- exactly
+		-- hasFirmwareCapability(256), literally "OpenWrt switch" as opposed
+		-- to a genuine QCA hardware switch ASIC (fitting, since that's
+		-- exactly what this is). Without it, the REST API's per-port VLAN
+		-- validator (com.ubnt.ace.api.e.VVyiC, only reachable once
+		-- hasQCASwitch() above is true) unconditionally rejects any port
+		-- whose forward mode resolves to the default "all" -- i.e. every
+		-- port that has never had `forward` explicitly set -- with
+		-- api.err.VlanTaggingUnsupportedByDevice, before ever touching
+		-- vlan_caps or anything port-specific. Confirmed live: assigning a
+		-- port's Native VLAN/Network failed with exactly that error at
+		-- fw_caps=0x10, and succeeded once this bit was added (0x110) --
+		-- reproduced directly against the REST endpoint, bypassing the UI,
+		-- to rule out unrelated causes. See PROTOCOL-VALIDATION.md section 18
+		-- for the full derivation (traced through an obfuscation-induced
+		-- macOS case-folding extraction bug along the way).
+		fw_caps          = 0x110,
 		-- Device-level (not per-radio -- see radio_table_stats above)
 		spectrum_scanning       = false,
 		spectrum_scan_timestamp = spectrum_scan_timestamp,
@@ -620,6 +720,7 @@ function M.build_json(st, cfg, ufhw)
 		radio_table      = radio_table,
 		radio_table_stats = radio_table_stats,
 		vap_table        = vap_table,
+		port_table       = port_table,
 		lldp_table       = lldp_table,
 	}
 

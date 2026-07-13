@@ -16,7 +16,8 @@ openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi
 | L3 inform (`set-inform` before adoption) | Sends informs and appears Pending, but adoption does not complete against a real controller (see [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md)) — use L2 adoption |
 | Controller-pushed SSID provisioning | ✅ Working (UCI) |
 | VLAN-tagged SSIDs (`network_table` join) | ✅ Working — field shapes unverified against a live capture |
-| Client & radio statistics in payload | ✅ Working (`user_table`, `num_sta`, `radio_table_stats`) |
+| Wireless client & radio statistics in payload | ✅ Working (`vap_table[].sta_table`, `num_sta`, `radio_table_stats`) |
+| Wired client statistics (`port_table[].mac_table`) | ✅ Working — U6-InWall's downstream switch ports report bridge-learned hosts as `is_wired` clients |
 | Locate (LED identify) | ✅ Working — requires `dev.conf.led` sysfs path set per board |
 | RF/spectrum scan | Best-effort trigger only — result-reporting wire format unconfirmed |
 | Firmware upgrade requests | Stored (version/url), never applied — flashing controller-supplied firmware onto non-Ubiquiti hardware would brick it |

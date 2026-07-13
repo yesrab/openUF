@@ -234,4 +234,90 @@ function M.sta_table(ifname)
 	return clients
 end
 
+-- First-seen timestamps for wired hosts, keyed by "ifname mac" -- used to
+-- derive `uptime` in M.mac_table() the same way sta_table's connected_sec
+-- comes from iw (which has no equivalent concept for a bridge-learned MAC).
+-- Injectable/resettable by tests, same pattern as M._prev_cpu above.
+M._mac_first_seen = {}
+M._time = os.time
+
+-- Returns a table of wired hosts learned on ifname's bridge port, by
+-- combining three sources also present on a real OpenWrt AP:
+--   `bridge fdb show dev <ifname>` -- authoritative MAC<->port mapping.
+--   `/proc/net/arp`                -- MAC -> IP.
+--   `/tmp/dhcp.leases`             -- MAC -> hostname (only present when this
+--                                    device is also the DHCP server; an AP
+--                                    usually is not, so hostname is optional).
+-- Each entry: {mac, ip, hostname, age, uptime}
+--
+-- Only dynamically-learned entries on this exact ifname are host candidates:
+-- lines containing "self" are the interface's own local addresses, and
+-- "permanent" entries are statically configured (this is also how bridge
+-- reports multicast/broadcast group addresses) -- neither is a real client.
+-- A multicast-bit check on the MAC's first octet is kept as a second filter
+-- in case a caller's mocked/real bridge output ever omits those markers.
+function M.mac_table(ifname)
+	if not ifname then return {} end
+	local fdb_out = M._run_cmd("bridge fdb show dev " .. ifname)
+	local macs = {}
+	for line in fdb_out:gmatch("[^\n]+") do
+		if not line:find("self") and not line:find("permanent") and line:find("master") then
+			local mac = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+			if mac then
+				local first_octet = tonumber(mac:sub(1, 2), 16)
+				if first_octet and first_octet % 2 == 0 then
+					macs[#macs + 1] = mac
+				end
+			end
+		end
+	end
+	if #macs == 0 then return {} end
+
+	-- MAC -> IP from /proc/net/arp (skip the header line)
+	local ip_by_mac = {}
+	local arp_out = M._read_file("/proc/net/arp")
+	if arp_out then
+		for line in arp_out:gmatch("[^\n]+") do
+			local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+			if ip and mac then ip_by_mac[mac:lower()] = ip end
+		end
+	end
+
+	-- MAC -> hostname from dnsmasq's lease file, when this device runs the
+	-- DHCP server (format: "<expiry> <mac> <ip> <hostname> <client-id>").
+	local hostname_by_mac = {}
+	local leases_out = M._read_file("/tmp/dhcp.leases")
+	if leases_out then
+		for line in leases_out:gmatch("[^\n]+") do
+			local mac, hostname = line:match("^%d+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+%S+%s+(%S+)")
+			if mac and hostname and hostname ~= "*" then
+				hostname_by_mac[mac:lower()] = hostname
+			end
+		end
+	end
+
+	local now = M._time()
+	local hosts = {}
+	for _, mac in ipairs(macs) do
+		local key = ifname .. " " .. mac
+		local first_seen = M._mac_first_seen[key]
+		if not first_seen then
+			first_seen = now
+			M._mac_first_seen[key] = now
+		end
+		hosts[#hosts + 1] = {
+			mac      = mac,
+			ip       = ip_by_mac[mac:lower()],
+			hostname = hostname_by_mac[mac:lower()],
+			-- age: seconds since last observed on this fdb -- 0 since this
+			-- call just observed it fresh (matches TtZhv's use of `age` to
+			-- pick the more-recently-seen of two ports reporting the same
+			-- client, favoring whichever port's dump is being processed).
+			age      = 0,
+			uptime   = math.floor(now - first_seen),
+		}
+	end
+	return hosts
+end
+
 return M

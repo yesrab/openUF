@@ -19,12 +19,16 @@ end
 -- (inform.lua loads its own sysinfo instance; M._sysinfo is that instance)
 -- with_clients: when true, sta_table()/radio_stats() return real fixture data
 -- (2 connected clients, one in-use channel survey entry) instead of empty.
-local function inject_sysinfo(with_clients)
+-- with_wired: when true, mac_table()'s bridge fdb/arp/dhcp-lease sources
+-- return real fixture data (2 wired hosts) instead of empty.
+local function inject_sysinfo(with_clients, with_wired)
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end
 		if path:find("loadavg") then return fixture("proc_loadavg.txt") end
 		if path:find("meminfo") then return fixture("proc_meminfo.txt") end
 		if path:find("net/dev") then return fixture("proc_net_dev.txt") end
+		if with_wired and path:find("net/arp")     then return fixture("proc_net_arp.txt") end
+		if with_wired and path:find("dhcp.leases") then return fixture("dhcp_leases.txt")  end
 		return ""
 	end
 	inform._sysinfo._run_cmd = function(cmd)
@@ -33,6 +37,9 @@ local function inject_sysinfo(with_clients)
 		end
 		if with_clients and cmd:find("survey dump") then
 			return fixture("iw_survey_dump.txt")
+		end
+		if with_wired and cmd:find("bridge fdb show") then
+			return fixture("bridge_fdb_dump.txt")
 		end
 		return ""
 	end
@@ -79,7 +86,7 @@ local ufhw = {
 }
 
 local function build(opts)
-	inject_sysinfo(opts and opts.with_clients)
+	inject_sysinfo(opts and opts.with_clients, opts and opts.with_wired)
 	if opts and opts.with_uci then inject_ucihelper() end
 	local st = {
 		authkey    = state.DEFAULT_KEY,
@@ -465,6 +472,128 @@ return {
 			local d = build({with_uci = true})
 			assert_eq(d.radio_table[1].builtin_ant_gain, 3, "builtin_ant_gain")
 			assert_eq(d.radio_table[1].max_txpower, 20, "max_txpower")
+		end
+	},
+	{
+		name = "inform json: fw_caps sets the QCA-switch and OWRT-switch bits (0x110)",
+		fn = function()
+			-- Confirmed via decompiled controller 10.4.57: Device.hasQCASwitch()
+			-- is hasFirmwareCapability(16) (gates the Ports view's projection
+			-- of port_table), and Device.hasOWRTSwitch() is
+			-- hasFirmwareCapability(256) (without it, the REST API's per-port
+			-- VLAN validator rejects any port assignment with
+			-- api.err.VlanTaggingUnsupportedByDevice -- see PROTOCOL-VALIDATION.md
+			-- section 18).
+			local d = build()
+			assert_eq(d.fw_caps, 0x110, "fw_caps bits 0x10 | 0x100 set")
+		end
+	},
+	{
+		name = "inform json: port_table has one entry per configured port, 1-based port_idx",
+		fn = function()
+			-- No cfg passed (build() always calls build_json with cfg=nil), so
+			-- port_table falls back to the default {uplink=eth0, lan=eth1} --
+			-- matching proc_net_dev.txt's interfaces.
+			local d = build()
+			assert_not_nil(d.port_table, "port_table present")
+			assert_eq(#d.port_table, 2, "two ports (uplink + lan) from the fallback default")
+			assert_eq(d.port_table[1].port_idx, 1, "first port_idx is 1-based")
+			assert_eq(d.port_table[2].port_idx, 2, "second port_idx")
+		end
+	},
+	{
+		name = "inform json: port_table marks exactly the uplink port is_uplink",
+		fn = function()
+			local d = build()
+			assert_true(d.port_table[1].is_uplink, "port 1 (wan/eth0) is the uplink")
+			assert_false(d.port_table[2].is_uplink, "port 2 (lan/eth1) is not the uplink")
+		end
+	},
+	{
+		name = "inform json: port_table's uplink port carries no mac_table",
+		fn = function()
+			local d = build({with_wired = true})
+			local uplink = d.port_table[1]
+			assert_true(uplink.mac_table == nil or #uplink.mac_table == 0,
+				"uplink port never reports wired clients -- the controller skips client creation on it")
+		end
+	},
+	{
+		name = "inform json: port_table's downstream port reports wired hosts from the bridge fdb",
+		fn = function()
+			local d = build({with_wired = true})
+			local lan = d.port_table[2]
+			assert_not_nil(lan.mac_table, "lan port has a mac_table")
+			assert_eq(#lan.mac_table, 2, "two wired hosts from the fixture")
+			assert_eq(lan.mac_table[1].mac, "aa:bb:cc:dd:ee:01", "first wired host mac")
+			assert_eq(lan.mac_table[1].ip, "192.168.1.50", "first wired host ip from arp")
+			assert_eq(lan.mac_table[1].hostname, "laptop", "first wired host hostname from dhcp leases")
+			assert_eq(lan.mac_table[2].mac, "aa:bb:cc:dd:ee:02", "second wired host mac")
+			assert_true(lan.mac_table[2].hostname == nil, "second wired host has no dhcp lease -- hostname stays nil")
+		end
+	},
+	{
+		name = "inform json: port_table's downstream port is empty without wired-client fixtures",
+		fn = function()
+			local d = build()
+			assert_eq(#d.port_table[2].mac_table, 0, "no wired hosts without fixtures")
+		end
+	},
+	{
+		name = "inform json: a wireless station is never double-reported as a wired client",
+		fn = function()
+			-- One of the bridge-fdb-learned MACs coincides with a currently
+			-- associated wireless station -- this must be excluded from
+			-- port_table's mac_table even though it's also bridged into
+			-- br-lan (and thus visible in the bridge FDB), or the same client
+			-- would appear twice: once correctly as wireless, once wrongly
+			-- as wired.
+			inject_sysinfo(false, true)
+			inject_ucihelper()
+			inform._sysinfo._run_cmd = function(cmd)
+				if cmd:find("station dump") then
+					return "Station aa:bb:cc:dd:ee:01 (on wlan0)\n" ..
+						"\tsignal:  \t-60 dBm\n\ttx bitrate:\t144.4 MBit/s\n"
+				end
+				if cmd:find("bridge fdb show") then
+					return fixture("bridge_fdb_dump.txt")
+				end
+				return ""
+			end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			assert_eq(d.vap_table[1].num_sta, 1, "the station is reported wirelessly")
+			local wired_macs = {}
+			for _, host in ipairs(d.port_table[2].mac_table) do wired_macs[host.mac] = true end
+			assert_true(not wired_macs["aa:bb:cc:dd:ee:01"],
+				"the same MAC is excluded from the wired mac_table -- reported wireless-only")
+			assert_true(wired_macs["aa:bb:cc:dd:ee:02"],
+				"an unrelated bridge-learned host is still reported as wired")
+		end
+	},
+	{
+		name = "inform json: the device's own MAC is never reported as a wired client of itself",
+		fn = function()
+			-- proc_net_dev.txt's eth1 has a real MAC in /sys/class/net/eth1/address
+			-- via inject_sysinfo's _read_file stub returning "" for that path
+			-- (no MAC) -- so self-exclusion here is driven by st.mac matching
+			-- one of bridge_fdb_dump.txt's fixture MACs directly.
+			inject_sysinfo(false, true)
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform",
+				mac = "aa:bb:cc:dd:ee:01",  -- coincides with a bridge_fdb_dump.txt MAC
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			local wired_macs = {}
+			for _, host in ipairs(d.port_table[2].mac_table) do wired_macs[host.mac] = true end
+			assert_true(not wired_macs["aa:bb:cc:dd:ee:01"], "device's own MAC excluded from its own mac_table")
+			assert_true(wired_macs["aa:bb:cc:dd:ee:02"], "the other bridge-learned host is still reported")
 		end
 	},
 }
