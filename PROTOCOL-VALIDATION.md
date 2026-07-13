@@ -2213,6 +2213,74 @@ prefixed behavior as correct).
   bit `0x100` `hasOWRTSwitch`), `tests/test_inform_json.lua` (updated assertion). All 199 tests
   pass.
 
+## 19. Client block/unblock — implemented and verified live (2026-07-13/14)
+
+- **Status:** ✅ implemented, unit-tested, and confirmed live end-to-end (real controller UI →
+  real wire `cmd` → real persisted state → real kernel-level nftables enforcement, surviving a
+  simulated restart).
+- **Wire format, captured directly (not inferred):** both Block and Unblock (device Settings tab
+  → Quick Actions area, works for both wireless and wired clients) send a one-shot inform-response
+  `cmd`, not a persistent field on every inform:
+  ```
+  {"_type":"cmd","cmd":"block-sta","mac":"ca:fe:be:ef:00:02", ...}
+  {"_type":"cmd","cmd":"unblock-sta","mac":"ca:fe:be:ef:00:02", ...}
+  ```
+  A candidate persistent field (`include_blocks`, present on every `noop`/`state` response) was
+  checked and ruled out — it stayed `[]` even while a client was genuinely blocked, so it isn't the
+  real mechanism. The device itself is expected to remember the block after the one-shot command,
+  the same way real hardware would.
+- **"Remove" sends no wire command at all.** Confirmed by watching the inform log across the
+  whole action — nothing but `noop`. It's pure controller-side bookkeeping (deletes the Mongo
+  client record); a still-physically-present client reappears on the very next inform, since
+  nothing tells the device to stop reporting a MAC it's still genuinely seeing. No code change
+  needed or possible here.
+- **Implementation:**
+  - `openuf/firewall.lua` (new) — nftables-based enforcement, in a dedicated `bridge openuf` table
+    so it can't collide with (or be wiped by) OpenWrt's own fw4-managed tables. A single dynamic
+    set (`blocked_macs`, `type ether_addr`) holds every blocked MAC; two static rules
+    (`ether saddr/daddr @blocked_macs drop`) reference the set once and never change — blocking/
+    unblocking is then just `nft add|delete element`, never touching the rules themselves.
+    `M.reconcile(blocked_macs)` rebuilds the whole table from scratch (delete + recreate) rather
+    than diffing, mirroring `netconfig.lua`'s existing flush-then-reapply precedent for the same
+    reason: simpler and self-healing regardless of prior state. `M.deauth(mac, ifnames)` issues
+    `hostapd_cli -i <ifname> deauthenticate <mac>` per configured radio, best-effort, to
+    immediately kick an already-associated station (the nft rule alone only stops *future*
+    traffic).
+  - `openuf/state.lua` — new persisted `blocked_stas` field (array of MAC strings). Like
+    `netconfig.lua`'s live `ip addr`/`ip route` state, nft rules are kernel-only and don't survive
+    a restart on their own, so the persisted list is what actually survives — `M.reconcile` is
+    called with it at `M.run()` startup, in the `setdefault` (factory reset) handler, and in
+    `_reload_if_changed` (out-of-band state.json edits), so every path that (re)establishes the
+    device's live state also re-establishes its enforcement to match.
+  - `openuf/inform.lua`'s `cmd` dispatch — new `block-sta`/`unblock-sta` branch: updates
+    `st.blocked_stas` (deduped), persists it, calls `M._firewall.reconcile`, and — for
+    `block-sta` only — resolves every configured radio's live ifname via the existing
+    `ucihelper.get_radio_table`/`get_ifname_for_radio` (same pattern the `spectrum-scan` cmd
+    handler already uses) and calls `M._firewall.deauth`.
+- **Verified live, twice:**
+  1. Blocked a fake wired client through the real controller UI. Confirmed all of: the wire `cmd`
+     arrived (`{"cmd":"block-sta","mac":"ca:fe:be:ef:00:02",...}`), `state.json` persisted
+     `"blocked_stas":["ca:fe:be:ef:00:02"]`, and the *live kernel nftables ruleset* inside the
+     validation AP container showed the MAC as a real set element
+     (`nft list table bridge openuf` → `elements = { ca:fe:be:ef:00:02 }`) — genuine enforcement,
+     not just a state-file flag. Unblocking through the UI removed it from both the persisted
+     state and the live nft set.
+  2. **Restart survival**: with the client still blocked, killed `inform.lua`, manually deleted
+     the `bridge openuf` nft table (simulating a reboot losing all kernel-only firewall state),
+     and restarted `inform.lua` fresh — with no new `cmd` from the controller at all, the block
+     was re-established purely from `state.json`, confirming the reconcile-at-startup path
+     actually works, not just the cmd-time path.
+- **Environment:** `nftables` and `hostapd` added to `tools/validation/ap/Dockerfile` (both
+  previously absent — installed and verified working, `nft` included, inside the already-present
+  `NET_ADMIN` capability added earlier for `netconfig.lua`). `hostapd_cli` itself has nothing to
+  actually talk to in this hardware-less container (no real hostapd process, since there's no real
+  wireless hardware) — the deauth call is exercised and asserted via unit tests (captured command
+  string, right MAC, right interface), not live, for that specific piece.
+- **Code changes:** `openuf/firewall.lua` (new), `openuf/state.lua` (`blocked_stas`),
+  `openuf/inform.lua` (`cmd` dispatch + reconcile-at-startup/setdefault/reload),
+  `tests/test_firewall.lua` (new), `tests/test_inform_packet.lua` (new block-sta/unblock-sta
+  cases), `tools/validation/ap/Dockerfile` (`nftables`, `hostapd`). All 203 tests pass.
+
 ---
 
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)

@@ -31,7 +31,7 @@ FROM alpine:3.20
 
 RUN apk add --no-cache \
         lua5.1 lua5.1-cjson lua5.1-socket lua5.1-bitop \
-        openssh openssl iw iproute2 \
+        openssh openssl iw iproute2 nftables hostapd \
     && ln -sf /usr/bin/lua5.1 /usr/bin/lua \
     && apk add --no-cache --virtual .build-deps \
         luarocks5.1 lua5.1-dev openssl-dev gcc musl-dev make \

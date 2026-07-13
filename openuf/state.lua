@@ -4,7 +4,8 @@
 	Reads and writes /etc/openuf/state.json (configurable via M._state_file).
 	Fields: authkey (32-char hex), adopted (bool), cfgversion (string),
 	        inform_url (string), use_gcm (bool), upgrade_requested_version
-	        (string), upgrade_requested_url (string).
+	        (string), upgrade_requested_url (string), blocked_stas
+	        (array of MAC strings).
 
 	Security invariant: if adopted == false, authkey is always reset to the
 	default key on load, regardless of what the file contains. This prevents a
@@ -30,6 +31,7 @@ local function defaults()
 		use_gcm                  = false,
 		upgrade_requested_version = "",
 		upgrade_requested_url     = "",
+		blocked_stas             = {},
 	}
 end
 
@@ -59,6 +61,9 @@ function M.load()
 	end
 	if type(tbl.upgrade_requested_url) == "string" then
 		st.upgrade_requested_url = tbl.upgrade_requested_url
+	end
+	if type(tbl.blocked_stas) == "table" then
+		st.blocked_stas = tbl.blocked_stas
 	end
 
 	-- Security invariant: never use a custom key when not adopted

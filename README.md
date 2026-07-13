@@ -18,6 +18,7 @@ openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi
 | VLAN-tagged SSIDs (`network_table` join) | ✅ Working — field shapes unverified against a live capture |
 | Wireless client & radio statistics in payload | ✅ Working (`vap_table[].sta_table`, `num_sta`, `radio_table_stats`) |
 | Wired client statistics (`port_table[].mac_table`) | ✅ Working — U6-InWall's downstream switch ports report bridge-learned hosts as `is_wired` clients |
+| Client block/unblock | ✅ Working — enforced via nftables (`block-sta`/`unblock-sta` cmd), persists across restarts |
 | Locate (LED identify) | ✅ Working — requires `dev.conf.led` sysfs path set per board |
 | RF/spectrum scan | Best-effort trigger only — result-reporting wire format unconfirmed |
 | Firmware upgrade requests | Stored (version/url), never applied — flashing controller-supplied firmware onto non-Ubiquiti hardware would brick it |

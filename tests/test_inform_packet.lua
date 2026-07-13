@@ -11,6 +11,13 @@ local inform = dofile("openuf/inform.lua")
 -- Redirect state file to /tmp so handle_response tests don't need /etc/openuf
 inform._state._state_file = "/tmp/openuf_test_inform.json"
 
+-- Stub firewall by default so tests don't shell out to real nft/hostapd_cli;
+-- individual block-sta/unblock-sta tests below override this to capture calls.
+inform._firewall = {
+	reconcile = function() end,
+	deauth = function() end,
+}
+
 -- Deterministic IV for reproducible packets
 local FIXED_IV = string.rep("\0", 16)
 crypto._random_bytes = function(n) return string.rep("\0", n) end
@@ -543,6 +550,79 @@ return {
 			local result = inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st)
 			assert_false(st.locating, "locating false after unset-locate")
 			assert_true(result, "re-inform immediately after executing a command")
+		end
+	},
+	{
+		name = "inform packet: handle_response cmd block-sta adds the MAC, persists, reconciles, and deauths",
+		fn = function()
+			local st = sample_state()
+			local reconciled, deauthed
+			inform._firewall = {
+				reconcile = function(macs) reconciled = macs end,
+				deauth = function(mac, ifnames) deauthed = {mac = mac, ifnames = ifnames} end,
+			}
+			inform._ucihelper = {
+				get_radio_table = function() return {{name = "radio0"}, {name = "radio1"}} end,
+				get_ifname_for_radio = function(name)
+					if name == "radio0" then return "wlan0" end
+					if name == "radio1" then return "wlan1" end
+					return nil
+				end,
+			}
+			local result = inform.handle_response(
+				'{"_type":"cmd","cmd":"block-sta","mac":"aa:bb:cc:dd:ee:01"}', st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			inform._ucihelper = nil
+			assert_eq(#st.blocked_stas, 1, "one MAC persisted")
+			assert_eq(st.blocked_stas[1], "aa:bb:cc:dd:ee:01", "correct MAC persisted")
+			assert_eq(#reconciled, 1, "reconcile called with the updated list")
+			assert_eq(reconciled[1], "aa:bb:cc:dd:ee:01", "reconcile sees the newly blocked MAC")
+			assert_eq(deauthed.mac, "aa:bb:cc:dd:ee:01", "deauth targets the blocked MAC")
+			assert_eq(#deauthed.ifnames, 2, "deauth issued across every configured radio")
+			assert_true(result, "re-inform immediately after executing a command")
+		end
+	},
+	{
+		name = "inform packet: handle_response cmd block-sta is idempotent for an already-blocked MAC",
+		fn = function()
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01"}})
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			inform.handle_response('{"_type":"cmd","cmd":"block-sta","mac":"aa:bb:cc:dd:ee:01"}', st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			assert_eq(#st.blocked_stas, 1, "MAC not duplicated")
+		end
+	},
+	{
+		name = "inform packet: handle_response cmd unblock-sta removes the MAC and reconciles",
+		fn = function()
+			local st = sample_state({blocked_stas = {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}})
+			local reconciled
+			inform._firewall = {
+				reconcile = function(macs) reconciled = macs end,
+				deauth = function() end,
+			}
+			local result = inform.handle_response(
+				'{"_type":"cmd","cmd":"unblock-sta","mac":"aa:bb:cc:dd:ee:01"}', st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			assert_eq(#st.blocked_stas, 1, "one MAC remains")
+			assert_eq(st.blocked_stas[1], "aa:bb:cc:dd:ee:02", "the other MAC is untouched")
+			assert_eq(#reconciled, 1, "reconcile called with the updated (shorter) list")
+			assert_true(result, "re-inform immediately after executing a command")
+		end
+	},
+	{
+		name = "inform packet: handle_response cmd block-sta without a mac field is a safe no-op",
+		fn = function()
+			local st = sample_state()
+			local called = false
+			inform._firewall = {
+				reconcile = function() called = true end,
+				deauth = function() called = true end,
+			}
+			inform.handle_response('{"_type":"cmd","cmd":"block-sta"}', st)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			assert_true(st.blocked_stas == nil, "state untouched without a mac field in the command")
+			assert_false(called, "firewall not touched without a mac field")
 		end
 	},
 	{

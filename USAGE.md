@@ -8,7 +8,7 @@ OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
 
 ```sh
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util
+apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftables
 ```
 
 | Package | Purpose |
@@ -21,6 +21,11 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util
 | `iw` | Radio and station statistics |
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-CBC fallback if `lua-openssl` is unavailable |
+| `nftables` | Client block/unblock enforcement (`openuf/firewall.lua`) |
+
+`hostapd_cli` (used to immediately deauthenticate a just-blocked wireless client)
+is not a separate dependency — any device running a wireless AP already has
+`hostapd` providing it.
 
 There is no Lua zlib binding in the OpenWrt 25.12 feeds. openUF therefore sends
 inform payloads uncompressed and decompresses zlib-compressed controller

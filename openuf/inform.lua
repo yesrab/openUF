@@ -56,6 +56,7 @@ local lldp      = _require_sibling("lldp")
 local ucihelper = _require_sibling("ucihelper")
 local led       = _require_sibling("led")
 local netconfig = _require_sibling("netconfig")
+local firewall  = _require_sibling("firewall")
 
 local M = {}
 
@@ -66,6 +67,7 @@ M._ucihelper = ucihelper
 M._lldp      = lldp
 M._led       = led
 M._netconfig = netconfig
+M._firewall  = firewall
 
 -- In-memory only (not persisted to state.json): per-radio spectrum-scan
 -- results, keyed by radio name. Ephemeral live data, same category as
@@ -968,6 +970,7 @@ function M.handle_response(json_str, st, cfg)
 		for k, v in pairs(fresh) do st[k] = v end
 		st.mac, st.ip, st.hostname = mac, ip, hostname
 		M._sync_bootstrap_account(false, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
+		M._firewall.reconcile(st.blocked_stas)
 		return false
 	end
 
@@ -1000,6 +1003,52 @@ function M.handle_response(json_str, st, cfg)
 			else M._led.locate_stop(led_path) end
 			st.locating = (cmd == "set-locate")
 			M._state.save(st)
+		elseif cmd == "block-sta" or cmd == "unblock-sta" then
+			-- One-shot command, confirmed live: block/unblock never appears
+			-- as a persistent field on any inform response (a candidate
+			-- top-level `include_blocks` list stays empty even while a
+			-- client is genuinely blocked) -- the device itself is expected
+			-- to remember the block, the same way real hardware would.
+			-- Persisted in state.blocked_stas and re-applied at M.run()
+			-- startup (M._firewall.reconcile), so it survives a restart.
+			local mac = resp.mac
+			if type(mac) == "string" then
+				st.blocked_stas = st.blocked_stas or {}
+				if cmd == "block-sta" then
+					local already = false
+					for _, m in ipairs(st.blocked_stas) do
+						if m == mac then already = true break end
+					end
+					if not already then
+						st.blocked_stas[#st.blocked_stas + 1] = mac
+					end
+				else
+					local kept = {}
+					for _, m in ipairs(st.blocked_stas) do
+						if m ~= mac then kept[#kept + 1] = m end
+					end
+					st.blocked_stas = kept
+				end
+				M._state.save(st)
+				M._firewall.reconcile(st.blocked_stas)
+				if cmd == "block-sta" then
+					-- Kick it immediately if it's currently associated --
+					-- the nft drop rule alone stops future traffic, but
+					-- doesn't tear down an existing association.
+					local ufuci = M._ucihelper
+					if ufuci and ufuci.get_radio_table then
+						local ok_r, radios = pcall(ufuci.get_radio_table)
+						if ok_r then
+							local ifnames = {}
+							for _, radio in ipairs(radios) do
+								local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+								if ok_if and ifname then ifnames[#ifnames + 1] = ifname end
+							end
+							M._firewall.deauth(mac, ifnames)
+						end
+					end
+				end
+			end
 		elseif cmd == "spectrum-scan" then
 			-- Trigger a scan per radio (sweeps every channel), then read back
 			-- per-channel survey data and build a spectrum_table entry per
@@ -1239,6 +1288,7 @@ function M._reload_if_changed(st, cfg, last_mtime)
 	for k, v in pairs(fresh) do st[k] = v end
 	st.mac, st.ip, st.hostname = mac, ip, hostname
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
+	M._firewall.reconcile(st.blocked_stas)
 	return mtime
 end
 
@@ -1248,6 +1298,10 @@ function M.run(cfg, ufhw)
 	local st = state.load()
 	M._populate_net_info(st, cfg)
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
+	-- Blocked-client nft rules are live kernel state, not persisted UCI --
+	-- reapply from state.json on every fresh start (mirrors the bootstrap
+	-- account reconciliation just above).
+	M._firewall.reconcile(st.blocked_stas)
 
 	local socket   = require("socket")
 	local interval = 10
