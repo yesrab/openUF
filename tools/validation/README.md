@@ -125,12 +125,78 @@ item" at the end of PROTOCOL-VALIDATION.md's L2 section. This doesn't block
 capturing responses via `debug_dump_file` for the matrix above, since the
 controller keeps actively pushing `setparam` every cycle regardless.
 
-## 6. Tear down / reset
+## 6. Device-to-device config clone ("Set Replacement Device" / "Load Configuration")
+
+The controller's device settings (**Manage** section) can copy one device's
+configuration to another — useful for spinning up a freshly-reset AP that inherits
+an already-configured device's settings without redoing UI configuration.
+**Neither feature involves a device-side export protocol**: both are
+controller-side clones of the source device's stored DB config, followed by a
+normal adopt + `setparam` push (confirmed in the decompiled controller sources —
+the inform reply types are only noop/setparam/cmd/upgrade/reboot/setdefault). So
+openUF supports them with no product-code changes; they just need a second
+same-model device, which the `ap2` compose service provides (unique MAC/IP come
+from its own `eth0`, model is the same U6-IW):
+
+```sh
+docker compose -f tools/validation/docker-compose.yml up -d ap2
+```
+
+`ap2` is behind the `replacement` compose profile, so the default
+single-AP workflow is unchanged.
+
+> **MAC caveat:** Docker hands the container a *fresh* eth0 MAC on every
+> `docker stop`/`start` (observed live, 2026-07-13), so a restarted AP
+> container is a brand-new device to the controller — its old device entry
+> can't be resumed. Handy for minting fresh replacement targets; read MACs
+> with the command in step 3 below *after* the container is up, never from
+> an earlier run.
+
+### Set Replacement Device (auto-adopt a new device with the old one's config)
+
+1. AP1 adopted and configured as usual (steps 1–4).
+2. Start `ap2` (command above), then inside it start **announce only** — the new
+   device must be *detected* (announcing unadopted); do **not** adopt it in the UI:
+   ```sh
+   docker exec -it openuf-validation-ap2 sh -c 'cd /opt/openuf && lua announce.lua'
+   ```
+3. Get AP2's MAC:
+   ```sh
+   docker exec openuf-validation-ap2 cat /sys/class/net/eth0/address
+   ```
+4. In the UI on **AP1**: Settings (gear) → Manage → **Set Replacement Device** →
+   enter AP2's MAC → Apply.
+5. Take AP1 offline (`docker stop openuf-validation-ap`) and start AP2's inform
+   loop in another shell:
+   ```sh
+   docker exec -it openuf-validation-ap2 sh -c 'cd /opt/openuf && lua inform.lua'
+   ```
+6. Once the controller marks AP1 offline, it auto-adopts AP2 (real SSH
+   `set-adopt`, no "Click to Adopt" needed) and provisions it with AP1's cloned
+   config. Watch it land:
+   ```sh
+   docker exec openuf-validation-ap2 tail -f /var/log/openuf-informs.log
+   ```
+
+### Load Configuration (clone between two adopted devices)
+
+1. Both APs adopted (adopt AP2 normally per step 4, running its own
+   `announce.lua` + `inform.lua`).
+2. On the **target** device (e.g. AP2): Settings → Manage → **Load
+   Configuration** → pick the source device in the dropdown (backed by
+   `GET /v2/api/site/default/device/<mac>/clone-candidates`) → Apply.
+3. The target receives an ordinary `setparam` push with the cloned config —
+   verify via its `/var/log/openuf-informs.log` as above.
+
+## 7. Tear down / reset
 
 ```sh
 # Full reset (fresh controller + fresh AP state -- remember to redo step 3,
-# Inform Host Override, after this since it lives in the wiped database):
-docker compose -f tools/validation/docker-compose.yml down -v
+# Inform Host Override, after this since it lives in the wiped database).
+# The --profile flag matters if you ever started ap2 (section 6): `down`
+# ignores services whose profile isn't active, so without it the ap2
+# container would survive the reset.
+docker compose -f tools/validation/docker-compose.yml --profile replacement down -v
 
 # Just re-adopt with a clean AP state, keep the controller/site config
 # (Inform Host Override survives this since it doesn't touch unifi-db):

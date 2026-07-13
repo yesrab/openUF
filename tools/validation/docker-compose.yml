@@ -79,6 +79,26 @@ services:
     # container's sshd over the internal `validation` network only, same
     # as it would reach real hardware on its own subnet.
 
+  # Second AP, for the controller's device-to-device config-clone features
+  # ("Set Replacement Device" / "Load Configuration" -- see README section 6).
+  # Both are controller-side clones of the source device's DB config followed
+  # by a normal adopt + setparam push, so no product-code changes are needed;
+  # they just require a second same-model device with its own MAC, which this
+  # container gets for free from its own eth0. Behind a profile so the default
+  # single-AP workflow (`docker compose up -d`) is unchanged; start it with
+  # `docker compose -f tools/validation/docker-compose.yml up -d ap2`.
+  ap2:
+    build:
+      context: ../..
+      dockerfile: tools/validation/ap/Dockerfile
+    container_name: openuf-validation-ap2
+    hostname: openuf-ap2
+    profiles: ["replacement"]
+    cap_add:
+      - NET_ADMIN   # same rationale as `ap` above
+    networks:
+      - validation
+
 networks:
   validation:
     driver: bridge

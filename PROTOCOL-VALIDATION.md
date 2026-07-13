@@ -1773,6 +1773,60 @@ prefixed behavior as correct).
 
 ---
 
+## 16. "Set Replacement Device" / "Load Configuration" (device-to-device config clone) — 2026-07-13
+
+- **Status:** ✅ both flows verified working end-to-end with openUF devices,
+  **zero product-code changes needed**.
+- **What these are:** device settings → Manage offers two config-transfer
+  actions. Decompiled controller sources
+  (`SNMiFVJXxaonBOtqbJ.java:2292/2317` — replace + clone;
+  `InformServlet.java:288-302` — reply types) prove **neither involves a
+  device-side export/import protocol**: the "configuration" is the source
+  device's stored MongoDB document, cloned field-by-field controller-side
+  (`commonDeviceCloneConfigService`), after which the target simply receives
+  an ordinary adopt + `setparam` push. The inform reply `_type`s remain only
+  noop/setparam/cmd/upgrade/reboot/setdefault — there is no
+  export/backup/dump command for openUF to implement.
+- **Environment:** needs two same-model devices → new `ap2` compose service
+  (`tools/validation/docker-compose.yml`, `replacement` profile); recipes in
+  `tools/validation/README.md` section 6. MAC/IP identity comes free from
+  each container's own `eth0`.
+- **Set Replacement Device, verified live:** with AP1 adopted+configured
+  (alias `openuf-src`, 2.4 GHz channel pinned to 6) and AP2 announcing
+  unadopted (L2 broadcast → "Pending Adoption"), entering AP2's MAC in the
+  dialog armed the replacement ("Replacement Device Set" toast; UI issues no
+  device command — it just stores the MAC). After `docker stop` on AP1, the
+  controller **auto-adopted AP2 ~50 s later with no UI interaction** (real
+  SSH `set-adopt`, same as manual adoption) and provisioned it with the
+  cloned config: AP2's first `system_cfg` already carried
+  `radio.1.channel=6`, and the UI showed a single migrated `openuf-src`
+  entry at AP2's IP. The old device entry is consumed by the migration.
+- **Load Configuration, verified live:** the dialog's dropdown is backed by
+  `GET /v2/api/site/default/device/<mac>/clone-candidates`. With only one
+  device it returns nothing ("No Devices Found"); once a second same-model
+  openUF device was adopted, it listed the other device — so an
+  adopted+online openUF AP qualifies as a clone source with no extra fields.
+  Selecting it → Apply produced "Configuration Loaded" and an immediate
+  `setparam` on the target: log showed `radio.1.channel=auto` → `=6`, fresh
+  `cfgversion`, settling back to `noop` within one cycle. Even the alias was
+  cloned (target renamed to `openuf-src` in the UI).
+- **Incidental but load-bearing observation:** a `docker stop`/`start` of an
+  AP container gets a **fresh MAC from Docker** (observed
+  `32:67:0d:e1:42:a9` → `a6:5c:1a:34:36:a5` across one restart, same
+  compose service). So a restarted AP container is a *brand-new device* to
+  the controller — convenient for producing fresh replacement targets, but
+  it means a stopped device's controller entry can never be resumed by
+  simply starting the container again.
+- **Why this matters for future UI tests:** a fully fresh openUF device can
+  now inherit a configured device's settings in ~1 minute without redoing
+  any UI configuration — either automatically (replacement) or with two
+  clicks (load configuration) — instead of hand-reconfiguring after every
+  device reset.
+- **Code changes:** validation environment + docs only (`ap2` service,
+  README section 6); `openuf/` untouched.
+
+---
+
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)
 
 Goal: determine the AP→controller spectrum-scan-result reporting shape — the
