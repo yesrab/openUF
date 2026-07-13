@@ -1401,6 +1401,69 @@ strict). All 187 tests pass.
 **Code changes:** `openuf/ucihelper.lua` (`radio`/`radio_name` fields on
 `get_vap_table()`). Unit test added in `tests/test_ucihelper.lua`.
 
+## RESOLVED: fake client's "Traffic Activity" was empty in the UI (2026-07-13)
+
+**Symptom:** with the previous client-creation fix in place, `de:ad:be:ef:00:01`
+appeared in the Clients list and Online, but its Traffic Activity panel (the
+per-client rx/tx bytes graph) showed no data.
+
+**Root cause:** each `sta_table` entry built in `openuf/inform.lua`'s
+`build_json` carried only `active/mac/ap_mac/channel/radio/signal/rssi/
+capacity/throughput/linkscore/multicast`. The per-station counters
+(`rx_bytes`/`tx_bytes`/`rx_packets`/`tx_packets`) parsed by
+`sysinfo.sta_table()` were read but only summed into the *per-VAP* totals
+("Air Stats" — see the section above); they were never copied onto the
+per-client entry itself, and no PHY rate (`tx_rate`/`rx_rate`) or
+uptime/idletime was sent per client either.
+
+**Field names confirmed via decompilation** (`internal-dependencies.jar`
+from `unifi-network-application:10.4.57`, CFR): the vapInformProcessor class
+`com.ubnt.service.devmgr.c.KHUkYjHujLgFBD` copies exactly these attributes
+off each incoming `sta_table` entry via `copyAttrsIfPresent`: `"channel",
+"radio", "name", "signal", "rssi", "tx_rate", "rx_rate", "tx_packets",
+"rx_packets", "tx_bytes", "rx_bytes"`. The same class computes its own
+inform-to-inform deltas server-side (`tx_bytes-d`, `rx_bytes-d`, `bytes-d`,
+`bytes-r`, keyed by `time_delta`) — meaning, like the VAP-level Air Stats,
+openUF must send **raw cumulative counters**, not a pre-computed rate.
+`tx_rate`/`rx_rate` are in **Kbps** (matches real-device captures, e.g.
+`tx_rate: 39000` for a 39 Mbps MCS rate elsewhere in the reference
+material); `iw station dump` reports Mbit/s, so `openuf/inform.lua` now
+converts (`tx_bitrate * 1000`). `uptime`/`idletime` map directly to iw's
+"connected time"/"inactive time" (seconds associated / seconds since last
+activity) — `sysinfo.sta_table()` didn't parse "connected time" at all
+before this fix.
+
+**Verified live** (full validation-stack reset per convention, `docker
+compose down -v` + rebuild): before the fix, `unifi_stat.stat_5minutes`
+already contained `o:"user"` records for `de:ad:be:ef:00:01` with correct
+`signal`/`rssi` (-58) but `rx_bytes`/`tx_bytes`/`rx_rate` all 0 — direct
+confirmation the gap was specifically the missing per-client counters, not
+a broken pipeline. After the fix and another full reset, the same query
+shows non-zero `rx_bytes`/`tx_bytes`/`x-total-*`/`rx_rate`, and the
+controller UI's Traffic Activity graph populates (needs ~15 minutes /
+a few 5-minute buckets before it's visible).
+
+**Correction to the 2026-07-12 "CPU/memory stats history" finding above:**
+that investigation queried `db.stat.count()` in the **`unifi`** database and
+found it empty, concluding the controller's historical stats-flush job was
+likely disabled in this Docker deployment. The historical time-series
+collections actually live in the separate **`unifi_stat`** database
+(`stat_5minutes`, `stat_hourly`, `stat_archive` — all populated and
+growing, confirmed by direct query this session). There is no disabled
+background job; the earlier finding queried the wrong database. Both the
+CPU/mem history gap and this Traffic Activity gap have the same
+explanation: openUF wasn't sending the field, not a controller-side
+persistence problem.
+
+**Code changes:** `openuf/sysinfo.lua` (`M.sta_table()` now parses
+"connected time" into `connected_sec`); `openuf/inform.lua` (per-client
+`sta_table` entry now includes `rx_bytes`/`tx_bytes`/`rx_packets`/
+`tx_packets`/`tx_rate`/`rx_rate`/`uptime`/`idletime`); `tools/validation/ap/
+iw-mock.sh` (emits `connected time`, and larger per-poll byte increments so
+the graph has a visible slope). Tests updated in `tests/test_sysinfo.lua`
+and `tests/test_inform_json.lua`; fixture `tests/fixtures/
+iw_station_dump.txt` updated. All 187 tests pass.
+
 ## 9. Firmware upgrade offer
 
 - **Status:** ✅ captured (real, via `debug_dump_file` + independent `tcpdump`
