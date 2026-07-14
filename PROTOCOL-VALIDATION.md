@@ -2539,6 +2539,138 @@ prefixed behavior as correct).
 
 ---
 
+## 22. Radios tab table: "Avg. Signal" / "Avg. Interference" / "Avg. Airtime" / "MIMO" columns (2026-07-14)
+
+- **Status:** ✅ All three "Avg." columns confirmed **live, end to end**, on a fully fresh reset:
+  the Radios page shows real `-64 dBm`/`-50 dBm` ("Avg. Signal"), `3%` ("Avg. Interference"), and
+  `7%` ("Avg. Airtime") for both radios, and the archived `stat_5minutes` `o:"ap"` bucket carries
+  `client_signal_avg`/`radio0-cu_total`/`ng-cu_total`/`radio0-cu_interf`/`ng-cu_interf`/etc. every
+  cycle. Two real openUF wire-field gaps found and fixed: `avg_client_signal` on `vap_table`, and
+  — the harder one — a nested `athstats` sub-object on each `radio_table` entry (see below). ⚠️ The
+  per-radio-row `MIMO` column remains unexplained — likely a dead/unfinished column in the real
+  controller's own UI, not an openUF gap; see below.
+- **Frontend investigation:** downloaded the live controller's `radiosPage.js` +
+  `react-app-wrapper.js` + `airview.<hash>.js` React bundles and found the exact selector building
+  each radio row:
+  ```js
+  averageSignal:t[_.mac]?.[n.name]?.client_signal_avg,
+  averageInterference:t[_.mac]?.[n.name]?.interference_avg,
+  averageAirtime:t[_.mac]?.[n.name]?.utilization_avg,
+  ```
+  `t` (a per-AP-mac, per-radio-name lookup) is *not* the `/v2/api/site/default/wifi-stats/radios`
+  response — it's fed by the classic `stat/report/5minutes.ap` archive (`unifi_stat.stat_5minutes`,
+  `o:"ap"` documents), the same periodic-archiver pattern already documented elsewhere in this
+  project for CPU/mem/Traffic Activity.
+- **Root cause #1 ("Avg. Signal"), found by decompiling the archiver itself**
+  (`com.ubnt.service.system.QDcGUYAmLvJwylXw`, the class that writes `stat_5minutes` `o:"ap"`
+  buckets): `client_signal_avg` (per band, e.g. `ng-client_signal_avg`) is computed as a
+  `num_sta`-weighted mean of a field literally named **`avg_client_signal`** read directly off
+  each `vap_table` entry (grouped by `radio_name`/`radio`) — filtered to
+  `num_sta > 0 && avg_client_signal < 0` (a valid negative dBm reading). This is **not** derived
+  from per-client `signal` the way `weakest_clients_signal_avg` is (confirmed already populating
+  in every bucket, computed server-side from live per-client records) — the AP itself must report
+  this pre-aggregated per-VAP average, like a real driver's own stat collection would. openUF was
+  not sending it at all, so the archiver's `num_sta > 0` list came up empty for this key on every
+  cycle.
+- **Root cause #2 ("Avg. Interference"/"Avg. Airtime"), the harder one — required a second decompile
+  pass.** openUF was already sending `cu_total`/`cu_self_rx`/`cu_self_tx` correctly in
+  `radio_table_stats` (derived from `iw survey dump`'s `channel_time_busy`/`_rx`/`_tx`), and adding
+  `cu_interf` there too (and mirroring all four onto `vap_table`, on a plausible but ultimately
+  wrong lead from the archived-field schema registry) still left every archived bucket with **zero**
+  `cu_*` keys, confirmed by direct Mongo inspection across three separate fresh 5-minute cycles.
+  Digging into a second archiver method
+  (`com.ubnt.service.system.x.htDMji.chgwykfBxZCAuEHPPQ(ekfCWfaSnrqscUb, RXiiEoHcunPcIq)`) found the
+  actual source: it iterates `radio_table` (not `radio_table_stats`, not `vap_table`) and, per
+  entry, **skips the radio entirely unless it has a nested `athstats` field**
+  (`if (!uCthhvfQNZ.containsField("athstats")) continue;`), then reads
+  `cu_total`/`cu_self_rx`/`cu_self_tx`/`satisfaction`/`cu_interf` off that nested sub-object — not
+  off the entry itself. `athstats` is named after the legacy Atheros (`ath9k`/`ath10k`) driver
+  stats struct real UniFi firmware has historically nested there, kept for newer radios too.
+  openUF had never sent this nested object at all, so this method's per-radio loop silently did
+  nothing on every cycle, regardless of what `radio_table_stats`/`vap_table` carried.
+- **Fix (`openuf/inform.lua`):**
+  - Each `vap_table` entry gains `avg_client_signal`, the mean of `sta.signal` across that VAP's
+    currently-connected stations (`sysinfo.sta_table()`'s existing per-client `signal` field,
+    already sent for years for the per-client display) — omitted entirely (not sent as `0`/`nil`)
+    when the VAP has no connected clients, matching the archiver's own validity filter.
+  - `radio_table_stats` entries gain `cu_interf = max(0, cu_total - cu_self_rx - cu_self_tx)` —
+    airtime busy for reasons other than this radio's own tx/rx, the natural remainder of the
+    already-computed breakdown. (Kept even though it turned out not to be what fixed the archived
+    bucket — it's still what the live `wifi-stats/radios` REST API's `QnvUxbsXyAJZ` reader expects.)
+  - Each `vap_table` entry also gains the same `cu_total`/`cu_self_rx`/`cu_self_tx`/`cu_interf`
+    (a plausible-but-insufficient lead from the schema registry, kept since it's evidence-based
+    and harmless).
+  - **The actual fix:** each `radio_table` entry gains a nested `athstats = {cu_total, cu_self_rx,
+    cu_self_tx, cu_interf}` sub-object, matching exactly what `com.ubnt.service.system.x.htDMji`
+    reads. Confirmed this — and only this — is what the archiver needed: the very next 5-minute
+    bucket after deploying it carried `radio0-cu_total`/`ng-cu_total`/`radio0-cu_interf`/
+    `ng-cu_interf`/etc. for both radios, and the live Radios page rendered real `3%`/`7%` values.
+  - New tests in `tests/test_inform_json.lua`: `cu_interf` arithmetic against the existing
+    `radio_table_stats` fixture (37/18/9 → `cu_interf` 10), `avg_client_signal` averaging the two
+    fixture clients' -62/-75 dBm signal (`floor(-137/2) = -69`), the same four `cu_*` values
+    mirrored onto `vap_table`, and `radio_table[1].athstats` matching the same four values.
+    228 tests pass (was 224).
+- **MIMO (per-radio-row) column — unresolved, likely not an openUF gap:** this is a *different*
+  "MIMO" from the per-client one fixed in §21 (this one is a column on the Radios page's own
+  per-radio-row table). Checked exhaustively:
+  - The backend's own `/v2/api/site/default/device` response has `nss` on every `radio_table`
+    entry but **no `mimo` key anywhere** — confirmed directly against the live API.
+  - Downloaded and grepped ~11 frontend JS chunks (`radiosPage.js`, the 1MB `react-app-wrapper.js`,
+    `airview.js`, and every numbered chunk referenced from the Radios page) for `nss`/`mimo`
+    computation logic tied to a radio row — found **zero** matches. The per-client MIMO string
+    (`"MIMO_2"` etc., §21) is computed entirely differently, server-side, and isn't reused here.
+  - Given the column ID (`e.MIMO="mimo"`) exists in the frontend's own column-definition enum but
+    no code path anywhere (frontend or backend) ever populates it, this reads as a genuinely
+    unfinished/dead column in the real controller's own UI — consistent with this project's
+    established precedent of real controller-UI quirks unrelated to openUF (the Environment tab's
+    frontend caching bug in §20, the Type filter's empty-means-nothing default in §21).
+- **Live verification, full fresh-reset run (`docker compose down -v` + `up -d --build`,
+  per this project's standing "always fully reset, never patch live state" rule):**
+  - First attempt hit the already-documented, known-benign **"404 with empty body ≠ rejected"**
+    behavior (§ near the top of this doc) — re-derived byte-level proof this was the same thing
+    before recognizing it (decompiled `InformServlet`/`jRsSex`/`KHUkYjHujLgFBD` down to exact byte
+    offsets, cross-verified openUF's AES-128-CBC ciphertext independently via `openssl` CLI). The
+    device correctly showed "1 device is ready to adopt" the whole time — clicking Adopt is the
+    right move on a 404, not more debugging.
+  - **Not a new bug — skipped an already-documented required setup step.** Adoption silently
+    stalled: `state.json` never flipped `adopted: true`, and the controller's `server.log` logged
+    `dev[<mac>] inform decryption failed with defaultAuthKey=false ... invalid JSON` (note
+    `defaultAuthKey=false` — the controller *had* assigned a new per-device key via the L3
+    `mgmt_cfg` handshake, but openUF never picked it up) alongside
+    `ERROR inform - dev[<mac>] invalid inform_ip openuf-validation-controller`. This is exactly
+    `tools/validation/README.md` §3, **"Set the Inform Host Override (required — do this before
+    adopting anything)"** — a controller-side setting that lives in its own DB and is wiped by
+    every `docker compose down -v`, which this run's fresh reset needed and didn't get. Setting
+    **Inform Host Override** to the controller container's real IP under **Devices → Device
+    Updates and Settings → Device SSH Settings** is the documented fix; the controller then
+    corrects the device's `inform_url` itself via the normal `mgmt_cfg` push, the same mechanism
+    `inform.lua` already handles. Manually pointing `syswrapper.sh set-inform` at the controller's
+    raw IP directly (skipping the override) also unblocks adoption, matching this doc's own earlier
+    working examples (`http://172.19.0.4:8080/inform`), but the override is the standard, documented
+    path — do that first on any future fresh reset before treating this as a new problem.
+  - With that fix, adoption completed for real this time (`Up to date`, green/Online — not stuck
+    at "Adopting"), so the **separate**, already-documented "stuck at Adopting" issue from Stage 1
+    above did *not* reproduce here; that issue may be specific to a different trigger than plain
+    fresh-site L3 adoption. WiFi network creation (previously gated behind a fully-adopted device)
+    worked immediately after.
+  - Created a WiFi network, waited for the fake `iw-mock.sh` clients to connect, then polled
+    `unifi_stat.stat_5minutes` every ~5 minutes: `client_signal_avg` (and its per-band/per-radio
+    variants) appeared in the very next bucket and every bucket after, and the live Radios page
+    rendered real `-64 dBm`/`-50 dBm` "Avg. Signal" values — the fix is proven live, not just
+    unit-tested.
+  - `cu_interf`/`cu_total` did **not** appear in three consecutive fresh buckets after only adding
+    `cu_interf` to `radio_table_stats` and mirroring all four `cu_*` fields onto `vap_table` (each
+    time forcing a fresh `system_cfg` push — remove + recreate the WiFi network, required after any
+    daemon restart per this project's own established in-memory-UCI-mock caveat). That led to
+    decompiling the archiver's actual reader (`com.ubnt.service.system.x.htDMji`, see Root cause #2
+    above) and finding the real requirement: a nested `athstats` object on each `radio_table` entry.
+    Deployed that fix, restarted the daemon, recreated the WiFi network once more, and the very next
+    5-minute bucket carried `radio0-cu_total`/`ng-cu_total`/`radio0-cu_interf`/`ng-cu_interf`/etc. for
+    both radios — and the live Radios page rendered real `3%`/`7%` "Avg. Interference"/"Avg. Airtime"
+    values. All three "Avg." columns are now confirmed working live, not just unit-tested.
+
+---
+
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)
 
 Goal: determine the AP→controller spectrum-scan-result reporting shape — the

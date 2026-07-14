@@ -320,6 +320,34 @@ return {
 		end
 	},
 	{
+		name = "inform json: vap_table avg_client_signal averages connected clients' signal",
+		fn = function()
+			local d = build({with_uci = true, with_clients = true})
+			-- fixture clients: -62 dBm and -75 dBm -> floor(-137/2) = -69
+			assert_eq(d.vap_table[1].avg_client_signal, -69, "mean of the two fixture clients' signal")
+		end
+	},
+	{
+		name = "inform json: vap_table avg_client_signal is omitted with no clients",
+		fn = function()
+			local d = build({with_uci = true, with_clients = false})
+			assert_true(d.vap_table[1].avg_client_signal == nil,
+				"no clients means no valid average to report")
+		end
+	},
+	{
+		name = "inform json: vap_table carries cu_total/cu_self_rx/cu_self_tx/cu_interf from its radio",
+		fn = function()
+			local d = build({with_uci = true, with_clients = true})
+			-- same fixture survey data as the radio_table_stats test: cu_total=37,
+			-- cu_self_rx=18, cu_self_tx=9, cu_interf=10
+			assert_eq(d.vap_table[1].cu_total, 37, "vap cu_total matches its radio's radio_table_stats")
+			assert_eq(d.vap_table[1].cu_self_rx, 18, "vap cu_self_rx matches its radio's radio_table_stats")
+			assert_eq(d.vap_table[1].cu_self_tx, 9, "vap cu_self_tx matches its radio's radio_table_stats")
+			assert_eq(d.vap_table[1].cu_interf, 10, "vap cu_interf matches its radio's radio_table_stats")
+		end
+	},
+	{
 		name = "inform json: vap_table nests connected clients as sta_table",
 		fn = function()
 			inform._sta_stats_cache = {}
@@ -463,6 +491,19 @@ return {
 			assert_eq(d.radio_table_stats[1].cu_total, 37, "cu_total = busy/total*100")
 			assert_eq(d.radio_table_stats[1].cu_self_rx, 18, "cu_self_rx = channel_time_rx/total*100")
 			assert_eq(d.radio_table_stats[1].cu_self_tx, 9, "cu_self_tx = channel_time_tx/total*100")
+			assert_eq(d.radio_table_stats[1].cu_interf, 10, "cu_interf = cu_total - cu_self_rx - cu_self_tx")
+		end
+	},
+	{
+		name = "inform json: radio_table entries carry a nested athstats object for the stat archiver",
+		fn = function()
+			local d = build({with_uci = true, with_clients = true})
+			local radio = d.radio_table[1]
+			assert_not_nil(radio.athstats, "radio_table entry has athstats")
+			assert_eq(radio.athstats.cu_total, 37, "athstats.cu_total matches radio_table_stats")
+			assert_eq(radio.athstats.cu_self_rx, 18, "athstats.cu_self_rx matches radio_table_stats")
+			assert_eq(radio.athstats.cu_self_tx, 9, "athstats.cu_self_tx matches radio_table_stats")
+			assert_eq(radio.athstats.cu_interf, 10, "athstats.cu_interf matches radio_table_stats")
 		end
 	},
 	{

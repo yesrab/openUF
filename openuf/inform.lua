@@ -378,7 +378,17 @@ function M.build_json(st, cfg, ufhw)
 		if ok_r then radio_table = rr end
 
 		-- Live per-radio channel utilization, parallel to radio_table (matches
-		-- real UniFi's split of static config vs. live stats).
+		-- real UniFi's split of static config vs. live stats). Also kept in
+		-- radio_cu_stats, keyed by radio name, so each vap_table entry on
+		-- that radio can carry the same cu_* figures -- confirmed via
+		-- decompile (com.ubnt.service.system.XrjNIQhefUEBuL's archived-field
+		-- schema registry) that cu_interf/cu_self_tx/cu_self_rx live in the
+		-- same per-VAP schema group as avg_client_signal, not solely in
+		-- radio_table_stats: live-tested against a real controller, adding
+		-- them only to radio_table_stats left the archiver's client_signal_avg
+		-- populating every cycle while cu_interf/cu_total never appeared at
+		-- all despite being sent correctly.
+		local radio_cu_stats = {}
 		for _, radio in ipairs(radio_table) do
 			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
 			if ok_if and ifname then
@@ -397,12 +407,53 @@ function M.build_json(st, cfg, ufhw)
 					local s     = stats[1]  -- in-use channel's survey entry
 					local total = s.channel_time or 0
 					local busy  = s.channel_time_busy or 0
+					local cu_total   = total > 0 and math.floor(busy * 100 / total) or 0
+					local cu_self_rx = total > 0 and math.floor((s.channel_time_rx or 0) * 100 / total) or 0
+					local cu_self_tx = total > 0 and math.floor((s.channel_time_tx or 0) * 100 / total) or 0
 					local entry = {
 						name        = radio.name,
 						channel     = radio.channel,
-						cu_total    = total > 0 and math.floor(busy * 100 / total) or 0,
-						cu_self_rx  = total > 0 and math.floor((s.channel_time_rx or 0) * 100 / total) or 0,
-						cu_self_tx  = total > 0 and math.floor((s.channel_time_tx or 0) * 100 / total) or 0,
+						cu_total    = cu_total,
+						cu_self_rx  = cu_self_rx,
+						cu_self_tx  = cu_self_tx,
+						-- cu_interf: airtime busy for reasons other than this
+						-- radio's own tx/rx (other-BSS/non-WiFi interference).
+						-- The stat archiver (com.ubnt.service.system.
+						-- QDcGUYAmLvJwylXw, confirmed via decompile) reads
+						-- this as a sibling of cu_total/cu_self_rx/cu_self_tx
+						-- and silently drops the whole per-band bucket without
+						-- it -- this is why "Avg. Interference" stayed blank
+						-- even though cu_total was already being sent.
+						cu_interf   = math.max(0, cu_total - cu_self_rx - cu_self_tx),
+					}
+					radio_cu_stats[radio.name] = {
+						cu_total   = entry.cu_total,
+						cu_self_rx = entry.cu_self_rx,
+						cu_self_tx = entry.cu_self_tx,
+						cu_interf  = entry.cu_interf,
+					}
+					-- athstats: the ACTUAL source the stat archiver reads for
+					-- these four fields, confirmed via decompiling
+					-- com.ubnt.service.system.x.htDMji -- it iterates
+					-- radio_table (not radio_table_stats, not vap_table) and
+					-- SKIPS a radio entirely if it lacks this nested
+					-- "athstats" sub-object (`if
+					-- (!uCthhvfQNZ.containsField("athstats")) continue;`),
+					-- then reads cu_total/cu_self_rx/cu_self_tx/satisfaction/
+					-- cu_interf off it (named after the legacy Atheros ath9k/
+					-- ath10k driver stats struct UniFi firmware historically
+					-- exposed under this name, kept for newer radios too).
+					-- radio_table_stats/vap_table's copies of these same
+					-- fields are real and used by other code paths (the live
+					-- wifi-stats/radios REST API, per-VAP display) but this
+					-- nested copy is what the periodic archiver needs --
+					-- omitting it is why "Avg. Interference"/"Avg. Airtime"
+					-- stayed blank even with correct data everywhere else.
+					radio.athstats = {
+						cu_total   = cu_total,
+						cu_self_rx = cu_self_rx,
+						cu_self_tx = cu_self_tx,
+						cu_interf  = entry.cu_interf,
 					}
 					-- Cached spectrum-scan result, if a "spectrum-scan" cmd
 					-- was handled for this radio (see cmd dispatch below).
@@ -513,6 +564,7 @@ function M.build_json(st, cfg, ufhw)
 			local vap_rx_bytes, vap_tx_bytes = 0, 0
 			local vap_rx_packets, vap_tx_packets = 0, 0
 			local vap_tx_retries, vap_tx_dropped = 0, 0
+			local signal_sum, signal_count = 0, 0
 			local sta_table = {}
 			for _, sta in ipairs(stas) do
 				station_macs[sta.mac] = true
@@ -522,6 +574,10 @@ function M.build_json(st, cfg, ufhw)
 				vap_tx_packets  = vap_tx_packets  + (sta.tx_packets or 0)
 				vap_tx_retries  = vap_tx_retries  + (sta.tx_retries or 0)
 				vap_tx_dropped  = vap_tx_dropped  + (sta.tx_failed or 0)
+				if sta.signal then
+					signal_sum   = signal_sum + sta.signal
+					signal_count = signal_count + 1
+				end
 				-- throughput: delta-sampled byte rate (bytes/sec), same
 				-- approach as M._sysinfo.cpu_percent()'s /proc/stat delta
 				-- sampling -- 0 on the first sample for a given MAC, since
@@ -649,6 +705,28 @@ function M.build_json(st, cfg, ufhw)
 			vap.tx_packets = vap_tx_packets
 			vap.tx_retries = vap_tx_retries
 			vap.tx_dropped = vap_tx_dropped
+			-- avg_client_signal: mean RSSI (dBm, negative) of currently
+			-- associated clients on this VAP. The stat archiver (decompiled
+			-- com.ubnt.service.system.QDcGUYAmLvJwylXw) reads this exact
+			-- field name directly off each vap_table entry -- alongside the
+			-- existing num_sta -- to compute the "Avg. Signal" column; it is
+			-- NOT derived server-side from per-client signal the way
+			-- "weakest_clients_signal_avg" is, so omitting it left that
+			-- column permanently blank regardless of per-client signal
+			-- already being sent correctly.
+			if signal_count > 0 then
+				vap.avg_client_signal = math.floor(signal_sum / signal_count)
+			end
+			-- cu_total/cu_self_rx/cu_self_tx/cu_interf: same per-radio channel-
+			-- utilization figures as radio_table_stats, duplicated onto each
+			-- VAP on that radio -- see radio_cu_stats above for why.
+			local cu = radio_cu_stats[vap.radio_name]
+			if cu then
+				vap.cu_total   = cu.cu_total
+				vap.cu_self_rx = cu.cu_self_rx
+				vap.cu_self_tx = cu.cu_self_tx
+				vap.cu_interf  = cu.cu_interf
+			end
 		end
 	end
 
