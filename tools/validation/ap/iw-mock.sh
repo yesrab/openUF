@@ -4,10 +4,10 @@
 # This is not part of openUF -- the real `iw` binary is still installed
 # (see the Dockerfile) and this script falls through to it for anything
 # it doesn't specifically handle. It only intercepts `survey dump`,
-# `station dump` and `scan dump` against the synthetic wlan0/wlan1
-# netdevs ubus-mock.sh invents (this container has no real wireless
-# hardware for the real `iw` to introspect, so those commands would
-# otherwise always fail).
+# `station dump`, `scan dump`, `dev <ifname> info`, and `phy phyN info`
+# against the synthetic wlan0/wlan1 netdevs ubus-mock.sh invents (this
+# container has no real wireless hardware for the real `iw` to
+# introspect, so those commands would otherwise always fail).
 # Field names deliberately match the real iw(8) binary's own format
 # strings (confirmed via `strings /usr/sbin/iw`) -- see the accompanying
 # openuf/sysinfo.lua fix, which found the *parser* previously expected
@@ -109,7 +109,7 @@ EOF
 		else
 			emit_station wlan1 de:ad:be:ef:00:03 -50 -51 \
 				980000 2100000 5200 3100 12 \
-				"866.7 MBit/s MCS 9 short GI" "780.0 MBit/s MCS 8 short GI" 300 \
+				"866.7 MBit/s VHT-MCS 9 VHT-NSS 2 80MHz short GI" "780.0 MBit/s VHT-MCS 8 VHT-NSS 2 80MHz short GI" 300 \
 				786432 1572864
 		fi
 		exit 0
@@ -167,6 +167,74 @@ BSS de:ad:be:ef:aa:03(on wlan1)
 		 * Capabilities: (0x0000)
 EOF
 		fi
+		exit 0
+		;;
+	"wlan0 info" | "wlan1 info")
+		# Feeds openuf/sysinfo.lua's M.radio_caps() -> inform.lua's per-radio
+		# capability fields (is_11ac/is_11ax/is_11be/has_dfs/has_ht160/nss)
+		# -> controller's Radios (channel-planning) tab MIMO/capability
+		# filters, which previously excluded the device entirely ("We
+		# Couldn't Find a Match") since openUF never sent these at all.
+		wiphy=$([ "$2" = "wlan0" ] && echo 0 || echo 1)
+		cat <<EOF
+Interface $2
+	ifindex 3
+	wdev 0x1
+	addr de:ad:be:ef:00:0$([ "$2" = "wlan0" ] && echo 1 || echo 2)
+	type AP
+	wiphy $wiphy
+	channel $([ "$2" = "wlan0" ] && echo "6 (2437 MHz), width: 20 MHz, center1: 2437 MHz" || echo "36 (5180 MHz), width: 80 MHz, center1: 5210 MHz")
+	txpower 20.00 dBm
+EOF
+		exit 0
+		;;
+	"phy0 info")
+		# 2.4GHz: HE (Wi-Fi 6) but no VHT (802.11ac is 5GHz-only) and no DFS.
+		cat <<EOF
+Wiphy phy0
+	wiphy index: 0
+	Band 1:
+		Capabilities: 0x19ef
+			RX LDPC
+			HT20/HT40
+		HT TX Max spatial streams: 2
+		HE Iftypes: AP
+		HE MAC Capabilities: (0x0001):
+		HE PHY Capabilities: (0x04):
+		Frequencies:
+			* 2412 MHz [1] (20.0 dBm)
+			* 2437 MHz [6] (20.0 dBm)
+			* 2462 MHz [11] (20.0 dBm)
+EOF
+		exit 0
+		;;
+	"phy1 info")
+		# 5GHz: VHT (802.11ac) + HE (802.11ax), 160MHz-capable, DFS channels.
+		cat <<EOF
+Wiphy phy1
+	wiphy index: 1
+	Band 2:
+		Capabilities: 0x19ef
+			RX LDPC
+			HT20/HT40
+		HT TX Max spatial streams: 2
+		VHT Capabilities (0x338001b2):
+			Max MPDU length: 11454
+			Supported Channel Width: 160 MHz, 80+80 MHz
+		VHT RX MCS set:
+			1 streams: MCS 0-9
+			2 streams: MCS 0-9
+			3 streams: not supported
+			4 streams: not supported
+		HE Iftypes: AP
+		HE MAC Capabilities: (0x0001):
+		HE PHY Capabilities: (0x04):
+		Frequencies:
+			* 5180 MHz [36] (23.0 dBm)
+			* 5260 MHz [52] (23.0 dBm) (radar detection)
+			* 5300 MHz [60] (23.0 dBm) (radar detection)
+			* 5500 MHz [100] (23.0 dBm) (radar detection)
+EOF
 		exit 0
 		;;
 esac

@@ -113,11 +113,42 @@ return {
 				assert_eq(stas[1].connected_sec, 3600,           "first client connected_sec")
 				assert_eq(stas[1].tx_mcs, 15,                    "first client tx_mcs from 'MCS 15'")
 				assert_eq(stas[1].rx_mcs, 7,                     "first client rx_mcs from 'MCS 7'")
+				assert_eq(stas[1].tx_generation, "n",            "first client is plain HT (bare MCS)")
+				assert_eq(stas[1].tx_nss, 2,                     "first client nss from MCS 15 -> floor(15/8)+1")
 				assert_eq(stas[2].mac,      "11:22:33:44:55:66", "second client MAC")
 				assert_eq(stas[2].signal,   -75,                 "second client signal")
 				assert_eq(stas[2].connected_sec, 42,              "second client connected_sec")
 				assert_eq(stas[2].tx_mcs, 6,                      "second client tx_mcs from 'MCS 6'")
 				assert_eq(stas[2].rx_mcs, 5,                      "second client rx_mcs from 'MCS 5'")
+				assert_eq(stas[2].tx_generation, "n",            "second client is plain HT (bare MCS)")
+				assert_eq(stas[2].tx_nss, 1,                     "second client nss from MCS 6 -> floor(6/8)+1")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: sta_table() derives generation/nss from VHT and HE bitrate lines",
+		fn = function()
+			local dump = "Station cc:cc:cc:cc:cc:cc (on wlan1)\n"
+				.. "\tsignal:  \t-50 dBm\n"
+				.. "\ttx bitrate:\t866.7 MBit/s VHT-MCS 9 VHT-NSS 2 80MHz short GI\n"
+				.. "\trx bitrate:\t780.0 MBit/s VHT-MCS 8 VHT-NSS 2 80MHz short GI\n"
+				.. "Station dd:dd:dd:dd:dd:dd (on wlan1)\n"
+				.. "\tsignal:  \t-45 dBm\n"
+				.. "\ttx bitrate:\t1200.9 MBit/s HE-MCS 11 HE-NSS 2 80MHz\n"
+				.. "\trx bitrate:\t1080.1 MBit/s HE-MCS 9 HE-NSS 2 80MHz\n"
+				.. "Station ee:ee:ee:ee:ee:ee (on wlan1)\n"
+				.. "\tsignal:  \t-70 dBm\n"
+				.. "\ttx bitrate:\t54.0 MBit/s\n"
+				.. "\trx bitrate:\t48.0 MBit/s\n"
+			with_fixtures({}, {["station dump"] = dump}, function()
+				local stas = sysinfo.sta_table("wlan1")
+				assert_eq(#stas, 3, "three stations")
+				assert_eq(stas[1].tx_generation, "ac", "VHT-MCS -> generation ac")
+				assert_eq(stas[1].tx_nss, 2, "VHT-NSS 2 read directly")
+				assert_eq(stas[2].tx_generation, "ax", "HE-MCS -> generation ax")
+				assert_eq(stas[2].tx_nss, 2, "HE-NSS 2 read directly")
+				assert_eq(stas[3].tx_generation, nil, "legacy rate has no generation token")
+				assert_eq(stas[3].tx_nss, nil, "legacy rate has no nss token")
 			end)
 		end
 	},
@@ -370,6 +401,74 @@ return {
 		fn = function()
 			with_fixtures({}, {}, function()
 				assert_eq(#sysinfo.scan_table(nil), 0, "nil ifname safe")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: radio_caps() parses a 2.4GHz (HE-only, no VHT/DFS) phy correctly",
+		fn = function()
+			with_fixtures({}, {
+				["dev wlan0 info"] = fixture("iw_dev_info.txt"),
+				["phy phy0 info"]  = fixture("iw_phy_info_2g.txt"),
+			}, function()
+				local caps = sysinfo.radio_caps("wlan0")
+				assert_false(caps.is_11ac, "2.4GHz has no VHT Capabilities section")
+				assert_true(caps.is_11ax, "HE PHY Capabilities present")
+				assert_false(caps.is_11be, "no EHT PHY Capabilities")
+				assert_false(caps.has_dfs, "no radar detection on 2.4GHz")
+				assert_false(caps.has_fccdfs, "has_fccdfs mirrors has_dfs")
+				assert_false(caps.has_ht160, "no 160 MHz support (no VHT at all on 2.4GHz)")
+				assert_eq(caps.nss, 2, "nss from 'HT TX Max spatial streams: 2'")
+				assert_eq(caps.channel, 6, "live channel from 'channel 6 (2437 MHz)...'")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: radio_caps() parses a 5GHz (VHT+HE, DFS, 160MHz) phy correctly",
+		fn = function()
+			with_fixtures({}, {
+				["dev wlan0 info"] = fixture("iw_dev_info.txt"):gsub("wiphy 0", "wiphy 1"),
+				["phy phy1 info"]  = fixture("iw_phy_info_5g.txt"),
+			}, function()
+				local caps = sysinfo.radio_caps("wlan0")
+				assert_true(caps.is_11ac, "VHT Capabilities present")
+				assert_true(caps.is_11ax, "HE PHY Capabilities present")
+				assert_false(caps.is_11be, "no EHT PHY Capabilities")
+				assert_true(caps.has_dfs, "radar detection present on several 5GHz channels")
+				assert_true(caps.has_fccdfs, "has_fccdfs mirrors has_dfs")
+				assert_true(caps.has_ht160, "'Supported Channel Width: 160 MHz, 80+80 MHz'")
+				assert_eq(caps.nss, 2, "nss from 'HT TX Max spatial streams: 2'")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: radio_caps() falls back to counting VHT MCS stream lines when the spatial-streams summary line is absent",
+		fn = function()
+			local phy_info = fixture("iw_phy_info_5g.txt"):gsub("HT TX Max spatial streams: 2\n", "")
+			with_fixtures({}, {
+				["dev wlan0 info"] = fixture("iw_dev_info.txt"),
+				["phy phy0 info"]  = phy_info,
+			}, function()
+				local caps = sysinfo.radio_caps("wlan0")
+				assert_eq(caps.nss, 2, "max of the 'N streams: MCS ...' lines (1 and 2 both supported)")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: radio_caps() returns empty table for nil ifname",
+		fn = function()
+			with_fixtures({}, {}, function()
+				local caps = sysinfo.radio_caps(nil)
+				assert_eq(next(caps), nil, "empty table for nil ifname")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: radio_caps() returns empty table when the wiphy can't be resolved",
+		fn = function()
+			with_fixtures({}, {["dev wlan0 info"] = "Interface wlan0\n\ttype AP\n"}, function()
+				local caps = sysinfo.radio_caps("wlan0")
+				assert_eq(next(caps), nil, "empty table -- no 'wiphy N' line to resolve")
 			end)
 		end
 	},

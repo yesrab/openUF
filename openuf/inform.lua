@@ -382,6 +382,16 @@ function M.build_json(st, cfg, ufhw)
 		for _, radio in ipairs(radio_table) do
 			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
 			if ok_if and ifname then
+				-- Hardware capability fields the controller's radio_table
+				-- ingestion expects independently of everything else here
+				-- (is_11ac/is_11ax/is_11be/has_dfs/has_fccdfs/has_ht160/
+				-- has_eht240/has_eht320/nss) -- see sysinfo.radio_caps()
+				-- for the decompile citation. Missing these is why the
+				-- Radios tab excluded the device entirely.
+				local ok_caps, caps = pcall(M._sysinfo.radio_caps, ifname)
+				if ok_caps and caps then
+					for k, v in pairs(caps) do radio[k] = v end
+				end
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 				if ok_rs and stats[1] then
 					local s     = stats[1]  -- in-use channel's survey entry
@@ -597,6 +607,20 @@ function M.build_json(st, cfg, ufhw)
 					-- pre-11n rates have none).
 					tx_mcs     = sta.tx_mcs,
 					rx_mcs     = sta.rx_mcs,
+					-- radio_proto/nss: confirmed real per-station wire fields,
+					-- read independently of tx_mcs/rx_mcs by the real
+					-- controller's client updater (com.ubnt.service.devmgr.
+					-- TtZhv, confirmed via decompile) -- neither is derived
+					-- from tx_mcs there, so leaving them unset made every
+					-- station show the controller's own fallback generation
+					-- ("g") and no MIMO/stream count at all, regardless of
+					-- what tx_mcs/rx_mcs said. Legacy (pre-MCS) rates carry no
+					-- generation token from iw at all; "a"/"g" here reflects
+					-- which band's legacy PHY that actually is (never "b" --
+					-- real dual-band-11n+ hardware doesn't negotiate down to
+					-- 802.11b-only rates), not an invented value.
+					radio_proto = sta.tx_generation or (vap.radio == "na" and "a" or "g"),
+					nss         = sta.tx_nss or 1,
 					wifi_tx_attempts = wifi_tx_attempts,
 					wifi_tx_retries_percentage = wifi_tx_retries_pct,
 					-- satisfaction/satisfaction_now: see estimate_satisfaction()

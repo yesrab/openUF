@@ -180,8 +180,43 @@ function M.radio_stats(ifname)
 	return result
 end
 
+-- Derives {generation, nss} from a station dump's "tx bitrate: ..." line.
+-- `generation` is one of "n"/"ac"/"ax"/"be"/nil (nil for legacy, pre-MCS
+-- rates) -- the caller combines it with the radio's own band to produce a
+-- final `radio_proto` ("legacy" + "na" => "a", "legacy" + "ng" => "g"),
+-- since sysinfo.lua has no band context of its own here.
+-- `nss` (spatial streams) comes directly from the VHT-NSS/HE-NSS/EHT-NSS
+-- token when present; for plain HT (bare "MCS N", no VHT-/HE-/EHT- prefix)
+-- it's derived as floor(N/8)+1, matching the real HT MCS index layout (MCS
+-- 0-7 = 1 stream, 8-15 = 2 streams, ...). Real controller ingestion (see
+-- com.ubnt.service.devmgr.TtZhv, confirmed via decompile) reads both
+-- `radio_proto` and `nss` as independent per-station wire fields -- neither
+-- is derived from tx_mcs/rx_mcs alone on the controller's side, which is why
+-- sending only tx_mcs/rx_mcs left every station showing as generation "g"
+-- (the controller's own fallback default) with no MIMO/stream count at all.
+local function _bitrate_generation_nss(line)
+	if line:find("EHT%-MCS") then
+		local nss = line:match("EHT%-NSS%s+(%d+)")
+		return "be", nss and tonumber(nss) or nil
+	end
+	if line:find("HE%-MCS") then
+		local nss = line:match("HE%-NSS%s+(%d+)")
+		return "ax", nss and tonumber(nss) or nil
+	end
+	if line:find("VHT%-MCS") then
+		local nss = line:match("VHT%-NSS%s+(%d+)")
+		return "ac", nss and tonumber(nss) or nil
+	end
+	local mcs = line:match("MCS%s+(%d+)")
+	if mcs then
+		return "n", math.floor(tonumber(mcs) / 8) + 1
+	end
+	return nil, nil
+end
+
 -- Returns a table of connected stations from `iw dev <ifname> station dump`.
--- Each entry: {mac, signal, tx_bitrate, rx_bitrate, tx_mcs, rx_mcs, tx_bytes,
+-- Each entry: {mac, signal, tx_bitrate, rx_bitrate, tx_mcs, rx_mcs,
+--              tx_generation, tx_nss, rx_generation, rx_nss, tx_bytes,
 --              rx_bytes, tx_packets, rx_packets, tx_retries, tx_failed,
 --              inactive_ms, connected_sec}
 -- tx_retries/tx_failed: iw(8) only exposes TX-side retry/failure counters
@@ -207,6 +242,11 @@ function M.sta_table(ifname)
 			-- optional fields below.
 			local tx_mcs     = line:match("tx bitrate:.*MCS%s+(%d+)")
 			local rx_mcs     = line:match("rx bitrate:.*MCS%s+(%d+)")
+			if line:find("tx bitrate:") then
+				cur.tx_generation, cur.tx_nss = _bitrate_generation_nss(line)
+			elseif line:find("rx bitrate:") then
+				cur.rx_generation, cur.rx_nss = _bitrate_generation_nss(line)
+			end
 			local tx_bytes   = line:match("tx bytes:%s+(%d+)")
 			local rx_bytes   = line:match("rx bytes:%s+(%d+)")
 			local tx_pkts    = line:match("tx packets:%s+(%d+)")
@@ -300,6 +340,70 @@ function M.scan_table(ifname)
 	end
 	flush()
 	return nets
+end
+
+-- Returns hardware/PHY capability fields for ifname's radio, by resolving
+-- its wiphy index via `iw dev <ifname> info` and parsing `iw phy phyN info`.
+-- These are NOT derived from anything else already in the payload -- the
+-- real controller's AP-inform processor (com.ubnt.service.devmgr.
+-- PGOcbDWlbnYQdFW, confirmed via decompile) copies is_11ac/is_11ax/is_11be/
+-- has_dfs/has_fccdfs/has_ht160/has_eht240/has_eht320/nss directly off each
+-- incoming radio_table entry, independent of radio_caps/radio_caps2; openUF
+-- never sent any of them, which is why the Radios (channel-planning) tab's
+-- MIMO/capability filters excluded the device entirely ("We Couldn't Find a
+-- Match") despite everything else being wired correctly.
+-- Each field is read from the OpenWrt board's own real driver/firmware
+-- capability report, not invented -- an arbitrary board running openUF may
+-- be far weaker or stronger than the U6-InWall it impersonates. Also
+-- returns `channel`, the live negotiated channel number (more authoritative
+-- than UCI's own config value, which is often the string "auto").
+function M.radio_caps(ifname)
+	if not ifname then return {} end
+	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")
+	local phy = dev_info:match("wiphy%s+(%d+)")
+	if not phy then return {} end
+	local phy_info = M._run_cmd("iw phy phy" .. phy .. " info")
+	if not phy_info or phy_info == "" then return {} end
+
+	local has_dfs = phy_info:find("radar detection") ~= nil
+	-- The live negotiated channel ("channel 6 (2437 MHz), width: ...") is
+	-- more authoritative than UCI's own config value, which is frequently
+	-- "auto" (a config *intent*, not a number) -- the controller has no use
+	-- for the literal string "auto" here and was left showing channel 0.
+	local channel = dev_info:match("channel%s+(%d+)")
+	local caps = {
+		channel    = channel and tonumber(channel) or nil,
+		is_11ac    = phy_info:find("VHT Capabilities") ~= nil,
+		is_11ax    = (phy_info:find("HE PHY Capabilities") ~= nil) or (phy_info:find("HE MAC Capabilities") ~= nil),
+		is_11be    = phy_info:find("EHT PHY Capabilities") ~= nil,
+		has_dfs    = has_dfs,
+		has_fccdfs = has_dfs,
+		has_ht160  = false,
+		has_eht240 = false,
+		has_eht320 = false,
+	}
+
+	local width_line = phy_info:match("Supported Channel Width:%s*([^\n]*)")
+	if width_line and width_line:find("160 MHz") then
+		caps.has_ht160 = true
+	end
+
+	local nss = phy_info:match("HT TX Max spatial streams:%s*(%d+)")
+	if not nss then
+		-- Fall back to counting "N streams: MCS ..." lines (VHT/HE MCS-set
+		-- tables list one line per supported spatial stream, "not supported"
+		-- for streams beyond the radio's capability) when the more direct
+		-- summary line isn't present.
+		local max_streams = 0
+		for n in phy_info:gmatch("(%d+) streams:%s*MCS") do
+			local count = tonumber(n)
+			if count and count > max_streams then max_streams = count end
+		end
+		if max_streams > 0 then nss = max_streams end
+	end
+	caps.nss = nss and tonumber(nss) or 1
+
+	return caps
 end
 
 -- First-seen timestamps for wired hosts, keyed by "ifname mac" -- used to

@@ -1,0 +1,43 @@
+Wiphy phy1
+	wiphy index: 1
+	max # scan SSIDs: 4
+	Band 2:
+		Capabilities: 0x19ef
+			RX LDPC
+			HT20/HT40
+			SM Power Save disabled
+			RX HT20 SGI
+			RX HT40 SGI
+			TX STBC
+			RX STBC 1-stream
+			Max AMSDU length: 3839 bytes
+		HT TX Max spatial streams: 2
+		HT TX/RX MCS rate indexes supported: 0-15, 32
+		VHT Capabilities (0x338001b2):
+			Max MPDU length: 11454
+			Supported Channel Width: 160 MHz, 80+80 MHz
+			RX antenna pattern consistency: no
+			TX antenna pattern consistency: no
+		VHT RX MCS set:
+			1 streams: MCS 0-9
+			2 streams: MCS 0-9
+			3 streams: not supported
+			4 streams: not supported
+		VHT TX MCS set:
+			1 streams: MCS 0-9
+			2 streams: MCS 0-9
+			3 streams: not supported
+			4 streams: not supported
+		HE Iftypes: AP
+		HE MAC Capabilities: (0x0001):
+		HE PHY Capabilities: (0x04):
+		Frequencies:
+			* 5180 MHz [36] (23.0 dBm)
+			* 5200 MHz [40] (23.0 dBm)
+			* 5220 MHz [44] (23.0 dBm)
+			* 5240 MHz [48] (23.0 dBm)
+			* 5260 MHz [52] (23.0 dBm) (radar detection)
+			* 5280 MHz [56] (23.0 dBm) (radar detection)
+			* 5300 MHz [60] (23.0 dBm) (radar detection)
+			* 5320 MHz [64] (23.0 dBm) (radar detection)
+			* 5500 MHz [100] (23.0 dBm) (radar detection)

@@ -23,7 +23,10 @@ end
 -- return real fixture data (2 wired hosts) instead of empty.
 -- with_scan: when true, scan_table()'s `iw scan dump` source returns real
 -- fixture data (2 neighboring networks) instead of empty.
-local function inject_sysinfo(with_clients, with_wired, with_scan)
+-- with_radio_caps: when true, radio_caps()'s `iw dev ... info` / `iw phy ...
+-- info` sources return a real 5GHz (VHT+HE+DFS+160MHz) fixture instead of
+-- empty.
+local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_caps)
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end
 		if path:find("loadavg") then return fixture("proc_loadavg.txt") end
@@ -45,6 +48,12 @@ local function inject_sysinfo(with_clients, with_wired, with_scan)
 		end
 		if with_scan and cmd:find("scan dump") then
 			return fixture("iw_scan_dump.txt")
+		end
+		if with_radio_caps and cmd:find("dev wlan0 info") then
+			return fixture("iw_dev_info.txt")
+		end
+		if with_radio_caps and cmd:find("phy phy0 info") then
+			return fixture("iw_phy_info_5g.txt")
 		end
 		return ""
 	end
@@ -91,7 +100,8 @@ local ufhw = {
 }
 
 local function build(opts)
-	inject_sysinfo(opts and opts.with_clients, opts and opts.with_wired, opts and opts.with_scan)
+	inject_sysinfo(opts and opts.with_clients, opts and opts.with_wired, opts and opts.with_scan,
+		opts and opts.with_radio_caps)
 	if opts and opts.with_uci then inject_ucihelper() end
 	local st = {
 		authkey    = state.DEFAULT_KEY,
@@ -347,6 +357,14 @@ return {
 			-- "tx_mcs_index" (that's only the ucore-message JSON name).
 			assert_eq(sta_table[1].tx_mcs, 15, "tx_mcs parsed from iw's 'MCS 15'")
 			assert_eq(sta_table[1].rx_mcs, 7, "rx_mcs parsed from iw's 'MCS 7'")
+			-- radio_proto/nss: confirmed real per-station wire fields, read
+			-- independently of tx_mcs/rx_mcs by the real controller's client
+			-- updater (com.ubnt.service.devmgr.TtZhv, confirmed via
+			-- decompile) -- without these every station showed as generation
+			-- "g" (the controller's own fallback) with no MIMO/stream count,
+			-- regardless of tx_mcs/rx_mcs.
+			assert_eq(sta_table[1].radio_proto, "n", "radio_proto from iw's bare 'MCS 15' (plain HT)")
+			assert_eq(sta_table[1].nss, 2, "nss from MCS 15 -> floor(15/8)+1")
 			-- wifi_tx_attempts/wifi_tx_retries_percentage: tx_packets(287) +
 			-- tx_retries(4) = 291 attempts, 4 of them retried.
 			assert_eq(sta_table[1].wifi_tx_attempts, 291, "wifi_tx_attempts = tx_packets + tx_retries")
@@ -477,6 +495,27 @@ return {
 			local d = build({with_uci = true})
 			assert_eq(d.radio_table[1].builtin_ant_gain, 3, "builtin_ant_gain")
 			assert_eq(d.radio_table[1].max_txpower, 20, "max_txpower")
+		end
+	},
+	{
+		name = "inform json: radio_table carries hardware capability fields from iw phy info",
+		fn = function()
+			-- Confirmed via decompile (com.ubnt.service.devmgr.PGOcbDWlbnYQdFW,
+			-- copyAttrsIfPresent): the controller reads nss/is_11ac/is_11ax/
+			-- is_11be/has_dfs/has_fccdfs/has_ht160 directly off each radio_table
+			-- entry, independent of radio_caps/radio_caps2 -- without these,
+			-- the Radios (channel-planning) tab's MIMO/capability filters
+			-- excluded the device entirely, "We Couldn't Find a Match".
+			local d = build({with_uci = true, with_radio_caps = true})
+			local r = d.radio_table[1]
+			assert_true(r.is_11ac, "VHT Capabilities present in the 5GHz fixture")
+			assert_true(r.is_11ax, "HE PHY Capabilities present")
+			assert_false(r.is_11be, "no EHT PHY Capabilities in the fixture")
+			assert_true(r.has_dfs, "radar detection present on several channels")
+			assert_true(r.has_fccdfs, "has_fccdfs mirrors has_dfs")
+			assert_true(r.has_ht160, "'Supported Channel Width: 160 MHz, 80+80 MHz'")
+			assert_eq(r.nss, 2, "nss from 'HT TX Max spatial streams: 2'")
+			assert_eq(r.channel, 6, "live channel from 'iw dev' overrides UCI's config value")
 		end
 	},
 	{

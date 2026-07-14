@@ -2428,6 +2428,84 @@ prefixed behavior as correct).
   `tools/validation/ap/iw-mock.sh` (fake `scan dump` entries, one with a width line). All 217 tests
   pass.
 
+## 21. Radios tab ("We Couldn't Find a Match") + client MIMO column — decompile + two more real bugs (2026-07-14)
+
+- **Status:** ✅ Radio hardware-capability fields (`nss`/`is_11ac`/`is_11ax`/`is_11be`/`has_dfs`/
+  `has_fccdfs`/`has_ht160`/live `channel`) and per-station `radio_proto`/`nss` both implemented,
+  unit-tested, and confirmed correct live. The Radios tab's "We Couldn't Find a Match" turned out to
+  be two separate things: a real openUF gap (missing radio capability fields, now fixed) and a
+  controller UI/filter-semantics red herring (the "Type: Wired/Meshed" filter defaults to showing
+  nothing until one is explicitly checked, unlike every other filter on the same page — not a bug).
+- **"Type: Wired" filter reframing (user-caught):** checking "Wired" under Type unexpectedly
+  revealed the device's two radio rows. This looked backwards (a WiFi radio showing under "Wired")
+  until reframed correctly: "Type" here means the **AP's own uplink connection type** (matches the
+  row's own "Uplink: GbE" column), not the radio's wireless/wired nature — our AP is genuinely wired-
+  uplinked, so "Wired" is the correct bucket. Unlike Band/MIMO/Status on the same page (empty
+  selection = show all, confirmed by testing each), the Type filter's empty state shows nothing —
+  an inconsistent, confusing default in the controller's own UI, not an openUF-side defect.
+- **Real bug: radio_table never carried hardware capability fields at all.** Confirmed via decompile
+  (`com.ubnt.service.devmgr.PGOcbDWlbnYQdFW`, `copyAttrsIfPresent`) that the controller reads
+  `nss`/`is_11ac`/`is_11ax`/`is_11be`/`has_dfs`/`has_fccdfs`/`has_ht160`/`has_eht240`/`has_eht320`
+  directly off each incoming `radio_table` entry, independent of `radio_caps`/`radio_caps2` — openUF
+  sent none of them. **Fix:** new `sysinfo.radio_caps(ifname)` resolves the radio's wiphy index via
+  `iw dev <ifname> info` and parses `iw phy phyN info` for these fields (`VHT Capabilities`/`HE PHY
+  Capabilities`/`EHT PHY Capabilities` section presence, `radar detection` per-frequency annotation,
+  `Supported Channel Width: ... 160 MHz`, and `HT TX Max spatial streams: N` — falling back to
+  counting `N streams: MCS ...` lines when that summary line is absent), all derived from the real
+  board's own driver/firmware report, not invented. Also returns the live negotiated `channel`
+  (from `iw dev`'s own "channel N (...)" line), which is more authoritative than UCI's own config
+  value (frequently the literal string `"auto"`, which the controller does not resolve to a number).
+  Confirmed correctly persisted via direct Mongo/API checks on both a reused and a fully fresh
+  (never-adopted-before) device — capability fields alone were not sufficient to make the Radios
+  table show data; see "Type" filter finding above for why.
+- **Real bug: per-station `radio_proto`/`nss` were never sent, only `tx_mcs`/`rx_mcs`.** Confirmed
+  via decompile that the real controller's client updater (`com.ubnt.service.devmgr.TtZhv`) reads
+  `radio_proto` and `nss` as independent per-station wire fields — neither is derived from
+  `tx_mcs`/`rx_mcs` on the controller's side. Without them, every station showed generation `"g"`
+  (the controller's own fallback default) and no MIMO/stream-count data at all in the client list's
+  Technology column, regardless of what `tx_mcs`/`rx_mcs` said. Root-caused after ruling out several
+  false leads (see "Debugging false starts" below).
+- **Fix:** `sysinfo.lua`'s `sta_table()` now derives `{tx_generation, tx_nss}` (and the `rx_*`
+  equivalents) from `iw`'s own tx/rx bitrate line tokens: bare `MCS N` → generation `"n"`, nss =
+  `floor(N/8)+1` (real HT MCS-index layout — MCS 0-7 is 1 stream, 8-15 is 2, ...); `VHT-MCS`/
+  `VHT-NSS` → generation `"ac"` with nss read directly; `HE-MCS`/`HE-NSS` → `"ax"`; `EHT-MCS`/
+  `EHT-NSS` → `"be"` (confirmed real `iw` format strings via `strings /usr/sbin/iw`). Legacy
+  (pre-MCS) rates carry no generation token at all; `inform.lua` falls back to the known radio band
+  (`"a"` for `na`, `"g"` for `ng`) in that case only — never `"b"`, since real dual-band 11n+
+  hardware doesn't negotiate down to 802.11b-only rates.
+- **Confirmed live:** a brand-new, never-before-seen fake station (VHT/HE-MCS, NSS 2) and the
+  existing MCS-6/MCS-15 stations all show up in the client list's Technology column with `mimo:
+  "MIMO_2"` / `"MIMO_1"` matching their real stream counts exactly — the original "missing values"
+  the user spotted. **`radio_proto` itself still shows the coarser band letter ("g"/"a") instead of
+  the finer generation ("n"/"ac"/"ax")** despite being sent correctly (confirmed via the same live
+  check) — a smaller, separate residual gap, not chased further this session; `mimo`/`nss` was the
+  concrete, user-visible problem and is resolved.
+- **Debugging false starts, recorded so they aren't re-walked:**
+  1. Deleting a stale client record and waiting for it to "reappear on next inform" (the established
+     wired-client pattern) does **not** apply the same way to wireless clients in this validation
+     setup — they simply never came back, even after 45+ seconds. Not resolved; worked around by
+     recreating the whole WiFi network instead (see next point).
+  2. `tools/validation/ap/uci-mock.lua` is an **in-memory-only** mock, explicit in its own header
+     comment: its `db` table is seeded fresh per-process and only ever one-way-dumped to a debug
+     JSON file on `commit()`, never read back. Restarting `inform.lua` to pick up new code silently
+     wipes any WiFi network config that was only ever pushed to the *previous* process's memory —
+     any fresh throwaway `lua5.1 script.lua` invocation (including ones that call `apply_config`
+     directly and appear to "work") is **also** a brand-new process with its own pristine mock state,
+     completely disconnected from the live daemon. Neither proves anything about the live process's
+     actual state. The only reliable way to verify live per-cycle wire data in this setup is to check
+     what the **controller actually received** (Mongo/API), never a fresh local script.
+  3. Following directly from (2): after restarting the daemon for this session's code changes, the
+     previously-created WiFi network was gone from the live process's memory, so no new wireless
+     clients (old or new) could be reported at all — mistaken at first for the code fix not working.
+     Recreating the WiFi network (delete + re-create, since the in-place edit panel's fields were
+     mostly disabled for this network) re-pushed a fresh `system_cfg`, and the live daemon picked it
+     up correctly, closing the loop.
+- **Code changes:** `openuf/sysinfo.lua` (`sta_table()`: `tx_generation`/`tx_nss`/`rx_generation`/
+  `rx_nss` derivation), `openuf/inform.lua` (`radio_proto`/`nss` per sta_table entry),
+  `tests/test_sysinfo.lua` + `tests/test_inform_json.lua` (new cases for HT/VHT/HE/legacy
+  derivation), `tools/validation/ap/iw-mock.sh` (wlan1's fake station now uses realistic VHT-MCS/
+  VHT-NSS tokens instead of bare MCS, matching real 5GHz hardware). All 224 tests pass.
+
 ---
 
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)
