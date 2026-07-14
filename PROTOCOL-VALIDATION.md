@@ -2541,14 +2541,14 @@ prefixed behavior as correct).
 
 ## 22. Radios tab table: "Avg. Signal" / "Avg. Interference" / "Avg. Airtime" / "MIMO" columns (2026-07-14)
 
-- **Status:** ✅ All three "Avg." columns confirmed **live, end to end**, on a fully fresh reset:
-  the Radios page shows real `-64 dBm`/`-50 dBm` ("Avg. Signal"), `3%` ("Avg. Interference"), and
-  `7%` ("Avg. Airtime") for both radios, and the archived `stat_5minutes` `o:"ap"` bucket carries
-  `client_signal_avg`/`radio0-cu_total`/`ng-cu_total`/`radio0-cu_interf`/`ng-cu_interf`/etc. every
-  cycle. Two real openUF wire-field gaps found and fixed: `avg_client_signal` on `vap_table`, and
-  — the harder one — a nested `athstats` sub-object on each `radio_table` entry (see below). ⚠️ The
-  per-radio-row `MIMO` column remains unexplained — likely a dead/unfinished column in the real
-  controller's own UI, not an openUF gap; see below.
+- **Status:** ✅ All four columns confirmed **live, end to end**, on a fully fresh reset:
+  the Radios page shows real `-64 dBm`/`-50 dBm` ("Avg. Signal"), `3%` ("Avg. Interference"),
+  `7%` ("Avg. Airtime"), and `2x2` ("MIMO") for both radios, and the archived `stat_5minutes`
+  `o:"ap"` bucket carries `client_signal_avg`/`radio0-cu_total`/`ng-cu_total`/`radio0-cu_interf`/
+  `ng-cu_interf`/etc. every cycle. Three real openUF wire-field gaps found and fixed:
+  `avg_client_signal` on `vap_table`, a nested `athstats` sub-object on each `radio_table` entry,
+  and — initially misdiagnosed as a dead controller-UI column — the `radio_caps` MIMO bitmask
+  (see below).
 - **Frontend investigation:** downloaded the live controller's `radiosPage.js` +
   `react-app-wrapper.js` + `airview.<hash>.js` React bundles and found the exact selector building
   each radio row:
@@ -2610,20 +2610,46 @@ prefixed behavior as correct).
     fixture clients' -62/-75 dBm signal (`floor(-137/2) = -69`), the same four `cu_*` values
     mirrored onto `vap_table`, and `radio_table[1].athstats` matching the same four values.
     228 tests pass (was 224).
-- **MIMO (per-radio-row) column — unresolved, likely not an openUF gap:** this is a *different*
-  "MIMO" from the per-client one fixed in §21 (this one is a column on the Radios page's own
-  per-radio-row table). Checked exhaustively:
-  - The backend's own `/v2/api/site/default/device` response has `nss` on every `radio_table`
-    entry but **no `mimo` key anywhere** — confirmed directly against the live API.
-  - Downloaded and grepped ~11 frontend JS chunks (`radiosPage.js`, the 1MB `react-app-wrapper.js`,
-    `airview.js`, and every numbered chunk referenced from the Radios page) for `nss`/`mimo`
-    computation logic tied to a radio row — found **zero** matches. The per-client MIMO string
-    (`"MIMO_2"` etc., §21) is computed entirely differently, server-side, and isn't reused here.
-  - Given the column ID (`e.MIMO="mimo"`) exists in the frontend's own column-definition enum but
-    no code path anywhere (frontend or backend) ever populates it, this reads as a genuinely
-    unfinished/dead column in the real controller's own UI — consistent with this project's
-    established precedent of real controller-UI quirks unrelated to openUF (the Environment tab's
-    frontend caching bug in §20, the Type filter's empty-means-nothing default in §21).
+- **MIMO (per-radio-row) column — RESOLVED, a real openUF gap; the earlier "dead column"
+  conclusion below was wrong and has been corrected.** This is a *different* "MIMO" from the
+  per-client one fixed in §21 (this one is a column, and a left-sidebar 1x1/2x2/3x3/4x4 filter, on
+  the Radios page's own per-radio-row table). The user pushed back on the original "unfinished/dead
+  column" call specifically because a *dedicated filter section* for it exists in the live UI — a
+  strong signal real backend data drives it, since a controller wouldn't build filter checkboxes
+  for a column nothing ever populates. That pushback was correct.
+  - Live-tested the filter directly: checking **"2x2"** on our genuinely-2x2 device made the
+    Radios table show **"We Couldn't Find a Match"**, excluding both radios entirely — not just
+    rendering them incorrectly. That ruled out "cosmetic/dead" outright: a truly inert filter
+    would have no effect at all, not actively exclude a matching device.
+  - Fetched and grepped the live controller's own React bundle (`swai.<hash>.js`,
+    `react-app-wrapper.<hash>.js`, `radiosPage.<hash>.js`) for `mimo`. Found the Radios-tab row
+    builder: `mimo:(0,_.e7)(c.radio_caps)` — the column value comes from a **nested
+    `c.radio_caps`**, not from `nss`. (A *separate*, coincidental finding along the way: client
+    rows elsewhere in the same bundles also carry a `client.mimo` field, copied verbatim alongside
+    `radio_proto`/`channel`/`essid`/`signal` in per-client normalizer functions — that is the
+    already-fixed §21 per-client MIMO, unrelated to this column.)
+  - Confirmed via decompile that `radio_caps` is a **genuine, separate integer field** on
+    `radio_table` (`com.ubnt.service.devmgr.PGOcbDWlbnYQdFW`/`tFhABnrHYJqvjaoEa`:
+    `uCthhvfQNZ2.put("radio_caps", uCthhvfQNZ3.getInt("radio_caps", 0))`), listed right alongside
+    the already-sent `is_11ac`/`is_11ax`/`nss`/etc. fields but never itself populated by openUF
+    (always defaulted to `0`). The Java side only ever passes this int through verbatim — no
+    server-side bit-decode exists anywhere in the backend; the decode into `"1x1"`..`"4x4"` happens
+    **client-side only**.
+  - First hypothesis — `radio_caps` simply equals `nss` (e.g. `2` for a 2x2 radio) — was **live-
+    tested and refuted**: setting `radio_caps=2` still left the MIMO column blank and the 2x2
+    filter still excluded the device. Rather than keep guessing blind, used the browser's own
+    webpack module registry (`window["webpackChunk..."].push([[Symbol()], {}, req => ...)`) to grab
+    a direct reference to the controller's *live* `e7` decoder function (module id `927316`) and
+    called it directly with a sweep of every single-bit value (`1<<0` .. `1<<31`). This is the
+    ground truth, not a decompiled guess: **bit 3 (`0x8`) → `"1x1"`, bit 4 (`0x10`) → `"2x2"`, bit 5
+    (`0x20`) → `"3x3"`, bit 26 (`0x4000000`) → `"4x4"`**, checked in that highest-first priority
+    order when multiple bits are set (confirmed with combination inputs too, e.g. `0x20|0x4000000`
+    → `"4x4"`).
+  - **Fix (`openuf/inform.lua`):** each `radio_table` entry gains `radio_caps`, set from a small
+    `nss → bit` lookup table (`1→0x8, 2→0x10, 3→0x20, 4→0x4000000`) keyed off the spatial-stream
+    count already computed by `sysinfo.radio_caps()`. New test in `tests/test_inform_json.lua`
+    asserts a 2x2 fixture radio (`nss=2`) gets `radio_caps == 0x10` exactly. 229 tests pass
+    (was 228).
 - **Live verification, full fresh-reset run (`docker compose down -v` + `up -d --build`,
   per this project's standing "always fully reset, never patch live state" rule):**
   - First attempt hit the already-documented, known-benign **"404 with empty body ≠ rejected"**
@@ -2668,6 +2694,15 @@ prefixed behavior as correct).
     5-minute bucket carried `radio0-cu_total`/`ng-cu_total`/`radio0-cu_interf`/`ng-cu_interf`/etc. for
     both radios — and the live Radios page rendered real `3%`/`7%` "Avg. Interference"/"Avg. Airtime"
     values. All three "Avg." columns are now confirmed working live, not just unit-tested.
+  - MIMO fix verified on a second, separate fresh-reset run: with `radio_caps` left at the
+    controller's default (`0`), the MIMO column was blank and checking the **2x2** filter produced
+    "We Couldn't Find a Match" for both radios (genuinely 2x2 hardware, wrongly excluded). After
+    deploying the `nss → radio_caps` bit fix and restarting the daemon, the very next inform showed
+    `radio_caps: 16` (`0x10`) on both radios in Mongo, the live Radios page rendered `MIMO: 2x2` for
+    both rows, and the 2x2 filter correctly included them. Cross-checked the filter isn't just
+    "always show everything" post-fix by checking **4x4** instead: both radios were correctly
+    excluded again ("We Couldn't Find a Match"), then re-checking 2x2 correctly re-included them —
+    proving genuine, working, bidirectional filtering, not a coincidental side effect.
 
 ---
 

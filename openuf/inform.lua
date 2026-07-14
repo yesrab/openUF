@@ -401,6 +401,40 @@ function M.build_json(st, cfg, ufhw)
 				local ok_caps, caps = pcall(M._sysinfo.radio_caps, ifname)
 				if ok_caps and caps then
 					for k, v in pairs(caps) do radio[k] = v end
+					-- radio_caps: a genuine SEPARATE integer field on
+					-- radio_table (confirmed via decompile,
+					-- com.ubnt.service.devmgr.PGOcbDWlbnYQdFW/
+					-- tFhABnrHYJqvjaoEa: `uCthhvfQNZ2.put("radio_caps",
+					-- uCthhvfQNZ3.getInt("radio_caps", 0))` -- an int, not the
+					-- flattened is_11ac/nss/etc. booleans above, and distinct
+					-- from radio_caps2) -- confirmed 2026-07-14 from the
+					-- controller's own React bundle (swai chunk) that the
+					-- Radios tab's MIMO column/filter computes
+					-- `mimo: e7(radio.radio_caps)` from exactly this field.
+					-- The controller's Java side only ever passes this int
+					-- through verbatim (no server-side bit-decode found in
+					-- the decompile); the decode into "1x1".."4x4" happens
+					-- client-side only. openUF previously always sent 0 (the
+					-- field was never populated), which is why every radio's
+					-- MIMO column stayed blank and the 1x1-4x4 filter
+					-- checkboxes excluded every radio outright rather than
+					-- just filtering incorrectly. The exact bit layout isn't
+					-- simply "value == nss" (confirmed live: radio_caps=2
+					-- still showed blank/excluded) -- it's a bitmask, reverse
+					-- engineered by calling the controller's own live e7()
+					-- decoder directly (via its webpack module cache) with a
+					-- sweep of single-bit values: bit 3 (0x8) -> "1x1", bit 4
+					-- (0x10) -> "2x2", bit 5 (0x20) -> "3x3", bit 26
+					-- (0x4000000) -> "4x4", checked in that highest-first
+					-- priority order when multiple bits are set (all
+					-- confirmed against the live decoder, not guessed).
+					local RADIO_CAPS_MIMO_BIT = {
+						[1] = 0x8,
+						[2] = 0x10,
+						[3] = 0x20,
+						[4] = 0x4000000,
+					}
+					radio.radio_caps = RADIO_CAPS_MIMO_BIT[caps.nss or 1] or RADIO_CAPS_MIMO_BIT[1]
 				end
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 				if ok_rs and stats[1] then

@@ -569,6 +569,31 @@ return {
 		end
 	},
 	{
+		name = "inform json: radio_table entries carry the correct radio_caps MIMO bitmask",
+		fn = function()
+			-- radio_caps is a genuine separate integer field (confirmed via
+			-- decompile, `uCthhvfQNZ3.getInt("radio_caps", 0)`), not the
+			-- flattened is_11ac/nss/etc. booleans -- openUF previously always
+			-- left it at the controller's own default of 0, which is why the
+			-- Radios tab's MIMO column stayed blank and its 1x1-4x4 filter
+			-- excluded every radio outright ("We Couldn't Find a Match").
+			-- The bit layout is NOT "value == nss" (confirmed live: sending
+			-- radio_caps=2 for a 2x2 radio still showed blank/excluded) --
+			-- it's a bitmask, reverse engineered by calling the controller's
+			-- own live MIMO decoder (webpack module 927316's `e7` export)
+			-- directly with a sweep of single-bit values: bit 3 (0x8) ->
+			-- "1x1", bit 4 (0x10) -> "2x2", bit 5 (0x20) -> "3x3", bit 26
+			-- (0x4000000) -> "4x4", checked highest-first when multiple bits
+			-- are set. Confirmed live end-to-end 2026-07-14: a genuinely 2x2
+			-- radio_caps=0x10 now renders "2x2" in the MIMO column and is
+			-- included by the 2x2 filter checkbox.
+			local d = build({with_uci = true, with_radio_caps = true})
+			local r = d.radio_table[1]
+			assert_eq(r.nss, 2, "fixture radio is 2x2 (nss=2)")
+			assert_eq(r.radio_caps, 0x10, "radio_caps carries the bit 4 (0x10) MIMO flag for a 2x2 radio")
+		end
+	},
+	{
 		name = "inform json: scan_radio_table reports neighboring networks per radio",
 		fn = function()
 			-- Confirmed real field names via the decompiled controller's
