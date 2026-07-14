@@ -2283,10 +2283,14 @@ prefixed behavior as correct).
 
 ## 20. Environment / rogue-AP scanning (`scan_radio_table`) — decompile + four real bugs found live (2026-07-14)
 
-- **Status:** ✅ implemented, unit-tested, and confirmed rendering live in the controller's own
-  Environment tab UI, end to end — three real bugs found and fixed via a combination of decompiled
-  backend Java, direct REST verification, and (for the last one) decompiling the controller's own
-  React frontend bundle.
+- **Status:** ✅ openUF's side fully implemented, unit-tested, and confirmed correct end-to-end —
+  four real bugs found and fixed this session via decompiled backend Java, direct REST
+  verification, and decompiling the controller's own React frontend bundle. openUF's payload and
+  the controller's backend ingestion/storage are both proven 100% reliable (direct polling never
+  missed). ⚠️ Separately, the controller's own Environment tab has a real, reproducible frontend
+  bug where the table stops reflecting fresh data ~10s after mount with no user interaction, only
+  recoverable by manually changing a filter/tab — see "Correction" below. That bug is outside
+  openUF's control; it is not evidence of anything wrong on openUF's side.
 - **What this adds:** openUF now reports neighboring wireless networks per radio (rogue-AP /
   WiFi-environment scanning), backing the controller's Insights → AirView → **Environment** tab
   (`GET /api/s/default/stat/rogueap`). Implementation: `openuf/sysinfo.lua`'s `M.scan_table(ifname)`
@@ -2375,15 +2379,32 @@ prefixed behavior as correct).
   UI's own facet list appears to derive from the same now-populated dataset, so their prior
   permanently-disabled appearance was itself a symptom of this bug). Reproduced this successfully
   twice across separate page loads.
-- **Residual timing flakiness, not a defect:** the row does not appear on *every* reload — it comes
-  and goes depending on exact timing, consistent with the backing store being a short-lived
-  in-memory cache on the controller side (not the `rogue` Mongo collection, which stayed empty
-  throughout — that collection is for the narrower `is_rogue`/evil-twin alert path traced in real
-  bug #2's section above, a red herring initially followed for a while before the decompile
-  clarified it) combined with the frontend's own `crudCacheStrategy` 12-second poll interval
-  (visible in the same bundle chunk). A continuously-informing real device (openUF's own 10s
-  interval included) will keep re-populating that cache, so this is expected live behavior, not
-  something to chase further.
+- **Correction (2026-07-14, prompted by the user questioning the first write-up of this): the
+  disappearing row is a real controller-frontend bug, not backend cache timing, and not
+  "expected live behavior" — that initial framing was wrong and too quick.** Verified properly:
+  - Polled `stat/rogueap` directly (bypassing the UI entirely) 10 times over 23 real seconds, 2–3s
+    apart: **10/10 returned all 3 entries**, no misses, no staleness. The backend/API never lost
+    the data once.
+  - Passively watched the mounted tab with **zero interaction**: row visible at page load; by ~10s
+    later, "No WiFi broadcasts found" and the Ch. Width/Channel/Security sidebar filters greyed out
+    again — with no click, no reload, nothing triggered by the user in between.
+  - Clicking a *different* Time Range tab (`1h`) at that point **instantly restored everything**:
+    the row reappeared, a correct signal-vs-channel curve rendered on the graph, and all sidebar
+    filters repopulated with real facets (`80`, `36`, `wpa2`).
+  - Conclusion: the data is reliably present server-side the entire time (confirmed both by direct
+    polling and by the fact that a mere tab click — not a new inform, not new data — instantly
+    fixes the display). Something in the frontend's own component state gets stuck a few seconds
+    after mount and does not self-heal on its own; only a manual filter/tab-triggered re-render
+    recovers it. Plausible mechanism from the decompiled bundle: the table's pagination state
+    (`useState({pageNumber:0,from:0,rowsPerPage:r.length})`) captures `rowsPerPage` from the
+    *current* (pre-fetch, empty) selector result at mount time and never recomputes it, so once the
+    real data arrives the client-side `.slice(from, from+rowsPerPage)` keeps clipping it to nothing
+    until something else (a tab change) resets the pagination state. Not confirmed via React
+    DevTools/live debugging, but consistent with every observation above.
+  - This is a genuine defect in the controller's own web application, entirely outside openUF's
+    control (proprietary compiled frontend, not something a device's wire payload can influence)
+    — but it is a real, reproducible, unprompted bug, and a real (if narrow) UX problem for anyone
+    passively watching this tab. Not something to wave away as "expected."
 - **Real bug #4 (found by the user visually inspecting the live UI after bug #3's fix, RESOLVED
   2026-07-14): the rendered row's "Ch. Width" column was blank.** Same frontend bundle, same table's
   column definitions:
