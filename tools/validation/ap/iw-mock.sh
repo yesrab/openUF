@@ -3,10 +3,11 @@
 #
 # This is not part of openUF -- the real `iw` binary is still installed
 # (see the Dockerfile) and this script falls through to it for anything
-# it doesn't specifically handle. It only intercepts `survey dump` and
-# `station dump` against the synthetic wlan0/wlan1 netdevs ubus-mock.sh
-# invents (this container has no real wireless hardware for the real
-# `iw` to introspect, so those commands would otherwise always fail).
+# it doesn't specifically handle. It only intercepts `survey dump`,
+# `station dump` and `scan dump` against the synthetic wlan0/wlan1
+# netdevs ubus-mock.sh invents (this container has no real wireless
+# hardware for the real `iw` to introspect, so those commands would
+# otherwise always fail).
 # Field names deliberately match the real iw(8) binary's own format
 # strings (confirmed via `strings /usr/sbin/iw`) -- see the accompanying
 # openuf/sysinfo.lua fix, which found the *parser* previously expected
@@ -110,6 +111,60 @@ EOF
 				980000 2100000 5200 3100 12 \
 				"866.7 MBit/s MCS 9 short GI" "780.0 MBit/s MCS 8 short GI" 300 \
 				786432 1572864
+		fi
+		exit 0
+		;;
+	"wlan0 scan" | "wlan1 scan")
+		# Feeds openuf/sysinfo.lua's M.scan_table() -> inform.lua's
+		# scan_radio_table -> controller's Insights/AirView/Environment tab
+		# (stat/rogueap). Fake neighboring BSSes so that pipeline can be
+		# proven end-to-end, same rationale as the fake stations above: this
+		# container has no real RF neighbors for a real scan to ever find.
+		# Field names match `iw`'s own scan-dump format (confirmed via
+		# `strings /usr/sbin/iw`), not the parser's prior assumptions.
+		if [ "$2" = "wlan0" ]; then
+			cat <<EOF
+BSS de:ad:be:ef:aa:01(on wlan0)
+	TSF: 111111111 usec (1d, 06:52:31)
+	freq: 2437
+	beacon interval: 100 TUs
+	capability: ESS Privacy ShortSlotTime (0x0411)
+	signal: -60.00 dBm
+	last seen: 80 ms ago
+	SSID: NeighborCafeWifi
+	DS Parameter set: channel 6
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+		 * Capabilities: (0x0000)
+BSS de:ad:be:ef:aa:02(on wlan0)
+	TSF: 222222222 usec (2d, 13:44:52)
+	freq: 2462
+	beacon interval: 100 TUs
+	capability: ESS ShortSlotTime (0x0401)
+	signal: -82.00 dBm
+	last seen: 500 ms ago
+	SSID: FreePublicWifi
+	DS Parameter set: channel 11
+EOF
+		else
+			cat <<EOF
+BSS de:ad:be:ef:aa:03(on wlan1)
+	TSF: 333333333 usec (3d, 02:11:09)
+	freq: 5180
+	beacon interval: 100 TUs
+	capability: ESS Privacy ShortSlotTime (0x0411)
+	signal: -65.00 dBm
+	last seen: 200 ms ago
+	SSID: NeighborCafeWifi-5G
+	DS Parameter set: channel 36
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+		 * Capabilities: (0x0000)
+EOF
 		fi
 		exit 0
 		;;

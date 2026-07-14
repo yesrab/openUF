@@ -1,0 +1,29 @@
+BSS aa:bb:cc:dd:ee:01(on wlan0)
+	TSF: 123456789 usec (1d, 10:17:36)
+	freq: 2437
+	beacon interval: 100 TUs
+	capability: ESS Privacy ShortSlotTime (0x0411)
+	signal: -55.00 dBm
+	last seen: 120 ms ago
+	Information elements from Probe Response frame:
+	SSID: NeighborNet
+	Supported rates: 1.0* 2.0* 5.5* 11.0* 6.0 9.0 12.0 18.0
+	DS Parameter set: channel 6
+	ERP: <no flags>
+	RSN:	 * Version: 1
+		 * Group cipher: CCMP
+		 * Pairwise ciphers: CCMP
+		 * Authentication suites: PSK
+		 * Capabilities: (0x0000)
+BSS 11:22:33:44:55:66(on wlan0)
+	TSF: 987654321 usec (2d, 03:14:07)
+	freq: 2462
+	beacon interval: 100 TUs
+	capability: ESS ShortSlotTime (0x0401)
+	signal: -78.00 dBm
+	last seen: 340 ms ago
+	Information elements from Probe Response frame:
+	SSID: OpenGuestWifi
+	Supported rates: 1.0* 2.0* 5.5* 11.0* 6.0 9.0 12.0 18.0
+	DS Parameter set: channel 11
+	ERP: <no flags>

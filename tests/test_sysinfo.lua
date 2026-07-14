@@ -293,4 +293,82 @@ return {
 			sysinfo._mac_first_seen = {}
 		end
 	},
+	{
+		name = "sysinfo: scan_table() parses iw scan dump into neighbor entries",
+		fn = function()
+			with_fixtures({}, {["scan dump"] = fixture("iw_scan_dump.txt")}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(#nets, 2, "two neighbor networks")
+				assert_eq(nets[1].bssid, "aa:bb:cc:dd:ee:01", "first bssid")
+				assert_eq(nets[1].essid, "NeighborNet", "first essid")
+				assert_eq(nets[1].freq, 2437, "first freq")
+				assert_eq(nets[1].channel, 6, "first channel derived from freq")
+				assert_eq(nets[1].signal, -55, "first signal")
+				assert_eq(nets[1].security, "wpa2", "first security from RSN IE")
+				assert_eq(nets[1].age, 0, "first age from '120 ms ago', floored to 0s")
+				assert_eq(nets[2].bssid, "11:22:33:44:55:66", "second bssid")
+				assert_eq(nets[2].essid, "OpenGuestWifi", "second essid")
+				assert_eq(nets[2].channel, 11, "second channel derived from freq")
+				assert_eq(nets[2].security, "open", "second security -- no Privacy, no RSN/WPA")
+				assert_eq(nets[2].age, 0, "second age from '340 ms ago', floored to 0s")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: scan_table() classifies Privacy-only (no RSN/WPA IE) as wep",
+		fn = function()
+			local dump = "BSS cc:cc:cc:cc:cc:cc(on wlan0)\n"
+				.. "\tfreq: 2412\n"
+				.. "\tcapability: ESS Privacy (0x0011)\n"
+				.. "\tsignal: -60.00 dBm\n"
+				.. "\tSSID: OldNetwork\n"
+			with_fixtures({}, {["scan dump"] = dump}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(nets[1].security, "wep", "Privacy bit with no RSN/WPA IE classified as wep")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: scan_table() converts 'last seen: N ms ago' to whole seconds",
+		fn = function()
+			local dump = "BSS dd:dd:dd:dd:dd:dd(on wlan0)\n"
+				.. "\tfreq: 2412\n"
+				.. "\tsignal: -60.00 dBm\n"
+				.. "\tlast seen: 45231 ms ago\n"
+				.. "\tSSID: StaleNetwork\n"
+			with_fixtures({}, {["scan dump"] = dump}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(nets[1].age, 45, "45231ms floors to 45s")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: scan_table() defaults age to 0 without a 'last seen' line",
+		fn = function()
+			local dump = "BSS ee:ee:ee:ee:ee:ee(on wlan0)\n"
+				.. "\tfreq: 2412\n"
+				.. "\tsignal: -60.00 dBm\n"
+				.. "\tSSID: NoLastSeen\n"
+			with_fixtures({}, {["scan dump"] = dump}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(nets[1].age, 0, "age defaults to 0 when 'last seen' is absent")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: scan_table() returns empty table for empty output",
+		fn = function()
+			with_fixtures({}, {["scan dump"] = ""}, function()
+				assert_eq(#sysinfo.scan_table("wlan0"), 0, "empty result")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: scan_table() returns empty table for nil ifname",
+		fn = function()
+			with_fixtures({}, {}, function()
+				assert_eq(#sysinfo.scan_table(nil), 0, "nil ifname safe")
+			end)
+		end
+	},
 }

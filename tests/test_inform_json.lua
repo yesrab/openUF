@@ -21,7 +21,9 @@ end
 -- (2 connected clients, one in-use channel survey entry) instead of empty.
 -- with_wired: when true, mac_table()'s bridge fdb/arp/dhcp-lease sources
 -- return real fixture data (2 wired hosts) instead of empty.
-local function inject_sysinfo(with_clients, with_wired)
+-- with_scan: when true, scan_table()'s `iw scan dump` source returns real
+-- fixture data (2 neighboring networks) instead of empty.
+local function inject_sysinfo(with_clients, with_wired, with_scan)
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end
 		if path:find("loadavg") then return fixture("proc_loadavg.txt") end
@@ -41,6 +43,9 @@ local function inject_sysinfo(with_clients, with_wired)
 		if with_wired and cmd:find("bridge fdb show") then
 			return fixture("bridge_fdb_dump.txt")
 		end
+		if with_scan and cmd:find("scan dump") then
+			return fixture("iw_scan_dump.txt")
+		end
 		return ""
 	end
 	-- Return empty neighbor list (no lldpd on dev machine)
@@ -53,7 +58,7 @@ local function inject_ucihelper()
 	inform._ucihelper = {
 		get_radio_table = function()
 			return {
-				{ name = "radio0", channel = "6", ht = "HT20", tx_power = "20",
+				{ name = "radio0", radio = "ng", channel = "6", ht = "HT20", tx_power = "20",
 				  disabled = false, builtin_antenna = true, builtin_ant_gain = 3,
 				  max_txpower = 20 },
 			}
@@ -86,7 +91,7 @@ local ufhw = {
 }
 
 local function build(opts)
-	inject_sysinfo(opts and opts.with_clients, opts and opts.with_wired)
+	inject_sysinfo(opts and opts.with_clients, opts and opts.with_wired, opts and opts.with_scan)
 	if opts and opts.with_uci then inject_ucihelper() end
 	local st = {
 		authkey    = state.DEFAULT_KEY,
@@ -472,6 +477,49 @@ return {
 			local d = build({with_uci = true})
 			assert_eq(d.radio_table[1].builtin_ant_gain, 3, "builtin_ant_gain")
 			assert_eq(d.radio_table[1].max_txpower, 20, "max_txpower")
+		end
+	},
+	{
+		name = "inform json: scan_radio_table reports neighboring networks per radio",
+		fn = function()
+			-- Confirmed real field names via the decompiled controller's
+			-- ingestion DTOs (com.ubnt.service.aO.bLwwMKkr, literally named
+			-- "PeerScan", and its consumer com.ubnt.service.aO.hhFgUVZPT) --
+			-- a top-level scan_radio_table, one entry per radio, each
+			-- carrying that radio's own scan_table list. Feeds Insights ->
+			-- AirView -> Environment (stat/rogueap), distinct from the
+			-- RF/spectrum-scan cmd's channel-utilization-only spectrum_table.
+			-- Confirmed live 2026-07-14: the wire field is `age` (elapsed
+			-- seconds), NOT `last_seen` -- the controller computes the
+			-- absolute last_seen itself as (report_time - age), and drops
+			-- any entry with age >= 30 as stale before it ever reaches the
+			-- rogue-AP list, so sending an absolute timestamp under either
+			-- name is silently ignored.
+			local d = build({with_uci = true, with_scan = true})
+			assert_eq(#d.scan_radio_table, 1, "one scan_radio_table entry (one configured radio)")
+			local srt = d.scan_radio_table[1]
+			assert_eq(srt.radio, "ng", "radio band from radio_table entry")
+			assert_eq(srt.name, "radio0", "radio device name from radio_table entry")
+			assert_eq(#srt.scan_table, 2, "two neighbor networks from the fixture")
+			assert_eq(srt.scan_table[1].bssid, "aa:bb:cc:dd:ee:01", "first neighbor bssid")
+			assert_eq(srt.scan_table[1].mac, "aa:bb:cc:dd:ee:01", "first neighbor mac mirrors bssid")
+			assert_eq(srt.scan_table[1].band, "ng", "first neighbor band mirrors the parent radio's band")
+			assert_eq(srt.scan_table[1].essid, "NeighborNet", "first neighbor essid")
+			assert_eq(srt.scan_table[1].channel, 6, "first neighbor channel")
+			assert_eq(srt.scan_table[1].signal, -55, "first neighbor signal")
+			assert_eq(srt.scan_table[1].rssi, -55, "first neighbor rssi mirrors signal")
+			assert_eq(srt.scan_table[1].security, "wpa2", "first neighbor security")
+			assert_eq(srt.scan_table[1].age, 0, "first neighbor age (elapsed seconds, not a timestamp)")
+			assert_eq(srt.scan_table[2].essid, "OpenGuestWifi", "second neighbor essid")
+			assert_eq(srt.scan_table[2].security, "open", "second neighbor security")
+		end
+	},
+	{
+		name = "inform json: scan_radio_table entries have empty scan_table with no neighbors detected",
+		fn = function()
+			local d = build({with_uci = true})
+			assert_eq(#d.scan_radio_table, 1, "one scan_radio_table entry")
+			assert_eq(#d.scan_radio_table[1].scan_table, 0, "no neighbors without fixtures")
 		end
 	},
 	{

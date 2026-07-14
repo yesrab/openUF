@@ -195,9 +195,23 @@ return {
 			local st = sample_state()
 			-- Real controller sends mgmt_cfg as newline-delimited key=value string.
 			-- Use \\n so the Lua literal contains \n (JSON newline escape).
-			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=http://1.2.3.4:8080/inform\\nuse_aes_gcm=false\\ncfgversion=2\\n"}'
+			local resp = '{"_type":"setparam","mgmt_cfg":"inform_url=http://1.2.3.4:8080/inform\\nuse_aes_gcm=false\\ncfgversion=2\\n"}'
 			inform.handle_response(resp, st)
-			assert_contains(st.inform_url, "1.2.3.4", "inform_url updated from mgmt_url")
+			assert_contains(st.inform_url, "1.2.3.4", "inform_url updated from inform_url")
+		end
+	},
+	{
+		name = "inform packet: handle_response setparam does NOT update inform_url from mgmt_url",
+		fn = function()
+			-- Confirmed live against a real controller (2026-07-14): mgmt_url is
+			-- the web UI deep link (https://host:8443/manage/site/default), not
+			-- an inform endpoint -- conflating the two broke the device's own
+			-- inform loop on the very next routine setparam cycle after adoption.
+			local st = sample_state()
+			local orig_url = st.inform_url
+			local resp = '{"_type":"setparam","mgmt_cfg":"mgmt_url=https://1.2.3.4:8443/manage/site/default\\nuse_aes_gcm=false\\n"}'
+			inform.handle_response(resp, st)
+			assert_eq(st.inform_url, orig_url, "inform_url unchanged by mgmt_url")
 		end
 	},
 	{

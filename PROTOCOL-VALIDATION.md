@@ -2281,6 +2281,115 @@ prefixed behavior as correct).
   `tests/test_firewall.lua` (new), `tests/test_inform_packet.lua` (new block-sta/unblock-sta
   cases), `tools/validation/ap/Dockerfile` (`nftables`, `hostapd`). All 203 tests pass.
 
+## 20. Environment / rogue-AP scanning (`scan_radio_table`) — decompile + three real bugs found live (2026-07-14)
+
+- **Status:** ✅ implemented, unit-tested, and confirmed rendering live in the controller's own
+  Environment tab UI, end to end — three real bugs found and fixed via a combination of decompiled
+  backend Java, direct REST verification, and (for the last one) decompiling the controller's own
+  React frontend bundle.
+- **What this adds:** openUF now reports neighboring wireless networks per radio (rogue-AP /
+  WiFi-environment scanning), backing the controller's Insights → AirView → **Environment** tab
+  (`GET /api/s/default/stat/rogueap`). Implementation: `openuf/sysinfo.lua`'s `M.scan_table(ifname)`
+  parses `iw dev <ifname> scan dump` (the kernel's already-cached BSS list — cheap, non-disruptive,
+  unlike the existing `spectrum-scan` cmd's real `iw scan` trigger) into
+  `{bssid, essid, freq, channel, signal, security, age}`; `openuf/inform.lua` wires one
+  `scan_radio_table` entry per configured radio, each carrying that radio's `scan_table` list, into
+  `build_json()`'s payload.
+- **Wire shape confirmed via decompile**, cross-checked against two controller classes pulled from
+  `internal-dependencies.jar` (10.4.57, `docker cp` + CFR 0.152, never a bind mount or macOS-native
+  unzip — see this doc's standing case-collision warning):
+  - `com.ubnt.service.devmgr.PGOcbDWlbnYQdFW` (the AP inform processor) reads a top-level
+    `scan_radio_table` array; for each entry with a `scan_table` field, it extracts `radio`
+    (default `"scan"`) and `name` (default `"unknown"`) and hands the nested `scan_table` list to
+    the scan-ingestion service — confirming the nested `scan_radio_table[].scan_table[]` shape is
+    exactly right, not a flat list.
+  - `com.ubnt.service.aO.hhFgUVZPT` (the scan-ingestion service, freshly re-decompiled 2026-07-14
+    after finding its package, `com.ubnt.service.aO`, had been silently merged into a differently-
+    cased sibling by an earlier macOS-native extraction — the exact corruption class this doc
+    already warns about) is where each entry is validated and cached. Its consumer DTO,
+    `com.ubnt.service.aO.bLwwMKkr` (literally named `"PeerScan"` in its own builder's `toString`),
+    confirmed the full field list: `mac, ap_mac, bssid, serialno, radio, radio_name, band, channel,
+    bw, freq, rssi, signal, last_seen, vwire_enabled, security, essid, model, model_display`.
+- **Real bug #1 (found live, unrelated to this feature but broke it in testing): `mgmt_url` was
+  wrongly treated as an alias for `inform_url`.** `inform.lua`'s `setparam` handler had
+  `if k == "mgmt_url" or k == "inform_url" then st.inform_url = v`. Live capture against a real
+  controller showed `mgmt_url` is the **web UI deep link**
+  (`https://host:8443/manage/site/default`), not an inform endpoint — completely different from the
+  genuine `inform_url` key the controller separately sends during initial adoption (already
+  correctly documented in §"L2 discovery + real SSH adoption", where a captured `mgmt_cfg` shows
+  both keys side by side with different values). Conflating the two meant that on the very first
+  routine `setparam` after adoption, the device overwrote its own working `inform_url` with the web
+  UI link and started POSTing informs there instead — fatal on an http-only build (`inform: POST
+  failed: https inform URL requires luasec`), and the device was never seen again by the controller
+  (`invalid inform_ip` / stuck in "Adopting"-adjacent limbo). **Fix:** only `inform_url` updates
+  `st.inform_url`; `mgmt_url` is ignored. Existing test that encoded the wrong assumption
+  (`tests/test_inform_packet.lua`, "setparam updates inform_url from key=value string") was fixed to
+  use a real `inform_url=` fixture; a new companion test asserts `mgmt_url` alone leaves
+  `st.inform_url` untouched.
+- **Real bug #2: scan entries need `age` (elapsed seconds), not an absolute `last_seen`
+  timestamp.** The first implementation computed `last_seen = M._time()` (an absolute Unix
+  timestamp) per entry. `hhFgUVZPT`'s ingestion code reads `uCthhvfQNZ.getInt("age")` — elapsed
+  seconds since the neighbor was last seen — and computes the absolute `last_seen` itself as
+  `report_time - age`; it also silently drops any entry with `age >= 30` before it ever reaches the
+  scan cache, as a staleness guard. Sending an absolute timestamp under either key is not just
+  wrong, it is silently discarded — no error, just an empty result, which is what made this bug hard
+  to spot without decompiling the consumer. **Fix:** `sysinfo.lua`'s `scan_table()` now parses `iw`'s
+  own `"last seen: N ms ago"` line (already present in real `iw scan dump` output) into `age =
+  floor(N / 1000)` seconds; `inform.lua` sends that instead of a timestamp.
+- **Confirmed live against the running controller (2026-07-14):** with both fixes applied, adopted
+  fresh (full `docker compose down -v` + `up -d --build` reset), pointed `iw-mock.sh` at three fake
+  neighbor BSSes across both radios (`tools/validation/ap/iw-mock.sh`, mirroring its established
+  shadow-the-real-binary pattern for `survey dump`/`station dump`). Verified in order:
+  1. `inform.lua` ran cleanly with no POST failures once the `mgmt_url` fix was in place (previously
+     crashed permanently on the very first post-adopt `setparam`).
+  2. Direct `GET /api/s/default/stat/rogueap?start=...&end=...` (executed via the browser's own
+     authenticated session, `javascript_tool` + `fetch`) returned all three fake neighbors with
+     fully correct fields — `age: 0`, correct `bssid`/`essid`/`channel`/`security`/`signal`/
+     `radio`/`radio_name`/`ap_mac` — proving the backend ingestion path (`PGOcbDWlbnYQdFW` →
+     `hhFgUVZPT` → cache) accepts and correctly stores openUF's payload end-to-end.
+  3. Also confirmed (from the same decompile) that `is_rogue` is a much narrower concept than the
+     tab's name suggests: it's only set `true` when a neighboring BSSID broadcasts the **same
+     essid as one of the site's own configured networks** (an evil-twin/spoofing check that raises
+     an `EVT_AP_DetectRogueAP` alert), not "any third-party network nearby." Ordinary neighbor
+     networks (openUF's fake ones included) are expected to have `is_rogue: false` and still appear
+     in the general Environment scan list — confirmed they do, per point 2.
+- **Real bug #3 (RESOLVED 2026-07-14): the Environment tab's own table rendered "No WiFi broadcasts
+  found" despite the API returning data — root-caused by decompiling the controller's own React
+  bundle, not just its backend jar.** Downloaded and grepped every `.js` chunk the `wifiScanner`
+  route loads (`react-app-wrapper.*.js` turned out to hold the relevant module). Found the actual
+  list selector applies an *unconditional* filter, upstream of every visible sidebar filter:
+  ```js
+  S=(0,s.Mz)(p,A=>A.filter(A=>!!T.R?.[A?.band]?.[A?.bw>0?A.bw:m.L?.[A?.band]]))
+  ```
+  This indexes a per-band/per-channel-width lookup table by **`A.band`** — a field distinct from
+  `radio`, which openUF's payload never sent at all. `T.R[undefined]` is `undefined`, so
+  `!!undefined` is `false` for every entry, unconditionally, regardless of any sidebar filter state
+  — indistinguishable from "no data" in the UI, even though the API response (confirmed in point 2
+  above) was correct and complete the whole time. The same bundle's own enum definition
+  (`function(e){e.RADIO_NA="na",e.RADIO_NG="ng",e.RADIO_AD="ad",e.RADIO_6E="6e"}`) confirmed `band`
+  takes the exact same string values as `radio`. **Fix:** `inform.lua` now sends
+  `band = radio.radio` alongside `radio`/`radio_name` on every `scan_table` entry.
+- **Confirmed live after the fix:** reloading the Environment tab showed a real row — "Channel 36",
+  "802.11n/a/be" — and the previously-static, greyed-out **Channel** and **Security** sidebar
+  filters populated with real facets (`36`, `wpa2`), which they had never done before (a filter
+  UI's own facet list appears to derive from the same now-populated dataset, so their prior
+  permanently-disabled appearance was itself a symptom of this bug). Reproduced this successfully
+  twice across separate page loads.
+- **Residual timing flakiness, not a defect:** the row does not appear on *every* reload — it comes
+  and goes depending on exact timing, consistent with the backing store being a short-lived
+  in-memory cache on the controller side (not the `rogue` Mongo collection, which stayed empty
+  throughout — that collection is for the narrower `is_rogue`/evil-twin alert path traced in real
+  bug #2's section above, a red herring initially followed for a while before the decompile
+  clarified it) combined with the frontend's own `crudCacheStrategy` 12-second poll interval
+  (visible in the same bundle chunk). A continuously-informing real device (openUF's own 10s
+  interval included) will keep re-populating that cache, so this is expected live behavior, not
+  something to chase further.
+- **Code changes:** `openuf/sysinfo.lua` (`M.scan_table()`), `openuf/inform.lua` (`scan_radio_table`
+  in `build_json()` including the `band` field, `mgmt_url`/`inform_url` fix in `handle_response()`),
+  `tests/test_sysinfo.lua` + `tests/test_inform_json.lua` + `tests/test_inform_packet.lua`
+  (new/fixed cases), `tests/fixtures/iw_scan_dump.txt` (new), `tools/validation/ap/iw-mock.sh` (fake
+  `scan dump` entries). All 217 tests pass.
+
 ---
 
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)

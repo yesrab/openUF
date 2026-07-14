@@ -234,6 +234,64 @@ function M.sta_table(ifname)
 	return clients
 end
 
+-- Returns a table of neighboring wireless networks visible to ifname, by
+-- parsing `iw dev <ifname> scan dump` -- the kernel's already-cached BSS
+-- list from cfg80211, not a fresh scan (that's what the spectrum-scan cmd
+-- handler's separate `iw dev <ifname> scan` call triggers; reading the
+-- cache here is cheap and non-disruptive enough to do on every inform,
+-- unlike a real scan).
+-- Each entry: {bssid, essid, freq, channel, signal, security, age}
+-- `age` is seconds elapsed since last seen, from iw's own "last seen: N ms
+-- ago" line -- NOT a substitute for an absolute last_seen timestamp. The
+-- controller's rogue-AP ingestion (com.ubnt.service.aO.hhFgUVZPT, confirmed
+-- live 2026-07-14) reads `age`, not `last_seen`, and derives the absolute
+-- last_seen itself as (report_time - age); it also silently drops any entry
+-- with age >= 30 as stale before it ever reaches the rogue-AP list, so this
+-- must be a small, genuinely-fresh number, not whatever we last computed.
+function M.scan_table(ifname)
+	if not ifname then return {} end
+	local output = M._run_cmd("iw dev " .. ifname .. " scan dump")
+	local nets = {}
+	local cur = nil
+	local seen_rsn, seen_wpa, seen_privacy = false, false, false
+
+	local function flush()
+		if not cur then return end
+		if not cur.age then cur.age = 0 end
+		if seen_rsn then cur.security = "wpa2"
+		elseif seen_wpa then cur.security = "wpa"
+		elseif seen_privacy then cur.security = "wep"
+		else cur.security = "open" end
+		nets[#nets + 1] = cur
+	end
+
+	for line in output:gmatch("[^\n]+") do
+		local bssid = line:match("^BSS (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+		if bssid then
+			flush()
+			cur = {bssid = bssid}
+			seen_rsn, seen_wpa, seen_privacy = false, false, false
+		elseif cur then
+			local freq     = line:match("freq:%s+(%d+)")
+			local signal   = line:match("signal:%s+(-?%d+)")
+			local ssid     = line:match("^\tSSID:%s?(.*)$")
+			local last_ms  = line:match("last seen:%s+(%d+) ms ago")
+			if freq then
+				cur.freq    = tonumber(freq)
+				cur.channel = M.channel_from_freq(freq)
+			end
+			if signal then cur.signal = tonumber(signal) end
+			if ssid and not cur.essid then cur.essid = ssid end
+			if last_ms then cur.age = math.floor(tonumber(last_ms) / 1000) end
+			if line:find("capability:.*Privacy") then seen_privacy = true end
+			if line:find("^\tRSN:") then seen_rsn = true end
+			if line:find("^\tWPA:") then seen_wpa = true end
+		end
+	end
+	flush()
+	return nets
+end
+
 -- First-seen timestamps for wired hosts, keyed by "ifname mac" -- used to
 -- derive `uptime` in M.mac_table() the same way sta_table's connected_sec
 -- comes from iw (which has no equivalent concept for a bridge-learned MAC).

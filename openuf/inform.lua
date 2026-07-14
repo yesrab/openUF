@@ -351,6 +351,7 @@ function M.build_json(st, cfg, ufhw)
 	local radio_table       = {}
 	local radio_table_stats = {}
 	local vap_table         = {}
+	local scan_radio_table  = {}
 
 	local mac_str = st.mac or "00:00:00:00:00:00"
 
@@ -407,6 +408,59 @@ function M.build_json(st, cfg, ufhw)
 						entry.spectrum_table_time = sscan.table_time
 					end
 					radio_table_stats[#radio_table_stats + 1] = entry
+				end
+				-- Neighboring wireless networks visible to this radio --
+				-- confirmed real field names via the decompiled controller's
+				-- ingestion DTO (com.ubnt.service.aO.bLwwMKkr, literally
+				-- named "PeerScan"): a top-level scan_radio_table, one entry
+				-- per radio, each carrying that radio's own scan_table list.
+				-- Feeds the controller's Insights -> AirView -> Environment
+				-- view (backed by stat/rogueap) -- a different, previously
+				-- unimplemented feature from the RF/spectrum-scan cmd above,
+				-- which only ever reported channel utilization, never which
+				-- neighboring SSIDs/BSSIDs were actually detected. See
+				-- PROTOCOL-VALIDATION.md for the full derivation.
+				local ok_sc, nets = pcall(M._sysinfo.scan_table, ifname)
+				if ok_sc and nets then
+					local scan_table = {}
+					for _, net in ipairs(nets) do
+						scan_table[#scan_table + 1] = {
+							mac        = net.bssid,
+							bssid      = net.bssid,
+							radio      = radio.radio,
+							radio_name = radio.name,
+							-- Confirmed from the controller's own React bundle
+							-- (2026-07-14, react-app-wrapper chunk): the
+							-- Environment tab's list is fed through an
+							-- unconditional filter keyed on `band` (a field
+							-- distinct from `radio`, but taking the exact same
+							-- enum values -- "ng"/"na"/"6e", confirmed from the
+							-- bundle's own enum definition) -- any entry
+							-- missing `band` fails that filter silently, with
+							-- no error and no visible UI cause, regardless of
+							-- every visible sidebar filter's state.
+							band       = radio.radio,
+							channel    = net.channel,
+							freq       = net.freq,
+							rssi       = net.signal,
+							signal     = net.signal,
+							-- NOT last_seen: the controller derives the
+							-- absolute last_seen itself from report_time -
+							-- age, and its rogue-AP detection silently
+							-- drops any entry with age >= 30 as stale
+							-- (confirmed live 2026-07-14, see
+							-- PROTOCOL-VALIDATION.md) -- age must be
+							-- seconds actually elapsed, not omitted.
+							age        = net.age or 0,
+							security   = net.security,
+							essid      = net.essid,
+						}
+					end
+					scan_radio_table[#scan_radio_table + 1] = {
+						radio      = radio.radio,
+						name       = radio.name,
+						scan_table = scan_table,
+					}
 				end
 			end
 		end
@@ -722,6 +776,7 @@ function M.build_json(st, cfg, ufhw)
 		radio_table      = radio_table,
 		radio_table_stats = radio_table_stats,
 		vap_table        = vap_table,
+		scan_radio_table = scan_radio_table,
 		port_table       = port_table,
 		lldp_table       = lldp_table,
 	}
@@ -863,7 +918,16 @@ function M.handle_response(json_str, st, cfg)
 			for line in (mgmt_raw .. "\n"):gmatch("([^\n]*)\n") do
 				local k, v = line:match("^([^=]+)=(.*)$")
 				if k and v then
-					if k == "mgmt_url" or k == "inform_url" then
+					if k == "inform_url" then
+						-- NOT "mgmt_url" -- confirmed live against a real controller
+						-- (2026-07-14) that mgmt_url is the web UI deep link
+						-- (https://host:8443/manage/site/default), a completely
+						-- different endpoint from the actual inform target.
+						-- Aliasing the two here previously made the device
+						-- overwrite its own working inform_url with the UI link on
+						-- the very next routine setparam cycle after adoption,
+						-- breaking the inform loop for good (http-only builds have
+						-- no luasec, so switching to that https URL is fatal).
 						if v ~= "" then st.inform_url = v end
 					elseif k == "use_aes_gcm" then
 						st.use_gcm = (v == "true")

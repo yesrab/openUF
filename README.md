@@ -21,6 +21,7 @@ openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi
 | Client block/unblock | ✅ Working — enforced via nftables (`block-sta`/`unblock-sta` cmd), persists across restarts |
 | Locate (LED identify) | ✅ Working — requires `dev.conf.led` sysfs path set per board |
 | RF/spectrum scan | Best-effort trigger only — result-reporting wire format unconfirmed |
+| Environment / rogue-AP scanning (`scan_radio_table`) | ✅ Working — confirmed rendering live in the controller's Environment tab UI |
 | Firmware upgrade requests | Stored (version/url), never applied — flashing controller-supplied firmware onto non-Ubiquiti hardware would brick it |
 | LLDP topology announcement | ✅ Working (via lldpd) |
 | AES-128-GCM (newer firmware flag) | Implemented, untested |
