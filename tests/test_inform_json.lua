@@ -365,6 +365,15 @@ return {
 			-- regardless of tx_mcs/rx_mcs.
 			assert_eq(sta_table[1].radio_proto, "n", "radio_proto from iw's bare 'MCS 15' (plain HT)")
 			assert_eq(sta_table[1].nss, 2, "nss from MCS 15 -> floor(15/8)+1")
+			-- is_11n/is_11ac/is_11ax/is_11be: the fields that ACTUALLY drive
+			-- the live (still-connected) client's displayed generation --
+			-- confirmed via decompile (com.ubnt.service.devmgr.HCKpgcBFPLu ->
+			-- com.ubnt.g.s.jRsSex) that radio_proto's own string value is
+			-- ignored entirely for a live client; only these booleans matter.
+			assert_true(sta_table[1].is_11n, "plain HT (bare MCS) sets is_11n")
+			assert_false(sta_table[1].is_11ac, "not VHT")
+			assert_false(sta_table[1].is_11ax, "not HE")
+			assert_false(sta_table[1].is_11be, "not EHT")
 			-- wifi_tx_attempts/wifi_tx_retries_percentage: tx_packets(287) +
 			-- tx_retries(4) = 291 attempts, 4 of them retried.
 			assert_eq(sta_table[1].wifi_tx_attempts, 291, "wifi_tx_attempts = tx_packets + tx_retries")

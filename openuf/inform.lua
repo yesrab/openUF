@@ -607,18 +607,25 @@ function M.build_json(st, cfg, ufhw)
 					-- pre-11n rates have none).
 					tx_mcs     = sta.tx_mcs,
 					rx_mcs     = sta.rx_mcs,
-					-- radio_proto/nss: confirmed real per-station wire fields,
-					-- read independently of tx_mcs/rx_mcs by the real
-					-- controller's client updater (com.ubnt.service.devmgr.
-					-- TtZhv, confirmed via decompile) -- neither is derived
-					-- from tx_mcs there, so leaving them unset made every
-					-- station show the controller's own fallback generation
-					-- ("g") and no MIMO/stream count at all, regardless of
-					-- what tx_mcs/rx_mcs said. Legacy (pre-MCS) rates carry no
-					-- generation token from iw at all; "a"/"g" here reflects
-					-- which band's legacy PHY that actually is (never "b" --
-					-- real dual-band-11n+ hardware doesn't negotiate down to
-					-- 802.11b-only rates), not an invented value.
+					-- radio_proto: still sent for the disconnect-time session
+					-- archive (com.ubnt.service.devmgr.TtZhv reads this string
+					-- directly when a client disconnects), but it is NOT what
+					-- drives the live, still-connected display -- confirmed by
+					-- decompiling the actual live-update path
+					-- (com.ubnt.service.devmgr.HCKpgcBFPLu, a KrlpWXOulbN
+					-- implementation) down to com.ubnt.g.s.jRsSex, whose
+					-- generation logic ignores any "radio_proto" string
+					-- entirely and instead derives it from boolean per-station
+					-- capability flags -- is_11be/is_11ax/is_11ac/is_11n/
+					-- is_11b -- falling through to the lowest ("g" on 2.4GHz,
+					-- "a" on 5GHz) when none are set. That's why sending only
+					-- radio_proto left every live client showing "g"/"a" and
+					-- why nss (read directly, no derivation) worked
+					-- immediately: these booleans were the missing piece.
+					is_11n     = sta.tx_generation == "n",
+					is_11ac    = sta.tx_generation == "ac",
+					is_11ax    = sta.tx_generation == "ax",
+					is_11be    = sta.tx_generation == "be",
 					radio_proto = sta.tx_generation or (vap.radio == "na" and "a" or "g"),
 					nss         = sta.tx_nss or 1,
 					wifi_tx_attempts = wifi_tx_attempts,

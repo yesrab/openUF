@@ -2428,14 +2428,16 @@ prefixed behavior as correct).
   `tools/validation/ap/iw-mock.sh` (fake `scan dump` entries, one with a width line). All 217 tests
   pass.
 
-## 21. Radios tab ("We Couldn't Find a Match") + client MIMO column — decompile + two more real bugs (2026-07-14)
+## 21. Radios tab ("We Couldn't Find a Match") + client MIMO/generation columns — decompile + three real bugs (2026-07-14)
 
 - **Status:** ✅ Radio hardware-capability fields (`nss`/`is_11ac`/`is_11ax`/`is_11be`/`has_dfs`/
-  `has_fccdfs`/`has_ht160`/live `channel`) and per-station `radio_proto`/`nss` both implemented,
-  unit-tested, and confirmed correct live. The Radios tab's "We Couldn't Find a Match" turned out to
-  be two separate things: a real openUF gap (missing radio capability fields, now fixed) and a
-  controller UI/filter-semantics red herring (the "Type: Wired/Meshed" filter defaults to showing
-  nothing until one is explicitly checked, unlike every other filter on the same page — not a bug).
+  `has_fccdfs`/`has_ht160`/live `channel`), per-station `nss`, and per-station `is_11n`/`is_11ac`/
+  `is_11ax`/`is_11be` all implemented, unit-tested, and confirmed correct live — including the live
+  (still-connected) client generation display, not just the disconnect-time archive. The Radios
+  tab's "We Couldn't Find a Match" turned out to be two separate things: a real openUF gap (missing
+  radio capability fields, now fixed) and a controller UI/filter-semantics red herring (the "Type:
+  Wired/Meshed" filter defaults to showing nothing until one is explicitly checked, unlike every
+  other filter on the same page — not a bug).
 - **"Type: Wired" filter reframing (user-caught):** checking "Wired" under Type unexpectedly
   revealed the device's two radio rows. This looked backwards (a WiFi radio showing under "Wired")
   until reframed correctly: "Type" here means the **AP's own uplink connection type** (matches the
@@ -2476,10 +2478,38 @@ prefixed behavior as correct).
 - **Confirmed live:** a brand-new, never-before-seen fake station (VHT/HE-MCS, NSS 2) and the
   existing MCS-6/MCS-15 stations all show up in the client list's Technology column with `mimo:
   "MIMO_2"` / `"MIMO_1"` matching their real stream counts exactly — the original "missing values"
-  the user spotted. **`radio_proto` itself still shows the coarser band letter ("g"/"a") instead of
-  the finer generation ("n"/"ac"/"ax")** despite being sent correctly (confirmed via the same live
-  check) — a smaller, separate residual gap, not chased further this session; `mimo`/`nss` was the
-  concrete, user-visible problem and is resolved.
+  the user spotted.
+- **RESOLVED (2026-07-14, user asked to keep chasing): `radio_proto` itself still showed the coarser
+  band letter ("g"/"a") instead of the finer generation ("n"/"ac"/"ax") even though the field was
+  being sent correctly.** Root-caused by decompiling one level deeper than `TtZhv` (which only
+  handles the disconnect-time session archive): the actual **live, still-connected** client display
+  is computed by `com.ubnt.service.devmgr.HCKpgcBFPLu` (a concrete `KrlpWXOulbN` implementation) →
+  `com.ubnt.g.s.jRsSex`, whose generation logic **ignores the wire `radio_proto` string entirely**
+  and instead derives it from independent **boolean** per-station capability flags —
+  `is_11be`/`is_11ax`/`is_11ac`/`is_11n`/`is_11b` — falling through to the lowest value (`"g"` on
+  2.4GHz, `"a"` on 5GHz) whenever none of them are set. Confirmed exactly via the decompiled source:
+  ```java
+  private static jRsSex lhPagEPcc(UCthhvfQNZ uCthhvfQNZ) {  // 2.4GHz (ng) path
+      if (uCthhvfQNZ.is("is_11be", false)) return BE;
+      if (uCthhvfQNZ.is("is_11ax", false)) return AX;
+      if (uCthhvfQNZ.is("is_11n", false))  return NG;
+      if (uCthhvfQNZ.is("is_11b", false))  return B;
+      return G;  // openUF never set any of the above, so always landed here
+  }
+  ```
+  This is why `nss` (read directly, no derivation) worked immediately while `radio_proto` (the
+  string field, unused by this path) never changed anything. **Fix:** `inform.lua` now also sends
+  `is_11n`/`is_11ac`/`is_11ax`/`is_11be` per `sta_table` entry, set from the same `tx_generation`
+  `sysinfo.lua` already derives (`radio_proto` itself is left in place too, since `TtZhv`'s
+  disconnect-time archive path does read it directly).
+- **Confirmed live after the fix**, on the exact same 4 stations, each showing correctly:
+
+  | station | real rate | `radio_proto` |
+  |---|---|---|
+  | HE-MCS 11 (new, never-before-seen MAC) | HE | `"ax"` |
+  | bare MCS 15 (HT, 2.4GHz) | HT | `"ng"` (the real enum string for 2.4GHz HT — not `"n"`) |
+  | 54.0 MBit/s (no MCS token at all) | legacy | `"g"` (genuinely legacy — correctly left alone) |
+  | VHT-MCS 9 (5GHz) | VHT | `"ac"` |
 - **Debugging false starts, recorded so they aren't re-walked:**
   1. Deleting a stale client record and waiting for it to "reappear on next inform" (the established
      wired-client pattern) does **not** apply the same way to wireless clients in this validation
@@ -2501,10 +2531,11 @@ prefixed behavior as correct).
      mostly disabled for this network) re-pushed a fresh `system_cfg`, and the live daemon picked it
      up correctly, closing the loop.
 - **Code changes:** `openuf/sysinfo.lua` (`sta_table()`: `tx_generation`/`tx_nss`/`rx_generation`/
-  `rx_nss` derivation), `openuf/inform.lua` (`radio_proto`/`nss` per sta_table entry),
-  `tests/test_sysinfo.lua` + `tests/test_inform_json.lua` (new cases for HT/VHT/HE/legacy
-  derivation), `tools/validation/ap/iw-mock.sh` (wlan1's fake station now uses realistic VHT-MCS/
-  VHT-NSS tokens instead of bare MCS, matching real 5GHz hardware). All 224 tests pass.
+  `rx_nss` derivation), `openuf/inform.lua` (`radio_proto`/`nss`/`is_11n`/`is_11ac`/`is_11ax`/
+  `is_11be` per sta_table entry), `tests/test_sysinfo.lua` + `tests/test_inform_json.lua` (new cases
+  for HT/VHT/HE/legacy derivation and the `is_11*` booleans), `tools/validation/ap/iw-mock.sh`
+  (wlan1's fake station now uses realistic VHT-MCS/VHT-NSS tokens instead of bare MCS, matching real
+  5GHz hardware). All 224 tests pass.
 
 ---
 
