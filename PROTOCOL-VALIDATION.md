@@ -2281,7 +2281,7 @@ prefixed behavior as correct).
   `tests/test_firewall.lua` (new), `tests/test_inform_packet.lua` (new block-sta/unblock-sta
   cases), `tools/validation/ap/Dockerfile` (`nftables`, `hostapd`). All 203 tests pass.
 
-## 20. Environment / rogue-AP scanning (`scan_radio_table`) — decompile + three real bugs found live (2026-07-14)
+## 20. Environment / rogue-AP scanning (`scan_radio_table`) — decompile + four real bugs found live (2026-07-14)
 
 - **Status:** ✅ implemented, unit-tested, and confirmed rendering live in the controller's own
   Environment tab UI, end to end — three real bugs found and fixed via a combination of decompiled
@@ -2384,11 +2384,28 @@ prefixed behavior as correct).
   (visible in the same bundle chunk). A continuously-informing real device (openUF's own 10s
   interval included) will keep re-populating that cache, so this is expected live behavior, not
   something to chase further.
-- **Code changes:** `openuf/sysinfo.lua` (`M.scan_table()`), `openuf/inform.lua` (`scan_radio_table`
-  in `build_json()` including the `band` field, `mgmt_url`/`inform_url` fix in `handle_response()`),
-  `tests/test_sysinfo.lua` + `tests/test_inform_json.lua` + `tests/test_inform_packet.lua`
-  (new/fixed cases), `tests/fixtures/iw_scan_dump.txt` (new), `tools/validation/ap/iw-mock.sh` (fake
-  `scan dump` entries). All 217 tests pass.
+- **Real bug #4 (found by the user visually inspecting the live UI after bug #3's fix, RESOLVED
+  2026-07-14): the rendered row's "Ch. Width" column was blank.** Same frontend bundle, same table's
+  column definitions:
+  ```js
+  {id:Nt.ye.BW, ..., renderCell:({bw:A})=>A?(0,n.jsxs)(Pt,{children:[A," ",(0,n.jsx)(k.sA,{id:"COMMON_UNIT_MHZ"})]}):null, ...}
+  ```
+  The cell reads `bw` directly and renders nothing at all when it's falsy — openUF's payload never
+  sent a `bw` field, only the filter-satisfying `band`. **Fix:** `sysinfo.lua`'s `scan_table()` now
+  parses `iw`'s own `"BSS operating channel width: N MHz"` line (confirmed via `strings
+  /usr/sbin/iw`; only present for HE/VHT-capable neighbors) into `bw`, defaulting to `20` (legacy-
+  safe, valid for both bands) when a neighbor doesn't advertise it, rather than leaving the wire
+  field absent and the column blank. `inform.lua` sends `bw = net.bw or 20` per entry.
+- **Confirmed live:** reloaded the Environment tab after redeploying — the 5 GHz row rendered "Ch.
+  Width: 80 MHz", matching the fake neighbor's mocked `iw-mock.sh` width line exactly (the 2.4 GHz
+  neighbors, which have no width line in the mock, fall back to the 20 MHz default).
+- **Code changes:** `openuf/sysinfo.lua` (`M.scan_table()`: `age`, `band` support via `radio`, `bw`
+  parsing/default), `openuf/inform.lua` (`scan_radio_table` in `build_json()` including `band`/`bw`,
+  `mgmt_url`/`inform_url` fix in `handle_response()`), `tests/test_sysinfo.lua` +
+  `tests/test_inform_json.lua` + `tests/test_inform_packet.lua` (new/fixed cases),
+  `tests/fixtures/iw_scan_dump.txt` (new, includes a width line on one entry),
+  `tools/validation/ap/iw-mock.sh` (fake `scan dump` entries, one with a width line). All 217 tests
+  pass.
 
 ---
 

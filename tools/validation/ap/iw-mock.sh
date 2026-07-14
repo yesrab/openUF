@@ -157,6 +157,7 @@ BSS de:ad:be:ef:aa:03(on wlan1)
 	capability: ESS Privacy ShortSlotTime (0x0411)
 	signal: -65.00 dBm
 	last seen: 200 ms ago
+	BSS operating channel width: 80 MHz
 	SSID: NeighborCafeWifi-5G
 	DS Parameter set: channel 36
 	RSN:	 * Version: 1

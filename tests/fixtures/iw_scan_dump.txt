@@ -6,6 +6,7 @@ BSS aa:bb:cc:dd:ee:01(on wlan0)
 	signal: -55.00 dBm
 	last seen: 120 ms ago
 	Information elements from Probe Response frame:
+	BSS operating channel width: 40 MHz
 	SSID: NeighborNet
 	Supported rates: 1.0* 2.0* 5.5* 11.0* 6.0 9.0 12.0 18.0
 	DS Parameter set: channel 6

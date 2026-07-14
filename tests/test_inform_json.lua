@@ -510,6 +510,8 @@ return {
 			assert_eq(srt.scan_table[1].rssi, -55, "first neighbor rssi mirrors signal")
 			assert_eq(srt.scan_table[1].security, "wpa2", "first neighbor security")
 			assert_eq(srt.scan_table[1].age, 0, "first neighbor age (elapsed seconds, not a timestamp)")
+			assert_eq(srt.scan_table[1].bw, 40, "first neighbor bw (Environment tab's Ch. Width column reads this directly)")
+			assert_eq(srt.scan_table[2].bw, 20, "second neighbor bw defaults to 20 when iw reports no width")
 			assert_eq(srt.scan_table[2].essid, "OpenGuestWifi", "second neighbor essid")
 			assert_eq(srt.scan_table[2].security, "open", "second neighbor security")
 		end

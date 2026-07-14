@@ -306,11 +306,13 @@ return {
 				assert_eq(nets[1].signal, -55, "first signal")
 				assert_eq(nets[1].security, "wpa2", "first security from RSN IE")
 				assert_eq(nets[1].age, 0, "first age from '120 ms ago', floored to 0s")
+				assert_eq(nets[1].bw, 40, "first bw parsed from 'BSS operating channel width: 40 MHz'")
 				assert_eq(nets[2].bssid, "11:22:33:44:55:66", "second bssid")
 				assert_eq(nets[2].essid, "OpenGuestWifi", "second essid")
 				assert_eq(nets[2].channel, 11, "second channel derived from freq")
 				assert_eq(nets[2].security, "open", "second security -- no Privacy, no RSN/WPA")
 				assert_eq(nets[2].age, 0, "second age from '340 ms ago', floored to 0s")
+				assert_eq(nets[2].bw, 20, "second bw defaults to 20 -- no width line for this BSS")
 			end)
 		end
 	},

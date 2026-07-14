@@ -444,6 +444,10 @@ function M.build_json(st, cfg, ufhw)
 							freq       = net.freq,
 							rssi       = net.signal,
 							signal     = net.signal,
+							-- The Environment tab's "Ch. Width" column reads
+							-- this directly and renders nothing at all when
+							-- it's falsy/missing (confirmed live 2026-07-14).
+							bw         = net.bw or 20,
 							-- NOT last_seen: the controller derives the
 							-- absolute last_seen itself from report_time -
 							-- age, and its rogue-AP detection silently

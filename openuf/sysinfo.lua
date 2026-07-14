@@ -240,7 +240,14 @@ end
 -- handler's separate `iw dev <ifname> scan` call triggers; reading the
 -- cache here is cheap and non-disruptive enough to do on every inform,
 -- unlike a real scan).
--- Each entry: {bssid, essid, freq, channel, signal, security, age}
+-- Each entry: {bssid, essid, freq, channel, signal, security, age, bw}
+-- `bw` is channel width in MHz, from iw's own "BSS operating channel width:
+-- N MHz" line (only present for HE/VHT-capable neighbors; confirmed via
+-- `strings /usr/sbin/iw`). The controller's Environment tab's "Ch. Width"
+-- column reads this field directly and renders nothing at all when it's
+-- missing (confirmed live 2026-07-14) -- default to 20 (legacy-safe, valid
+-- for both bands) when a neighbor doesn't advertise it, rather than leaving
+-- the column blank.
 -- `age` is seconds elapsed since last seen, from iw's own "last seen: N ms
 -- ago" line -- NOT a substitute for an absolute last_seen timestamp. The
 -- controller's rogue-AP ingestion (com.ubnt.service.aO.hhFgUVZPT, confirmed
@@ -258,6 +265,7 @@ function M.scan_table(ifname)
 	local function flush()
 		if not cur then return end
 		if not cur.age then cur.age = 0 end
+		if not cur.bw then cur.bw = 20 end
 		if seen_rsn then cur.security = "wpa2"
 		elseif seen_wpa then cur.security = "wpa"
 		elseif seen_privacy then cur.security = "wep"
@@ -276,6 +284,7 @@ function M.scan_table(ifname)
 			local signal   = line:match("signal:%s+(-?%d+)")
 			local ssid     = line:match("^\tSSID:%s?(.*)$")
 			local last_ms  = line:match("last seen:%s+(%d+) ms ago")
+			local bw       = line:match("BSS operating channel width:%s+(%d+) MHz")
 			if freq then
 				cur.freq    = tonumber(freq)
 				cur.channel = M.channel_from_freq(freq)
@@ -283,6 +292,7 @@ function M.scan_table(ifname)
 			if signal then cur.signal = tonumber(signal) end
 			if ssid and not cur.essid then cur.essid = ssid end
 			if last_ms then cur.age = math.floor(tonumber(last_ms) / 1000) end
+			if bw then cur.bw = tonumber(bw) end
 			if line:find("capability:.*Privacy") then seen_privacy = true end
 			if line:find("^\tRSN:") then seen_rsn = true end
 			if line:find("^\tWPA:") then seen_wpa = true end
