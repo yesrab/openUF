@@ -35,6 +35,25 @@ case "$1" in
 			echo "  Install them with: apk update && apk add$MISSING"
 		fi
 
+		# usteer (Band Steering) + a full wpad build (BSS Transition /
+		# Band Steering both need real 802.11k/v support -- wpad-basic-*
+		# lacks bss_transition entirely and errors with "unknown
+		# configuration item 'bss_transition'"). Unlike the base packages
+		# above, these are actually installed (not just warned about) so
+		# both features work out of the box.
+		if ! apk info -e usteer >/dev/null 2>&1; then
+			echo "Installing usteer (Band Steering support) ..."
+			apk add usteer \
+				|| echo "WARNING: failed to install usteer -- Band Steering will not function."
+		fi
+
+		if ! apk info -e wpad-wolfssl >/dev/null 2>&1 && ! apk info -e wpad-openssl >/dev/null 2>&1; then
+			echo "Installing a full wpad build (required for BSS Transition / Band Steering) ..."
+			apk add wpad-wolfssl \
+				|| apk add wpad-openssl \
+				|| echo "WARNING: failed to install a full wpad build -- BSS Transition and Band Steering will not function (wpad-basic-* lacks 802.11v support)."
+		fi
+
 		# Copy Lua source
 		mkdir -p "$INSTALL_DIR"
 		cp -r openuf/* "$INSTALL_DIR/"

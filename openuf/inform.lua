@@ -57,6 +57,7 @@ local ucihelper = _require_sibling("ucihelper")
 local led       = _require_sibling("led")
 local netconfig = _require_sibling("netconfig")
 local firewall  = _require_sibling("firewall")
+local usteer    = _require_sibling("usteer")
 
 local M = {}
 
@@ -68,6 +69,7 @@ M._lldp      = lldp
 M._led       = led
 M._netconfig = netconfig
 M._firewall  = firewall
+M._usteer    = usteer
 
 -- In-memory only (not persisted to state.json): per-radio spectrum-scan
 -- results, keyed by radio name. Ephemeral live data, same category as
@@ -389,6 +391,12 @@ function M.build_json(st, cfg, ufhw)
 		-- populating every cycle while cu_interf/cu_total never appeared at
 		-- all despite being sent correctly.
 		local radio_cu_stats = {}
+		-- Minimum RSSI enforcement data, keyed by radio name (e.g. "radio0"),
+		-- consumed by the per-station loop below -- kept as absolute dBm
+		-- thresholds (already converted using this same loop's live noise
+		-- reading) so the enforcement check further down is a plain
+		-- sta.signal comparison.
+		local minrssi_threshold_by_radio = {}
 		for _, radio in ipairs(radio_table) do
 			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
 			if ok_if and ifname then
@@ -437,6 +445,20 @@ function M.build_json(st, cfg, ufhw)
 					radio.radio_caps = RADIO_CAPS_MIMO_BIT[caps.nss or 1] or RADIO_CAPS_MIMO_BIT[1]
 				end
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
+				-- min_rssi (outbound field, confirmed via decompile alongside
+				-- radio_caps/tx_power/athstats in the same DTO) needs the
+				-- live noise floor to convert rf_config()'s stored raw wire
+				-- units back to dBm -- minrssi.rssi is an offset from the
+				-- driver's noise floor, NOT plain dBm (confirmed live: UI
+				-- "-80 dBm" <-> wire "15", UI "-85 dBm" <-> wire "10", both
+				-- consistent with raw = dbm + 95). Falls back to that -95
+				-- assumption only when a live noise reading isn't available.
+				local noise = (ok_rs and stats[1] and stats[1].noise) or -95
+				if radio.min_rssi_enabled then
+					radio.min_rssi = radio.min_rssi_raw + noise
+					minrssi_threshold_by_radio[radio.name] = radio.min_rssi
+				end
+				radio.min_rssi_raw = nil
 				if ok_rs and stats[1] then
 					local s     = stats[1]  -- in-use channel's survey entry
 					local total = s.channel_time or 0
@@ -611,6 +633,16 @@ function M.build_json(st, cfg, ufhw)
 				if sta.signal then
 					signal_sum   = signal_sum + sta.signal
 					signal_count = signal_count + 1
+				end
+				-- "Minimum RSSI": a real per-radio (not per-vap) setting --
+				-- vap.radio_name is the shared UCI radio device name, so every
+				-- vap/SSID broadcasting on this same physical radio enforces
+				-- the identical threshold. One-shot deauth only (see
+				-- ucihelper.kick_station) -- no block, client can reassociate
+				-- immediately.
+				local minrssi_threshold = minrssi_threshold_by_radio[vap.radio_name]
+				if minrssi_threshold and sta.signal and sta.signal < minrssi_threshold then
+					pcall(ufuci.kick_station, ifname, sta.mac)
 				end
 				-- throughput: delta-sampled byte rate (bytes/sec), same
 				-- approach as M._sysinfo.cpu_percent()'s /proc/stat delta
@@ -956,14 +988,29 @@ end
 -- Security derivation is confirmed only for the plain WPA2-PSK case seen
 -- live (aaa.<n>.wpa=2 + wpa.key.1.mgmt=WPA-PSK -> "wpa2"); WPA3/mixed/
 -- enterprise are best-effort guesses pending a live capture of those modes.
+local function _wire_bool(v)
+	if v == nil then return nil end
+	return v == "1" or v == "true" or v == "enabled"
+end
+
 function M._parse_wifi_system_cfg(sys_raw)
-	local aaa, wireless, radio = {}, {}, {}
+	local aaa, wireless, radio, stamgr = {}, {}, {}, {}
 	for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
 		local section, idx, key, v = line:match("^(aaa)%.(%d+)%.(.+)=(.*)$")
 		if not section then section, idx, key, v = line:match("^(wireless)%.(%d+)%.(.+)=(.*)$") end
 		if not section then section, idx, key, v = line:match("^(radio)%.(%d+)%.(.+)=(.*)$") end
+		-- stamgr.<n>: per-radio "Station Manager" block, indexed the same as
+		-- radio.<n> -- confirmed live 2026-07-14 (Devices -> [AP] -> Radios ->
+		-- "Minimum RSSI" checkbox+slider, NOT a WLAN-level setting): toggling
+		-- it emits stamgr.<n>.radio (band, "ng"/"na"), stamgr.<n>.minrssi.status
+		-- and stamgr.<n>.minrssi.rssi, alongside an unrelated
+		-- stamgr.<n>.loadbalance.status sub-feature sharing the same block.
+		-- The whole block is simply absent when disabled (no explicit
+		-- status=false), same convention as every other optional section here.
+		if not section then section, idx, key, v = line:match("^(stamgr)%.(%d+)%.(.+)=(.*)$") end
 		if section then
-			local tbl = (section == "aaa" and aaa) or (section == "wireless" and wireless) or radio
+			local tbl = (section == "aaa" and aaa) or (section == "wireless" and wireless)
+				or (section == "radio" and radio) or stamgr
 			idx = tonumber(idx)
 			tbl[idx] = tbl[idx] or {}
 			tbl[idx][key] = v
@@ -981,11 +1028,23 @@ function M._parse_wifi_system_cfg(sys_raw)
 	for _, idx in ipairs(sorted_indices(radio)) do
 		local r = radio[idx]
 		if r.phyname then
-			radio_table[#radio_table + 1] = {
+			local entry = {
 				name     = r.phyname,
 				channel  = tonumber(r.channel),   -- "auto" -> nil, leaves channel unchanged
 				tx_power = tonumber(r.txpower),   -- "auto" -> nil, leaves tx_power unchanged
 			}
+			local sm = stamgr[idx]
+			-- minrssi.rssi is NOT plain dBm -- confirmed live: UI "-80 dBm"
+			-- wire-encoded as 15, UI "-85 dBm" as 10 (a madwifi-driver
+			-- convention, offset from an assumed -95 dBm noise floor: raw =
+			-- dbm + 95). Kept as raw wire units here; converted to dBm only
+			-- where a live noise-floor reading is available (apply_config/
+			-- enforcement), not at parse time.
+			if sm and sm["minrssi.status"] == "true" then
+				entry.min_rssi_enabled = true
+				entry.min_rssi         = tonumber(sm["minrssi.rssi"])
+			end
+			radio_table[#radio_table + 1] = entry
 		end
 	end
 
@@ -1022,6 +1081,38 @@ function M._parse_wifi_system_cfg(sys_raw)
 				fast_roaming_enabled  = (a["ft.status"] == "enabled"),
 				vlan_enabled          = vlan_id ~= nil,
 				vlan                  = vlan_id,
+				-- aaa.<n>.bss_transition: CONFIRMED live 2026-07-15 (toggled
+				-- "BSS Transition (802.11v)" in the Behavior Controls panel,
+				-- diffed system_cfg via debug_dump_file) -- present on every
+				-- aaa.<n> block for the WLAN, "enabled"/"disabled" string,
+				-- flips independently of Fast Roaming/other toggles. Maps
+				-- 1:1 onto hostapd/UCI's own current option name -- no
+				-- translation needed, unlike the deprecated ieee80211v
+				-- alias ucihelper used to (incorrectly) emit.
+				bss_transition        = _wire_bool(a.bss_transition),
+				-- wireless.<n>.dtim_period: CONFIRMED live 2026-07-15 --
+				-- always present as a plain integer regardless of the
+				-- WLAN's Auto/Custom DTIM toggle (toggling "Auto 802.11
+				-- DTIM Period" off and setting a custom 2.4/5GHz value only
+				-- changed this same field's value; there is no separate
+				-- dtim_mode/dtim_ng/dtim_na key on the wire at all -- an
+				-- earlier version of this parser guessed such a scheme and
+				-- was wrong). Maps 1:1 onto hostapd/UCI's own
+				-- wifi-iface.dtim_period option.
+				dtim_period           = tonumber(w.dtim_period),
+				-- wireless.<n>.no2ghz_oui: CONFIRMED live 2026-07-15 --
+				-- this, not a per-device mgmt_cfg key, is Band Steering's
+				-- real wire representation (toggled "Band Steering" in the
+				-- Behavior Controls panel with nothing else changed; only
+				-- this field flipped, and only on the WLAN's 2.4GHz/radio0
+				-- wireless.<n> entry -- a madwifi/QCA driver convention:
+				-- omitting the AP's OUI from 2.4GHz beacons/probe responses
+				-- nudges dual-band-capable clients toward 5GHz). An
+				-- earlier version of this parser guessed a per-device
+				-- Device.BandsteeringMode-style mgmt_cfg field (per
+				-- paultyng/go-unifi's REST model) that does not exist on
+				-- this wire protocol at all -- see PROTOCOL-VALIDATION.md.
+				no2ghz_oui            = _wire_bool(w.no2ghz_oui),
 			}
 		end
 	end
@@ -1159,8 +1250,21 @@ function M.handle_response(json_str, st, cfg)
 			if ufuci and ufuci.apply_config then
 				local radio_table, vap_table = M._parse_wifi_system_cfg(sys_raw)
 				if #radio_table > 0 or #vap_table > 0 then
+					-- Band Steering (wireless.<n>.no2ghz_oui) is confirmed
+					-- live to be a per-WLAN wire field, not a per-device
+					-- one -- but usteer (the daemon that actually
+					-- implements steering on OpenWrt) is a single
+					-- device-wide config, so band steering is treated as
+					-- active for the whole device whenever ANY WLAN has it
+					-- enabled.
+					local steering_active = false
+					for _, vap in ipairs(vap_table) do
+						if vap.no2ghz_oui then steering_active = true end
+					end
+					M._usteer.set_enabled(steering_active, cfg)
 					pcall(ufuci.apply_config,
-						{radio_table = radio_table, vap_table = vap_table, network_table = {}}, cfg)
+						{radio_table = radio_table, vap_table = vap_table, network_table = {}},
+						cfg, {band_steering_active = steering_active})
 				end
 			end
 		end

@@ -291,6 +291,52 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response derives band_steering_active from vap_table.no2ghz_oui and drives usteer",
+		fn = function()
+			local st = sample_state()
+			local captured_enabled, captured_cfg
+			local orig = inform._usteer.set_enabled
+			inform._usteer.set_enabled = function(enabled, cfg)
+				captured_enabled, captured_cfg = enabled, cfg
+			end
+			local applied_opts
+			inform._ucihelper = {
+				apply_config = function(_, _, opts) applied_opts = opts end,
+			}
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\nwireless.1.no2ghz_oui=enabled\n"
+			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg:gsub("\n", "\\n"))
+			inform.handle_response(resp, st, cfg)
+			inform._usteer.set_enabled = orig
+			inform._ucihelper = nil
+			assert_true(captured_enabled, "usteer.set_enabled(true, ...) called -- a vap has no2ghz_oui enabled")
+			assert_eq(captured_cfg, cfg, "cfg passed through to usteer.set_enabled")
+			assert_true(applied_opts.band_steering_active, "band_steering_active threaded through to apply_config")
+		end
+	},
+	{
+		name = "inform packet: handle_response derives band_steering_active=false when no vap has no2ghz_oui",
+		fn = function()
+			local st = sample_state()
+			local captured_enabled
+			local orig = inform._usteer.set_enabled
+			inform._usteer.set_enabled = function(enabled) captured_enabled = enabled end
+			local applied_opts
+			inform._ucihelper = {
+				apply_config = function(_, _, opts) applied_opts = opts end,
+			}
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg:gsub("\n", "\\n"))
+			inform.handle_response(resp, st, {net = {lan_cpueth = "eth0"}})
+			inform._usteer.set_enabled = orig
+			inform._ucihelper = nil
+			assert_false(captured_enabled, "usteer.set_enabled(false, ...) called -- no vap has no2ghz_oui")
+			assert_false(applied_opts.band_steering_active, "band_steering_active false")
+		end
+	},
+	{
 		name = "inform packet: handle_response setparam applies static IP from system_cfg",
 		fn = function()
 			local st = sample_state()
@@ -422,15 +468,126 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg extracts minrssi from stamgr.<n> onto radio_table",
+		fn = function()
+			-- Real captured shape (2026-07-14): "Minimum RSSI" lives under
+			-- Devices -> [AP] -> Radios, per-radio (not per-SSID) -- a new
+			-- stamgr.<n> section, indexed the same as radio.<n>, entirely
+			-- separate from aaa.<n>/wireless.<n>. minrssi.rssi is NOT plain
+			-- dBm (UI "-80 dBm" captured as wire value 15) -- parsing keeps
+			-- the raw wire units; conversion happens later where a live
+			-- noise-floor reading exists.
+			local sys_cfg = "radio.1.phyname=radio0\nradio.1.channel=auto\nradio.1.txpower=auto\n"
+				.. "stamgr.1.status=true\nstamgr.1.radio=ng\n"
+				.. "stamgr.1.minrssi.status=true\nstamgr.1.minrssi.rssi=15\n"
+				.. "stamgr.1.loadbalance.status=false\n"
+				.. "radio.2.phyname=radio1\nradio.2.channel=36\nradio.2.txpower=17\n"
+			local radio_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(#radio_table, 2, "two radios parsed")
+			assert_eq(radio_table[1].min_rssi_enabled, true, "radio0 minrssi enabled")
+			assert_eq(radio_table[1].min_rssi, 15, "radio0 minrssi raw wire value (not dBm)")
+			assert_eq(radio_table[2].min_rssi_enabled, nil, "radio1 has no stamgr block -> not enabled")
+			assert_eq(radio_table[2].min_rssi, nil, "radio1 has no minrssi value")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.bss_transition",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.bss_transition=1\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].bss_transition, true, "bss_transition=1 -> true")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.bss_transition=0 as false",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.bss_transition=0\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].bss_transition, false, "bss_transition=0 -> false")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves bss_transition nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].bss_transition, nil, "no bss_transition key -> nil")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg reads wireless.<n>.dtim_period regardless of Auto/Custom",
+		fn = function()
+			-- CONFIRMED live 2026-07-15: wireless.<n>.dtim_period is always a
+			-- plain int on the wire, whether the WLAN's DTIM toggle is left
+			-- on Auto or set to Custom -- there is no separate dtim_mode/
+			-- dtim_ng/dtim_na key at all (an earlier version of this parser
+			-- guessed such a scheme and was wrong).
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\nwireless.1.dtim_period=1\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].dtim_period, 1, "dtim_period read directly from wireless.1.dtim_period")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg reads a custom wireless.<n>.dtim_period on radio1 (5GHz)",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio1\nwireless.1.dtim_period=9\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].dtim_period, 9, "custom dtim_period read regardless of band")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves dtim_period nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].dtim_period, nil, "no dtim_period key -> nil")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.no2ghz_oui (Band Steering)",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\nwireless.1.no2ghz_oui=enabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].no2ghz_oui, true, "no2ghz_oui=enabled -> true")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.no2ghz_oui=disabled as false",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\nwireless.1.no2ghz_oui=disabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].no2ghz_oui, false, "no2ghz_oui=disabled -> false")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves no2ghz_oui nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].no2ghz_oui, nil, "no no2ghz_oui key -> nil")
+		end
+	},
+	{
 		name = "inform packet: handle_response setparam applies WiFi config from system_cfg via ucihelper",
 		fn = function()
 			local st = sample_state()
-			local applied_resp, applied_cfg
+			local applied_resp, applied_cfg, applied_opts
 			inform._ucihelper = {
-				apply_config = function(resp, cfg)
-					applied_resp, applied_cfg = resp, cfg
+				apply_config = function(resp, cfg, opts)
+					applied_resp, applied_cfg, applied_opts = resp, cfg, opts
 				end,
 			}
+			local orig_usteer = inform._usteer.set_enabled
+			inform._usteer.set_enabled = function() end  -- avoid touching real UCI in this test
 			local cfg = {net = {lan_cpueth = "eth0"}}
 			local sys_cfg = "radio.1.phyname=radio0\nradio.1.channel=6\nradio.1.txpower=20\n"
 				.. "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.psk=TestPass123\n"
@@ -438,10 +595,13 @@ return {
 			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg:gsub("\n", "\\n"))
 			inform.handle_response(resp, st, cfg)
 			inform._ucihelper = nil
+			inform._usteer.set_enabled = orig_usteer
 			assert_true(applied_resp ~= nil, "ucihelper.apply_config was called")
 			assert_eq(#applied_resp.vap_table, 1, "one vap passed through")
 			assert_eq(applied_resp.vap_table[1].ssid, "openuf-test", "ssid passed through")
 			assert_eq(applied_cfg, cfg, "cfg passed through unchanged")
+			assert_false(applied_opts.band_steering_active,
+				"band_steering_active false -- no vap has no2ghz_oui enabled")
 		end
 	},
 	{

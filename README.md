@@ -16,6 +16,9 @@ openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi
 | L3 inform (`set-inform` before adoption) | Sends informs and appears Pending, but adoption does not complete against a real controller (see [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md)) — use L2 adoption |
 | Controller-pushed SSID provisioning | ✅ Working (UCI) |
 | VLAN-tagged SSIDs (`network_table` join) | ✅ Working — field shapes unverified against a live capture |
+| BSS Transition (802.11v, Behavior Controls) | ✅ Working (`bss_transition` UCI option) — confirmed live against a real controller |
+| Auto 802.11 DTIM Period (Behavior Controls) | ✅ Working — always reads the controller's `dtim_period` (Auto and Custom both send a concrete value) — confirmed live against a real controller |
+| Band Steering (Behavior Controls) | ✅ Working via `usteer` — requires the `usteer` package and a full `wpad` build (see Quick start); wire key confirmed live against a real controller |
 | Wireless client & radio statistics in payload | ✅ Working (`vap_table[].sta_table`, `num_sta`, `radio_table_stats`) |
 | Wired client statistics (`port_table[].mac_table`) | ✅ Working — U6-InWall's downstream switch ports report bridge-learned hosts as `is_wired` clients |
 | Client block/unblock | ✅ Working — enforced via nftables (`block-sta`/`unblock-sta` cmd), persists across restarts |
@@ -43,7 +46,7 @@ Any OpenWrt device with at least 8 MB flash and a dual-band wireless chipset.  K
 ```sh
 # 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk)
 apk update
-apk add lua lua-cjson luasocket lua-openssl iw lldpd openssl-util
+apk add lua lua-cjson luasocket lua-openssl iw lldpd openssl-util usteer wpad-wolfssl
 
 # 2. Download and install the latest release (no git client or scp needed)
 mkdir openuf-install && cd openuf-install
@@ -60,6 +63,13 @@ ssh root@<device> syswrapper.sh set-inform http://<controller-ip>:8080/inform
 #     — The device will appear as pending in the controller.
 #     — Click Adopt.
 ```
+
+`install.sh install` automatically installs `usteer` and a full `wpad` build
+(`wpad-wolfssl`, falling back to `wpad-openssl`) if either is missing — both are
+required for BSS Transition (802.11v) and Band Steering to work at all.
+`wpad-basic-*` builds lack 802.11v support entirely and will error with
+"unknown configuration item 'bss_transition'"; if you've manually installed a
+basic wpad build, replace it with `apk add wpad-wolfssl` first.
 
 Installing from a git checkout instead (for contributors/dev builds) still works — `scp -r
 openuf/ install.sh root@<device>:/tmp/openuf/` and run `install.sh` from there.

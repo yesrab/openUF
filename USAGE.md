@@ -8,7 +8,7 @@ OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
 
 ```sh
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftables
+apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftables usteer wpad-wolfssl
 ```
 
 | Package | Purpose |
@@ -22,6 +22,12 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftab
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-CBC fallback if `lua-openssl` is unavailable |
 | `nftables` | Client block/unblock enforcement (`openuf/firewall.lua`) |
+| `usteer` | Band Steering (Behavior Controls) — ubus-based client-steering daemon, driven by `openuf/usteer.lua` |
+| `wpad-wolfssl` (or `wpad-openssl`) | Full hostapd build with 802.11k/v support — required for BSS Transition and Band Steering. `wpad-basic-*` lacks `bss_transition` entirely and errors with "unknown configuration item 'bss_transition'" |
+
+`install.sh install` installs `usteer` and a full `wpad` build automatically if
+either is missing (falling back from `wpad-wolfssl` to `wpad-openssl`), so a
+manual `apk add` is only needed if you're not using the installer.
 
 `hostapd_cli` (used to immediately deauthenticate a just-blocked wireless client)
 is not a separate dependency — any device running a wireless AP already has

@@ -265,6 +265,148 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes bss_transition from vap.bss_transition",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", bss_transition = true},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.bss_transition, "1", "bss_transition enabled")
+				assert_eq(s.ieee80211v, nil, "deprecated ieee80211v option never written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes bss_transition=0 (explicit off), not omitted",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", bss_transition = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.bss_transition, "0", "bss_transition explicitly disabled")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config omits bss_transition when absent from the vap",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.bss_transition, nil, "no bss_transition option written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes dtim_period from vap.dtim_period",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", dtim_period = 3},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.dtim_period, "3", "custom dtim_period written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config omits dtim_period when absent (Auto DTIM)",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.dtim_period, nil, "no dtim_period option written -- leaves hostapd default")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config forces 802.11k/BSS-Transition on when band steering is active",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", bss_transition = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil, {band_steering_active = true})
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.bss_transition, "1", "forced on despite vap.bss_transition=false")
+				assert_eq(s.ieee80211k, "1", "802.11k forced on")
+				assert_eq(s.rrm_neighbor_report, "1", "rrm_neighbor_report forced on")
+				assert_eq(s.rrm_beacon_report, "1", "rrm_beacon_report forced on")
+				assert_eq(s.wnm_sleep_mode, "1", "wnm_sleep_mode forced on")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config respects per-vap bss_transition when band steering is off",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", bss_transition = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil, {band_steering_active = false})
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.bss_transition, "0", "per-vap setting respected, not forced")
+				assert_eq(s.ieee80211k, nil, "802.11k not forced on")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config respects per-vap bss_transition when opts is nil",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", bss_transition = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.bss_transition, "0", "per-vap setting respected without opts")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_vap_table echoes the wlanconf id as both id and wlanconf_id",
 		fn = function()
 			-- Regression test: the controller's vapInformProcessor silently
@@ -342,6 +484,76 @@ return {
 				local radios = ucihelper.get_radio_table()
 				assert_eq(radios[1].radio, "ng", "channel 6 is 2.4GHz")
 				assert_eq(radios[2].radio, "na", "channel 36 is 5GHz")
+			end)
+		end
+	},
+	{
+		-- "Minimum RSSI" (Devices -> [AP] -> Radios) is per-radio, not
+		-- per-SSID -- confirmed live 2026-07-14 via the controller's
+		-- stamgr.<n>.minrssi.* wire keys, a section indexed the same as
+		-- radio.<n> (separate from vap_table/aaa.<n>/wireless.<n>).
+		name = "ucihelper: apply_config writes minrssi UCI options from radio_table",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					vap_table = {}, network_table = {},
+					radio_table = {
+						{name = "radio0", min_rssi_enabled = true, min_rssi = 15},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.radio0
+				assert_eq(s.minrssi_enabled, "1", "minrssi_enabled written")
+				assert_eq(s.minrssi_rssi, "15", "minrssi_rssi written as raw wire units")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config omits minrssi UCI options when disabled/absent",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					vap_table = {}, network_table = {},
+					radio_table = {{name = "radio0", channel = 6}},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.radio0
+				assert_eq(s.minrssi_rssi, nil, "no minrssi_rssi written when absent from radio_table")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: get_radio_table echoes minrssi_enabled/minrssi_rssi as raw UCI values",
+		fn = function()
+			with_ucihelper(function(db)
+				local uci = ucihelper._uci
+				local cursor = uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "channel", "6")
+				cursor:set("wireless", "radio0", "minrssi_enabled", "1")
+				cursor:set("wireless", "radio0", "minrssi_rssi", "15")
+				cursor:set("wireless", "radio1", "wifi-device")
+				cursor:set("wireless", "radio1", "channel", "36")
+				local radios = ucihelper.get_radio_table()
+				assert_eq(radios[1].min_rssi_enabled, true, "radio0 minrssi enabled")
+				assert_eq(radios[1].min_rssi_raw, 15, "radio0 minrssi raw wire value")
+				assert_eq(radios[2].min_rssi_enabled, false, "radio1 minrssi not enabled")
+				assert_eq(radios[2].min_rssi_raw, nil, "radio1 has no minrssi_rssi set")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: kick_station issues a single hostapd_cli deauthenticate",
+		fn = function()
+			with_ucihelper(function(db)
+				local calls = {}
+				ucihelper._run_cmd = function(cmd) calls[#calls + 1] = cmd; return true end
+				ucihelper.kick_station("wlan0", "aa:bb:cc:dd:ee:ff")
+				assert_eq(#calls, 1, "exactly one command run")
+				assert_true(calls[1]:find("hostapd_cli", 1, true) ~= nil, "uses hostapd_cli")
+				assert_true(calls[1]:find("-i wlan0", 1, true) ~= nil, "targets the given interface")
+				assert_true(calls[1]:find("deauthenticate aa:bb:cc:dd:ee:ff", 1, true) ~= nil,
+					"deauthenticates the given mac")
 			end)
 		end
 	},

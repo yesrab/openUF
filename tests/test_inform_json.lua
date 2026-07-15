@@ -507,6 +507,85 @@ return {
 		end
 	},
 	{
+		-- "Minimum RSSI" (Devices -> [AP] -> Radios) is per-radio -- confirmed
+		-- live 2026-07-14. min_rssi/min_rssi_enabled are the confirmed
+		-- outbound field names (decompiled alongside radio_caps/tx_power/
+		-- athstats in the same DTO). The UCI-stored value is raw wire units
+		-- (an offset from the driver's noise floor, not dBm) -- build_json
+		-- converts it using the live noise reading from radio_stats()'s
+		-- survey dump (fixture noise: -95 dBm; raw 25 -> -95+25 = -70 dBm).
+		name = "inform json: radio_table converts min_rssi from raw wire units to dBm using live noise floor",
+		fn = function()
+			inject_sysinfo(true)
+			inject_ucihelper()
+			inform._ucihelper.get_radio_table = function()
+				return {
+					{ name = "radio0", radio = "ng", channel = "6", ht = "HT20", tx_power = "20",
+					  disabled = false, builtin_antenna = true, builtin_ant_gain = 3,
+					  max_txpower = 20, min_rssi_enabled = true, min_rssi_raw = 25 },
+				}
+			end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			assert_eq(d.radio_table[1].min_rssi_enabled, true, "min_rssi_enabled echoed")
+			assert_eq(d.radio_table[1].min_rssi, -70, "min_rssi converted: 25 + (-95 noise) = -70 dBm")
+			assert_nil(d.radio_table[1].min_rssi_raw, "raw wire units not leaked into the outbound payload")
+		end
+	},
+	{
+		-- Enforcement: a station below the radio's minrssi threshold gets a
+		-- single deauth via ucihelper.kick_station -- confirmed via web
+		-- research this is a one-shot roaming-assist kick, not a persistent
+		-- block, so it's deliberately separate from firewall.lua's
+		-- block-sta feature (no nftables, no state.json).
+		name = "inform json: stations below the radio's minrssi threshold get kicked, others don't",
+		fn = function()
+			inject_sysinfo(true)  -- fixture: aa:bb:cc:dd:ee:ff at -62 dBm, 11:22:33:44:55:66 at -75 dBm
+			inject_ucihelper()
+			inform._ucihelper.get_radio_table = function()
+				return {
+					{ name = "radio0", radio = "ng", channel = "6",
+					  min_rssi_enabled = true, min_rssi_raw = 25 },  -- threshold: 25 + (-95) = -70 dBm
+				}
+			end
+			local kicked = {}
+			inform._ucihelper.kick_station = function(ifname, mac)
+				kicked[#kicked + 1] = {ifname = ifname, mac = mac}
+			end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			inform.build_json(st, nil, ufhw)
+			assert_eq(#kicked, 1, "exactly one station kicked")
+			assert_eq(kicked[1].mac, "11:22:33:44:55:66", "the -75 dBm station (below -70 threshold) is kicked")
+			assert_eq(kicked[1].ifname, "wlan0", "kicked on the resolved live ifname")
+		end
+	},
+	{
+		name = "inform json: no stations kicked when the radio's minrssi is disabled",
+		fn = function()
+			inject_sysinfo(true)
+			inject_ucihelper()  -- default mock radio_table has no min_rssi_enabled
+			local kicked = {}
+			inform._ucihelper.kick_station = function(ifname, mac)
+				kicked[#kicked + 1] = {ifname = ifname, mac = mac}
+			end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			inform.build_json(st, nil, ufhw)
+			assert_eq(#kicked, 0, "no stations kicked when minrssi is not enabled")
+		end
+	},
+	{
 		name = "inform json: radio_table_stats includes spectrum_table when cached from a prior spectrum-scan cmd",
 		fn = function()
 			inform._spectrum_cache = {

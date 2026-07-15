@@ -201,7 +201,15 @@ end
 -- mode:   "11n" | "11ac" | "11ax" (mapped to UCI htmode)
 -- chan:   channel number or "auto"
 -- txpwr: TX power in dBm (or nil to leave unchanged)
-function M.rf_config(radio, mode, chan, txpwr)
+-- minrssi_enabled/minrssi_raw: "Minimum RSSI" (Devices -> [AP] -> Radios),
+-- a per-radio (not per-SSID) setting -- confirmed live 2026-07-14 via the
+-- controller's stamgr.<n>.minrssi.* wire keys, a section separate from and
+-- indexed the same as radio.<n>. minrssi_raw is stored as-received (raw wire
+-- units, an offset from the driver's noise floor, NOT plain dBm -- see
+-- inform.lua's M._parse_wifi_system_cfg for the conversion math), since the
+-- dBm conversion needs a live noise-floor reading only available later, at
+-- enforcement/readback time.
+function M.rf_config(radio, mode, chan, txpwr, minrssi_enabled, minrssi_raw)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	local htmode_map = {
@@ -218,6 +226,12 @@ function M.rf_config(radio, mode, chan, txpwr)
 	if txpwr then
 		cursor:set("wireless", radio, "txpower", tostring(txpwr))
 	end
+	if minrssi_enabled ~= nil then
+		cursor:set("wireless", radio, "minrssi_enabled", minrssi_enabled and "1" or "0")
+	end
+	if minrssi_raw then
+		cursor:set("wireless", radio, "minrssi_rssi", tostring(minrssi_raw))
+	end
 	cursor:commit("wireless")
 end
 
@@ -228,9 +242,14 @@ end
 -- cfg:  device configuration (from conf.lua); used for dev.conf.net.lan_cpueth
 --       when a VAP requires a VLAN-tagged network. VLAN tagging is skipped
 --       (falls back to "lan") if cfg is nil.
+-- opts: optional table; opts.band_steering_active (boolean) forces 802.11k +
+--       BSS Transition on for every managed iface regardless of each WLAN's
+--       own bss_transition setting, since usteer (Band Steering) needs it
+--       network-wide to function at all -- see openuf/usteer.lua. nil/false
+--       leaves each vap's own setting in effect.
 -- Handles vap_table, radio_table, and network_table (VLAN join) from the
 -- setparam/config response.
-function M.apply_config(resp, cfg)
+function M.apply_config(resp, cfg, opts)
 	local radio_table   = resp.radio_table   or {}
 	local vap_table     = resp.vap_table     or {}
 	local network_table = resp.network_table or {}
@@ -239,7 +258,8 @@ function M.apply_config(resp, cfg)
 	-- Apply radio parameters
 	for _, radio in ipairs(radio_table) do
 		if radio.name then
-			M.rf_config(radio.name, radio.mode, radio.channel, radio.tx_power)
+			M.rf_config(radio.name, radio.mode, radio.channel, radio.tx_power,
+				radio.min_rssi_enabled, radio.min_rssi)
 		end
 	end
 
@@ -264,8 +284,26 @@ function M.apply_config(resp, cfg)
 				extra.ft_psk_generate_local = "1"
 				extra.ft_over_ds = "0"
 			end
-			if vap.ieee80211k then extra.ieee80211k = vap.ieee80211k end
-			if vap.ieee80211v then extra.ieee80211v = vap.ieee80211v end
+			if opts and opts.band_steering_active then
+				-- usteer requires 802.11k (neighbor reports) + BSS
+				-- Transition on every managed iface network-wide to
+				-- function at all -- confirmed via the OpenWrt wiki's
+				-- usteer setup guide. This overrides each WLAN's own
+				-- bss_transition/ieee80211k value while device-wide Band
+				-- Steering is on, since usteer can't be scoped to a
+				-- single SSID.
+				extra.ieee80211k          = "1"
+				extra.bss_transition      = "1"
+				extra.rrm_neighbor_report = "1"
+				extra.rrm_beacon_report   = "1"
+				extra.wnm_sleep_mode      = "1"
+			else
+				if vap.ieee80211k then extra.ieee80211k = vap.ieee80211k end
+				if vap.bss_transition ~= nil then
+					extra.bss_transition = vap.bss_transition and "1" or "0"
+				end
+			end
+			if vap.dtim_period then extra.dtim_period = vap.dtim_period end
 			-- Controller-sent values win over the derived/default stopgap ones above.
 			if vap.mobility_domain then extra.mobility_domain = vap.mobility_domain end
 			if vap.ft_psk_generate_local then
@@ -311,6 +349,14 @@ function M.get_radio_table()
 			builtin_antenna  = M.RADIO_DEFAULTS.builtin_antenna,
 			builtin_ant_gain = M.RADIO_DEFAULTS.builtin_ant_gain,
 			max_txpower      = M.RADIO_DEFAULTS.max_txpower,
+			-- min_rssi_enabled/min_rssi_raw: raw UCI echo of rf_config()'s
+			-- minrssi_enabled/minrssi_rssi options. min_rssi_raw is still
+			-- wire-encoded units at this point (not dBm) -- inform.lua's
+			-- build_json converts it to the real outbound "min_rssi" dBm
+			-- field once a live noise-floor reading is available, then
+			-- discards this raw field.
+			min_rssi_enabled = (s.minrssi_enabled == "1"),
+			min_rssi_raw     = tonumber(s.minrssi_rssi),
 		}
 	end)
 	return radios
@@ -337,6 +383,19 @@ function M.get_ifname_for_radio(radio)
 		end
 	end
 	return nil
+end
+
+-- "Minimum RSSI" enforcement: send a single 802.11 deauthentication frame to
+-- mac on ifname. Deliberately standalone from firewall.lua's block-sta
+-- feature -- confirmed via web research that Minimum RSSI is a roaming aid,
+-- not a block: it's a one-shot deauth with no persistent drop rule, and the
+-- client is free to reassociate immediately (even back to the same radio).
+-- No state.json persistence either, unlike blocked_stas -- there's nothing
+-- to reconcile on restart since this is fully re-derived every inform cycle
+-- from live UCI config + sta_table.
+function M.kick_station(ifname, mac)
+	M._run_cmd("hostapd_cli -i " .. ifname .. " deauthenticate " .. mac .. " 2>/dev/null")
+	return true
 end
 
 -- Return a table of VAP (virtual AP) info for the inform payload.

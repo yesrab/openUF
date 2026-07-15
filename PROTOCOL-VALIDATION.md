@@ -764,6 +764,18 @@ question.
   confirming the derivation is stable per-SSID as designed),
   `ft_psk_generate_local: "1"`, `ft_over_ds: "0"`.
 - **Code changes:** none — already correct from section 3's fix.
+- **Re-confirmed 2026-07-14** on a second WLAN (`openuf-minrssi`, WPA2/WPA3),
+  this time with an exact `diff` of the raw `system_cfg` payload captured
+  before/after toggling, in both directions (enable→disable). Result: **only
+  `aaa.1.ft.status` / `aaa.2.ft.status` changes** — every other line is
+  byte-for-byte identical (a `cron.*` 11k-scan block appeared/disappeared
+  between captures, but independently of the toggle — unrelated noise, not
+  investigated further here). Also confirmed `aaa.<n>.pmf.status`,
+  `pmf.mode`, `pmf.cipher`, and `bss_transition` are present in both captures
+  regardless of the FT toggle state — they're baseline per-SSID fields (PMF
+  from the WPA2/WPA3 security mode, `bss_transition`/802.11v from elsewhere),
+  not something the Fast Roaming checkbox adds. This fully validates the
+  toggle-only assumption with a rigorous diff, not just a spot-check.
 
 ## 6. TX power (Low/Medium/High/Custom) per radio
 
@@ -2703,6 +2715,225 @@ prefixed behavior as correct).
     "always show everything" post-fix by checking **4x4** instead: both radios were correctly
     excluded again ("We Couldn't Find a Match"), then re-checking 2x2 correctly re-included them —
     proving genuine, working, bidirectional filtering, not a coincidental side effect.
+
+---
+
+## 23. Minimum RSSI (2026-07-14)
+
+- **Status:** ✅ Real wire keys and outbound field names confirmed live/via
+  decompile. Inbound parsing, UCI storage, outbound echo, and enforcement all
+  implemented; enforcement itself can't be RF-tested in this Docker
+  validation env (no real radios here) so it's only unit-tested with mocked
+  `sta_table`/`radio_stats`.
+- **Wrong initial assumption, corrected before writing any code:** the
+  obvious guess was a `vap_table`-level (per-WLAN) field, since the
+  controller's admin REST DTO does have a `roamingAssistantNaEnabled`/
+  `roamingAssistantNaRssi` (+ `6e` variant, no `Ng`) pair on the WLAN model.
+  That's a real field, but for a *different* feature ("Roaming Assistant" in
+  the WLAN's own Advanced panel — which in this 10.4.57 site only exposed a
+  "Fast Roaming (802.11r)" checkbox, no RSSI control at all). **Minimum RSSI
+  itself lives somewhere else entirely: Devices → [the AP] → Radios**, one
+  checkbox + dBm slider per radio band (2.4GHz and 5GHz both have it) — a
+  device/radio-level setting, not a WLAN one. Found by live-toggling it in
+  the running validation controller (`openuf-validation-controller`) rather
+  than trusting the DTO grep, per this project's standing rule.
+- **Wire format, confirmed live:** a new top-level `stamgr.<n>` section in
+  the flat `system_cfg` blob, indexed the same as `radio.<n>` (not
+  `aaa.<n>`/`wireless.<n>`, i.e. not tied to any SSID):
+  ```
+  stamgr.1.status=true
+  stamgr.1.radio=ng
+  stamgr.1.minrssi.status=true
+  stamgr.1.minrssi.rssi=15
+  stamgr.1.loadbalance.status=false
+  ```
+  A second data point (5GHz radio, UI slider at -85 dBm) gave
+  `stamgr.2.radio=na`, `stamgr.2.minrssi.rssi=10`. Disabling a band removes
+  its whole `stamgr.<n>` block from the payload (no explicit
+  `status=false`), the same "presence = enabled" convention used elsewhere
+  in this doc. `stamgr.<n>.loadbalance.status` is a sibling sub-feature
+  (load balancing) sharing the same block — out of scope here, left
+  unimplemented.
+- **The wire threshold is not plain dBm.** UI "-80 dBm" → wire `15`; UI
+  "-85 dBm" → wire `10`. Both consistent with `wire = dbm + 95`, i.e. an
+  offset from an assumed -95 dBm noise floor — a real convention for the
+  `madwifi` driver (the same capture's `aaa.1.driver=madwifi` line confirms
+  this is genuinely madwifi-era firmware talking), which doesn't match our
+  OpenWrt/mac80211 target hardware's own driver semantics at all. openUF
+  stores the raw wire value in UCI as-received and converts to/from dBm only
+  where a live noise-floor reading exists (`sysinfo.radio_stats()`'s
+  `iw survey dump` parse, already used for `cu_total`/etc.) — falling back
+  to the -95 dBm assumption if a live reading isn't available.
+- **Outbound `radio_table` field names, confirmed via decompile:** `min_rssi`
+  (int, dBm) and `min_rssi_enabled` (bool) — found as literal string
+  constants sitting directly beside `radio_caps`/`tx_power`/`athstats`/
+  `channel` in `com/ubnt/service/devmgr/PGOcbDWlbnYQdFW.class` and
+  `tFhABnrHYJqvjaoEa.class`, the exact same classes §21/§22 above already
+  cite as the outbound `radio_table` schema reference for those other
+  fields. (A separate `min_rssi`/`min_rssi_enabled` pair also turned up in
+  an old DB migration class, `"Migrate min rssi settings"` /
+  `"Remove assisted_roaming_enabled / assisted_roaming_rssi from device
+  radio_table"` — consistent with this being a legacy, still-current
+  device-radio-level field, not evidence of a second unrelated feature.)
+- **Enforcement design, informed by web research (not decompile — this is
+  client-facing driver/AP behavior, not a wire format):** Minimum RSSI is a
+  roaming aid, not a block. The AP sends a single 802.11 deauthentication
+  frame to a client whose signal drops below the threshold; there's no
+  persistent drop rule or lockout, and the client is free to reassociate
+  immediately (even back to the same AP). This is a materially different
+  mechanism from `openuf/firewall.lua`'s `block-sta` feature (deauth +
+  persistent nftables drop, deliberately preventing reassociation) — so
+  enforcement got its own standalone helper, `ucihelper.kick_station()`,
+  instead of reusing `firewall.deauth()`.
+- **Fix (`openuf/inform.lua`, `openuf/ucihelper.lua`):**
+  - `M._parse_wifi_system_cfg()` gains a fourth `stamgr` section parser
+    (alongside `aaa`/`wireless`/`radio`), attaching `min_rssi_enabled`/
+    `min_rssi` (raw wire units) onto the matching `radio_table[idx]` entry.
+  - `ucihelper.rf_config()` gains two optional params writing
+    `minrssi_enabled`/`minrssi_rssi` UCI options on the radio's
+    `wifi-device` section (radio-level, not per-vap — unlike 802.11r/k/v,
+    which live on the per-SSID `wifi-iface` section via the generic `extra`
+    table).
+  - `ucihelper.get_radio_table()` echoes those UCI options back as
+    `min_rssi_enabled`/`min_rssi_raw` (still raw wire units at this layer).
+  - `inform.lua`'s `build_json` per-radio loop (which already fetches
+    `radio_stats()` for `cu_total`/etc.) converts `min_rssi_raw` + live noise
+    into the confirmed outbound `min_rssi` dBm field, and separately builds a
+    `minrssi_threshold_by_radio` lookup (keyed by UCI radio name) for
+    enforcement.
+  - The existing per-vap/per-station loop (which already reads `sta.signal`
+    from `sysinfo.sta_table()` for `avg_client_signal`/etc.) looks up that
+    station's radio's threshold via `vap.radio_name` (since Minimum RSSI
+    applies to every vap/SSID sharing the same physical radio, not just one)
+    and calls `ucihelper.kick_station(ifname, sta.mac)` when the signal is
+    below threshold.
+  - New tests: `tests/test_inform_packet.lua` (`stamgr.<n>` parsing),
+    `tests/test_ucihelper.lua` (`rf_config`/`apply_config` UCI writes,
+    `get_radio_table` echo, `kick_station`'s exact `hostapd_cli` invocation),
+    `tests/test_inform_json.lua` (outbound dBm conversion using the fixture's
+    -95 dBm noise, and enforcement: the fixture's two stations at -62/-75 dBm
+    against a -70 dBm threshold — only the -75 dBm one gets kicked). 237
+    tests pass (was 229).
+
+## 24. Security tab WPA2/WPA3 protocol option — controller-side, not capability-driven (2026-07-15)
+
+- **Status:** informational only, no code change. Confirmed via code read
+  (not a fresh live capture), but consistent with section 5's existing live
+  diff findings above.
+- **Question:** does the WiFi network Security tab's default "WPA2/WPA3"
+  protocol option get chosen based on AP-reported capabilities, or derived
+  from the model we emulate? Real hardware behind one fake identity is
+  WPA2-only; would prefer WPA3 not to appear in the dropdown at all.
+- **Finding:** neither, in the sense of anything openUF controls. There is
+  no `security_cap`/`wpa_mode`/similar capability field anywhere in the
+  inform payload openUF builds. `sysinfo.lua`'s `radio_caps()` only reports
+  PHY capabilities (`is_11ac`/`is_11ax`/`is_11be`/MIMO/DFS/etc.) — nothing
+  security-related. `ucihelper.lua:73-79`'s `SECURITY_MAP` (`wpa2`→`psk2`,
+  `wpa3`→`sae`, `wpa2/wpa3`→`sae-mixed`, `wpa-enterprise`→`wpa2+ccmp`) only
+  translates a security choice the controller has *already* pushed down via
+  `system_cfg`'s `aaa.<n>.wpa` — it's a one-way, unconditional map with no
+  per-model gating, so it doesn't feed back into what the dropdown offers.
+  Section 5's live re-confirmation (2026-07-14, byte-for-byte `system_cfg`
+  diff) already showed PMF/security fields present as baseline per-SSID
+  fields regardless of anything openUF sends. None of the `openuf/ufmodel/
+  *.lua` or `openuf/modelmap/*.lua` identity files carry a security/WPA3
+  capability flag either — only `platform`/`model`/`fw.ver`/`bootver`/
+  `required_version`.
+- **Conclusion:** the Security tab's available protocol options come from
+  the real controller UI's own internal model-capability database, keyed on
+  the `model`/`platform` string openUF reports in `inform.lua`'s
+  device-info payload (e.g. `U6IW`) — that lookup lives inside the
+  proprietary controller bundle, not in this repo. The only lever available
+  to hide WPA3 would be reporting a different `model`/`platform` string
+  that the real controller's own (external, undocumented) database doesn't
+  consider WPA3-capable — not something fixable inside this codebase's
+  protocol logic. Not pursued further.
+
+---
+
+## 25. WiFi "Behavior Controls" — Band Steering, BSS Transition, Auto 802.11 DTIM Period (2026-07-15)
+
+- **Status:** implemented and **CONFIRMED live** against `tools/validation`'s
+  real controller (10.4.57) — toggled each of the three "Behavior Controls"
+  settings individually on the `openuf-minrssi` test WLAN and diffed
+  `system_cfg` via `debug_dump_file` before/after each change. Two of the
+  three initial implementations (below) were built on a wrong model and had
+  to be reworked after this capture — recorded here for anyone who reads an
+  older commit/diff and wonders why the shape changed.
+- **Context:** these three toggles live in the real controller's WiFi network
+  editor under "Behavior Controls" and are on by default. A code audit found
+  none of the three wired end-to-end previously (BSS Transition had a dead
+  stub writing the deprecated `ieee80211v` UCI option instead of the current
+  `bss_transition`; DTIM and Band Steering had zero footprint).
+- **BSS Transition (802.11v) — CONFIRMED, first guess was right.**
+  `aaa.<n>.bss_transition`, `"enabled"`/`"disabled"` string, present on the
+  WLAN's `aaa.<n>` block for every band it's broadcast on (both `aaa.1` and
+  `aaa.2` flipped together in the capture) and flips independently of Fast
+  Roaming/other toggles. `inform.lua`'s `_parse_wifi_system_cfg` and its
+  `_wire_bool()` helper already handled this exactly right on the first
+  attempt (it happens to accept `"enabled"`/`"disabled"` defensively
+  alongside `"1"`/`"0"`/`"true"`). `ucihelper.lua` writes the corresponding
+  `bss_transition` UCI option (fixing the old `ieee80211v` bug). No code
+  changes needed after this capture, only removing the "unconfirmed"
+  caveats from the comments.
+- **Auto 802.11 DTIM Period — CONFIRMED, first guess was WRONG.** There is
+  **no `dtim_mode`/`dtim_ng`/`dtim_na` key on the wire at all.** The real
+  field is simply `wireless.<n>.dtim_period`, a plain integer, **always
+  present** regardless of whether the WLAN's DTIM toggle is left on Auto or
+  set to Custom — toggling Auto off and typing custom 2.4/5GHz values
+  (tested with 7 and 9) only changed this same already-present field's
+  value; nothing else appeared or disappeared on the wire. The original
+  implementation (modeled speculatively on `paultyng/go-unifi`'s `Wlan`
+  struct, which exposes a `dtim_mode`+band-split-ints admin API shape) was
+  wrong for this wire protocol — go-unifi describes the controller's REST
+  API, not what actually flows over inform. Fixed: `_parse_wifi_system_cfg`
+  now reads `tonumber(w.dtim_period)` unconditionally per vap and
+  `ucihelper.lua`'s existing `if vap.dtim_period then extra.dtim_period = ...`
+  needed no change (it always resolves now, correctly).
+- **Band Steering — CONFIRMED, first guess was WRONG.** This is **not** a
+  per-device `mgmt_cfg` field (the `Device.BandsteeringMode`/
+  `bandsteering_mode` off|equal|prefer_5g enum from `paultyng/go-unifi`'s
+  `device.generated.go` describes the controller's admin REST API, not this
+  wire protocol, and never appeared anywhere in `mgmt_cfg` or `system_cfg`
+  during the capture). The real field is
+  **`wireless.<n>.no2ghz_oui`** (`"enabled"`/`"disabled"`), and toggling
+  "Band Steering" in the UI changed *only* this one field and nothing else
+  — confirmed by a clean before/after diff of the full `system_cfg` blob.
+  It's present on `wireless.<n>` for every band the WLAN broadcasts on
+  (both `wireless.1`/2.4GHz and `wireless.2`/5GHz carried the key in the
+  capture), but — unlike BSS Transition — only the 2.4GHz entry's value
+  ever changes with the toggle; `wireless.2.no2ghz_oui` stayed `"disabled"`
+  across every capture regardless of Band Steering's state (verified
+  against the real parser directly, not just the raw diff: feeding the
+  actual captured `system_cfg` through `_parse_wifi_system_cfg` yields
+  `no2ghz_oui=true` for the `radio0` vap entry and `no2ghz_oui=false` for
+  the `radio1` one, matching the "nudge clients away from 2.4GHz" semantics
+  — there's nothing to toggle on the 5GHz side). `no2ghz_oui` is a
+  real madwifi/QCA driver convention: omitting the AP's own OUI from
+  2.4GHz beacons/probe responses nudges dual-band-capable clients toward
+  5GHz — mainline OpenWrt mac80211/hostapd has no equivalent option, so
+  there's still no literal UCI passthrough for it. Fixed:
+  `_parse_wifi_system_cfg` now parses `no2ghz_oui` into each vap table
+  entry; `inform.lua`'s `handle_response` derives a single device-wide
+  `steering_active` boolean (true if *any* vap has `no2ghz_oui` enabled,
+  since `usteer` — the real steering mechanism on OpenWrt — is a
+  single device-wide daemon, not scoped per SSID) and calls the simplified
+  `openuf/usteer.lua` `M.set_enabled(bool, cfg)` (previously a 3-state
+  `set_mode("off"|"equal"|"prefer_5g", cfg)` API modeled on the wrong
+  go-unifi enum — simplified to a boolean since the real wire protocol, and
+  this controller version's UI, only ever expose a single on/off checkbox,
+  making the "equal" vs "prefer_5g" distinction unreachable dead code).
+  `ucihelper.apply_config`'s `opts` field was renamed from
+  `bandsteering_mode` (string) to `band_steering_active` (boolean) to match.
+  **Still unconfirmed** (not testable without real usteer-capable hardware
+  in the validation environment): the real `/etc/config/usteer` option
+  names/defaults `openuf/usteer.lua`'s `USTEER_DEFAULTS` guesses at — verify
+  against the package's own shipped default config if it's ever installed
+  in `tools/validation`'s AP container.
+- **Package dependencies (`usteer`, full `wpad`):** unaffected by the above
+  corrections — `install.sh` installs `usteer` and a full `wpad` build
+  (`wpad-wolfssl`/`wpad-openssl`, since `wpad-basic-*` lacks 802.11v support
+  entirely) automatically, as before.
 
 ---
 
