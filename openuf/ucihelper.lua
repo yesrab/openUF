@@ -334,6 +334,23 @@ function M.apply_config(resp, cfg, opts)
 				extra.wps_device_name = (opts and opts.device_name) or "openUF"
 				extra.ap_setup_locked = "1"
 			end
+			if vap.sae_anti_clogging then
+				-- hostapd's own option name for this exact WPA3-SAE tuning
+				-- value (default 5, confirmed via hostapd upstream docs).
+				-- Renamed to "anti_clogging_threshold" in newer hostapd
+				-- (to also cover PASN, not just SAE) -- using the older
+				-- name here since it's the one broadly supported across
+				-- the OpenWrt/wpad versions this project targets; revisit
+				-- if a target build's hostapd has dropped the old alias.
+				extra.sae_anti_clogging_threshold = vap.sae_anti_clogging
+			end
+			if vap.sae_sync then
+				-- hostapd's own option name, unchanged/stable across
+				-- versions (confirmed via hostapd upstream docs) -- max
+				-- SAE sync errors (dot11RSNASAESync) before disconnecting
+				-- the offending peer.
+				extra.sae_sync = vap.sae_sync
+			end
 			-- Controller-sent values win over the derived/default stopgap ones above.
 			if vap.mobility_domain then extra.mobility_domain = vap.mobility_domain end
 			if vap.ft_psk_generate_local then

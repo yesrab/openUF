@@ -460,6 +460,42 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes sae_anti_clogging_threshold/sae_sync from vap fields",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa3",
+						 x_passphrase = "hunter22", sae_anti_clogging = 12, sae_sync = 20},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.sae_anti_clogging_threshold, "12", "sae_anti_clogging_threshold written")
+				assert_eq(s.sae_sync, "20", "sae_sync written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config omits sae_anti_clogging_threshold/sae_sync when absent",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.sae_anti_clogging_threshold, nil, "no sae_anti_clogging_threshold written")
+				assert_eq(s.sae_sync, nil, "no sae_sync written")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_vap_table echoes the wlanconf id as both id and wlanconf_id",
 		fn = function()
 			-- Regression test: the controller's vapInformProcessor silently

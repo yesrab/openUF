@@ -1140,6 +1140,31 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- derivation). "enabled"/"disabled" string, same
 				-- convention as bss_transition/no2ghz_oui.
 				advertise_ap_name     = _wire_bool(w.advertise_ap_name),
+				-- aaa.<n>.sae.anti_clogging / aaa.<n>.sae.sync: "SAE
+				-- Anti-clogging"/"SAE Sync Time" (WPA3-SAE tuning).
+				-- CONFIRMED via decompiling the controller's WLAN-config-
+				-- generator (a small SAE-specific helper class): both are
+				-- plain integers, only emitted when > 0 (the controller's
+				-- own admin-side default is 5 for each), and -- unlike
+				-- every other field on this vap -- gated on the WLAN
+				-- actually being in real WPA3/SAE mode (Wlan.isWpa3() --
+				-- an admin-facing "wpa3_support" flag, NOT the same thing
+				-- as the "WPA2/WPA3" mixed Security Protocol dropdown
+				-- option -- or a 6GHz radio, not a device capability like
+				-- advertise_ap_name above). Live-tested: a WPA2/WPA3
+				-- mixed-mode WLAN never emits either key even with a
+				-- non-default admin value saved server-side, confirming
+				-- the gate. Could not live-confirm the emitting (pure
+				-- WPA3) case end-to-end -- switching this validation
+				-- environment's test WLAN to pure WPA3 tripped an
+				-- unrelated, already-documented config-sync flakiness
+				-- (see PROTOCOL-VALIDATION.md) where the controller
+				-- stopped pushing the WLAN's aaa./wireless. blocks
+				-- entirely, even across an inform.lua restart. High
+				-- confidence from the decompiled method body alone
+				-- (a simple getInt(key, -1) > 0 check, no ambiguity).
+				sae_anti_clogging     = tonumber(a["sae.anti_clogging"]),
+				sae_sync              = tonumber(a["sae.sync"]),
 			}
 		end
 	end

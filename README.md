@@ -20,6 +20,7 @@ openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi
 | Auto 802.11 DTIM Period (Behavior Controls) | ✅ Working — always reads the controller's `dtim_period` (Auto and Custom both send a concrete value) — confirmed live against a real controller |
 | Band Steering (Behavior Controls) | ✅ Working via `usteer` — requires the `usteer` package and a full `wpad` build (see Quick start); wire key confirmed live against a real controller |
 | Show Access Point Name in Beacon (Behavior Controls) | ✅ Wire protocol confirmed live (requires reporting the `wifi_caps2` device capability bit); OpenWrt-side beacon effect uses the standard WPS Device Name element (`wps_device_name`), not independently verified against real hardware |
+| SAE Anti-clogging / SAE Sync Time (WPA3-SAE tuning) | ✅ Wire key names and gating logic confirmed via decompile (`sae_anti_clogging_threshold`/`sae_sync` hostapd options); only sent by the controller when the WLAN is genuinely in WPA3/SAE mode, not the mixed "WPA2/WPA3" option — the emitting case wasn't reachable in this session's validation environment (see PROTOCOL-VALIDATION.md) |
 | Wireless client & radio statistics in payload | ✅ Working (`vap_table[].sta_table`, `num_sta`, `radio_table_stats`) |
 | Wired client statistics (`port_table[].mac_table`) | ✅ Working — U6-InWall's downstream switch ports report bridge-learned hosts as `is_wired` clients |
 | Client block/unblock | ✅ Working — enforced via nftables (`block-sta`/`unblock-sta` cmd), persists across restarts |

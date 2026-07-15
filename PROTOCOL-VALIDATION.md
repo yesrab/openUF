@@ -3014,6 +3014,73 @@ prefixed behavior as correct).
 
 ---
 
+## 27. "SAE Anti-clogging" / "SAE Sync Time" — WPA3-only wire fields, root-caused via decompile (2026-07-15)
+
+- **Status:** wire key names/shape and gating logic CONFIRMED via decompile
+  (a small, unambiguous method body — no reverse-engineering guesswork
+  needed). The emitting (true WPA3) case could **not** be confirmed with a
+  live before/after diff — switching the test WLAN's Security Protocol
+  from "WPA2/WPA3" to pure "WPA3" tripped an unrelated environmental
+  issue (below) before a diff could be captured.
+- **Context:** these two WLAN fields tune WPA3-SAE's anti-clogging-token
+  defense (mitigates SAE DoS flooding). Both showed as editable number
+  inputs (default 5/5) in the same panel section as PMF, right above
+  Behavior Controls. Setting them to non-default values (12/20) on the
+  test WLAN (Security Protocol: "WPA2/WPA3", PMF Optional) produced
+  **zero** `system_cfg` diff, even though the values persisted
+  server-side (confirmed via page reload) — same symptom as the
+  "Show Access Point Name in Beacon" case, but a **different root
+  cause**, found in the same decompile session:
+  `com/ubnt/service/config/ubntconf/OXMua.class`'s config-emitter method
+  is simple and capability-gate-free:
+  ```
+  n = wlan.getInt("sae_anti_clogging", -1); if (n > 0) emit "aaa.<idx>.sae.anti_clogging" = n
+  s = wlan.getInt("sae_sync", -1);          if (s > 0) emit "aaa.<idx>.sae.sync" = s
+  ```
+  But this whole method is only *called* when
+  `com/ubnt/service/config/j/rYtJfMBbtgWvku.chgwykfBxZCAuEHPPQ(wlan)` is
+  true, which is exactly `wlan.isWpa3() || wlan.isOn6GHzBand()`. And
+  `isWpa3()` reads a distinct admin-facing DB flag, `wpa3_support`
+  (default false) — **not** the same thing as the "WPA2/WPA3" mixed
+  Security Protocol dropdown choice we had selected. In other words: this
+  is gated on the WLAN's own security configuration, not a device
+  capability like `advertise_ap_name` was — our test WLAN's "WPA2/WPA3"
+  mode apparently doesn't set `wpa3_support=true` at the DB level (the
+  UI's mixed-mode option is evidently implemented some other way — see
+  section 24's related finding that Security Protocol dropdown behavior
+  lives in an external, undocumented per-model UI database). Fixed
+  regardless of live-diff availability, since the method body leaves no
+  ambiguity: `_parse_wifi_system_cfg` now reads `aaa.<n>.sae.anti_clogging`
+  / `aaa.<n>.sae.sync` (plain integers) into each vap, and
+  `ucihelper.apply_config` writes hostapd's own `sae_anti_clogging_threshold`
+  / `sae_sync` options (both confirmed real, stable hostapd config
+  directives via hostapd's own upstream docs — note
+  `sae_anti_clogging_threshold` was later renamed to
+  `anti_clogging_threshold` in newer hostapd to also cover PASN; using the
+  older name since it's the one broadly supported across the OpenWrt/wpad
+  versions this project targets).
+- **Environmental blocker hit while trying to force the emitting case:**
+  switching the test WLAN's Security Protocol to pure "WPA3" (PMF
+  auto-forced to Required) made the controller **stop pushing any
+  `wireless.<n>`/`aaa.<n>` config for this WLAN at all** — not just the
+  SAE fields, the entire WLAN vanished from `system_cfg`, and stayed
+  gone even after restarting `inform.lua` inside the AP container (a
+  fresh full resync). No related error in `server.log` (only the
+  already-known, unrelated ULP-manifest connection-refused noise).
+  Reverting the Security Protocol back to "WPA2/WPA3" did not
+  immediately restore pushes either, within the observation window. This
+  looks like the same family of issue as the already-documented
+  `wait_for_initial_inform`/controller-minidev-cache flakiness elsewhere
+  in this doc (config changes not always triggering a fresh push once a
+  device's informs have "stabilized") rather than anything specific to
+  SAE or security-mode changes — **flagged as a reusable warning**: don't
+  assume a live no-op result on this validation setup always means "the
+  controller is deliberately withholding this field" (as it correctly was
+  for `advertise_ap_name`'s capability gate) — verify by decompile first,
+  since sometimes it means "the environment's config-sync got stuck."
+
+---
+
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)
 
 Goal: determine the AP→controller spectrum-scan-result reporting shape — the
