@@ -577,6 +577,44 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.advertise_ap_name (Show AP Name in Beacon)",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\nwireless.1.advertise_ap_name=enabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].advertise_ap_name, true, "advertise_ap_name=enabled -> true")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves advertise_ap_name nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].advertise_ap_name, nil, "no advertise_ap_name key -> nil")
+		end
+	},
+	{
+		name = "inform packet: handle_response parses resolv.host.1.name and threads it as opts.device_name",
+		fn = function()
+			local st = sample_state()
+			local applied_opts
+			inform._ucihelper = {
+				apply_config = function(_, _, opts) applied_opts = opts end,
+			}
+			local orig_usteer = inform._usteer.set_enabled
+			inform._usteer.set_enabled = function() end
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "resolv.host.1.name=Living-Room-AP\n"
+			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg:gsub("\n", "\\n"))
+			inform.handle_response(resp, st, {net = {lan_cpueth = "eth0"}})
+			inform._ucihelper = nil
+			inform._usteer.set_enabled = orig_usteer
+			assert_eq(applied_opts.device_name, "Living-Room-AP", "resolv.host.1.name threaded through as opts.device_name")
+		end
+	},
+	{
 		name = "inform packet: handle_response setparam applies WiFi config from system_cfg via ucihelper",
 		fn = function()
 			local st = sample_state()

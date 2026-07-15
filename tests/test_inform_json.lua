@@ -732,6 +732,20 @@ return {
 		end
 	},
 	{
+		name = "inform json: wifi_caps2 sets the advertise-device-name-in-beacon bit (0x40)",
+		fn = function()
+			-- Confirmed via decompiling the controller: Device.
+			-- supportAdvertisingDeviceNameInBeacon() is hasWifiCapability2(64)
+			-- -- a SEPARATE bitmask from fw_caps/wifi_caps -- and gates whether
+			-- wireless.<n>.advertise_ap_name is ever pushed to system_cfg at
+			-- all for "Show Access Point Name in Beacon". Only this bit is
+			-- claimed (see PROTOCOL-VALIDATION.md for the other wifi_caps2
+			-- bits this device does not implement/claim).
+			local d = build()
+			assert_eq(d.wifi_caps2, 0x40, "wifi_caps2 bit 0x40 set")
+		end
+	},
+	{
 		name = "inform json: port_table has one entry per configured port, 1-based port_idx",
 		fn = function()
 			-- No cfg passed (build() always calls build_json with cfg=nil), so

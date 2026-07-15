@@ -937,6 +937,22 @@ function M.build_json(st, cfg, ufhw)
 		-- for the full derivation (traced through an obfuscation-induced
 		-- macOS case-folding extraction bug along the way).
 		fw_caps          = 0x110,
+		-- Bit 0x40 (64): Device.supportAdvertisingDeviceNameInBeacon() in the
+		-- decompiled controller is exactly hasWifiCapability2(64) -- i.e. bit
+		-- 6 of a SECOND capability bitmask, wifi_caps2, entirely separate
+		-- from fw_caps/wifi_caps above. Confirmed by decompiling
+		-- com/ubnt/service/config's WLAN-config-generator method: it only
+		-- emits wireless.<n>.advertise_ap_name into system_cfg at all when
+		-- this bit is set -- otherwise the "Show Access Point Name in
+		-- Beacon" WLAN toggle is silently dropped, which is exactly what a
+		-- live capture showed (toggling it produced zero system_cfg/mgmt_cfg
+		-- diff, and the controller didn't even bother re-pushing config on
+		-- the next change) before this bit was added. Only this one bit is
+		-- claimed -- wifi_caps2 also gates several other real-hardware-only
+		-- features (Mesh MLO parent/child, assisted roaming, etc., see
+		-- PROTOCOL-VALIDATION.md) that openUF does not implement and must
+		-- not claim.
+		wifi_caps2       = 0x40,
 		-- Device-level (not per-radio -- see radio_table_stats above)
 		spectrum_scanning       = false,
 		spectrum_scan_timestamp = spectrum_scan_timestamp,
@@ -1113,6 +1129,17 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- paultyng/go-unifi's REST model) that does not exist on
 				-- this wire protocol at all -- see PROTOCOL-VALIDATION.md.
 				no2ghz_oui            = _wire_bool(w.no2ghz_oui),
+				-- wireless.<n>.advertise_ap_name: "Show Access Point Name
+				-- in Beacon". CONFIRMED via decompiling the controller's
+				-- WLAN-config-generator method directly (not a live diff
+				-- -- a live capture showed zero effect from this toggle
+				-- until the wifi_caps2 capability bit above was added,
+				-- since the controller only emits this key at all when
+				-- Device.supportAdvertisingDeviceNameInBeacon() is true;
+				-- see that field's comment in build_json for the full
+				-- derivation). "enabled"/"disabled" string, same
+				-- convention as bss_transition/no2ghz_oui.
+				advertise_ap_name     = _wire_bool(w.advertise_ap_name),
 			}
 		end
 	end
@@ -1208,6 +1235,7 @@ function M.handle_response(json_str, st, cfg)
 		if type(sys_raw) == "string" then
 			local ip, netmask, gateway
 			local dhcp = false
+			local device_name
 			for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
 				local k, v = line:match("^([^=]+)=(.*)$")
 				if k and v then
@@ -1215,6 +1243,15 @@ function M.handle_response(json_str, st, cfg)
 					elseif k == "netconf.1.netmask" then netmask = v
 					elseif k == "route.1.gateway" then gateway = v
 					elseif k == "dhcpc.1.status" then dhcp = true
+					elseif k == "resolv.host.1.name" then
+						-- The controller's own idea of this device's name
+						-- (its local network hostname) -- already present
+						-- in every capture (e.g. "U6IW" when never
+						-- renamed). Reused as the WPS Device Name value
+						-- when advertise_ap_name is on, since it's the
+						-- only controller-assigned "AP name" string
+						-- available on this wire protocol.
+						if v ~= "" then device_name = v end
 					end
 				end
 			end
@@ -1264,7 +1301,7 @@ function M.handle_response(json_str, st, cfg)
 					M._usteer.set_enabled(steering_active, cfg)
 					pcall(ufuci.apply_config,
 						{radio_table = radio_table, vap_table = vap_table, network_table = {}},
-						cfg, {band_steering_active = steering_active})
+						cfg, {band_steering_active = steering_active, device_name = device_name})
 				end
 			end
 		end

@@ -246,7 +246,10 @@ end
 --       BSS Transition on for every managed iface regardless of each WLAN's
 --       own bss_transition setting, since usteer (Band Steering) needs it
 --       network-wide to function at all -- see openuf/usteer.lua. nil/false
---       leaves each vap's own setting in effect.
+--       leaves each vap's own setting in effect. opts.device_name is the
+--       controller-assigned device name, used as the WPS Device Name value
+--       when a vap has advertise_ap_name enabled ("Show Access Point Name in
+--       Beacon"); defaults to "openUF" if nil.
 -- Handles vap_table, radio_table, and network_table (VLAN join) from the
 -- setparam/config response.
 function M.apply_config(resp, cfg, opts)
@@ -304,6 +307,33 @@ function M.apply_config(resp, cfg, opts)
 				end
 			end
 			if vap.dtim_period then extra.dtim_period = vap.dtim_period end
+			if vap.advertise_ap_name then
+				-- "Show Access Point Name in Beacon" -- CONFIRMED (via
+				-- decompiling the controller) to require a device-reported
+				-- wifi_caps2 capability bit before the controller even
+				-- pushes this field at all; see inform.lua's build_json
+				-- for that side. There's no standalone "put this string in
+				-- a beacon IE" hostapd option, but there IS a real,
+				-- standard mechanism for broadcasting a human-readable
+				-- device name in every beacon: the Wi-Fi Alliance WPS/WSC
+				-- information element's Device Name attribute, which
+				-- hostapd includes automatically once WPS is active
+				-- (confirmed via hostapd's own README-WPS and OpenWrt's
+				-- documented wifi-iface options: wps_device_name maps
+				-- directly to hostapd's device_name). ap_setup_locked=1 is
+				-- a standard hostapd/WPS hardening flag that disables
+				-- PIN-based external registrar enrollment -- set
+				-- unconditionally here to minimize the WPS surface this
+				-- opens to only what's needed for the name broadcast,
+				-- since no push-button/PIN config method is ever enabled.
+				-- NOT independently confirmed against genuine Ubiquiti
+				-- hardware (no real device available to capture from) --
+				-- this is the standards-based mechanism for the stated
+				-- goal, not a verified replica of Ubiquiti's own
+				-- implementation.
+				extra.wps_device_name = (opts and opts.device_name) or "openUF"
+				extra.ap_setup_locked = "1"
+			end
 			-- Controller-sent values win over the derived/default stopgap ones above.
 			if vap.mobility_domain then extra.mobility_domain = vap.mobility_domain end
 			if vap.ft_psk_generate_local then

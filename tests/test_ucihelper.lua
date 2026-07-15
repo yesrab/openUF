@@ -407,6 +407,59 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config sets wps_device_name/ap_setup_locked when advertise_ap_name is on",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", advertise_ap_name = true},
+					},
+				}
+				ucihelper.apply_config(resp, nil, {device_name = "Living-Room-AP"})
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.wps_device_name, "Living-Room-AP", "WPS device name from opts.device_name")
+				assert_eq(s.ap_setup_locked, "1", "PIN-based WPS enrollment locked out")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config defaults wps_device_name to 'openUF' without opts.device_name",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", advertise_ap_name = true},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.wps_device_name, "openUF", "falls back to 'openUF'")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config omits wps_device_name/ap_setup_locked when advertise_ap_name is off",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil, {device_name = "Living-Room-AP"})
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.wps_device_name, nil, "no WPS device name written")
+				assert_eq(s.ap_setup_locked, nil, "no ap_setup_locked written")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_vap_table echoes the wlanconf id as both id and wlanconf_id",
 		fn = function()
 			-- Regression test: the controller's vapInformProcessor silently

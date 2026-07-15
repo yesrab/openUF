@@ -2937,6 +2937,83 @@ prefixed behavior as correct).
 
 ---
 
+## 26. "Show Access Point Name in Beacon" — capability-gated, root-caused via decompile (2026-07-15)
+
+- **Status:** wire protocol/capability-gating fully CONFIRMED LIVE, both
+  directions. The actual OpenWrt/hostapd beacon effect (WPS Device Name)
+  could not be verified further — `tools/validation`'s AP container is a
+  plain Alpine simulator with no real `uci`/`hostapd`/`wifi` binaries at
+  all (confirmed: `uci show wireless` and `which uci` both come up empty),
+  so it can only validate the wire protocol, not the OpenWrt-side
+  application of it.
+- **Initial live test was a dead end, by design of the real controller:**
+  toggling "Show Access Point Name in Beacon" on the test WLAN produced
+  **zero** `system_cfg`/`mgmt_cfg` diff in either direction, and the
+  controller didn't even bother re-pushing `setparam` on one of the
+  toggles (45+ seconds, nothing but `noop`). This is different from every
+  other Behavior Controls finding above — not a wrong wire-key guess, but
+  the controller genuinely refusing to send anything for this device.
+- **Root cause, found by decompiling the controller's Java bytecode**
+  (`docker export` + extract `internal-dependencies.jar` + `javap -p -c`
+  on the specific classes, per the technique in the "New reusable source
+  for wire-format field names" note above): `com/ubnt/service/config/
+  eWivisHeQsnaqDtx.class`'s WLAN-config-generator method only emits
+  `wireless.<n>.advertise_ap_name` (`"enabled"`/`"disabled"`, same
+  convention as `bss_transition`/`no2ghz_oui`) when
+  `Device.supportAdvertisingDeviceNameInBeacon()` returns true. That
+  method (in `com/ubnt/data/uuvchZbWVhirD.class`, the Device DTO) is
+  exactly `hasWifiCapability2(64)` — bit 6 of a **second**, entirely
+  separate capability bitmask, `wifi_caps2` (there's also a first
+  `wifi_caps`, used by unrelated methods like `supportBandsteering()`/
+  `supportZeroHandoff()` — openUF sets neither of those bits, only
+  `wifi_caps2`'s bit 64). Both bitmasks are read via the identical
+  `getInt("wifi_caps"/"wifi_caps2")` accessor pattern already confirmed
+  for `fw_caps` (`hasFirmwareCapability` at the same class), i.e.
+  `wifi_caps2` is a self-reported field on the
+  AP's own inform payload that openUF had simply never sent — the
+  controller correctly determined our device doesn't support the
+  feature and silently declined to configure it, exactly matching the
+  live no-op observed.
+- **Fix, then RE-confirmed live after redeploying updated code to the
+  validation AP container:** added `wifi_caps2 = 0x40` to `build_json`'s
+  top-level payload (only this one bit — `wifi_caps2` also gates Mesh
+  MLO parent/child, assisted roaming, quick/neighbour scan, and other
+  real-hardware-only features this device doesn't implement and must
+  not claim). After restarting `inform.lua` inside the AP container with
+  the new code, toggling the WLAN setting off then back on now correctly
+  produces `wireless.1.advertise_ap_name=disabled` then
+  `wireless.1.advertise_ap_name=enabled` (and the `wireless.2` /5GHz
+  entry alongside it) — confirming the capability-bit fix actually
+  works, not just that the bytecode read was correct in theory.
+- **OpenWrt/hostapd side — standards-based, not independently verified.**
+  There is no vendor-specific "put this string in a beacon IE" hostapd
+  option, and no confirmed source for Ubiquiti's own real vendor-IE byte
+  format (it lives in AP firmware, not the controller). Per user
+  direction ("adopt a norm if one exists rather than copy Ubiquiti
+  directly"): the real, standard mechanism for broadcasting a
+  human-readable device name in every beacon is the **Wi-Fi Alliance
+  WPS/WSC information element's Device Name attribute** — hostapd
+  natively includes it once WPS is active (confirmed via hostapd's own
+  README-WPS and beacon.c, which gate WSC-IE inclusion on
+  `conf->wps_state`), and OpenWrt's own documented wifi-iface UCI schema
+  exposes this directly as `wps_device_name` (confirmed against the
+  OpenWrt wiki's wireless configuration reference, mapping 1:1 to
+  hostapd's `device_name` directive). Implemented in `ucihelper.lua`:
+  when a vap's `advertise_ap_name` is true, set `wps_device_name` (from
+  `opts.device_name`, itself parsed from the controller-pushed
+  `resolv.host.1.name`) and `ap_setup_locked=1` — a standard hostapd/WPS
+  hardening flag disabling PIN-based external registrar enrollment,
+  set to minimize the WPS attack surface this opens to only what's
+  needed for the name broadcast (no push-button/PIN config method is
+  ever enabled). **Could not verify hostapd actually accepts these
+  options or emits the WSC IE as expected** — this Docker validation
+  environment has no real hostapd to test against; would need real
+  OpenWrt hardware (or at minimum a real `hostapd`/`wpad` install) to
+  confirm the generated `hostapd-*.conf` is accepted and the beacon
+  actually changes.
+
+---
+
 ## Stage 2 (attempted 2026-07-11: firmware side inconclusive, controller side succeeded)
 
 Goal: determine the AP→controller spectrum-scan-result reporting shape — the
