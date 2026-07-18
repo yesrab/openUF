@@ -4,36 +4,71 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Lua 5.1+](https://img.shields.io/badge/Lua-5.1%2B-blue.svg)](https://www.lua.org/)
 
-openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi U6-InWall** (or other UniFi AP models) to a UniFi Network Application controller.  The controller can then adopt the device, push SSID configuration, and display client statistics — all without genuine Ubiquiti hardware.
+openUF is a Lua daemon that makes an OpenWrt device appear as a **Ubiquiti UniFi U6-InWall** (or other UniFi AP models) to a UniFi Network Application controller.  The controller can then adopt the device, push SSID and network configuration, and display live client and radio statistics — all without genuine Ubiquiti hardware.
+
+Tested end-to-end against **UniFi Network Application 10.4.57**.  The default device identity presented is **U6-InWall** (model `U6IW`).  openUF emulates a UniFi **access point** only — gateway (USG) and switch (USW) emulation are not implemented and not planned.
+
+Most rows below marked ✅ were verified by driving the real controller UI against a live openUF device and reading back the resulting wire capture; [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md) records the evidence, including where a claim rests on decompiling the controller rather than a live capture.
 
 ## What it does
+
+### Adoption and transport
 
 | Feature | Status |
 |---|---|
 | L2 UDP discovery (port 10001) | ✅ Working |
-| TNBU inform protocol (AES-128-CBC) | ✅ Working |
-| Adoption via `syswrapper.sh set-adopt` | ✅ Working |
-| L3 inform (`set-inform` before adoption) | Sends informs and appears Pending, but adoption does not complete against a real controller (see [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md)) — use L2 adoption |
-| Controller-pushed SSID provisioning | ✅ Working (UCI) |
-| VLAN-tagged SSIDs (`network_table` join) | ✅ Working — field shapes unverified against a live capture |
-| BSS Transition (802.11v, Behavior Controls) | ✅ Working (`bss_transition` UCI option) — confirmed live against a real controller |
-| Auto 802.11 DTIM Period (Behavior Controls) | ✅ Working — always reads the controller's `dtim_period` (Auto and Custom both send a concrete value) — confirmed live against a real controller |
-| Band Steering (Behavior Controls) | ✅ Working via `usteer` — requires the `usteer` package and a full `wpad` build (see Quick start); wire key confirmed live against a real controller |
-| Show Access Point Name in Beacon (Behavior Controls) | ✅ Wire protocol confirmed live (requires reporting the `wifi_caps2` device capability bit); OpenWrt-side beacon effect uses the standard WPS Device Name element (`wps_device_name`), not independently verified against real hardware |
-| SAE Anti-clogging / SAE Sync Time (WPA3-SAE tuning) | ✅ Wire key names and gating logic confirmed via decompile (`sae_anti_clogging_threshold`/`sae_sync` hostapd options); only sent by the controller when the WLAN is genuinely in WPA3/SAE mode, not the mixed "WPA2/WPA3" option — the emitting case wasn't reachable in this session's validation environment (see PROTOCOL-VALIDATION.md) |
-| Wireless client & radio statistics in payload | ✅ Working (`vap_table[].sta_table`, `num_sta`, `radio_table_stats`) |
-| Wired client statistics (`port_table[].mac_table`) | ✅ Working — U6-InWall's downstream switch ports report bridge-learned hosts as `is_wired` clients |
-| Client block/unblock | ✅ Working — enforced via nftables (`block-sta`/`unblock-sta` cmd), persists across restarts |
-| Locate (LED identify) | ✅ Working — requires `dev.conf.led` sysfs path set per board |
-| RF/spectrum scan | Best-effort trigger only — result-reporting wire format unconfirmed |
-| Environment / rogue-AP scanning (`scan_radio_table`) | ✅ Working — confirmed rendering live in the controller's Environment tab UI |
+| TNBU inform protocol | ✅ Working — AES-128-CBC and AES-128-GCM |
+| AES-128-GCM | ✅ Working — **required**: 10.4.57 will not finish provisioning a device until it receives a genuine GCM inform. Needs a GCM-capable `lua-openssl` build |
+| L2 adoption (SSH `syswrapper.sh set-adopt`) | ✅ Working — completes to **Connected** |
+| L3 adoption (`set-inform`, different subnets) | ✅ Working — the controller skips SSH entirely and delivers the new authkey in the `setparam` `mgmt_cfg`; openUF accepts it only while unadopted |
+| Zero-touch bootstrap adoption | ✅ Optional (`install.sh install --bootstrap-adopt`) — a locked-down, non-root SSH account auto-disabled after adoption |
+| Forget device / factory reset | ✅ Working (`syswrapper.sh reset-inform`) |
+| Restart / reboot command | ✅ Working |
 | Firmware upgrade requests | Stored (version/url), never applied — flashing controller-supplied firmware onto non-Ubiquiti hardware would brick it |
-| LLDP topology announcement | ✅ Working (via lldpd) |
-| AES-128-GCM (newer firmware flag) | Implemented, untested |
-| Speed test | Not applicable — gateway-only feature in current UniFi Network, doesn't apply to APs |
-| USG / USW emulation | Not implemented |
 
-Tested against **UniFi Network Application 10.4.57**.  The device identity presented is **U6-InWall** (model `U6IW`).
+### WiFi provisioning
+
+| Feature | Status |
+|---|---|
+| Controller-pushed SSID provisioning | ✅ Working (UCI); only `openuf_`-prefixed sections are touched |
+| WPA2 / WPA3 / WPA2-WPA3 mixed security | ✅ Working — derived from the pushed AKM set |
+| PMF / 802.11w (`ieee80211w`) | ✅ Working — from `aaa.<n>.pmf.status`/`pmf.mode`; also what carries WPA3-transition intent on a mixed WLAN |
+| Fast Roaming (802.11r) | ✅ Working |
+| VLAN-tagged SSIDs (`network_table` join) | ✅ Working — bridges onto a per-VLAN `br0.<vlan>` device |
+| Channel and TX power per radio | ✅ Working (Low/Medium/High/Custom) |
+| BSS Transition (802.11v) | ✅ Working (`bss_transition`) — needs a full `wpad` build |
+| Band Steering | ✅ Working via `usteer` — requires the `usteer` package and a full `wpad` build (see Quick start) |
+| Auto 802.11 DTIM Period | ✅ Working — Auto and Custom both arrive as a concrete `dtim_period` |
+| Multicast Enhancement (multicast-to-unicast) | ✅ Working — from `wireless.<n>.mcast.enhance` |
+| Minimum RSSI | ✅ Working — per **radio**, not per WLAN; enforced by deauthenticating clients below the threshold (a one-shot kick, not a persistent block) |
+| Show Access Point Name in Beacon | ✅ Wire protocol confirmed live (requires reporting the `wifi_caps2` capability bit); the OpenWrt-side beacon effect uses the standard WPS Device Name element, not independently verified against real hardware |
+| SAE Anti-clogging / SAE Sync Time | ⚠️ Implemented from a decompile of the controller's WLAN-config generator. The controller only emits these for a genuine WPA3/SAE WLAN — not the mixed "WPA2/WPA3" option — and that emitting case was never reachable in the validation environment, so it is unconfirmed on the wire |
+
+### Reporting and statistics
+
+| Feature | Status |
+|---|---|
+| Wireless client statistics | ✅ Working — per-client traffic, signal, MIMO/generation, TX MCS (`vap_table[].sta_table`) |
+| Radio statistics | ✅ Working — channel utilization, avg. signal/interference/airtime, per-VAP "Air Stats" |
+| WiFi Experience / satisfaction score | ✅ Working — device-computed, confirmed rendering live |
+| Wired client statistics (`port_table[].mac_table`) | ✅ Working — bridge-learned hosts on downstream switch ports report as `is_wired` clients |
+| Environment / rogue-AP scanning (`scan_radio_table`) | ✅ Working — confirmed rendering live in the Environment tab |
+| LLDP topology announcement | ✅ Working (via `lldpd`) |
+| RF/spectrum scan | ⚠️ Best-effort trigger only — the result-reporting wire format is unconfirmed |
+
+### Device management
+
+| Feature | Status |
+|---|---|
+| Locate (LED identify blink) | ✅ Working — requires `dev.conf.led` set per board |
+| Manage → LED steady on/off toggle | ✅ Working — same `dev.conf.led` requirement |
+| Client block / unblock | ✅ Working — enforced via nftables, persists across restarts |
+| IP Settings (DHCP / static) | ✅ Working — reconfigures the device's own management interface |
+| Per-port VLAN assignment | ✅ Working — requires reporting the `hasOWRTSwitch` capability bit |
+| Set Replacement Device / Load Configuration | ✅ Working — both are controller-side clones; no device-side protocol involved |
+| Power / PoE reporting | Not applicable — the flagged UI field belongs to the upstream parent device, not the AP |
+| Speed test | Not applicable — gateway-only feature in current UniFi Network |
+| USG / USW emulation | Not implemented, not planned |
 
 ## Supported hardware
 
@@ -42,6 +77,8 @@ Any OpenWrt device with at least 8 MB flash and a dual-band wireless chipset.  K
 - **TP-Link WDR3500** (dual-band 802.11n) — use `modelmap/generic-dualband-ap.lua`
 - **TP-Link Archer C5 v1** (dual-band 802.11n/ac) — use `modelmap/generic-dualband-ap.lua`
 - **TP-Link WR1043ND v2** (single-band 802.11n) — use `modelmap/tl-wr1043ndv2.lua`
+
+The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end — `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
 
 ## Quick start
 
@@ -60,11 +97,15 @@ sh install.sh install
 #     — The device will appear in UniFi Discover automatically.
 #     — Click Adopt in the controller UI.
 
-# 3b. L3 adoption (different subnets)
+# 3b. L3 adoption (different subnets — no SSH from the controller needed)
 ssh root@<device> syswrapper.sh set-inform http://<controller-ip>:8080/inform
-#     — The device will appear as pending in the controller.
+#     — The device will appear as Pending in the controller.
 #     — Click Adopt.
 ```
+
+Both adoption paths complete to **Connected**.  L2 requires the controller to
+SSH in (set a root password first, or use `--bootstrap-adopt`); L3 skips SSH
+entirely and delivers the adoption key over the inform channel.
 
 `install.sh install` automatically installs `usteer` and a full `wpad` build
 (`wpad-wolfssl`, falling back to `wpad-openssl`) if either is missing — both are
@@ -110,9 +151,12 @@ openUF implements the **TNBU binary inform protocol**:
 
 - HTTP POST to `/inform` every 10 seconds
 - Binary header: `TNBU` magic + version + MAC + flags + 16-byte IV + data version + payload length
-- Payload: zlib-compressed JSON, AES-128-CBC encrypted with the device's authkey
+- Payload: JSON, AES-128 encrypted with the device's authkey — CBC, or GCM (with a
+  40-byte AAD) once the controller sets `use_aes_gcm`.  Controller responses may be
+  zlib-compressed; openUF decompresses them with a bundled pure-Lua inflater
 - Default pre-adoption key: `ba86f2bbe107c7c57eb5f2690775c712`
-- Adoption: controller SSHes in and calls `syswrapper.sh set-adopt <url> <newkey>`
+- Adoption: L2 — controller SSHes in and calls `syswrapper.sh set-adopt <url> <newkey>`;
+  L3 — new authkey arrives in the `setparam` response's `mgmt_cfg`
 
 Key reference material:
 - [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md) — this project's own findings from running openUF against a real self-hosted UniFi controller; supersedes the below where they disagree

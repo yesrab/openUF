@@ -16,11 +16,11 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftab
 | `lua` | Lua 5.1 runtime |
 | `lua-cjson` | Fast JSON encode/decode |
 | `luasocket` | TCP client for HTTP POST to controller |
-| `lua-openssl` | AES-128-CBC/GCM (replaces `luacrypto`, which was dropped from the 25.12 feeds) |
+| `lua-openssl` | AES-128-CBC **and AES-128-GCM** (replaces `luacrypto`, which was dropped from the 25.12 feeds). Effectively mandatory — see the GCM note below |
 | `luabitop` | bit operations for Lua 5.1 |
 | `iw` | Radio and station statistics |
 | `lldpd` | LLDP topology announcement and neighbor discovery |
-| `openssl-util` | `openssl` CLI — last-resort AES-CBC fallback if `lua-openssl` is unavailable |
+| `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
 | `nftables` | Client block/unblock enforcement (`openuf/firewall.lua`) |
 | `usteer` | Band Steering (Behavior Controls) — ubus-based client-steering daemon, driven by `openuf/usteer.lua` |
 | `wpad-wolfssl` (or `wpad-openssl`) | Full hostapd build with 802.11k/v support — required for BSS Transition and Band Steering. `wpad-basic-*` lacks `bss_transition` entirely and errors with "unknown configuration item 'bss_transition'" |
@@ -29,9 +29,16 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftab
 either is missing (falling back from `wpad-wolfssl` to `wpad-openssl`), so a
 manual `apk add` is only needed if you're not using the installer.
 
-`hostapd_cli` (used to immediately deauthenticate a just-blocked wireless client)
-is not a separate dependency — any device running a wireless AP already has
-`hostapd` providing it.
+`hostapd_cli` (used to immediately deauthenticate a just-blocked wireless client,
+and to enforce Minimum RSSI) is not a separate dependency — any device running a
+wireless AP already has `hostapd` providing it.
+
+> **AES-GCM is required for adoption.** UniFi Network Application 10.4.57 will
+> not finish provisioning a device until it has received a genuine
+> AES-128-GCM-encrypted inform; a device that can only do CBC stays stuck at
+> "Adopting" indefinitely. openUF's GCM support needs a `lua-openssl` build with
+> AEAD/GCM available — the `openssl-util` CLI fallback above is CBC-only and will
+> not get you adopted. See PROTOCOL-VALIDATION.md's AES-GCM section.
 
 There is no Lua zlib binding in the OpenWrt 25.12 feeds. openUF therefore sends
 inform payloads uncompressed and decompresses zlib-compressed controller
@@ -236,18 +243,18 @@ whether `--bootstrap-adopt` is passed to it.
 3. It appears as **Pending** in the controller
 4. Click **Adopt**
 
-> **Updated (2026-07-12):** for **L3-discovered** devices the controller
-> explicitly logs `discovered via L3 inform, skip SSH adoption` and never
-> attempts SSH at all — contradicting the SSH-based flow documented above for L2.
-> Instead, it delivers the new `authkey` directly in the `mgmt_cfg` field of the
-> `setparam` response sent right after the Adopt click — confirmed against a
-> real controller (`linuxserver/unifi-network-application:10.4.57`), reproduced
-> from a clean environment. openUF's `inform.lua` already accepts this (only
-> while unadopted, matching `amd989/unifi-gateway`'s reference behavior — see
-> [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md)). Adoption completes without
-> any SSH involved; a separate, unrelated controller-side issue currently keeps
-> every newly-adopted device (L2 or L3) stuck at "Adopting" in the UI
-> indefinitely — see PROTOCOL-VALIDATION.md's "stuck in Adopting" notes.
+> **No SSH is involved in L3 adoption.** For **L3-discovered** devices the
+> controller explicitly logs `discovered via L3 inform, skip SSH adoption` and
+> never attempts SSH at all — unlike the L2 flow documented above. It delivers
+> the new `authkey` directly in the `mgmt_cfg` field of the `setparam` response
+> sent right after the Adopt click — confirmed against a real controller
+> (`linuxserver/unifi-network-application:10.4.57`), reproduced from a clean
+> environment. openUF's `inform.lua` accepts this only while unadopted, matching
+> `amd989/unifi-gateway`'s reference behavior. Adoption completes to
+> **Connected** — provided the device can encrypt with AES-GCM (see § 1). An
+> earlier version of this guide reported every newly-adopted device getting stuck
+> at "Adopting"; that was the missing GCM backend, not a controller-side issue,
+> and it is resolved — see [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md).
 
 ---
 
@@ -263,7 +270,8 @@ Persistent state is stored at `/etc/openuf/state.json`:
   "inform_url": "http://unifi:8080/inform",
   "use_gcm":    false,
   "upgrade_requested_version": "",
-  "upgrade_requested_url":     ""
+  "upgrade_requested_url":     "",
+  "blocked_stas": []
 }
 ```
 
@@ -275,6 +283,7 @@ Persistent state is stored at `/etc/openuf/state.json`:
 | `upgrade_requested_version` / `upgrade_requested_url` | Set when the controller sends an `upgrade` command; stored for visibility only — openUF never downloads or flashes firmware (see below) |
 | `inform_url` | URL for the 10-second inform heartbeat |
 | `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
+| `blocked_stas` | MACs blocked from the controller's Clients view; re-applied to nftables on startup so blocks survive restarts |
 
 To reset to factory defaults:
 ```sh
@@ -285,7 +294,25 @@ syswrapper.sh reset-inform
 
 ## 6. WiFi provisioning
 
-When the controller pushes a config (SSID, channel, security), `ucihelper.lua` applies it via OpenWrt UCI.  Only sections prefixed with `openuf_` are touched — existing hand-configured SSIDs are preserved.
+When the controller pushes a config, `ucihelper.lua` applies it via OpenWrt UCI.  Only sections prefixed with `openuf_` are touched — existing hand-configured SSIDs are preserved (unless `use_only_unifi_wlan` is left at its default `true`, which disables them during provisioning).
+
+Settings carried through from the controller:
+
+| Controller setting | Applied as |
+|---|---|
+| SSID, passphrase, hidden, security | `wifi-iface` ssid/key/hidden/encryption |
+| WPA2 / WPA3 / WPA2-WPA3 mixed | derived from the pushed AKM set, not a single flag |
+| PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
+| Fast Roaming (802.11r) | `ieee80211r` |
+| BSS Transition (802.11v) | `bss_transition` — **needs a full `wpad` build** |
+| Band Steering | `usteer` config, not a hostapd option |
+| Auto/Custom DTIM Period | `dtim_period` |
+| Multicast Enhancement | `multicast_to_unicast` |
+| Network / VLAN assignment | a `br0.<vlan>` bridge + tagged sub-interface |
+| Channel, TX power, channel width | `wifi-device` channel/txpower/htmode |
+| Minimum RSSI | per-**radio**; enforced by openUF deauthenticating clients below the threshold, not by hostapd |
+
+Minimum RSSI is a *radio* setting in the controller UI (Devices → AP → Radios), not a per-WLAN one, and the wire value is an offset from an assumed noise floor rather than a dBm figure — openUF converts it using a live noise reading.
 
 To verify provisioned SSIDs:
 ```sh
@@ -294,7 +321,7 @@ uci show wireless | grep openuf_
 
 To remove all provisioned SSIDs:
 ```sh
-lua -e "dofile('/opt/openuf/ucihelper.lua'); require('M').wlan_clear()"
+lua -e "dofile('/opt/openuf/ucihelper.lua').wlan_clear()"
 # or simply reset-inform and re-adopt
 ```
 
@@ -321,7 +348,11 @@ If `lldpd` is absent or returns no neighbors, `lldp.lua` returns an empty table 
 | Device doesn't appear in UniFi Discover | `announce.lua` not running, or UDP port 10001 blocked |
 | Controller shows device as "Disconnected" | `inform.lua` not running, or wrong `inform_url` |
 | Adoption fails with SSH error | SSH not reachable from controller, or root password not set — run `passwd root` on the device, or reinstall with `--bootstrap-adopt` |
+| Device stays stuck at "Adopting" forever | No AES-GCM backend — `lua-openssl` missing or built without AEAD support. The CLI `openssl-util` fallback is CBC-only and will not work (see § 1) |
 | Controller rejects device ("firmware incompatible") | Adjust `fw.ver` in `ufmodel/u6iw.lua` |
+| hostapd fails: "unknown configuration item 'bss_transition'" | A `wpad-basic-*` build is installed — replace it with `apk add wpad-wolfssl` |
+| Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
+| Locate/LED does nothing | `dev.conf.led` is `nil` in your modelmap — set it to a path from `ls /sys/class/leds` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
 | SSID not appearing after adoption | Check `uci show wireless`, check `loglevel` in `/var/log/openuf.log` |
 | `lldp_table` empty | `lldpd` not running — run `/etc/init.d/lldpd start` |
