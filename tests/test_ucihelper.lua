@@ -872,6 +872,76 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: use_only_unifi_wlan disables hand-configured SSIDs, not openuf_ ones",
+		fn = function()
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "default_radio0", "wifi-iface")
+				cursor:set("wireless", "default_radio0", "ssid", "MyOwnWiFi")
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, {config = {use_only_unifi_wlan = true}})
+				assert_eq(db.wireless.default_radio0.disabled, "1", "user SSID disabled")
+				assert_eq(db.wireless.default_radio0.openuf_autodisabled, "1", "and stamped")
+				assert_eq(db.wireless.openuf_radio0_corp.disabled, nil,
+					"openUF's own vap is never disabled")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: use_only_unifi_wlan=false leaves hand-configured SSIDs alone",
+		fn = function()
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "default_radio0", "wifi-iface")
+				cursor:set("wireless", "default_radio0", "ssid", "MyOwnWiFi")
+				ucihelper.apply_config({radio_table = {}, network_table = {}, vap_table = {}},
+					{config = {use_only_unifi_wlan = false}})
+				assert_eq(db.wireless.default_radio0.disabled, nil, "left untouched")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: turning use_only_unifi_wlan off re-enables only what openUF disabled",
+		fn = function()
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "mine", "wifi-iface")
+				cursor:set("wireless", "theirs", "wifi-iface")
+				-- An SSID the user disabled themselves: never stamped, so it
+				-- must not be switched back on behind their back.
+				cursor:set("wireless", "theirs", "disabled", "1")
+
+				ucihelper.set_wlan_exclusive(true)
+				assert_eq(db.wireless.mine.disabled, "1", "ours disabled")
+				assert_eq(db.wireless.theirs.openuf_autodisabled, nil,
+					"already-disabled SSID not stamped")
+
+				ucihelper.set_wlan_exclusive(false)
+				assert_eq(db.wireless.mine.disabled, "0", "re-enabled")
+				assert_eq(db.wireless.theirs.disabled, "1",
+					"user's own disabled SSID stays disabled")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a missing cfg is treated as use_only_unifi_wlan=false",
+		fn = function()
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "default_radio0", "wifi-iface")
+				ucihelper.apply_config({radio_table = {}, network_table = {}, vap_table = {}}, nil)
+				assert_eq(db.wireless.default_radio0.disabled, nil,
+					"no cfg threaded through -- must not disable a stranger's SSID")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_radio_table echoes minrssi_enabled/minrssi_rssi as raw UCI values",
 		fn = function()
 			with_ucihelper(function(db)

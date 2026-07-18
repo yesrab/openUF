@@ -25,7 +25,10 @@ dev = dofile("modelmap/generic-dualband-ap.lua")
 
 config = {
 	-- When true, any wifi-iface sections NOT prefixed with "openuf_" are disabled
-	-- during WiFi provisioning.  Set false to preserve hand-configured SSIDs.
+	-- during WiFi provisioning, so the radios carry only what the controller
+	-- pushed.  Set false to keep hand-configured SSIDs broadcasting; openUF
+	-- stamps each SSID it disables, so switching back to false re-enables
+	-- exactly those and leaves ones you disabled yourself alone.
 	use_only_unifi_wlan = true,
 
 	-- URL the inform loop posts to.  Overwritten at runtime when the controller

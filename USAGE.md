@@ -294,7 +294,9 @@ syswrapper.sh reset-inform
 
 ## 6. WiFi provisioning
 
-When the controller pushes a config, `ucihelper.lua` applies it via OpenWrt UCI.  Only sections prefixed with `openuf_` are touched — existing hand-configured SSIDs are preserved (unless `use_only_unifi_wlan` is left at its default `true`, which disables them during provisioning).
+When the controller pushes a config, `ucihelper.lua` applies it via OpenWrt UCI.  Only sections prefixed with `openuf_` are created or deleted.
+
+`use_only_unifi_wlan` (default `true`) additionally sets `disabled=1` on every *other* `wifi-iface`, so the radios carry only what the controller provisioned.  openUF stamps each SSID it turns off with `openuf_autodisabled=1`; setting the option back to `false` re-enables exactly those and leaves everything else as-is, so an SSID you had disabled yourself is never switched back on.  Set it to `false` from the start to keep hand-configured SSIDs broadcasting alongside the controller's.
 
 Settings carried through from the controller:
 

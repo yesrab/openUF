@@ -115,6 +115,46 @@ function M.wlan_clear(radio)
 	cursor:commit("wireless")
 end
 
+-- UCI option marking a wifi-iface that openUF disabled on the user's behalf,
+-- so use_only_unifi_wlan can be switched back off without stranding the SSID.
+local AUTODISABLED = OPENUF_PREFIX .. "autodisabled"
+
+-- Apply conf.lua's use_only_unifi_wlan to every wifi-iface openUF does not
+-- manage (i.e. not "openuf_"-prefixed).
+--
+-- enabled=true  -> disable those SSIDs, stamping each one openUF turns off.
+-- enabled=false -> re-enable only the ones carrying that stamp.
+--
+-- An SSID the *user* had already disabled is never stamped, so switching the
+-- option off later does not silently switch their SSID back on. The option is
+-- documented (README/USAGE) and shipped as true in conf.lua, but a missing
+-- config is treated as false: openUF should not start disabling a stranger's
+-- SSIDs just because a caller failed to thread cfg through.
+function M.set_wlan_exclusive(enabled)
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	local targets = {}
+	cursor:foreach("wireless", "wifi-iface", function(s)
+		local name = s[".name"]
+		if name and name:sub(1, #OPENUF_PREFIX) ~= OPENUF_PREFIX then
+			targets[#targets + 1] = {name = name, disabled = s.disabled,
+				stamped = (s[AUTODISABLED] == "1")}
+		end
+	end)
+	for _, t in ipairs(targets) do
+		if enabled then
+			if t.disabled ~= "1" then
+				cursor:set("wireless", t.name, "disabled", "1")
+				cursor:set("wireless", t.name, AUTODISABLED, "1")
+			end
+		elseif t.stamped then
+			cursor:set("wireless", t.name, "disabled", "0")
+			cursor:set("wireless", t.name, AUTODISABLED, "0")
+		end
+	end
+	cursor:commit("wireless")
+end
+
 -- Create a new wifi-iface section named openuf_<ssid> on the given radio.
 -- radio:    UCI radio name, e.g. "radio0" or "radio1"
 -- ssid:     SSID string
@@ -415,6 +455,11 @@ function M.apply_config(resp, cfg, opts)
 				network, vap.networkconf_id, vap.wlanconf_id)
 		end
 	end
+
+	-- Hand-configured (non-openuf_) SSIDs: disable or restore them per
+	-- conf.lua's use_only_unifi_wlan. Runs after the vap loop so it sees the
+	-- final section set, and before the reload so both land in one restart.
+	M.set_wlan_exclusive(cfg and cfg.config and cfg.config.use_only_unifi_wlan == true)
 
 	-- Reload wireless
 	M._run_cmd("wifi reload")
