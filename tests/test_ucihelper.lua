@@ -686,6 +686,38 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes hidden from vap.hide_ssid",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", hide_ssid = true},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.hidden, "1", "SSID hidden")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes hidden=0 (explicit off)",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", hide_ssid = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.hidden, "0", "SSID explicitly broadcast")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes multicast_to_unicast from vap.mcast_enhance",
 		fn = function()
 			with_ucihelper(function(db)

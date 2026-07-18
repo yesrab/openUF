@@ -1322,6 +1322,21 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- else moved. Always present. Maps onto OpenWrt's
 					-- "isolate" (hostapd ap_isolate).
 					l2_isolation          = _wire_bool(w.l2_isolation),
+					-- wireless.<n>.hide_ssid: "Hide WiFi Name" -- suppress the
+					-- SSID from beacons. CONFIRMED live 2026-07-18 by toggling
+					-- the control in the UI and diffing system_cfg: exactly
+					-- aaa.<n>.hide_ssid and wireless.<n>.hide_ssid flipped
+					-- false->true, on both band entries of the WLAN, nothing
+					-- else moved. The two keys are redundant duplicates; the
+					-- wireless.<n> one is read here to keep this next to the
+					-- other wireless.<n> booleans.
+					--
+					-- Note the value vocabulary is "true"/"false" here, not the
+					-- "enabled"/"disabled" most of these keys use -- _wire_bool
+					-- accepts both. Always present, so "off" is explicit and
+					-- must be written back out as such. Maps onto OpenWrt's
+					-- wifi-iface "hidden" (hostapd ignore_broadcast_ssid).
+					hide_ssid             = _wire_bool(w.hide_ssid),
 					-- "Minimum Data Rate Control" (Settings -> WiFi -> [WLAN]).
 					-- CONFIRMED live 2026-07-18 by REST-setting
 					-- minrate_setting_preference=manual + minrate_ng_enabled +

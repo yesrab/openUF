@@ -301,7 +301,8 @@ Settings carried through from the controller:
 
 | Controller setting | Applied as |
 |---|---|
-| SSID, passphrase, hidden, security | `wifi-iface` ssid/key/hidden/encryption |
+| SSID, passphrase, security | `wifi-iface` ssid/key/encryption |
+| Hide WiFi Name | `hidden` (hostapd `ignore_broadcast_ssid`) |
 | WPA2 / WPA3 / WPA2-WPA3 mixed | derived from the pushed AKM set, not a single flag |
 | PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
 | Fast Roaming (802.11r) | `ieee80211r` |

@@ -745,6 +745,36 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.hide_ssid",
+		fn = function()
+			-- Note the true/false vocabulary here, not enabled/disabled.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.hide_ssid=true\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].hide_ssid, true, "hide_ssid=true -> true")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses hide_ssid=false as false",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.hide_ssid=false\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].hide_ssid, false, "hide_ssid=false -> false")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves hide_ssid nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].hide_ssid, nil, "no hide_ssid key -> nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg collects the bcfilt allow-list",
 		fn = function()
 			-- The wire index is 1-based and does not follow the REST list's
@@ -880,6 +910,7 @@ return {
 				"aaa.1.proxy_arp=enabled",
 				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
 				"wireless.1.l2_isolation=enabled",
+				"wireless.1.hide_ssid=true",
 				"wireless.1.minrate_data=12000", "wireless.1.beacon_rate=12000",
 				"wireless.1.minrate_cck_rates.status=false",
 				"wireless.1.minrate_below_disable=true",
@@ -895,6 +926,7 @@ return {
 			assert_true(s ~= nil, "vap section created from a real system_cfg blob")
 			assert_eq(s.proxy_arp, "1", "aaa.<n>.proxy_arp reached UCI proxy_arp")
 			assert_eq(s.isolate, "1", "wireless.<n>.l2_isolation reached UCI isolate")
+			assert_eq(s.hidden, "1", "wireless.<n>.hide_ssid reached UCI hidden")
 
 			-- Minimum Data Rate lands on the RADIO section, not the vap.
 			local r = db.wireless.radio0

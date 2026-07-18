@@ -541,6 +541,16 @@ function M.apply_config(resp, cfg, opts)
 				-- hostapd_common_add_bss_config declaration list.
 				extra.isolate = vap.l2_isolation and "1" or "0"
 			end
+			if vap.hide_ssid ~= nil then
+				-- "Hide WiFi Name": leave the SSID out of beacons (clients must
+				-- know the name to associate). OpenWrt's wifi-iface option is
+				-- spelled "hidden" and maps to hostapd's
+				-- ignore_broadcast_ssid -- confirmed in hostapd.sh's
+				-- hostapd_common_add_bss_config declaration list. Written
+				-- explicitly on and off, since the controller always sends the
+				-- key and un-hiding has to actually take effect.
+				extra.hidden = vap.hide_ssid and "1" or "0"
+			end
 			if vap.advertise_ap_name then
 				-- "Show Access Point Name in Beacon" -- CONFIRMED (via
 				-- decompiling the controller) to require a device-reported
