@@ -1202,16 +1202,35 @@ function M._parse_wifi_system_cfg(sys_raw)
 	for _, idx in ipairs(sorted_indices(wireless)) do
 		local w = wireless[idx]
 		local a = aaa[idx] or {}
-		if w.ssid and w.parent then
+
+		-- Aggregate every aaa.<n>.wpa.key.<k>.mgmt entry (transition mode can
+		-- list WPA-PSK and SAE either space-joined on one key or across
+		-- separate keys). Hoisted out of the security branch below because the
+		-- WPA-Enterprise check needs it before anything else is decided.
+		local akm = ""
+		for k, val in pairs(a) do
+			if k:match("^wpa%.key%.%d+%.mgmt$") then akm = akm .. " " .. val end
+		end
+
+		-- WPA-Enterprise (802.1X, mgmt "WPA-EAP"). openUF cannot provision it:
+		-- the wire carries no RADIUS server/port/secret -- aaa.<n>.wpa.psk is
+		-- simply absent -- and wlan_add() writes no auth_server/auth_secret.
+		-- Left to fall through, an Enterprise WLAN matched neither the SAE nor
+		-- the PSK branch and landed on security="wpa2", producing a psk2
+		-- section with a nil key: a VAP hostapd refuses to bring up, with
+		-- nothing logged anywhere. Skipping it loudly is strictly better -- a
+		-- missing WLAN an admin can diagnose beats a broken one that looks
+		-- provisioned.
+		local is_enterprise = akm:find("EAP", 1, true) ~= nil
+		if is_enterprise and w.ssid then
+			io.stderr:write(("inform: skipping WLAN %q -- WPA-Enterprise (%s) is not "
+				.. "supported; openUF has no RADIUS configuration on this wire protocol\n")
+				:format(w.ssid, (akm:gsub("^%s+", ""))))
+		end
+
+		if w.ssid and w.parent and not is_enterprise then
 			local security = "open"
 			if a.wpa == "2" or a.wpa == "3" then
-				-- Aggregate every aaa.<n>.wpa.key.<k>.mgmt entry (transition
-				-- mode can list WPA-PSK and SAE either space-joined on one
-				-- key or across separate keys).
-				local akm = ""
-				for k, val in pairs(a) do
-					if k:match("^wpa%.key%.%d+%.mgmt$") then akm = akm .. " " .. val end
-				end
 				local has_sae = akm:find("SAE", 1, true) ~= nil
 				local has_psk = akm:find("PSK", 1, true) ~= nil
 				if has_sae and has_psk then security = "wpa2/wpa3"

@@ -307,6 +307,7 @@ Settings carried through from the controller:
 | MAC Address Filter | `macfilter` (`disable`/`allow`/`deny`) + `maclist` |
 | WiFi Speed Limit | `tc` shaping per VAP, not a hostapd option (plus `openuf_ratelimit_down`/`openuf_ratelimit_up` on the section for visibility) |
 | WPA2 / WPA3 / WPA2-WPA3 mixed | derived from the pushed AKM set, not a single flag |
+| WPA-Enterprise (802.1X) | **not supported** — the WLAN is skipped and logged. The wire protocol carries no RADIUS server/port/secret to write, so there is nothing openUF could provision |
 | PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
 | Fast Roaming (802.11r) | `ieee80211r` |
 | BSS Transition (802.11v) | `bss_transition` — **needs a full `wpad` build** |

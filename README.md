@@ -32,7 +32,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 |---|---|
 | Controller-pushed SSID provisioning | ✅ Working (UCI); only `openuf_`-prefixed sections are created or deleted |
 | Exclusive-WLAN mode (`use_only_unifi_wlan`) | ✅ Working — default `true` disables hand-configured SSIDs so the radios carry only what the controller pushed; reversible (openUF stamps what it disabled) |
-| WPA2 / WPA3 / WPA2-WPA3 mixed security | ✅ Working — derived from the pushed AKM set |
+| WPA2 / WPA3 / WPA2-WPA3 mixed security | ✅ Working — derived from the pushed AKM set. **WPA-Enterprise (802.1X) is not supported**: the wire protocol carries no RADIUS server, port or secret, so such a WLAN is skipped with a log line rather than mis-provisioned as a keyless WPA2 SSID |
 | PMF / 802.11w (`ieee80211w`) | ✅ Working — from `aaa.<n>.pmf.status`/`pmf.mode`; also what carries WPA3-transition intent on a mixed WLAN |
 | Fast Roaming (802.11r) | ✅ Working |
 | VLAN-tagged SSIDs | ✅ Working — from `aaa.<n>.br.devname` (`br0.<vlan>`), the wire's only VLAN signal; bridges onto a matching per-VLAN device |

@@ -95,13 +95,19 @@ end
 -- The UCI prefix applied to all openuf-managed wireless sections
 local OPENUF_PREFIX = "openuf_"
 
--- Map from UniFi security type strings to UCI encryption values
+-- Map from UniFi security type strings to UCI encryption values.
+--
+-- There is deliberately no "wpa-enterprise" entry. One existed, mapping to
+-- "wpa2+ccmp", but no producer ever emitted that string -- and it could not
+-- have worked anyway, since wlan_add() writes no auth_server/auth_secret and
+-- the wire protocol carries no RADIUS configuration to write. Enterprise
+-- WLANs are now rejected at parse time in inform.lua's
+-- _parse_wifi_system_cfg() instead of being silently mis-provisioned.
 local SECURITY_MAP = {
 	["open"]       = "none",
 	["wpa2"]       = "psk2",
 	["wpa3"]       = "sae",
 	["wpa2/wpa3"]  = "sae-mixed",
-	["wpa-enterprise"] = "wpa2+ccmp",
 }
 
 -- Deterministic 16-bit id from a string, formatted as 4 hex chars (802.11r
@@ -236,7 +242,7 @@ end
 -- Create a new wifi-iface section named openuf_<ssid> on the given radio.
 -- radio:    UCI radio name, e.g. "radio0" or "radio1"
 -- ssid:     SSID string
--- security: "open" | "wpa2" | "wpa3" | "wpa2/wpa3" | "wpa-enterprise"
+-- security: "open" | "wpa2" | "wpa3" | "wpa2/wpa3"
 -- password: WPA pre-shared key (ignored when security == "open")
 -- extra:    optional table of additional UCI key/value pairs (802.11r/k/v etc.)
 -- network:  UCI network/interface name to bridge this SSID onto (defaults to

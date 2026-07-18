@@ -408,6 +408,26 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg skips WPA-Enterprise WLANs",
+		fn = function()
+			-- An Enterprise WLAN carries mgmt=WPA-EAP and NO wpa.psk. Before
+			-- this guard it matched neither the SAE nor the PSK branch and fell
+			-- through to security="wpa2", producing a psk2 section with a nil
+			-- key -- a VAP hostapd refuses to bring up, silently. openUF has no
+			-- RADIUS configuration on this wire protocol, so the only honest
+			-- outcome is to drop the WLAN and say so.
+			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+				.. "aaa.2.ssid=guest\naaa.2.wpa=2\naaa.2.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "aaa.2.wpa.psk=secret123\n"
+				.. "wireless.2.ssid=guest\nwireless.2.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(#vap_table, 1, "only the PSK WLAN survives")
+			assert_eq(vap_table[1].ssid, "guest", "the Enterprise WLAN was dropped, not mis-provisioned")
+			assert_eq(vap_table[1].security, "wpa2", "the PSK WLAN is unaffected")
+		end
+	},
+	{
 		name = "inform packet: handle_response setparam applies DNS servers in wire order",
 		fn = function()
 			-- resolv.nameserver.<k>.ip is part of the same "IP Settings" push as
