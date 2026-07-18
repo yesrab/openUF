@@ -1277,6 +1277,22 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- (a simple getInt(key, -1) > 0 check, no ambiguity).
 				sae_anti_clogging     = tonumber(a["sae.anti_clogging"]),
 				sae_sync              = tonumber(a["sae.sync"]),
+					-- aaa.<n>.proxy_arp: "Proxy ARP". CONFIRMED live
+					-- 2026-07-18 by REST-toggling wlanconf.proxy_arp and
+					-- diffing system_cfg -- exactly aaa.<n>.proxy_arp flipped
+					-- disabled->enabled, on both the 2.4GHz and 5GHz entries
+					-- of the WLAN and nothing else. Always present on every
+					-- aaa.<n> block (like bss_transition), never absent, so
+					-- the "disabled" case is explicit rather than implied.
+					-- Maps 1:1 onto hostapd/OpenWrt's own proxy_arp option.
+					proxy_arp             = _wire_bool(a.proxy_arp),
+					-- wireless.<n>.l2_isolation: "Client Isolation" (blocks
+					-- station-to-station traffic within the BSS). CONFIRMED
+					-- live 2026-07-18 in the same diff as proxy_arp above --
+					-- flipped disabled->enabled on both band entries, nothing
+					-- else moved. Always present. Maps onto OpenWrt's
+					-- "isolate" (hostapd ap_isolate).
+					l2_isolation          = _wire_bool(w.l2_isolation),
 			}
 		end
 	end

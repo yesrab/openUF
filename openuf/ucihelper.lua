@@ -371,6 +371,27 @@ function M.apply_config(resp, cfg, opts)
 				-- Written explicitly on/off, mirroring bss_transition.
 				extra.multicast_to_unicast = vap.mcast_enhance and "1" or "0"
 			end
+			if vap.proxy_arp ~= nil then
+				-- "Proxy ARP": the AP answers ARP (and IPv6 ND) on behalf of
+				-- associated stations instead of flooding the request over the
+				-- air, so sleeping clients aren't woken by every broadcast ARP.
+				-- proxy_arp is hostapd's own option name and OpenWrt exposes it
+				-- verbatim as a wifi-iface boolean (confirmed in OpenWrt's
+				-- hostapd.sh: declared in hostapd_common_add_bss_config and
+				-- emitted as "proxy_arp=1" into the per-BSS config). Like
+				-- bss_transition it needs a full wpad build -- hostapd only
+				-- compiles proxy_arp support in with CONFIG_PROXYARP, which the
+				-- -mini/-basic wpad variants leave out. Written explicitly on
+				-- and off, mirroring bss_transition/mcast_enhance.
+				extra.proxy_arp = vap.proxy_arp and "1" or "0"
+			end
+			if vap.l2_isolation ~= nil then
+				-- "Client Isolation": drop station-to-station frames inside the
+				-- BSS. OpenWrt's wifi-iface option is spelled "isolate" (it maps
+				-- to hostapd's ap_isolate) -- confirmed in hostapd.sh's
+				-- hostapd_common_add_bss_config declaration list.
+				extra.isolate = vap.l2_isolation and "1" or "0"
+			end
 			if vap.advertise_ap_name then
 				-- "Show Access Point Name in Beacon" -- CONFIRMED (via
 				-- decompiling the controller) to require a device-reported

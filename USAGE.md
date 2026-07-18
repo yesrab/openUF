@@ -309,6 +309,8 @@ Settings carried through from the controller:
 | Band Steering | `usteer` config, not a hostapd option |
 | Auto/Custom DTIM Period | `dtim_period` |
 | Multicast Enhancement | `multicast_to_unicast` |
+| Proxy ARP | `proxy_arp` — **needs a full `wpad` build** |
+| Client Isolation | `isolate` (hostapd `ap_isolate`) |
 | Network / VLAN assignment | a `br0.<vlan>` bridge + tagged sub-interface |
 | Channel, TX power | `wifi-device` channel/txpower |
 | Channel width | `wifi-device` htmode, from the radio's `ieee_mode` token |

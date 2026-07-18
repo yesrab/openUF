@@ -689,6 +689,125 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.proxy_arp",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.proxy_arp=enabled\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].proxy_arp, true, "proxy_arp=enabled -> true")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.proxy_arp=disabled as false",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.proxy_arp=disabled\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].proxy_arp, false, "proxy_arp=disabled -> false")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves proxy_arp nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].proxy_arp, nil, "no proxy_arp key -> nil")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.l2_isolation",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.l2_isolation=enabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].l2_isolation, true, "l2_isolation=enabled -> true")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses l2_isolation=disabled as false",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.l2_isolation=disabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].l2_isolation, false, "l2_isolation=disabled -> false")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves l2_isolation nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].l2_isolation, nil, "no l2_isolation key -> nil")
+		end
+	},
+	{
+		-- End-to-end producer/consumer link test. Every other WiFi-field test
+		-- checks ONE side: the parse tests assert on _parse_wifi_system_cfg's
+		-- output, the ucihelper tests hand-build a vap_table and assert on UCI.
+		-- Both keep passing if the two sides disagree on a field NAME (parse
+		-- emits vap.proxy_arp, apply_config reads vap.proxyarp) -- which is the
+		-- exact shape of bug this codebase has hit repeatedly (channel width,
+		-- multicast enhancement, minimum RSSI: all parsed by nothing or applied
+		-- from nothing, all invisible to per-side tests). This drives a real
+		-- system_cfg blob all the way through to UCI so a rename on either side
+		-- fails here.
+		name = "inform packet: system_cfg -> parse -> apply_config reaches UCI (producer/consumer link)",
+		fn = function()
+			local ucihelper = dofile("openuf/ucihelper.lua")
+			local db = {}
+			local section_order = {}
+			local cursor = {}
+			function cursor:set(config, section, a, b)
+				db[config] = db[config] or {}
+				if not db[config][section] then
+					db[config][section] = {[".name"] = section}
+					section_order[config] = section_order[config] or {}
+					section_order[config][#section_order[config] + 1] = section
+				end
+				if b == nil then db[config][section][".type"] = a
+				else db[config][section][a] = b end
+			end
+			function cursor:foreach(config, stype, fn)
+				for _, name in ipairs(section_order[config] or {}) do
+					local s = db[config][name]
+					if s and s[".type"] == stype then fn(s) end
+				end
+			end
+			function cursor:delete(config, section)
+				if db[config] then db[config][section] = nil end
+			end
+			function cursor:commit() end
+
+			ucihelper._uci      = {cursor = function() return cursor end}
+			ucihelper._popen    = function() return "" end
+			ucihelper._read_file = function() return nil end
+			ucihelper._run_cmd  = function() return true end
+
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=openuf-test", "aaa.1.wpa=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-PSK", "aaa.1.wpa.psk=hunter22",
+				"aaa.1.proxy_arp=enabled",
+				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
+				"wireless.1.l2_isolation=enabled",
+				"radio.1.phyname=radio0", "radio.1.channel=6",
+			}, "\n") .. "\n"
+
+			local radio_table, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			ucihelper.apply_config({radio_table = radio_table, vap_table = vap_table}, nil)
+
+			-- wlan_add's sanitizer keeps "-", so the section is
+			-- openuf_radio0_openuf-test (bracket syntax, not a dotted key).
+			local s = db.wireless and db.wireless["openuf_radio0_openuf-test"]
+			assert_true(s ~= nil, "vap section created from a real system_cfg blob")
+			assert_eq(s.proxy_arp, "1", "aaa.<n>.proxy_arp reached UCI proxy_arp")
+			assert_eq(s.isolate, "1", "wireless.<n>.l2_isolation reached UCI isolate")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg maps WPA-PSK akm to wpa2",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"

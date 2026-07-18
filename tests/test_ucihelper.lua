@@ -389,6 +389,86 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes proxy_arp from vap.proxy_arp",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", proxy_arp = true},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.proxy_arp, "1", "proxy ARP enabled")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes proxy_arp=0 (explicit off)",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", proxy_arp = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.proxy_arp, "0", "proxy ARP explicitly off")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config leaves proxy_arp unset when the vap has none",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.proxy_arp, nil, "no proxy_arp written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes isolate from vap.l2_isolation",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", l2_isolation = true},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.isolate, "1", "client isolation enabled")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes isolate=0 (explicit off)",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", l2_isolation = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.isolate, "0", "client isolation explicitly off")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes multicast_to_unicast from vap.mcast_enhance",
 		fn = function()
 			with_ucihelper(function(db)
