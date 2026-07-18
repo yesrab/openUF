@@ -1293,6 +1293,41 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- else moved. Always present. Maps onto OpenWrt's
 					-- "isolate" (hostapd ap_isolate).
 					l2_isolation          = _wire_bool(w.l2_isolation),
+					-- "Minimum Data Rate Control" (Settings -> WiFi -> [WLAN]).
+					-- CONFIRMED live 2026-07-18 by REST-setting
+					-- minrate_setting_preference=manual + minrate_ng_enabled +
+					-- minrate_ng_data_rate_kbps=12000 and diffing system_cfg:
+					--   minrate_data     1000 -> 12000   (kbps -- 12 Mbps)
+					--   beacon_rate      1000 -> 12000
+					--   mgmt_rate        1000 -> 12000
+					--   minrate_cck_rates.status  true -> false
+					--   pureg            0    -> 1
+					-- i.e. beacon_rate/mgmt_rate simply mirror minrate_data, and
+					-- the CCK/pureg pair are derived consequences (12 Mbps is an
+					-- OFDM rate, so every CCK rate falls below the floor and
+					-- 802.11b clients are excluded outright).
+					--
+					-- Per-band, and NOT band-gated: the 5 GHz entries carried
+					-- none of these keys at first only because that band's
+					-- minrate was disabled. Enabling minrate_na (24 Mbps) made
+					-- minrate_data/beacon_rate/mgmt_rate appear on the radio1
+					-- entries too, with no cck/pureg keys (2.4 GHz-only
+					-- concepts). So the controller has already done the band
+					-- math and this side needs no band awareness.
+					--
+					-- Nothing is emitted at all when that band's Minimum Data
+					-- Rate is off, so absent -> nil -> leave the radio alone.
+					minrate_data          = tonumber(w.minrate_data),
+					minrate_cck           = _wire_bool(w["minrate_cck_rates.status"]),
+					beacon_rate           = tonumber(w.beacon_rate),
+					-- wireless.<n>.minrate_below_disable: the "advertising
+					-- rates" sub-toggle (REST minrate_<band>_advertising_rates).
+					-- CONFIRMED live in its own diff -- turning it on added
+					-- exactly this key (=true) to both band entries and changed
+					-- nothing else. Distinguishes "make the floor a basic rate"
+					-- (association still requires it) from "also stop
+					-- advertising every rate below the floor".
+					minrate_below_disable = _wire_bool(w.minrate_below_disable),
 			}
 		end
 	end

@@ -155,6 +155,58 @@ function M.set_wlan_exclusive(enabled)
 	cursor:commit("wireless")
 end
 
+-- ─── Minimum Data Rate ───────────────────────────────────────────────────────
+
+-- The 802.11 legacy rate ladder, in kb/s -- the unit both the controller's
+-- wireless.<n>.minrate_data and OpenWrt's basic_rate/supported_rates use.
+-- CCK (802.11b) rates first, then the OFDM (802.11g/a) set.
+local CCK_RATES  = {1000, 2000, 5500, 11000}
+local OFDM_RATES = {6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000}
+
+-- Derive a radio's UCI rate options from a Minimum Data Rate floor.
+--
+-- floor_kbps:    the minimum data rate, in kb/s (wireless.<n>.minrate_data)
+-- allow_cck:     whether 802.11b/CCK rates stay on the ladder at all
+--                (wireless.<n>.minrate_cck_rates.status)
+-- drop_below:    whether rates under the floor are also removed from the
+--                advertised set, not merely made non-basic
+--                (wireless.<n>.minrate_below_disable)
+--
+-- basic_rate is what actually enforces a *minimum*: a station must support
+-- every basic rate to associate at all, so making the floor basic excludes
+-- anything slower. supported_rates additionally stops the lower rates being
+-- advertised, which is the separate "advertising rates" sub-toggle.
+--
+-- Returns nil when the floor excludes every rate in the band, rather than
+-- emitting an empty list that would leave hostapd unable to bring the BSS up.
+function M.derive_rates(floor_kbps, allow_cck, drop_below)
+	if not floor_kbps then return nil end
+	local ladder = {}
+	if allow_cck ~= false then
+		for _, r in ipairs(CCK_RATES) do ladder[#ladder + 1] = r end
+	end
+	for _, r in ipairs(OFDM_RATES) do ladder[#ladder + 1] = r end
+
+	local at_or_above = {}
+	for _, r in ipairs(ladder) do
+		if r >= floor_kbps then at_or_above[#at_or_above + 1] = r end
+	end
+	if #at_or_above == 0 then return nil end
+
+	local rates = {
+		-- The floor itself is the mandatory rate. Kept as a one-element list
+		-- rather than "every rate at or above the floor": each additional basic
+		-- rate is another rate a station must implement to associate, which
+		-- would exclude clients the controller never intended to exclude.
+		basic_rate   = {at_or_above[1]},
+		-- OpenWrt's legacy_rates is the 802.11b on/off switch; 0 is also what
+		-- the controller signals via pureg=1 on 2.4 GHz.
+		legacy_rates = (allow_cck == false) and "0" or "1",
+	}
+	if drop_below then rates.supported_rates = at_or_above end
+	return rates
+end
+
 -- Create a new wifi-iface section named openuf_<ssid> on the given radio.
 -- radio:    UCI radio name, e.g. "radio0" or "radio1"
 -- ssid:     SSID string
@@ -250,7 +302,14 @@ end
 -- inform.lua's M._parse_wifi_system_cfg for the conversion math), since the
 -- dBm conversion needs a live noise-floor reading only available later, at
 -- enforcement/readback time.
-function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw)
+-- rates: optional table from M.derive_rates() plus an optional beacon_rate,
+-- i.e. the "Minimum Data Rate" settings. These are wifi-DEVICE options in
+-- OpenWrt, not wifi-iface ones (confirmed in OpenWrt's hostapd.sh: basic_rate,
+-- supported_rates, legacy_rates and beacon_rate are all read by
+-- hostapd_common_add_device_config and appended to the radio's base_cfg), even
+-- though the controller sends Minimum Data Rate per WLAN. apply_config()
+-- therefore aggregates the radio's VAPs down to one setting -- see there.
+function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	if chan then
@@ -267,6 +326,29 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw)
 	end
 	if minrssi_raw then
 		cursor:set("wireless", radio, "minrssi_rssi", tostring(minrssi_raw))
+	end
+	if rates then
+		-- basic_rate/supported_rates are UCI *list* options carrying kb/s
+		-- values; OpenWrt divides each by 100 itself (hostapd_add_rate) to
+		-- reach hostapd's 100-kbps units, so they are set in kb/s as received.
+		if rates.basic_rate then
+			cursor:set("wireless", radio, "basic_rate", rates.basic_rate)
+		end
+		if rates.supported_rates then
+			cursor:set("wireless", radio, "supported_rates", rates.supported_rates)
+		end
+		if rates.legacy_rates then
+			cursor:set("wireless", radio, "legacy_rates", rates.legacy_rates)
+		end
+		if rates.beacon_rate then
+			-- beacon_rate is the exception: OpenWrt appends it to the hostapd
+			-- config verbatim, with NO /100 conversion, and hostapd documents
+			-- its beacon_rate as a legacy rate in 100-kbps units. So this one
+			-- option -- unlike basic_rate/supported_rates right above -- has to
+			-- be converted here, or a 12000 kb/s floor would ask for 1.2 Gbps.
+			cursor:set("wireless", radio, "beacon_rate",
+				tostring(math.floor(rates.beacon_rate / 100)))
+		end
 	end
 	cursor:commit("wireless")
 end
@@ -292,11 +374,46 @@ function M.apply_config(resp, cfg, opts)
 	local vap_table     = resp.vap_table     or {}
 	local cpueth = cfg and cfg.net and cfg.net.lan_cpueth
 
+	-- "Minimum Data Rate" arrives per WLAN but OpenWrt's rate options are
+	-- per radio, so every VAP sharing a radio has to collapse to one setting.
+	-- The aggregate is deliberately the most PERMISSIVE of them: the lowest
+	-- floor, CCK still allowed if any WLAN allows it, and lower rates only
+	-- dropped from the advertised set if every WLAN asked for that. Erring
+	-- the other way would apply one WLAN's stricter floor to a co-hosted WLAN
+	-- and lock out clients the controller fully intended to admit -- a
+	-- silent, on-air-only failure. VAPs with no floor (the key is absent
+	-- whenever that band's control is off) contribute nothing.
+	local rates_by_radio = {}
+	for _, vap in ipairs(vap_table) do
+		if vap.radio and vap.minrate_data then
+			local agg = rates_by_radio[vap.radio]
+			if not agg then
+				agg = {floor = vap.minrate_data, allow_cck = vap.minrate_cck,
+					drop_below = vap.minrate_below_disable ~= false,
+					beacon_rate = vap.beacon_rate}
+				rates_by_radio[vap.radio] = agg
+			else
+				if vap.minrate_data < agg.floor then
+					agg.floor = vap.minrate_data
+					agg.beacon_rate = vap.beacon_rate
+				end
+				if vap.minrate_cck ~= false then agg.allow_cck = true end
+				if not vap.minrate_below_disable then agg.drop_below = false end
+			end
+		end
+	end
+
 	-- Apply radio parameters
 	for _, radio in ipairs(radio_table) do
 		if radio.name then
+			local rates
+			local agg = rates_by_radio[radio.name]
+			if agg then
+				rates = M.derive_rates(agg.floor, agg.allow_cck, agg.drop_below)
+				if rates then rates.beacon_rate = agg.beacon_rate end
+			end
 			M.rf_config(radio.name, radio.htmode, radio.channel, radio.tx_power,
-				radio.min_rssi_enabled, radio.min_rssi)
+				radio.min_rssi_enabled, radio.min_rssi, rates)
 		end
 	end
 

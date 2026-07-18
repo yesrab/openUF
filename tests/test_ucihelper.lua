@@ -389,6 +389,132 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: derive_rates makes the floor the sole basic rate",
+		fn = function()
+			local r = ucihelper.derive_rates(12000, false, false)
+			assert_eq(#r.basic_rate, 1, "exactly one basic rate")
+			assert_eq(r.basic_rate[1], 12000, "the floor itself is the basic rate")
+			assert_eq(r.legacy_rates, "0", "CCK excluded -> legacy_rates off")
+			assert_eq(r.supported_rates, nil, "supported_rates untouched without drop_below")
+		end
+	},
+	{
+		name = "ucihelper: derive_rates drops rates below the floor when asked",
+		fn = function()
+			local r = ucihelper.derive_rates(12000, false, true)
+			assert_eq(r.supported_rates[1], 12000, "advertised set starts at the floor")
+			assert_eq(r.supported_rates[#r.supported_rates], 54000, "and runs to the top")
+			for _, rate in ipairs(r.supported_rates) do
+				assert_true(rate >= 12000, "no advertised rate below the floor")
+			end
+		end
+	},
+	{
+		name = "ucihelper: derive_rates keeps CCK rates on the ladder when allowed",
+		fn = function()
+			local r = ucihelper.derive_rates(1000, true, true)
+			assert_eq(r.supported_rates[1], 1000, "1 Mbps CCK retained")
+			assert_eq(r.legacy_rates, "1", "legacy rates allowed")
+		end
+	},
+	{
+		name = "ucihelper: derive_rates returns nil rather than an empty rate list",
+		fn = function()
+			-- A floor above every rate on the ladder would otherwise produce an
+			-- empty basic_rate and leave hostapd unable to start the BSS.
+			assert_eq(ucihelper.derive_rates(99000, true, true), nil, "no rates -> nil")
+			assert_eq(ucihelper.derive_rates(nil, true, true), nil, "no floor -> nil")
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes radio-level rates from a vap's minrate_data",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {{name = "radio0"}},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", minrate_data = 12000,
+						 minrate_cck = false, beacon_rate = 12000,
+						 minrate_below_disable = true},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local r = db.wireless.radio0
+				assert_eq(r.basic_rate[1], 12000, "floor written as the basic rate")
+				assert_eq(r.legacy_rates, "0", "CCK off")
+				-- beacon_rate is the one option OpenWrt does NOT divide by 100.
+				assert_eq(r.beacon_rate, "120", "12000 kb/s -> 120 (100-kbps units)")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config takes the lowest floor across VAPs on one radio",
+		fn = function()
+			with_ucihelper(function(db)
+				-- Two WLANs share radio0 with different floors. Applying the
+				-- stricter 12 Mbps would lock out clients the 1 Mbps WLAN is
+				-- meant to admit, so the permissive floor has to win.
+				local resp = {
+					radio_table = {{name = "radio0"}},
+					vap_table = {
+						{ssid = "fast", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", minrate_data = 12000,
+						 minrate_cck = false, minrate_below_disable = true},
+						{ssid = "iot", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", minrate_data = 1000,
+						 minrate_cck = true, minrate_below_disable = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local r = db.wireless.radio0
+				assert_eq(r.basic_rate[1], 1000, "lowest floor wins")
+				assert_eq(r.legacy_rates, "1", "CCK allowed because one WLAN allows it")
+				assert_eq(r.supported_rates, nil, "not all WLANs asked to drop lower rates")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config leaves radio rates alone when no VAP has a floor",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {{name = "radio0"}},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local r = db.wireless.radio0 or {}
+				assert_eq(r.basic_rate, nil, "no basic_rate written")
+				assert_eq(r.legacy_rates, nil, "no legacy_rates written")
+				assert_eq(r.beacon_rate, nil, "no beacon_rate written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config keeps each radio's floor separate",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {{name = "radio0"}, {name = "radio1"}},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", minrate_data = 1000,
+						 minrate_cck = true},
+						{ssid = "corp", radio = "radio1", security = "wpa2",
+						 x_passphrase = "hunter22", minrate_data = 24000,
+						 minrate_cck = nil},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.radio0.basic_rate[1], 1000, "2.4GHz floor")
+				assert_eq(db.wireless.radio1.basic_rate[1], 24000, "5GHz floor")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes proxy_arp from vap.proxy_arp",
 		fn = function()
 			with_ucihelper(function(db)

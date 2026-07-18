@@ -309,6 +309,7 @@ Settings carried through from the controller:
 | Band Steering | `usteer` config, not a hostapd option |
 | Auto/Custom DTIM Period | `dtim_period` |
 | Multicast Enhancement | `multicast_to_unicast` |
+| Minimum Data Rate | per-**radio** `basic_rate` / `supported_rates` / `legacy_rates` / `beacon_rate` |
 | Proxy ARP | `proxy_arp` — **needs a full `wpad` build** |
 | Client Isolation | `isolate` (hostapd `ap_isolate`) |
 | Network / VLAN assignment | a `br0.<vlan>` bridge + tagged sub-interface |
@@ -318,6 +319,16 @@ Settings carried through from the controller:
 | IoT Optimization: DTIM Interval Lock | nothing new — arrives as `dtim_period=3` on the 2.4 GHz SSID |
 | IoT Optimization: Force WiFi 4 Mode | `bss_load_update_period=0` (suppresses the QBSS Load IE) + an `openuf_iot` marker |
 | Minimum RSSI | per-**radio**; enforced by openUF deauthenticating clients below the threshold, not by hostapd |
+
+**Minimum Data Rate** is set per WLAN in the controller but OpenWrt's rate options
+(`basic_rate`, `supported_rates`, `legacy_rates`, `beacon_rate`) are `wifi-device`
+options, so two WLANs sharing a radio cannot each get their own floor. openUF applies
+the most permissive of them — the lowest floor, CCK still allowed if any WLAN allows
+it — because the stricter choice would silently lock clients out of a co-hosted WLAN
+that was meant to admit them. Give a WLAN its own radio if it needs its floor enforced
+exactly. Note also that the floor is enforced by making it the sole *basic* rate (a
+station must support every basic rate to associate); the "advertising rates" sub-toggle
+additionally trims `supported_rates`.
 
 Minimum RSSI is a *radio* setting in the controller UI (Devices → AP → Radios), not a per-WLAN one, and the wire value is an offset from an assumed noise floor rather than a dBm figure — openUF converts it using a live noise reading.
 

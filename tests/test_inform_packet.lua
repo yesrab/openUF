@@ -745,6 +745,38 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses the Minimum Data Rate keys",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.minrate_data=12000\nwireless.1.beacon_rate=12000\n"
+				.. "wireless.1.minrate_cck_rates.status=false\n"
+				.. "wireless.1.minrate_below_disable=true\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			local v = vap_table[1]
+			assert_eq(v.minrate_data, 12000, "minrate_data in kb/s")
+			assert_eq(v.beacon_rate, 12000, "beacon_rate mirrors the floor")
+			assert_eq(v.minrate_cck, false, "12 Mbps floor excludes CCK")
+			assert_eq(v.minrate_below_disable, true, "advertising-rates sub-toggle")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves Minimum Data Rate fields nil when absent",
+		fn = function()
+			-- The controller emits none of these when that band's Minimum Data
+			-- Rate is off, which must leave the radio's rates untouched rather
+			-- than reset to a default.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			local v = vap_table[1]
+			assert_eq(v.minrate_data, nil, "no minrate_data -> nil")
+			assert_eq(v.beacon_rate, nil, "no beacon_rate -> nil")
+			assert_eq(v.minrate_cck, nil, "no cck status -> nil")
+			assert_eq(v.minrate_below_disable, nil, "no below_disable -> nil")
+		end
+	},
+	{
 		-- End-to-end producer/consumer link test. Every other WiFi-field test
 		-- checks ONE side: the parse tests assert on _parse_wifi_system_cfg's
 		-- output, the ucihelper tests hand-build a vap_table and assert on UCI.
@@ -793,6 +825,9 @@ return {
 				"aaa.1.proxy_arp=enabled",
 				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
 				"wireless.1.l2_isolation=enabled",
+				"wireless.1.minrate_data=12000", "wireless.1.beacon_rate=12000",
+				"wireless.1.minrate_cck_rates.status=false",
+				"wireless.1.minrate_below_disable=true",
 				"radio.1.phyname=radio0", "radio.1.channel=6",
 			}, "\n") .. "\n"
 
@@ -805,6 +840,13 @@ return {
 			assert_true(s ~= nil, "vap section created from a real system_cfg blob")
 			assert_eq(s.proxy_arp, "1", "aaa.<n>.proxy_arp reached UCI proxy_arp")
 			assert_eq(s.isolate, "1", "wireless.<n>.l2_isolation reached UCI isolate")
+
+			-- Minimum Data Rate lands on the RADIO section, not the vap.
+			local r = db.wireless.radio0
+			assert_true(r ~= nil, "radio section created")
+			assert_eq(r.basic_rate[1], 12000, "minrate_data reached UCI basic_rate")
+			assert_eq(r.legacy_rates, "0", "cck status reached UCI legacy_rates")
+			assert_eq(r.beacon_rate, "120", "beacon_rate converted to 100-kbps units")
 		end
 	},
 	{
