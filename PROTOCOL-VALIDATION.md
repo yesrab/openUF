@@ -416,9 +416,18 @@ server-side. openUF maps these to hostapd's `sae_anti_clogging_threshold` / `sae
 ### `radio.<n>.*` — per-radio config
 
 `phyname` (`radio0`), `channel` (integer or the literal `auto`), `txpower` (integer or `auto`),
-`txpower_mode` (`custom`), `status`. When no radio is provisionable the blob contains the
+`txpower_mode` (`custom`), `status`, `ieee_mode`. When no radio is provisionable the blob contains the
 literal comment `# no wlan provisioned as no radio found` and `radio.status=disabled` — see
 [`radio_table` must not be empty](#radio_table-entry).
+
+`ieee_mode` is **the wire's only channel-width signal**: a compound `11` + band (`ng`/`na`) +
+PHY and width token — `11nght20`, `11nght40`, `11naht40`, `11acvht80`, `11axhe80`. Changing
+Devices → [AP] → Settings → Radios → "2.4 GHz Channel Width" from 20 to 40 changes exactly this
+key (alongside `cwm.mode` 0→1, a redundant channel-width-management flag carrying no extra
+information). openUF maps it to UCI `wifi-device.htmode`; on OpenWrt/mac80211 that option is the
+PHY ceiling, so `HT20`/`HT40` also *is* "802.11n only". There is no separate 11n/11ac/11ax mode
+key — an earlier version of openUF expected one, never populated it, and so silently never
+applied channel width at all.
 
 ### `stamgr.<n>.*` — per-radio Station Manager (Minimum RSSI)
 
@@ -849,6 +858,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 26 | Show AP Name in Beacon | `wifi_caps2` bit `0x40` → `wireless.<n>.advertise_ap_name` | ✅ Wire protocol and capability gating confirmed live, both directions. **The OpenWrt/hostapd side is not verified** — implemented via the WPS/WSC Device Name attribute (`wps_device_name` + `ap_setup_locked=1`, the standard mechanism, per hostapd's README-WPS/`beacon.c` and OpenWrt's wifi-iface schema) rather than an unknown Ubiquiti vendor IE. Needs real hardware to confirm hostapd accepts it and the beacon changes. |
 | 27 | SAE Anti-clogging / Sync Time | `aaa.<n>.sae.anti_clogging` / `.sae.sync` | ⚠️ Key names, integer shape, and `isWpa3()` gating confirmed via an unambiguous decompiled method body. The **emitting** (true WPA3) case could not be live-diffed — forcing pure WPA3 tripped the [config-sync issue](#config-sync-can-get-stuck-after-informs-stabilise). |
 | 28 | PMF (802.11w) / Multicast Enhancement | `aaa.<n>.pmf.status`/`.pmf.mode`; `wireless.<n>.mcast.enhance` | ✅ Confirmed live by `system_cfg` diff. PMF is what actually carries WPA2/WPA3 transition intent on this model. |
+| 29 | Channel width | `radio.<n>.ieee_mode` → `wifi-device.htmode` | ✅ Confirmed live both directions: `11nght20`↔`11nght40` follows the per-AP 2.4 GHz Channel Width control, and the pushed value reaches UCI (`radio0` `HT20`, `radio1` `HT40`). Previously parsed by nothing, so width never applied. |
 
 ---
 

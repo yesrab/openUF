@@ -309,7 +309,8 @@ Settings carried through from the controller:
 | Auto/Custom DTIM Period | `dtim_period` |
 | Multicast Enhancement | `multicast_to_unicast` |
 | Network / VLAN assignment | a `br0.<vlan>` bridge + tagged sub-interface |
-| Channel, TX power, channel width | `wifi-device` channel/txpower/htmode |
+| Channel, TX power | `wifi-device` channel/txpower |
+| Channel width | `wifi-device` htmode, from the radio's `ieee_mode` token |
 | Minimum RSSI | per-**radio**; enforced by openUF deauthenticating clients below the threshold, not by hostapd |
 
 Minimum RSSI is a *radio* setting in the controller UI (Devices → AP → Radios), not a per-WLAN one, and the wire value is an offset from an assumed noise floor rather than a dBm figure — openUF converts it using a live noise reading.

@@ -991,6 +991,43 @@ local function _width_from_htmode(htmode)
 	return n and tonumber(n) or 20
 end
 
+-- radio.<n>.ieee_mode: the controller's per-radio 802.11 mode + channel width,
+-- as a single madwifi/Ubiquiti-style compound token -- "11" + band ("ng"/"na")
+-- + PHY and width ("ht20", "ht40", "vht80", "he80", ...). CONFIRMED live
+-- 2026-07-18: a stock dual-band AP sends radio.1.ieee_mode=11nght20 (2.4GHz)
+-- and radio.2.ieee_mode=11naht40 (5GHz), and flipping the per-device radio
+-- setting Devices -> [AP] -> Settings -> Radios -> "2.4 GHz Channel Width"
+-- from 20 to 40 changes exactly this key to 11nght40 (alongside
+-- radio.<n>.cwm.mode 0->1, a redundant "channel width management" flag the
+-- same width is already encoded in). This is the only channel-width signal on
+-- the wire -- an earlier version of openUF parsed no mode key at all, so
+-- ucihelper.rf_config()'s htmode mapping was unreachable and channel width
+-- silently never applied despite USAGE.md claiming it did.
+--
+-- Returns an OpenWrt htmode string ("HT20"/"HT40"/"VHT80"/"HE80"/...), or nil
+-- for an absent or unrecognized token, which leaves htmode unchanged (same
+-- "absent -> nil -> leave alone" convention as channel/txpower above).
+-- Longest suffix first: "eht"/"vht" must win over the "ht" they end with.
+local _IEEE_MODE_PHY = {
+	{ "eht", "EHT" }, { "vht", "VHT" }, { "he", "HE" }, { "ht", "HT" },
+}
+local _IEEE_MODE_WIDTHS = { ["20"] = true, ["40"] = true, ["80"] = true,
+	["160"] = true, ["320"] = true }
+
+local function _htmode_from_ieee_mode(ieee_mode)
+	if type(ieee_mode) ~= "string" then return nil end
+	-- The band ("ng"/"na"/...) between the "11" and the PHY is deliberately
+	-- dropped: OpenWrt derives the band from the channel, and the controller
+	-- can send channel=auto (leave as-is) while still naming a band here.
+	local head, width = ieee_mode:match("^(11%a+)(%d+)$")
+	if not (head and _IEEE_MODE_WIDTHS[width]) then return nil end
+	for _, phy in ipairs(_IEEE_MODE_PHY) do
+		local kind, prefix = phy[1], phy[2]
+		if head:sub(-#kind) == kind then return prefix .. width end
+	end
+	return nil
+end
+
 -- WiFi/radio config (SSID, security, per-radio channel/TX power) arrives via
 -- system_cfg as a flat, hostapd/OpenWrt-style key=value blob -- NOT as the
 -- resp.vap_table/radio_table/network_table JSON that ucihelper.apply_config()
@@ -1056,6 +1093,8 @@ function M._parse_wifi_system_cfg(sys_raw)
 				name     = r.phyname,
 				channel  = tonumber(r.channel),   -- "auto" -> nil, leaves channel unchanged
 				tx_power = tonumber(r.txpower),   -- "auto" -> nil, leaves tx_power unchanged
+				-- nil for an absent/unrecognized token, leaving htmode alone.
+				htmode   = _htmode_from_ieee_mode(r.ieee_mode),
 			}
 			local sm = stamgr[idx]
 			-- minrssi.rssi is NOT plain dBm -- confirmed live: UI "-80 dBm"

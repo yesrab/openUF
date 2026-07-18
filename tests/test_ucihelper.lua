@@ -766,6 +766,60 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes htmode from radio.htmode (channel width)",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					vap_table = {}, network_table = {},
+					radio_table = {
+						{name = "radio0", htmode = "HT40", channel = 6},
+						{name = "radio1", htmode = "VHT80", channel = 36},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.radio0.htmode, "HT40", "2.4GHz htmode written")
+				assert_eq(db.wireless.radio1.htmode, "VHT80", "5GHz htmode written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config leaves htmode untouched when radio.htmode is absent",
+		fn = function()
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "htmode", "VHT80")
+				local resp = {
+					vap_table = {}, network_table = {},
+					radio_table = {{name = "radio0", channel = 6}},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.radio0.htmode, "VHT80",
+					"pre-existing htmode preserved when the controller sends no ieee_mode")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an applied htmode round-trips back out via get_radio_table().ht",
+		fn = function()
+			-- radio_table[].ht is what build_json turns into the outbound
+			-- spectrum_table width. Before ieee_mode was parsed, openUF only
+			-- ever echoed a width it had never applied.
+			with_ucihelper(function()
+				-- The wifi-device section already exists on a real device;
+				-- rf_config only mutates it.
+				ucihelper._uci.cursor():set("wireless", "radio0", "wifi-device")
+				local resp = {
+					vap_table = {}, network_table = {},
+					radio_table = {{name = "radio0", htmode = "HT40", channel = 6}},
+				}
+				ucihelper.apply_config(resp, nil)
+				local radios = ucihelper.get_radio_table()
+				assert_eq(radios[1].ht, "HT40", "applied htmode reported back as ht")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_radio_table echoes minrssi_enabled/minrssi_rssi as raw UCI values",
 		fn = function()
 			with_ucihelper(function(db)

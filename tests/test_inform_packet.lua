@@ -493,6 +493,53 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg maps radio.<n>.ieee_mode onto htmode",
+		fn = function()
+			-- CONFIRMED live 2026-07-18: a stock dual-band AP sends
+			-- 11nght20 on 2.4GHz and 11naht40 on 5GHz, and flipping the
+			-- per-device "2.4 GHz Channel Width" to 40 changes exactly this
+			-- key to 11nght40. It is the wire's only channel-width signal.
+			local sys_cfg = "radio.1.phyname=radio0\nradio.1.channel=auto\n"
+				.. "radio.1.ieee_mode=11nght20\n"
+				.. "radio.2.phyname=radio1\nradio.2.channel=36\n"
+				.. "radio.2.ieee_mode=11naht40\n"
+			local radio_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(radio_table[1].htmode, "HT20", "11nght20 -> HT20")
+			assert_eq(radio_table[2].htmode, "HT40", "11naht40 -> HT40")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg maps 11ac/11ax/11be ieee_mode tokens",
+		fn = function()
+			local cases = {
+				["11acvht80"] = "VHT80",
+				["11axhe80"]  = "HE80",
+				["11axhe160"] = "HE160",
+				["11beeht320"] = "EHT320",
+			}
+			for token, expected in pairs(cases) do
+				local sys_cfg = "radio.1.phyname=radio0\nradio.1.ieee_mode=" .. token .. "\n"
+				local radio_table = inform._parse_wifi_system_cfg(sys_cfg)
+				assert_eq(radio_table[1].htmode, expected, token .. " -> " .. expected)
+			end
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves htmode nil for absent/garbage ieee_mode",
+		fn = function()
+			-- nil means "leave the radio's current width alone", the same
+			-- convention channel=auto/txpower=auto already use. Garbage must
+			-- never reach UCI as an htmode value.
+			local absent = inform._parse_wifi_system_cfg("radio.1.phyname=radio0\n")
+			assert_eq(absent[1].htmode, nil, "no ieee_mode key -> nil")
+			for _, token in ipairs({ "auto", "11ng", "11nght", "nght20", "11nght33", "" }) do
+				local t = inform._parse_wifi_system_cfg(
+					"radio.1.phyname=radio0\nradio.1.ieee_mode=" .. token .. "\n")
+				assert_eq(t[1].htmode, nil, "unrecognized ieee_mode '" .. token .. "' -> nil")
+			end
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.bss_transition",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.bss_transition=1\n"

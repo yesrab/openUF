@@ -36,6 +36,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | Fast Roaming (802.11r) | ✅ Working |
 | VLAN-tagged SSIDs (`network_table` join) | ✅ Working — bridges onto a per-VLAN `br0.<vlan>` device |
 | Channel and TX power per radio | ✅ Working (Low/Medium/High/Custom) |
+| Channel width per radio | ✅ Working — from `radio.<n>.ieee_mode` (`11nght20`/`11naht40`/…) → `htmode`. This is also the only 802.11n/ac/ax mode signal the wire carries |
 | BSS Transition (802.11v) | ✅ Working (`bss_transition`) — needs a full `wpad` build |
 | Band Steering | ✅ Working via `usteer` — requires the `usteer` package and a full `wpad` build (see Quick start) |
 | Auto 802.11 DTIM Period | ✅ Working — Auto and Custom both arrive as a concrete `dtim_period` |

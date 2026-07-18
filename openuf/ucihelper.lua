@@ -198,7 +198,13 @@ end
 
 -- Configure a radio's channel, mode, and TX power.
 -- radio:  UCI radio name, e.g. "radio0"
--- mode:   "11n" | "11ac" | "11ax" (mapped to UCI htmode)
+-- htmode: UCI/OpenWrt htmode string ("HT20", "HT40", "VHT80", "HE80", ...), or
+-- nil to leave the radio's current width/PHY unchanged. Derived from the
+-- controller's radio.<n>.ieee_mode by inform.lua's _htmode_from_ieee_mode --
+-- that key is the wire's only channel-width signal (CONFIRMED live
+-- 2026-07-18). Until then this argument was a "11n"/"11ac"/"11ax" token that
+-- nothing on the parse side ever produced, so htmode was never written at all
+-- and the controller's channel-width setting silently did nothing.
 -- chan:   channel number or "auto"
 -- txpwr: TX power in dBm (or nil to leave unchanged)
 -- minrssi_enabled/minrssi_raw: "Minimum RSSI" (Devices -> [AP] -> Radios),
@@ -209,19 +215,14 @@ end
 -- inform.lua's M._parse_wifi_system_cfg for the conversion math), since the
 -- dBm conversion needs a live noise-floor reading only available later, at
 -- enforcement/readback time.
-function M.rf_config(radio, mode, chan, txpwr, minrssi_enabled, minrssi_raw)
+function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw)
 	local uci = get_uci()
 	local cursor = uci.cursor()
-	local htmode_map = {
-		["11n"]  = "HT20",
-		["11ac"] = "VHT80",
-		["11ax"] = "HE80",
-	}
 	if chan then
 		cursor:set("wireless", radio, "channel", tostring(chan))
 	end
-	if mode and htmode_map[mode] then
-		cursor:set("wireless", radio, "htmode", htmode_map[mode])
+	if htmode then
+		cursor:set("wireless", radio, "htmode", htmode)
 	end
 	if txpwr then
 		cursor:set("wireless", radio, "txpower", tostring(txpwr))
@@ -261,7 +262,7 @@ function M.apply_config(resp, cfg, opts)
 	-- Apply radio parameters
 	for _, radio in ipairs(radio_table) do
 		if radio.name then
-			M.rf_config(radio.name, radio.mode, radio.channel, radio.tx_power,
+			M.rf_config(radio.name, radio.htmode, radio.channel, radio.tx_power,
 				radio.min_rssi_enabled, radio.min_rssi)
 		end
 	end
