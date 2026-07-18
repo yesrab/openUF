@@ -39,9 +39,6 @@ config = {
 	-- Path for persistent state (authkey, adopted flag, cfgversion, inform_url).
 	state_file = "/etc/openuf/state.json",
 
-	-- Log file (used by the init.d service wrapper).
-	log_file = "/var/log/openuf.log",
-
 	-- Opt-in: when set, every decrypted controller inform response is appended
 	-- verbatim (with a UTC timestamp) to this file, before dispatch. Off by
 	-- default. Used to capture ground-truth payload shapes when validating

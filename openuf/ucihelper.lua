@@ -560,7 +560,4 @@ function M.get_vap_table()
 	return vaps
 end
 
--- Legacy global API (backwards compat with original stub callers)
-ufuci = M
-
 return M

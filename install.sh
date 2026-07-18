@@ -12,7 +12,6 @@ INSTALL_DIR=/opt/openuf
 STATE_DIR=/etc/openuf
 BIN_LINK=/usr/bin/syswrapper.sh
 INIT_SCRIPT=/etc/init.d/openuf
-LOG_FILE=/var/log/openuf.log
 
 case "$1" in
 
@@ -170,7 +169,7 @@ case "$1" in
 			fi
 		fi
 
-		echo "Done.  Check $LOG_FILE for status."
+		echo "Done.  Check status with: logread -e openuf"
 		echo ""
 		echo "Next steps:"
 		echo "  1. If controller is on a different subnet:"

@@ -149,7 +149,6 @@ config = {
     use_only_unifi_wlan = true,  -- disable non-openuf_ SSIDs during provisioning
     inform_url  = "http://unifi:8080/inform",   -- default URL (overwritten at adoption)
     state_file  = "/etc/openuf/state.json",
-    log_file    = "/var/log/openuf.log",
     debug_dump_file = nil,       -- see below
     bootstrap_adopt_user = nil,  -- see below
 }
