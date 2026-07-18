@@ -518,7 +518,8 @@ function M.build_json(st, cfg, ufhw)
 					-- -- confirmed against the real controller's own device
 					-- schema, which has them at the top level while
 					-- spectrum_table/spectrum_table_time are the per-radio
-					-- fields (see PROTOCOL-VALIDATION.md section 8).
+					-- fields (see PROTOCOL-VALIDATION.md's
+					-- radio_table_stats reference).
 					local sscan = M._spectrum_cache[radio.name]
 					if sscan then
 						entry.spectrum_table      = sscan.table
@@ -590,7 +591,8 @@ function M.build_json(st, cfg, ufhw)
 		-- the real controller's vap-stats DTO, which nests connected clients
 		-- inside each vap_table entry rather than a flat top-level table
 		-- (confirmed against unifi-network-application:10.4.57's own
-		-- bytecode; see PROTOCOL-VALIDATION.md "Stage 2c").
+		-- bytecode; see PROTOCOL-VALIDATION.md's outbound payload
+		-- field reference).
 		local now = M._time()
 		for _, vap in ipairs(vap_table) do
 			-- get_ifname_for_radio() resolves a UCI radio device name
@@ -860,7 +862,8 @@ function M.build_json(st, cfg, ufhw)
 	end
 
 	-- lldp_table (field names confirmed against the real controller's OXMua
-	-- DTO -- see PROTOCOL-VALIDATION.md "Stage 2c")
+	-- DTO -- see PROTOCOL-VALIDATION.md's outbound payload field
+	-- reference)
 	local lldp_table = {}
 	for _, nbr in ipairs(lldp_nbrs) do
 		lldp_table[#lldp_table + 1] = {
@@ -933,9 +936,10 @@ function M.build_json(st, cfg, ufhw)
 		-- port's Native VLAN/Network failed with exactly that error at
 		-- fw_caps=0x10, and succeeded once this bit was added (0x110) --
 		-- reproduced directly against the REST endpoint, bypassing the UI,
-		-- to rule out unrelated causes. See PROTOCOL-VALIDATION.md section 18
-		-- for the full derivation (traced through an obfuscation-induced
-		-- macOS case-folding extraction bug along the way).
+		-- to rule out unrelated causes. See PROTOCOL-VALIDATION.md's
+		-- "Capability bitmasks" for the full derivation (traced through
+		-- an obfuscation-induced macOS case-folding extraction bug along
+		-- the way).
 		fw_caps          = 0x110,
 		-- Bit 0x40 (64): Device.supportAdvertisingDeviceNameInBeacon() in the
 		-- decompiled controller is exactly hasWifiCapability2(64) -- i.e. bit
@@ -1480,7 +1484,7 @@ function M.handle_response(json_str, st, cfg)
 			-- interference) are confirmed against the real UniFi Network
 			-- Application's own Java bytecode (10.4.57's ace.jar/
 			-- internal-dependencies.jar constant pool -- see
-			-- PROTOCOL-VALIDATION.md section 8 for the full derivation), not
+			-- PROTOCOL-VALIDATION.md's radio_table_stats reference), not
 			-- guessed. The exact numeric semantics of `width` and
 			-- `interference` are still a best-effort approximation (radio's
 			-- configured htmode, and raw noise-floor dBm, respectively) --

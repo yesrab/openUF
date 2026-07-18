@@ -421,8 +421,9 @@ return {
 	{
 		name = "inform packet: _parse_wifi_system_cfg extracts vap_table and radio_table from a real captured blob",
 		fn = function()
-			-- Real captured shape (PROTOCOL-VALIDATION.md section 3): WiFi
-			-- config arrives as flat aaa.<n>.*/wireless.<n>.*/radio.<n>.*
+			-- Real captured shape (PROTOCOL-VALIDATION.md, feature matrix:
+			-- SSID push): WiFi config arrives as flat
+			-- aaa.<n>.*/wireless.<n>.*/radio.<n>.*
 			-- keys, not resp.vap_table/radio_table JSON.
 			local sys_cfg = "radio.1.phyname=radio0\nradio.1.channel=auto\nradio.1.txpower=auto\n"
 				.. "radio.2.phyname=radio1\nradio.2.channel=36\nradio.2.txpower=17\n"
@@ -454,8 +455,9 @@ return {
 	{
 		name = "inform packet: _parse_wifi_system_cfg extracts VLAN id from a tagged br.devname",
 		fn = function()
-			-- Real captured shape (PROTOCOL-VALIDATION.md section 4): assigning
-			-- a WiFi network to a VLAN-tagged network changes aaa.<n>.br.devname
+			-- Real captured shape (PROTOCOL-VALIDATION.md, feature matrix:
+			-- VLAN-tagged network): assigning a WiFi network to a
+			-- VLAN-tagged network changes aaa.<n>.br.devname
 			-- from "br0" to "br0.<vlan>" -- the only field that carries the
 			-- VLAN id in this wire format (no separate vap->network join).
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.psk=TestPass123\n"

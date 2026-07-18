@@ -1,6 +1,6 @@
-# Override to test against an older controller version, to check whether
-# the L3-adoption deadlock documented in PROTOCOL-VALIDATION.md is a
-# version regression rather than something all versions share.
+# Override to test against an older controller version, to check whether a
+# behavior documented in PROTOCOL-VALIDATION.md against the pinned 10.4.57
+# is version-specific rather than something all versions share.
 #
 # Usage (from repo root):
 #   docker compose -f tools/validation/docker-compose.yml \

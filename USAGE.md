@@ -38,7 +38,7 @@ wireless AP already has `hostapd` providing it.
 > AES-128-GCM-encrypted inform; a device that can only do CBC stays stuck at
 > "Adopting" indefinitely. openUF's GCM support needs a `lua-openssl` build with
 > AEAD/GCM available — the `openssl-util` CLI fallback above is CBC-only and will
-> not get you adopted. See PROTOCOL-VALIDATION.md's AES-GCM section.
+> not get you adopted. See PROTOCOL-VALIDATION.md's "The GCM provisioning gate".
 
 There is no Lua zlib binding in the OpenWrt 25.12 feeds. openUF therefore sends
 inform payloads uncompressed and decompresses zlib-compressed controller

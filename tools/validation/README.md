@@ -8,13 +8,10 @@ flag used to capture responses.
 
 No target OpenWrt hardware or real Ubiquiti device needed — the controller is a
 plain Docker container, and the "AP" is a disposable Alpine container reachable via
-SSH. **L2 (broadcast) adoption works end-to-end** in this environment: the
-controller's real adopt flow (SSH in, run `syswrapper.sh set-adopt`) completes
-exactly as it would against genuine hardware, once the setup below is followed
-exactly (three separate real bugs had to be fixed to get here — see
-PROTOCOL-VALIDATION.md's "L2 discovery + real SSH adoption now works end-to-end"
-section for what they were and why). L3-only adoption (`set-inform` with no L2
-broadcast) still does not complete — see PROTOCOL-VALIDATION.md.
+SSH. **Both L2 (broadcast + SSH) and L3 (`set-inform` only) adoption work
+end-to-end** in this environment, once the setup below is followed exactly — see
+PROTOCOL-VALIDATION.md's "Adoption: L2 vs L3" for how the two paths differ and
+what each requires.
 
 ## 1. Start the environment
 
@@ -113,17 +110,17 @@ scenario from the controller UI, then tail the capture file in another shell:
 docker exec openuf-validation-ap tail -f /var/log/openuf-informs.log
 ```
 
-Copy the relevant raw JSON into the corresponding section of
-`PROTOCOL-VALIDATION.md`, diff it against the current code's assumptions, and note
-the verdict (confirmed / corrected). Any field-name corrections get their own commit
-in the main codebase, per the project's usual per-finding commit cadence.
+Diff the captured JSON against the current code's assumptions, then record the
+*confirmed end state* in `PROTOCOL-VALIDATION.md` — its field-reference tables and
+feature matrix, not a narrative of the investigation. Any field-name corrections get
+their own commit in the main codebase, per the project's usual per-finding commit
+cadence.
 
-**Note:** the device currently never settles out of "Adopting" in the UI, even
-though `server.log` shows a completed adopt and a continuous stream of successful,
-decrypted informs (confirmed via `tcpdump` and `debug_dump_file`) — see the "Open
-item" at the end of PROTOCOL-VALIDATION.md's L2 section. This doesn't block
-capturing responses via `debug_dump_file` for the matrix above, since the
-controller keeps actively pushing `setparam` every cycle regardless.
+**If the device never settles out of "Adopting"** — informs decrypting fine,
+`last_seen` advancing, but a *different* `cfgversion` on every cycle — the AP is
+sending CBC rather than AES-GCM informs, and the controller will not provision it.
+See PROTOCOL-VALIDATION.md's "The GCM provisioning gate"; the AP image must have a
+working `lua-openssl` build.
 
 ## 6. Device-to-device config clone ("Set Replacement Device" / "Load Configuration")
 
