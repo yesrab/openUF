@@ -15,18 +15,13 @@
 	  u6iw.lua  — presents as U6-InWall (U6IW)  ← default for AP emulation
 	  uapg1.lua — presents as UAP Gen1
 	  uapg2-ac-lr.lua — presents as UAP-AC-LR
+
+	openUF emulates a UniFi AP only. Gateway (USG) and switch (USW) emulation
+	are not implemented and are not planned.
 ]]--
 
 -- Select your hardware model map here:
 dev = dofile("modelmap/generic-dualband-ap.lua")
-
--- Feature switches
-enable = {
-	led = true,		-- provision/status LED: slow blink = unconfigured, solid = connected
-	uap = true,		-- emulate a UniFi AP (sends announce + inform)
-	usg = false,	-- USG (gateway) mode — not implemented
-	usw = false,	-- USW (switch) mode  — not implemented
-}
 
 config = {
 	-- When true, any wifi-iface sections NOT prefixed with "openuf_" are disabled

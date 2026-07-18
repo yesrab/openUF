@@ -49,17 +49,4 @@ dev.openuf.uap = {
 	hwassign 	= {"radio0"}
 }
 
-dev.openuf.usg = {
-	umodel 		= "usg3",
-	bootver 	= "",
-	firmver 	= "",
-	rulepre 	= "uf_",
-	descpre 	= "UF Controller - "
-}
-
-dev.openuf.usw = {
-	switch 		= "switch0",
-	mirror_type = "single"
-}
-
 return dev

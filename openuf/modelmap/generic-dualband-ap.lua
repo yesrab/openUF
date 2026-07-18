@@ -57,17 +57,4 @@ dev.openuf.uap = {
 	hwassign	= {"radio0", "radio1"},	-- radio0 = 2.4 GHz, radio1 = 5 GHz
 }
 
-dev.openuf.usg = {
-	umodel	= "usg3",
-	bootver	= "",
-	firmver	= "",
-	rulepre	= "uf_",
-	descpre	= "UF Controller - ",
-}
-
-dev.openuf.usw = {
-	switch		= "switch0",
-	mirror_type	= "single",
-}
-
 return dev

@@ -107,8 +107,11 @@ The modelmap sets:
   used to create VLAN-tagged sub-interfaces (`eth1.<vlanid>`) for controller-pushed VLAN SSIDs
 - `dev.conf.net.wan_iface`  — WAN interface (e.g. `eth0`)
 - `dev.conf.switch`         — Switch device name (e.g. `switch0`)
-- `dev.conf.led`            — sysfs LED path (e.g. `/sys/class/leds/tp-link:green:wlan`) driven by
-  the controller's Locate action; `nil` by default — set it per board to enable Locate
+- `dev.conf.led`            — status LED, driven by the controller's Locate action and its
+  **Manage → LED** toggle. Accepts a full sysfs path (`/sys/class/leds/tp-link:green:wlan`)
+  or a bare LED name (`tp-link:green:wlan`). `nil` by default, since a generic profile can't
+  know the board's LED — LED control is a silent no-op until you set it. Find yours with
+  `ls /sys/class/leds`
 - `dev.openuf.uap.ufmodel`  — Which ufmodel file to load (e.g. `"u6iw"`)
 - `dev.openuf.uap.hwassign` — Radio names (e.g. `{"radio0", "radio1"}`)
 
@@ -132,17 +135,9 @@ uap = {
 }
 ```
 
-### Feature flags and paths (`openuf/conf.lua`)
+### Paths and options (`openuf/conf.lua`)
 
 ```lua
-enable = {
-    led = true,   -- status LED (slow blink = unconfigured, solid = connected);
-                  -- also gates the controller-triggered Locate blink (openuf/led.lua)
-    uap = true,   -- AP emulation
-    usg = false,  -- USG mode (not implemented)
-    usw = false,  -- USW mode (not implemented)
-}
-
 config = {
     use_only_unifi_wlan = true,  -- disable non-openuf_ SSIDs during provisioning
     inform_url  = "http://unifi:8080/inform",   -- default URL (overwritten at adoption)
