@@ -271,7 +271,15 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	-- 802.11r/k/v
 	if extra then
 		for k, v in pairs(extra) do
-			cursor:set("wireless", section_name, k, tostring(v))
+			-- A table value is a UCI *list* option (e.g. maclist) and must be
+			-- handed to the binding as-is -- tostring() would write the
+			-- literal "table: 0x...". Same convention rf_config already uses
+			-- for basic_rate/supported_rates.
+			if type(v) == "table" then
+				cursor:set("wireless", section_name, k, v)
+			else
+				cursor:set("wireless", section_name, k, tostring(v))
+			end
 		end
 	end
 	cursor:commit("wireless")
@@ -550,6 +558,17 @@ function M.apply_config(resp, cfg, opts)
 				-- explicitly on and off, since the controller always sends the
 				-- key and un-hiding has to actually take effect.
 				extra.hidden = vap.hide_ssid and "1" or "0"
+			end
+			-- "MAC Address Filter". OpenWrt's wifi-iface options are macfilter
+			-- (disable|allow|deny) plus a maclist list, and the policy
+			-- vocabulary lines up 1:1 with the controller's: allow = maclist is
+			-- a whitelist, deny = blacklist. Written as "disable" when the
+			-- control is off so turning it off actually lifts the filter.
+			if vap.mac_filter_policy then
+				extra.macfilter = vap.mac_filter_policy
+				extra.maclist   = vap.mac_filter_list or {}
+			else
+				extra.macfilter = "disable"
 			end
 			if vap.advertise_ap_name then
 				-- "Show Access Point Name in Beacon" -- CONFIRMED (via

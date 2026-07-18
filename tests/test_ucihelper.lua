@@ -718,6 +718,46 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes macfilter/maclist from the MAC filter",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22",
+						 mac_filter_policy = "allow",
+						 mac_filter_list = {"00:11:22:33:44:55", "66:77:88:99:aa:bb"}},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.macfilter, "allow", "policy written")
+				-- Asserted by index: maclist must reach UCI as a real list, not
+				-- a stringified table.
+				assert_eq(s.maclist[1], "00:11:22:33:44:55", "first MAC in the list")
+				assert_eq(s.maclist[2], "66:77:88:99:aa:bb", "second MAC in the list")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes macfilter=disable when the filter is off",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.macfilter, "disable",
+					"no filter -> explicitly disabled")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes multicast_to_unicast from vap.mcast_enhance",
 		fn = function()
 			with_ucihelper(function(db)

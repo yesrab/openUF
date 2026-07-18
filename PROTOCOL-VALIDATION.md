@@ -414,6 +414,8 @@ server-side. openUF maps these to hostapd's `sae_anti_clogging_threshold` / `sae
 | `minrate_data`, `beacon_rate`, `mgmt_rate`, `minrate_cck_rates.status`, `minrate_below_disable`, `pureg` | **Minimum Data Rate Control.** `minrate_data` is the floor in kb/s; `beacon_rate`/`mgmt_rate` simply mirror it. `minrate_cck_rates.status` and `pureg` are derived consequences on 2.4 GHz (a 12 Mbps floor is OFDM, so CCK goes `false` and `pureg` goes `1`). `minrate_below_disable` is the separate "advertising rates" sub-toggle. Emitted per band and **absent entirely** when that band's control is off — not band-gated, which an early reading of a 2.4-GHz-only capture suggested. |
 | `bcfilt.status`, `bcfilt.<k>.mac`, `bcfilt.<k>.status` | **Multicast and Broadcast Blocker** (REST `bc_filter_enabled`/`bc_filter_list`). `status` appears whenever the control is on, including with an empty allow-list; the indexed entries only once it is non-empty. `<k>` is 1-based and does **not** follow the REST list's order — adding a second MAC renumbered the first — so the index means nothing beyond grouping. Emitted on both band entries. |
 | `l2_isolation` | **Client Isolation.** `enabled`\|`disabled`, always present, emitted on both band entries. → OpenWrt `isolate` (hostapd `ap_isolate`). |
+| `devname` | The Ubiquiti-side netdev for this vap (`ath0`…`ath3`). **The join key for the top-level [`macacl.*`](#macacl--mac-address-filter) section**, whose own indices do not line up with `<n>`. Not a name that exists on OpenWrt — enforcement resolves the real netdev via `ubus`. |
+| `mac_acl.status`, `mac_acl.policy` | ⚠️ **Decoys — not the MAC Address Filter.** Sit at `enabled`/`deny` with the control off and do not move when it is toggled; the real feature is the top-level [`macacl.*`](#macacl--mac-address-filter) section. |
 | `hide_ssid` | **Hide WiFi Name.** `true`\|`false` — note the vocabulary, not the `enabled`/`disabled` most keys here use. Always present, emitted on both band entries, and duplicated verbatim as `aaa.<n>.hide_ssid`. → OpenWrt `hidden` (hostapd `ignore_broadcast_ssid`). |
 | `mcastrate` | Multicast rate. Observed only ever as `auto` — no WLAN-level control in 10.4.57's UI moves it, and OpenWrt's `mcast_rate` is adhoc/mesh-only anyway, so openUF does not map it. |
 | `advertise_ap_name` | "Show Access Point Name in Beacon". **Only emitted when the device declares `wifi_caps2` bit `0x40`** — see [capability bitmasks](#capability-bitmasks). |
@@ -463,6 +465,38 @@ format): Minimum RSSI is a **roaming aid, not a block**. The AP sends a single d
 a below-threshold client; there is no persistent drop rule and the client may reassociate
 immediately, even to the same AP. This is materially different from `block-sta`, so it has its
 own helper, `ucihelper.kick_station()`, rather than reusing `firewall.deauth()`.
+
+### `macacl.*` — MAC Address Filter
+
+A **top-level section keyed by devname**, not by the `wireless.<n>` index. Confirmed live
+2026-07-18 by enabling the control on one WLAN with a single allow-listed MAC:
+
+```
+macacl.status=enabled                       # global gate
+macacl.1.devname=ath0                       # join key -> wireless.<n>.devname
+macacl.1.status=enabled
+macacl.1.acl.status=enabled
+macacl.1.acl.policy=allow                   # allow | deny  (UI "Filter Type")
+macacl.1.acl.1.mac=02:11:22:33:44:55
+macacl.1.acl.1.status=enabled
+macacl.1.acl.1.type=user
+macacl.2.devname=ath2                       # the same WLAN's 5 GHz vap
+```
+
+Only the vaps belonging to the filtered WLAN get a block, and they are numbered from 1
+independently of `wireless.<n>` — in this capture `macacl.1`/`macacl.2` correspond to
+`wireless.1`/`wireless.3`. **A join on `devname` is mandatory**; an index-based reading
+misfiles the filter onto the wrong WLAN.
+
+Like `bcfilt.<k>`, the `acl.<k>` index carries no meaning beyond grouping, so openUF sorts
+the list. Maps onto OpenWrt's `macfilter` (`disable`\|`allow`\|`deny`) + `maclist`, whose
+policy vocabulary lines up 1:1 with the controller's.
+
+⚠️ **Two decoys excluded by the same diff.** `wireless.<n>.mac_acl.status` /
+`wireless.<n>.mac_acl.policy` sit at `enabled`/`deny` with the control **off** and did not
+move when it was toggled — the same shape as `radio.<n>.bcmc_l2_filter.status` was for the
+broadcast blocker. `aaa.<n>.radius.macacl.status` is the unrelated RADIUS MAC Authentication
+control. Do not re-investigate these.
 
 ### `netconf.*` / `dhcpc.*` / `route.*` / `resolv.*` — IP settings
 
@@ -872,6 +906,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 34 | Minimum Data Rate Control | `wireless.<n>.minrate_data` (+ `beacon_rate`, `mgmt_rate`, `minrate_cck_rates.status`, `minrate_below_disable`, `pureg`) | ✅ Confirmed live 2026-07-18 by REST-setting `minrate_setting_preference=manual` + `minrate_ng_data_rate_kbps=12000` and diffing: `minrate_data`/`beacon_rate`/`mgmt_rate` 1000→12000, `minrate_cck_rates.status` true→false, `pureg` 0→1. Separately confirmed **not band-gated** — enabling `minrate_na` (24 Mbps) made the same keys appear on the 5 GHz entries. **The OpenWrt side is radio-level**, not per-BSS (verified in OpenWrt's `hostapd.sh`: these are `hostapd_common_add_device_config` options), so openUF aggregates a radio's VAPs to the most permissive floor. Note `beacon_rate` is passed to hostapd **verbatim in 100-kbps units** while `basic_rate`/`supported_rates` are divided by 100 by `hostapd_add_rate` — openUF converts only the former. Not verified on real hardware. |
 | 35 | Multicast and Broadcast Blocker | `wireless.<n>.bcfilt.status` + `bcfilt.<k>.mac`/`.status` | ✅ Wire format confirmed live 2026-07-18 across four diffs (on with one MAC, with two MACs, on with an empty list, off). Two keys already on the wire were **excluded** as candidates by the same diffs: `radio.<n>.bcmc_l2_filter.status` (sits at `enabled` with the control off) and `wireless.<n>.multicast.inspect` — neither moved. ⚠️ Enforcement is openUF's own nftables ruleset (`bridge openuf_bcfilt`), since no hostapd/OpenWrt option expresses a multicast allow-list; the generated ruleset is verified against real nftables 1.0.9 and confirmed not to collide with `firewall.lua`'s table, but the on-air effect is unverified (no real radios). |
 | 36 | Hide WiFi Name | `wireless.<n>.hide_ssid` (+ duplicate `aaa.<n>.hide_ssid`) | ✅ Confirmed live 2026-07-18 by toggling the control in the UI and diffing `system_cfg`: exactly those two keys flipped `false`→`true`, on both band entries of the WLAN, nothing else moved. Always present, so "off" is explicit and is written back out as `hidden=0`. Note the `true`/`false` vocabulary rather than `enabled`/`disabled`. Previously **documented in USAGE.md as already applied, but no code read or wrote it** — the same doc-vs-code drift as `use_only_unifi_wlan`. |
+| 37 | MAC Address Filter | top-level `macacl.<m>.*`, joined on `wireless.<n>.devname` | ✅ Confirmed live 2026-07-18 by enabling the control with one allow-listed MAC and diffing `system_cfg`: the whole `macacl` section appeared at once, keyed by devname (`ath0`/`ath2`) and numbered independently of `wireless.<n>`, so **the devname join is mandatory**. Two keys already on the wire were **excluded** by the same diff: `wireless.<n>.mac_acl.status`/`.policy` (sit at `enabled`/`deny` with the control off) and `aaa.<n>.radius.macacl.status` (the separate RADIUS MAC Authentication control). → OpenWrt `macfilter` + `maclist`, whose allow/deny vocabulary matches the controller's 1:1. Enforced by hostapd itself, so no openUF-side ruleset is involved. |
 
 ---
 

@@ -775,6 +775,107 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses the macacl MAC filter",
+		fn = function()
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=openuf-test", "aaa.1.wpa=2",
+				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
+				"wireless.1.devname=ath0",
+				"macacl.status=enabled",
+				"macacl.1.devname=ath0", "macacl.1.status=enabled",
+				"macacl.1.acl.status=enabled", "macacl.1.acl.policy=allow",
+				"macacl.1.acl.1.mac=02:11:22:33:44:55",
+				"macacl.1.acl.1.status=enabled", "macacl.1.acl.1.type=user",
+			}, "\n") .. "\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].mac_filter_policy, "allow", "policy parsed")
+			assert_eq(vap_table[1].mac_filter_list[1], "02:11:22:33:44:55", "MAC collected")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg joins macacl on devname, not index",
+		fn = function()
+			-- The real wire numbers macacl blocks independently of wireless.<n>
+			-- -- here the filtered vap is wireless.2/ath1 but its macacl block
+			-- is macacl.1. An index-based implementation would misfile this
+			-- onto the first vap.
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=open-a", "aaa.1.wpa=2",
+				"wireless.1.ssid=open-a", "wireless.1.parent=radio0",
+				"wireless.1.devname=ath0",
+				"aaa.2.ssid=open-b", "aaa.2.wpa=2",
+				"wireless.2.ssid=open-b", "wireless.2.parent=radio0",
+				"wireless.2.devname=ath1",
+				"macacl.status=enabled",
+				"macacl.1.devname=ath1", "macacl.1.status=enabled",
+				"macacl.1.acl.status=enabled", "macacl.1.acl.policy=deny",
+				"macacl.1.acl.1.mac=aa:bb:cc:dd:ee:ff",
+				"macacl.1.acl.1.status=enabled", "macacl.1.acl.1.type=user",
+			}, "\n") .. "\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].mac_filter_policy, nil, "unfiltered vap untouched")
+			assert_eq(vap_table[2].mac_filter_policy, "deny", "filter landed on the ath1 vap")
+			assert_eq(vap_table[2].mac_filter_list[1], "aa:bb:cc:dd:ee:ff", "its MAC too")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg sorts the MAC filter list",
+		fn = function()
+			-- <k> ordering is meaningless on the wire (same as bcfilt), so the
+			-- list is sorted to stay comparable across pushes.
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=openuf-test", "aaa.1.wpa=2",
+				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
+				"wireless.1.devname=ath0",
+				"macacl.status=enabled",
+				"macacl.1.devname=ath0", "macacl.1.status=enabled",
+				"macacl.1.acl.status=enabled", "macacl.1.acl.policy=allow",
+				"macacl.1.acl.1.mac=ff:ff:00:00:00:01",
+				"macacl.1.acl.1.status=enabled", "macacl.1.acl.1.type=user",
+				"macacl.1.acl.2.mac=00:00:00:00:00:02",
+				"macacl.1.acl.2.status=enabled", "macacl.1.acl.2.type=user",
+			}, "\n") .. "\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].mac_filter_list[1], "00:00:00:00:00:02", "sorted first")
+			assert_eq(vap_table[1].mac_filter_list[2], "ff:ff:00:00:00:01", "sorted second")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg ignores a disabled macacl block",
+		fn = function()
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=openuf-test", "aaa.1.wpa=2",
+				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
+				"wireless.1.devname=ath0",
+				"macacl.status=disabled",
+				"macacl.1.devname=ath0", "macacl.1.status=disabled",
+				"macacl.1.acl.status=enabled", "macacl.1.acl.policy=allow",
+				"macacl.1.acl.1.mac=02:11:22:33:44:55",
+				"macacl.1.acl.1.status=enabled", "macacl.1.acl.1.type=user",
+			}, "\n") .. "\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].mac_filter_policy, nil, "disabled block -> no filter")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg ignores wireless.<n>.mac_acl decoys",
+		fn = function()
+			-- These keys are present on the real wire with the control OFF and
+			-- must never be mistaken for the feature.
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=openuf-test", "aaa.1.wpa=2",
+				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
+				"wireless.1.devname=ath0",
+				"wireless.1.mac_acl.status=enabled",
+				"wireless.1.mac_acl.policy=deny",
+				"aaa.1.radius.macacl.status=disabled",
+				"macacl.status=disabled",
+			}, "\n") .. "\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].mac_filter_policy, nil, "decoy keys do not enable the filter")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg collects the bcfilt allow-list",
 		fn = function()
 			-- The wire index is 1-based and does not follow the REST list's
@@ -910,7 +1011,12 @@ return {
 				"aaa.1.proxy_arp=enabled",
 				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
 				"wireless.1.l2_isolation=enabled",
-				"wireless.1.hide_ssid=true",
+				"wireless.1.hide_ssid=true", "wireless.1.devname=ath0",
+				"macacl.status=enabled",
+				"macacl.1.devname=ath0", "macacl.1.status=enabled",
+				"macacl.1.acl.status=enabled", "macacl.1.acl.policy=allow",
+				"macacl.1.acl.1.mac=02:11:22:33:44:55",
+				"macacl.1.acl.1.status=enabled", "macacl.1.acl.1.type=user",
 				"wireless.1.minrate_data=12000", "wireless.1.beacon_rate=12000",
 				"wireless.1.minrate_cck_rates.status=false",
 				"wireless.1.minrate_below_disable=true",
@@ -927,6 +1033,8 @@ return {
 			assert_eq(s.proxy_arp, "1", "aaa.<n>.proxy_arp reached UCI proxy_arp")
 			assert_eq(s.isolate, "1", "wireless.<n>.l2_isolation reached UCI isolate")
 			assert_eq(s.hidden, "1", "wireless.<n>.hide_ssid reached UCI hidden")
+			assert_eq(s.macfilter, "allow", "macacl.<m>.acl.policy reached UCI macfilter")
+			assert_eq(s.maclist[1], "02:11:22:33:44:55", "macacl MAC reached UCI maclist")
 
 			-- Minimum Data Rate lands on the RADIO section, not the vap.
 			local r = db.wireless.radio0

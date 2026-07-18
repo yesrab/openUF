@@ -1055,7 +1055,7 @@ local function _wire_bool(v)
 end
 
 function M._parse_wifi_system_cfg(sys_raw)
-	local aaa, wireless, radio, stamgr = {}, {}, {}, {}
+	local aaa, wireless, radio, stamgr, macacl = {}, {}, {}, {}, {}
 	for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
 		local section, idx, key, v = line:match("^(aaa)%.(%d+)%.(.+)=(.*)$")
 		if not section then section, idx, key, v = line:match("^(wireless)%.(%d+)%.(.+)=(.*)$") end
@@ -1069,9 +1069,23 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- The whole block is simply absent when disabled (no explicit
 		-- status=false), same convention as every other optional section here.
 		if not section then section, idx, key, v = line:match("^(stamgr)%.(%d+)%.(.+)=(.*)$") end
+		-- macacl.<m>: the "MAC Address Filter". CONFIRMED live 2026-07-18 by
+		-- enabling the control with one allow-listed MAC and diffing system_cfg
+		-- -- this whole top-level section appeared at once, and it is keyed by
+		-- devname (ath0/ath2), NOT by the wireless.<n> index: only the two ath
+		-- devices belonging to the filtered WLAN got blocks, numbered 1 and 2
+		-- while the WLAN is wireless.1/wireless.3. Hence the devname join below.
+		--
+		-- The obvious-looking wireless.<n>.mac_acl.status/.policy keys are NOT
+		-- this feature: they sit at enabled/deny with the control off and did
+		-- not move in the diff -- the same decoy shape as
+		-- radio.<n>.bcmc_l2_filter.status was for the broadcast blocker.
+		-- aaa.<n>.radius.macacl.status is the separate RADIUS MAC
+		-- Authentication control.
+		if not section then section, idx, key, v = line:match("^(macacl)%.(%d+)%.(.+)=(.*)$") end
 		if section then
 			local tbl = (section == "aaa" and aaa) or (section == "wireless" and wireless)
-				or (section == "radio" and radio) or stamgr
+				or (section == "radio" and radio) or (section == "macacl" and macacl) or stamgr
 			idx = tonumber(idx)
 			tbl[idx] = tbl[idx] or {}
 			tbl[idx][key] = v
@@ -1108,6 +1122,38 @@ function M._parse_wifi_system_cfg(sys_raw)
 				entry.min_rssi         = tonumber(sm["minrssi.rssi"])
 			end
 			radio_table[#radio_table + 1] = entry
+		end
+	end
+
+	-- MAC Address Filter, keyed by the vap's wire devname (ath0/ath1/...).
+	-- Wire shape, all confirmed live 2026-07-18:
+	--   macacl.status=enabled            -- global gate
+	--   macacl.<m>.devname=ath0          -- join key
+	--   macacl.<m>.status=enabled
+	--   macacl.<m>.acl.status=enabled
+	--   macacl.<m>.acl.policy=allow      -- allow|deny (UI "Filter Type")
+	--   macacl.<m>.acl.<k>.mac=02:11:22:33:44:55
+	--   macacl.<m>.acl.<k>.status=enabled
+	--   macacl.<m>.acl.<k>.type=user
+	-- Like bcfilt, <k> is 1-based and carries no meaning beyond grouping, so
+	-- the list is sorted for a stable, comparable result. Entries are taken
+	-- only when both the block and the entry are enabled; type is "user" for
+	-- hand-entered MACs (the only kind this UI produces).
+	local mac_filter_by_dev = {}
+	for _, e in pairs(macacl) do
+		if e.devname and e.status == "enabled" and e["acl.status"] == "enabled" then
+			local macs = {}
+			for k, val in pairs(e) do
+				local ki = k:match("^acl%.(%d+)%.mac$")
+				if ki and e["acl." .. ki .. ".status"] == "enabled" then
+					macs[#macs + 1] = val
+				end
+			end
+			table.sort(macs)
+			mac_filter_by_dev[e.devname] = {
+				policy = e["acl.policy"],
+				macs   = macs,
+			}
 		end
 	end
 
@@ -1337,6 +1383,13 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- must be written back out as such. Maps onto OpenWrt's
 					-- wifi-iface "hidden" (hostapd ignore_broadcast_ssid).
 					hide_ssid             = _wire_bool(w.hide_ssid),
+					-- "MAC Address Filter", joined from the top-level macacl
+					-- section on wireless.<n>.devname (see mac_filter_by_dev
+					-- above for the wire shape and why the join is needed).
+					-- Both are nil when the control is off for this vap, which
+					-- the consumer turns into macfilter=disable.
+					mac_filter_policy     = (mac_filter_by_dev[w.devname] or {}).policy,
+					mac_filter_list       = (mac_filter_by_dev[w.devname] or {}).macs,
 					-- "Minimum Data Rate Control" (Settings -> WiFi -> [WLAN]).
 					-- CONFIRMED live 2026-07-18 by REST-setting
 					-- minrate_setting_preference=manual + minrate_ng_enabled +

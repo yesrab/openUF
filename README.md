@@ -49,6 +49,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | Proxy ARP | ✅ Wire protocol confirmed live (`aaa.<n>.proxy_arp`) → `proxy_arp`. Needs a full `wpad` build (hostapd only compiles proxy-ARP support in with `CONFIG_PROXYARP`) |
 | Client Isolation | ✅ Wire protocol confirmed live (`wireless.<n>.l2_isolation`) → `isolate` (hostapd `ap_isolate`) |
 | Hide WiFi Name | ✅ Wire protocol confirmed live (`wireless.<n>.hide_ssid`, duplicated as `aaa.<n>.hide_ssid`) → `hidden` (hostapd `ignore_broadcast_ssid`) |
+| MAC Address Filter | ✅ Wire protocol confirmed live. Arrives in a top-level `macacl.<m>.*` section keyed by **devname**, not by WLAN index, so it is joined on `wireless.<n>.devname` → `macfilter` + `maclist`. Allow/deny policy maps 1:1 onto OpenWrt's; enforced by hostapd itself |
 | Minimum RSSI | ✅ Working — per **radio**, not per WLAN; enforced by deauthenticating clients below the threshold (a one-shot kick, not a persistent block) |
 | Show Access Point Name in Beacon | ✅ Wire protocol confirmed live (requires reporting the `wifi_caps2` capability bit); the OpenWrt-side beacon effect uses the standard WPS Device Name element, not independently verified against real hardware |
 | SAE Anti-clogging / SAE Sync Time | ⚠️ Implemented from a decompile of the controller's WLAN-config generator. The controller only emits these for a genuine WPA3/SAE WLAN — not the mixed "WPA2/WPA3" option — and that emitting case was never reachable in the validation environment, so it is unconfirmed on the wire |
