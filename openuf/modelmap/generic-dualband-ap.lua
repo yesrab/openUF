@@ -28,7 +28,12 @@ dev.conf.net = {
 	},
 }
 
--- No dedicated LED entry by default; set to nil or a sysfs path if available
+-- Status LED driven for Locate and the controller's Manage > LED toggle.
+-- Left unset because a generic profile can't know the board's LED name; LED
+-- control is a silent no-op until you set it. Find yours with
+-- `ls /sys/class/leds` and set either a bare name or a full path, e.g.
+--   dev.conf.led = "tp-link:green:wlan"
+--   dev.conf.led = "/sys/class/leds/tp-link:green:wlan"
 dev.conf.led = nil
 
 -- Switch layout (common for both target devices)

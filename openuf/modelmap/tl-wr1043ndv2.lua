@@ -25,11 +25,8 @@ dev.conf.net = {
 	},
 }
 
-dev.conf.led = {
-	name 		= "uf_status",
-	desc 		= "UF Status LED",
-	sysfs 		= "tp-link:green:system"
-}
+-- Status LED driven for Locate and the controller's Manage > LED toggle.
+dev.conf.led = "/sys/class/leds/tp-link:green:system"
 
 dev.conf.vlan = {
 	cpu_lan 	= 0,
