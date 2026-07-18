@@ -584,23 +584,24 @@ return {
 		end
 	},
 	{
-		name = "inform packet: _parse_wifi_system_cfg parses nwireless.<n>.mcast.enhance=1",
+		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.mcast.enhance=1",
 		fn = function()
-			-- The leading "n" is why the ^-anchored wireless pattern doesn't
-			-- swallow these lines; needs its own section branch.
+			-- Real key lives on the wireless.<n> block (like dtim_period);
+			-- the "\nwireless." dump text once misread as an "nwireless"
+			-- section is just the escaped newline before the wireless key.
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
 				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
-				.. "nwireless.1.mcast.enhance=1\nnwireless.1.mcastrate=auto\n"
+				.. "wireless.1.mcast.enhance=1\nwireless.1.mcastrate=auto\n"
 			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
 			assert_eq(vap_table[1].mcast_enhance, true, "mcast.enhance=1 -> true")
 		end
 	},
 	{
-		name = "inform packet: _parse_wifi_system_cfg parses nwireless.<n>.mcast.enhance=0 as false",
+		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.mcast.enhance=0 as false",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
 				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
-				.. "nwireless.1.mcast.enhance=0\n"
+				.. "wireless.1.mcast.enhance=0\n"
 			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
 			assert_eq(vap_table[1].mcast_enhance, false, "mcast.enhance=0 -> false")
 		end
@@ -611,21 +612,7 @@ return {
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
 				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
 			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
-			assert_eq(vap_table[1].mcast_enhance, nil, "no nwireless block -> nil")
-		end
-	},
-	{
-		name = "inform packet: _parse_wifi_system_cfg keeps nwireless separate from wireless",
-		fn = function()
-			-- Regression guard: nwireless.1.* must not leak into wireless[1]
-			-- (e.g. clobber ssid/parent) via the ^-anchored patterns.
-			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
-				.. "wireless.1.ssid=realssid\nwireless.1.parent=radio0\n"
-				.. "nwireless.1.mcast.enhance=1\n"
-			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
-			assert_eq(vap_table[1].ssid, "realssid", "wireless.1.ssid intact")
-			assert_eq(vap_table[1].radio, "radio0", "wireless.1.parent intact")
-			assert_eq(vap_table[1].mcast_enhance, true, "nwireless still parsed")
+			assert_eq(vap_table[1].mcast_enhance, nil, "no mcast.enhance key -> nil")
 		end
 	},
 	{
