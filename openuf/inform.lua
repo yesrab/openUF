@@ -1056,7 +1056,17 @@ end
 
 function M._parse_wifi_system_cfg(sys_raw)
 	local aaa, wireless, radio, stamgr, macacl = {}, {}, {}, {}, {}
+	local qos_vap = {}
 	for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
+		-- qos.vap.<m>: "WiFi Speed Limit". Needs its own pattern rather than
+		-- the generic <section>.<idx>.<key> one below, since the index sits a
+		-- level down (qos.vap.1.*, alongside qos.if.<n>.* and qos.ebt.<n>.*).
+		local qidx, qkey, qv = line:match("^qos%.vap%.(%d+)%.(.+)=(.*)$")
+		if qidx then
+			qidx = tonumber(qidx)
+			qos_vap[qidx] = qos_vap[qidx] or {}
+			qos_vap[qidx][qkey] = qv
+		end
 		local section, idx, key, v = line:match("^(aaa)%.(%d+)%.(.+)=(.*)$")
 		if not section then section, idx, key, v = line:match("^(wireless)%.(%d+)%.(.+)=(.*)$") end
 		if not section then section, idx, key, v = line:match("^(radio)%.(%d+)%.(.+)=(.*)$") end
@@ -1154,6 +1164,37 @@ function M._parse_wifi_system_cfg(sys_raw)
 				policy = e["acl.policy"],
 				macs   = macs,
 			}
+		end
+	end
+
+	-- "WiFi Speed Limit", keyed by the vap's wire devname -- same join as the
+	-- MAC filter above. Wire shape, confirmed live 2026-07-18 by creating a
+	-- speed-limit profile (33 Mbps down / 17 Mbps up) and assigning it to a
+	-- WLAN:
+	--   qos.status=enabled
+	--   qos.vap.<m>.devname=ath0
+	--   qos.vap.<m>.dwnlink.maxspeed=33000     -- kbps (UI Mbps x 1000)
+	--   qos.vap.<m>.dwnlink.minspeed=33000
+	--   qos.vap.<m>.uplink.1.maxspeed=17000    -- kbps
+	--
+	-- The discriminator is the presence of *maxspeed*, not qos.status (which
+	-- is global) and not the block itself: an UNLIMITED vap still gets a
+	-- qos.vap.<m> block, carrying only minspeed set to that radio's raw
+	-- devspeed (570 on 2.4 GHz, 2400 on 5 GHz in the capture). Reading the
+	-- block's existence as "limited" would cap every WLAN at its own PHY rate.
+	--
+	-- This is a per-VAP aggregate cap, not a per-client one: the limit applies
+	-- to the whole netdev, which is what makes a single tc qdisc sufficient.
+	--
+	-- The accompanying qos.ebt.<n>.cmd entries are literal ebtables fragments
+	-- the stock firmware would replay to fwmark each VAP. openUF implements
+	-- the intent with tc instead (see shaper.lua) rather than replaying them.
+	local ratelimit_by_dev = {}
+	for _, q in pairs(qos_vap) do
+		local down = tonumber(q["dwnlink.maxspeed"])
+		local up   = tonumber(q["uplink.1.maxspeed"])
+		if q.devname and (down or up) then
+			ratelimit_by_dev[q.devname] = {down = down, up = up}
 		end
 	end
 
@@ -1390,6 +1431,9 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- the consumer turns into macfilter=disable.
 					mac_filter_policy     = (mac_filter_by_dev[w.devname] or {}).policy,
 					mac_filter_list       = (mac_filter_by_dev[w.devname] or {}).macs,
+					-- "WiFi Speed Limit", in kbps, nil when unlimited.
+					ratelimit_down_kbps   = (ratelimit_by_dev[w.devname] or {}).down,
+					ratelimit_up_kbps     = (ratelimit_by_dev[w.devname] or {}).up,
 					-- "Minimum Data Rate Control" (Settings -> WiFi -> [WLAN]).
 					-- CONFIRMED live 2026-07-18 by REST-setting
 					-- minrate_setting_preference=manual + minrate_ng_enabled +

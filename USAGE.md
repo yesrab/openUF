@@ -304,6 +304,7 @@ Settings carried through from the controller:
 | SSID, passphrase, security | `wifi-iface` ssid/key/encryption |
 | Hide WiFi Name | `hidden` (hostapd `ignore_broadcast_ssid`) |
 | MAC Address Filter | `macfilter` (`disable`/`allow`/`deny`) + `maclist` |
+| WiFi Speed Limit | `tc` shaping per VAP, not a hostapd option (plus `openuf_ratelimit_down`/`openuf_ratelimit_up` on the section for visibility) |
 | WPA2 / WPA3 / WPA2-WPA3 mixed | derived from the pushed AKM set, not a single flag |
 | PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
 | Fast Roaming (802.11r) | `ieee80211r` |

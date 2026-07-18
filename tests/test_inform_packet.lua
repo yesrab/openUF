@@ -876,6 +876,68 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses the qos speed limit",
+		fn = function()
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=openuf-test", "aaa.1.wpa=2",
+				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
+				"wireless.1.devname=ath0",
+				"qos.status=enabled", "qos.mode=1",
+				"qos.vap.1.devname=ath0", "qos.vap.1.id=1",
+				"qos.vap.1.dwnlink.maxspeed=33000",
+				"qos.vap.1.dwnlink.minspeed=33000",
+				"qos.vap.1.uplink.1.devname=eth0",
+				"qos.vap.1.uplink.1.maxspeed=17000",
+				"qos.vap.1.uplink.1.minspeed=17000",
+			}, "\n") .. "\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].ratelimit_down_kbps, 33000, "downlink kbps parsed")
+			assert_eq(vap_table[1].ratelimit_up_kbps, 17000, "uplink kbps parsed")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg treats a minspeed-only qos block as unlimited",
+		fn = function()
+			-- The real wire emits a qos.vap block for EVERY vap. An unlimited
+			-- one carries only minspeed, set to that radio's raw devspeed.
+			-- Reading the block's existence as "limited" would cap every WLAN
+			-- at its own PHY rate.
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=openuf-test", "aaa.1.wpa=2",
+				"wireless.1.ssid=openuf-test", "wireless.1.parent=radio0",
+				"wireless.1.devname=ath0",
+				"qos.status=enabled",
+				"qos.vap.1.devname=ath0", "qos.vap.1.id=1",
+				"qos.vap.1.dwnlink.minspeed=570",
+				"qos.vap.1.uplink.1.devname=eth0",
+				"qos.vap.1.uplink.1.minspeed=570",
+			}, "\n") .. "\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].ratelimit_down_kbps, nil, "no maxspeed -> unlimited")
+			assert_eq(vap_table[1].ratelimit_up_kbps, nil, "no maxspeed -> unlimited")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg joins qos on devname, not index",
+		fn = function()
+			-- Same hazard as macacl: qos.vap indices are their own sequence.
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=open-a", "aaa.1.wpa=2",
+				"wireless.1.ssid=open-a", "wireless.1.parent=radio0",
+				"wireless.1.devname=ath0",
+				"aaa.2.ssid=open-b", "aaa.2.wpa=2",
+				"wireless.2.ssid=open-b", "wireless.2.parent=radio0",
+				"wireless.2.devname=ath1",
+				"qos.status=enabled",
+				"qos.vap.1.devname=ath1",
+				"qos.vap.1.dwnlink.maxspeed=12000",
+			}, "\n") .. "\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].ratelimit_down_kbps, nil, "uncapped vap untouched")
+			assert_eq(vap_table[2].ratelimit_down_kbps, 12000, "cap landed on the ath1 vap")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg collects the bcfilt allow-list",
 		fn = function()
 			-- The wire index is 1-based and does not follow the REST list's
@@ -1017,6 +1079,10 @@ return {
 				"macacl.1.acl.status=enabled", "macacl.1.acl.policy=allow",
 				"macacl.1.acl.1.mac=02:11:22:33:44:55",
 				"macacl.1.acl.1.status=enabled", "macacl.1.acl.1.type=user",
+				"qos.status=enabled",
+				"qos.vap.1.devname=ath0",
+				"qos.vap.1.dwnlink.maxspeed=33000",
+				"qos.vap.1.uplink.1.maxspeed=17000",
 				"wireless.1.minrate_data=12000", "wireless.1.beacon_rate=12000",
 				"wireless.1.minrate_cck_rates.status=false",
 				"wireless.1.minrate_below_disable=true",
@@ -1035,6 +1101,8 @@ return {
 			assert_eq(s.hidden, "1", "wireless.<n>.hide_ssid reached UCI hidden")
 			assert_eq(s.macfilter, "allow", "macacl.<m>.acl.policy reached UCI macfilter")
 			assert_eq(s.maclist[1], "02:11:22:33:44:55", "macacl MAC reached UCI maclist")
+			assert_eq(s.openuf_ratelimit_down, "33000", "qos.vap maxspeed reached UCI")
+			assert_eq(s.openuf_ratelimit_up, "17000", "qos.vap uplink maxspeed reached UCI")
 
 			-- Minimum Data Rate lands on the RADIO section, not the vap.
 			local r = db.wireless.radio0

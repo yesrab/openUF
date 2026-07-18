@@ -758,6 +758,43 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config stamps the speed limit on the section",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22",
+						 ratelimit_down_kbps = 33000, ratelimit_up_kbps = 17000},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.openuf_ratelimit_down, "33000", "downlink kbps recorded")
+				assert_eq(s.openuf_ratelimit_up, "17000", "uplink kbps recorded")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config leaves no speed-limit stamp when uncapped",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.openuf_ratelimit_down, nil, "no downlink stamp")
+				assert_eq(s.openuf_ratelimit_up, nil, "no uplink stamp")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes multicast_to_unicast from vap.mcast_enhance",
 		fn = function()
 			with_ucihelper(function(db)

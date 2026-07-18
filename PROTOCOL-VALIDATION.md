@@ -498,6 +498,33 @@ move when it was toggled — the same shape as `radio.<n>.bcmc_l2_filter.status`
 broadcast blocker. `aaa.<n>.radius.macacl.status` is the unrelated RADIUS MAC Authentication
 control. Do not re-investigate these.
 
+### `qos.*` — WiFi Speed Limit
+
+Another **top-level section keyed by devname**. Confirmed live 2026-07-18 by creating a
+speed-limit profile (33 Mbps down / 17 Mbps up) and assigning it to one WLAN. Note the
+per-WLAN toggle does nothing until at least one profile exists in the site settings — with no
+profile there is nothing to select and nothing reaches the wire.
+
+```
+qos.status=enabled
+qos.mode=1
+qos.if.1.devname=eth0 / .devspeed=1000 / .type=uplink   # interface inventory
+qos.if.2.devname=ath0 / .devspeed=570
+qos.vap.1.devname=ath0                                  # join key
+qos.vap.1.dwnlink.maxspeed=33000                        # kbps  (UI Mbps x 1000)
+qos.vap.1.dwnlink.minspeed=33000
+qos.vap.1.uplink.1.devname=eth0
+qos.vap.1.uplink.1.maxspeed=17000                       # kbps
+qos.ebt.1.cmd=PREROUTING --in-interface ath0 -j mark --mark-or 0x1000 ...
+```
+
+| Detail | |
+|---|---|
+| Units | **kbps**. The UI's Mbps value × 1000. |
+| Discriminator | **Presence of `maxspeed`.** Not `qos.status` (global), and *not the block itself*: an unlimited vap still gets a `qos.vap.<m>` block carrying only `minspeed`, set to that radio's raw `devspeed` (570 on 2.4 GHz, 2400 on 5 GHz here). Treating the block as "limited" would cap every WLAN at its own PHY rate. |
+| Scope | A **per-VAP aggregate** cap, not per-client — there is no per-station structure on the wire. All clients on the SSID share the ceiling, which is what makes one qdisc per VAP sufficient. |
+| `qos.ebt.<n>.cmd` | Literal ebtables fragments the stock firmware would replay to fwmark each VAP. openUF implements the intent with `tc` instead (`shaper.lua`), since ebtables is not a given on OpenWrt while `tc` ships in the base iproute2. |
+
 ### `netconf.*` / `dhcpc.*` / `route.*` / `resolv.*` — IP settings
 
 ```
@@ -907,6 +934,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 35 | Multicast and Broadcast Blocker | `wireless.<n>.bcfilt.status` + `bcfilt.<k>.mac`/`.status` | ✅ Wire format confirmed live 2026-07-18 across four diffs (on with one MAC, with two MACs, on with an empty list, off). Two keys already on the wire were **excluded** as candidates by the same diffs: `radio.<n>.bcmc_l2_filter.status` (sits at `enabled` with the control off) and `wireless.<n>.multicast.inspect` — neither moved. ⚠️ Enforcement is openUF's own nftables ruleset (`bridge openuf_bcfilt`), since no hostapd/OpenWrt option expresses a multicast allow-list; the generated ruleset is verified against real nftables 1.0.9 and confirmed not to collide with `firewall.lua`'s table, but the on-air effect is unverified (no real radios). |
 | 36 | Hide WiFi Name | `wireless.<n>.hide_ssid` (+ duplicate `aaa.<n>.hide_ssid`) | ✅ Confirmed live 2026-07-18 by toggling the control in the UI and diffing `system_cfg`: exactly those two keys flipped `false`→`true`, on both band entries of the WLAN, nothing else moved. Always present, so "off" is explicit and is written back out as `hidden=0`. Note the `true`/`false` vocabulary rather than `enabled`/`disabled`. Previously **documented in USAGE.md as already applied, but no code read or wrote it** — the same doc-vs-code drift as `use_only_unifi_wlan`. |
 | 37 | MAC Address Filter | top-level `macacl.<m>.*`, joined on `wireless.<n>.devname` | ✅ Confirmed live 2026-07-18 by enabling the control with one allow-listed MAC and diffing `system_cfg`: the whole `macacl` section appeared at once, keyed by devname (`ath0`/`ath2`) and numbered independently of `wireless.<n>`, so **the devname join is mandatory**. Two keys already on the wire were **excluded** by the same diff: `wireless.<n>.mac_acl.status`/`.policy` (sit at `enabled`/`deny` with the control off) and `aaa.<n>.radius.macacl.status` (the separate RADIUS MAC Authentication control). → OpenWrt `macfilter` + `maclist`, whose allow/deny vocabulary matches the controller's 1:1. Enforced by hostapd itself, so no openUF-side ruleset is involved. |
+| 38 | WiFi Speed Limit | top-level `qos.vap.<m>.*`, joined on `wireless.<n>.devname` | ✅ Wire format confirmed live 2026-07-18 by creating a speed-limit profile (33/17 Mbps) and assigning it to a WLAN. Values are **kbps**, and the discriminator is the presence of `maxspeed` — an unlimited vap still gets a block, carrying only `minspeed` set to its raw `devspeed`. The cap is a **per-VAP aggregate**, not per-client. Requires a profile to exist before the per-WLAN toggle does anything. ⚠️ Enforcement is openUF's own `tc` ruleset (`shaper.lua`), since no hostapd/OpenWrt option expresses a throughput cap: HTB on egress for downlink, ingress policing for uplink. Every generated command is verified against real tc (iproute2 6.9.0), but the on-air throughput is unverified (no real radios). |
 
 ---
 

@@ -15,6 +15,8 @@ M._uci        = nil  -- override with a mock UCI table; nil = require("uci")
 -- "Multicast and Broadcast Blocker" enforcement (nftables). Injectable so
 -- tests can capture the reconciled rules without shelling out to real nft.
 M._bcfilter   = nil  -- nil = load openuf/bcfilter.lua on first use
+-- "WiFi Speed Limit" enforcement (tc). Injectable for the same reason.
+M._shaper     = nil  -- nil = load openuf/shaper.lua on first use
 M._run_cmd    = function(cmd) return os.execute(cmd) end
 
 -- Injectable: command execution that captures stdout (for read-only introspection,
@@ -50,14 +52,14 @@ local function get_uci()
 	return require("uci")
 end
 
--- Load bcfilter.lua by path, mirroring inform.lua's _require_sibling: openUF's
--- modules are not on package.path, and the working directory differs between
--- running from openuf/ and from an install root. Returns nil rather than
--- erroring if it cannot be found, so a missing module degrades to "blocker not
+-- Load an enforcement sibling by path, mirroring inform.lua's _require_sibling:
+-- openUF's modules are not on package.path, and the working directory differs
+-- between running from openuf/ and from an install root. Returns nil rather
+-- than erroring if it cannot be found, so a missing module degrades to "not
 -- enforced" instead of taking the whole config apply down with it.
-local function get_bcfilter()
-	if M._bcfilter then return M._bcfilter end
-	for _, p in ipairs({"bcfilter.lua", "openuf/bcfilter.lua"}) do
+local function get_sibling(name, override)
+	if override then return override end
+	for _, p in ipairs({name .. ".lua", "openuf/" .. name .. ".lua"}) do
 		local f = io.open(p, "r")
 		if f then
 			f:close()
@@ -67,6 +69,9 @@ local function get_bcfilter()
 	end
 	return nil
 end
+
+local function get_bcfilter() return get_sibling("bcfilter", M._bcfilter) end
+local function get_shaper()   return get_sibling("shaper",   M._shaper)   end
 
 -- Map a UCI wifi-device's channel number to the controller's band identifier.
 -- The real controller's radio_table schema requires this "radio" field
@@ -570,6 +575,16 @@ function M.apply_config(resp, cfg, opts)
 			else
 				extra.macfilter = "disable"
 			end
+			-- "WiFi Speed Limit". Recorded on the section so the configured
+			-- state shows up in `uci show`; the actual enforcement is tc, done
+			-- after the wifi reload below (see shaper.lua for why no hostapd or
+			-- OpenWrt option can express it). Values are kbps, as pushed.
+			if vap.ratelimit_down_kbps then
+				extra.openuf_ratelimit_down = vap.ratelimit_down_kbps
+			end
+			if vap.ratelimit_up_kbps then
+				extra.openuf_ratelimit_up = vap.ratelimit_up_kbps
+			end
 			if vap.advertise_ap_name then
 				-- "Show Access Point Name in Beacon" -- CONFIRMED (via
 				-- decompiling the controller) to require a device-reported
@@ -655,6 +670,29 @@ function M.apply_config(resp, cfg, opts)
 			end
 		end
 		bcfilter.reconcile(rules)
+	end
+
+	-- "WiFi Speed Limit" enforcement, after the reload for the same reason.
+	-- EVERY managed VAP is passed, not just the capped ones: shaper.reconcile
+	-- clears each interface it is handed before reshaping it, so a VAP whose
+	-- limit was just removed has to appear here (with both rates nil) to get
+	-- its old qdisc torn down.
+	local shaper = get_shaper()
+	if shaper then
+		local rules = {}
+		for _, vap in ipairs(vap_table) do
+			if vap.ssid and vap.radio then
+				local ifname = M.get_ifname_for_vap(vap.radio, vap.ssid)
+				if ifname then
+					rules[#rules + 1] = {
+						ifname    = ifname,
+						down_kbps = vap.ratelimit_down_kbps,
+						up_kbps   = vap.ratelimit_up_kbps,
+					}
+				end
+			end
+		end
+		shaper.reconcile(rules)
 	end
 end
 
