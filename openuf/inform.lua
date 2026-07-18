@@ -1203,6 +1203,31 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- was wrong). Maps 1:1 onto hostapd/UCI's own
 				-- wifi-iface.dtim_period option.
 				dtim_period           = tonumber(w.dtim_period),
+				-- wireless.<n>.iot / wireless.<n>.qbssload: "Force WiFi 4
+				-- Mode" (Settings -> WiFi -> [WLAN] -> IoT Optimization,
+				-- REST field enhanced_iot). CONFIRMED live 2026-07-18 by
+				-- diffing system_cfg across the toggle: both keys are
+				-- absent entirely when it is off, and appear together as
+				-- iot=enabled + qbssload=disabled on the WLAN's 2.4GHz
+				-- wireless.<n> entry when it is on.
+				--
+				-- Most of what this feature *does* is encoded by the
+				-- controller in keys openUF already applies -- the same
+				-- diff showed the WLAN's 5GHz vap removed outright
+				-- (wlan_bands forced to 2.4GHz-only), security pinned to
+				-- WPA2, and bss_transition/proxy_arp/no2ghz_oui/PMF/
+				-- advertise_ap_name all forced off. Notably the parent
+				-- radio is NOT touched: radio.<n>.ieee_mode stayed at the
+				-- site's configured width (verified by turning this on
+				-- with the 2.4GHz radio at HT40 -- it stayed 11nght40), so
+				-- this is a per-BSS flag only and must not be reflected
+				-- back onto the shared radio.
+				--
+				-- That leaves qbssload as its one distinct on-air effect:
+				-- suppress the QBSS Load information element in this
+				-- BSS's beacons, which some legacy clients mis-parse.
+				iot                   = _wire_bool(w.iot),
+				qbssload              = _wire_bool(w.qbssload),
 				-- wireless.<n>.no2ghz_oui: CONFIRMED live 2026-07-15 --
 				-- this, not a per-device mgmt_cfg key, is Band Steering's
 				-- real wire representation (toggled "Band Steering" in the

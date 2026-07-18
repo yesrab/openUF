@@ -800,6 +800,58 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes channel 6 from the IoT channel lock",
+		fn = function()
+			-- "Lock 2.4 GHz to Channel 6 (All APs)" reaches the device as
+			-- radio.<n>.channel=6 (CONFIRMED live 2026-07-18) -- no dedicated
+			-- key, so this regression-locks the plain channel path it rides.
+			with_ucihelper(function(db)
+				local resp = {
+					vap_table = {}, network_table = {},
+					radio_table = {{name = "radio0", channel = 6}},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.radio0.channel, "6", "channel 6 written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes bss_load_update_period/openuf_iot (Force WiFi 4)",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", iot = true, qbssload = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.bss_load_update_period, "0", "QBSS Load element suppressed")
+				assert_eq(s.openuf_iot, "1", "WiFi-4-compat state recorded")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config omits the Force WiFi 4 options when the vap has neither",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.bss_load_update_period, nil, "no bss_load_update_period written")
+				assert_eq(s.openuf_iot, nil, "no openuf_iot marker written")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: an applied htmode round-trips back out via get_radio_table().ht",
 		fn = function()
 			-- radio_table[].ht is what build_json turns into the outbound

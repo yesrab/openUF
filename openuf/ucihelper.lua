@@ -308,6 +308,27 @@ function M.apply_config(resp, cfg, opts)
 				end
 			end
 			if vap.dtim_period then extra.dtim_period = vap.dtim_period end
+			if vap.qbssload ~= nil then
+				-- "Force WiFi 4 Mode" (IoT Optimization) sends
+				-- wireless.<n>.qbssload=disabled alongside iot=enabled. The
+				-- QBSS Load element is emitted by hostapd whenever
+				-- bss_load_update_period is non-zero (it is the element's
+				-- refresh interval, in beacon intervals); 0 suppresses the
+				-- element entirely, which is what the controller is asking
+				-- for. 60 is hostapd's own conventional enabled value.
+				extra.bss_load_update_period = vap.qbssload and "60" or "0"
+			end
+			if vap.iot then
+				-- Recorded so the applied WiFi-4-compat state is visible in
+				-- UCI (and in tests) rather than being invisible. There is
+				-- deliberately no radio-level action here: the controller
+				-- keeps the shared radio at its configured width, and the
+				-- rest of the mode's behavior arrives as the ordinary keys
+				-- handled above and below (2.4GHz-only vap placement, WPA2,
+				-- PMF/BSS-transition/proxy-ARP/band-steering off). See
+				-- inform.lua's parse-side comment for the live evidence.
+				extra.openuf_iot = "1"
+			end
 			if vap.pmf_status ~= nil then
 				-- 802.11w PMF. ieee80211w: 0=disabled, 1=optional, 2=required
 				-- (hostapd's own option, madwifi/mac80211 alike). The

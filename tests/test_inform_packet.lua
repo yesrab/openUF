@@ -540,6 +540,30 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.iot/qbssload (Force WiFi 4)",
+		fn = function()
+			-- CONFIRMED live 2026-07-18: "Force WiFi 4 Mode" (IoT
+			-- Optimization) emits both keys together on the WLAN's 2.4GHz
+			-- wireless.<n> entry; they are absent entirely when it is off.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.iot=enabled\nwireless.1.qbssload=disabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].iot, true, "iot=enabled -> true")
+			assert_eq(vap_table[1].qbssload, false, "qbssload=disabled -> false")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves iot/qbssload nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].iot, nil, "no iot key -> nil")
+			assert_eq(vap_table[1].qbssload, nil, "no qbssload key -> nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.bss_transition",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.bss_transition=1\n"

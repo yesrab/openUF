@@ -37,6 +37,8 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | VLAN-tagged SSIDs (`network_table` join) | ✅ Working — bridges onto a per-VLAN `br0.<vlan>` device |
 | Channel and TX power per radio | ✅ Working (Low/Medium/High/Custom) |
 | Channel width per radio | ✅ Working — from `radio.<n>.ieee_mode` (`11nght20`/`11naht40`/…) → `htmode`. This is also the only 802.11n/ac/ax mode signal the wire carries |
+| IoT Optimization: Lock 2.4 GHz to Channel 6 / DTIM Interval Lock | ✅ Working — both are controller-side shortcuts that arrive as an ordinary `radio.<n>.channel=6` and `dtim_period=3`, needing no dedicated handling |
+| IoT Optimization: Force WiFi 4 Mode | ✅ Wire protocol confirmed live (`wireless.<n>.iot` + `qbssload`); most of the mode arrives as ordinary keys (2.4 GHz-only, WPA2, PMF/BSS-transition/proxy-ARP off). Its one distinct effect, suppressing the QBSS Load IE via `bss_load_update_period`, is not verified against real hardware |
 | BSS Transition (802.11v) | ✅ Working (`bss_transition`) — needs a full `wpad` build |
 | Band Steering | ✅ Working via `usteer` — requires the `usteer` package and a full `wpad` build (see Quick start) |
 | Auto 802.11 DTIM Period | ✅ Working — Auto and Custom both arrive as a concrete `dtim_period` |
