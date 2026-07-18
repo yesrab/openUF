@@ -164,13 +164,11 @@ end
 -- network:  UCI network/interface name to bridge this SSID onto (defaults to
 --           "lan"); pass a VLAN-tagged interface from ensure_vlan_network() to
 --           put the SSID on that VLAN.
--- networkconf_id: optional controller-side network object id, stashed as a
---           custom option so get_vap_table() can report it back unchanged.
 -- wlanconf_id: optional controller-side wlanconf object id (system_cfg's
 --           aaa.<n>.id), stashed the same way so get_vap_table() can echo it
 --           back as the vap's "id" -- required for the controller to accept
 --           the vap (and its sta_table) at all.
-function M.wlan_add(radio, ssid, security, password, extra, network, networkconf_id, wlanconf_id)
+function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	-- Section name includes the radio, not just the SSID: broadcasting the
@@ -191,9 +189,6 @@ function M.wlan_add(radio, ssid, security, password, extra, network, networkconf
 	cursor:set("wireless", section_name, "ssid", ssid)
 	cursor:set("wireless", section_name, "encryption", enc)
 	cursor:set("wireless", section_name, "network", network or "lan")
-	if networkconf_id then
-		cursor:set("wireless", section_name, "openuf_networkconf_id", networkconf_id)
-	end
 	if wlanconf_id then
 		cursor:set("wireless", section_name, "openuf_wlanconf_id", wlanconf_id)
 	end
@@ -291,12 +286,10 @@ end
 --       controller-assigned device name, used as the WPS Device Name value
 --       when a vap has advertise_ap_name enabled ("Show Access Point Name in
 --       Beacon"); defaults to "openUF" if nil.
--- Handles vap_table, radio_table, and network_table (VLAN join) from the
--- setparam/config response.
+-- Handles vap_table and radio_table from the setparam/config response.
 function M.apply_config(resp, cfg, opts)
 	local radio_table   = resp.radio_table   or {}
 	local vap_table     = resp.vap_table     or {}
-	local network_table = resp.network_table or {}
 	local cpueth = cfg and cfg.net and cfg.net.lan_cpueth
 
 	-- Apply radio parameters
@@ -307,24 +300,14 @@ function M.apply_config(resp, cfg, opts)
 		end
 	end
 
-	-- Index network_table by id for the vap_table.networkconf_id join
-	-- (field shapes per paultyng/go-unifi's WLAN/NetworkConf structs --
-	-- verify against a live controller capture).
-	local network_by_id = {}
-	for _, net in ipairs(network_table) do
-		local id = net._id or net.id
-		if id then network_by_id[id] = net end
-	end
-
 	-- Clear existing openuf_ VAPs and re-add from vap_table
 	M.wlan_clear()
 	for _, vap in ipairs(vap_table) do
 		if vap.ssid and vap.radio then
 			local extra = {}
-			local fast_roaming = vap.fast_roaming_enabled or vap.ieee80211r
-			if fast_roaming then
+			if vap.fast_roaming_enabled then
 				extra.ieee80211r = "1"
-				extra.mobility_domain = M.derive_mobility_domain(vap.networkconf_id or vap.ssid)
+				extra.mobility_domain = M.derive_mobility_domain(vap.ssid)
 				extra.ft_psk_generate_local = "1"
 				extra.ft_over_ds = "0"
 			end
@@ -342,7 +325,6 @@ function M.apply_config(resp, cfg, opts)
 				extra.rrm_beacon_report   = "1"
 				extra.wnm_sleep_mode      = "1"
 			else
-				if vap.ieee80211k then extra.ieee80211k = vap.ieee80211k end
 				if vap.bss_transition ~= nil then
 					extra.bss_transition = vap.bss_transition and "1" or "0"
 				end
@@ -433,18 +415,10 @@ function M.apply_config(resp, cfg, opts)
 				-- the offending peer.
 				extra.sae_sync = vap.sae_sync
 			end
-			-- Controller-sent values win over the derived/default stopgap ones above.
-			if vap.mobility_domain then extra.mobility_domain = vap.mobility_domain end
-			if vap.ft_psk_generate_local then
-				extra.ft_psk_generate_local = vap.ft_psk_generate_local
-			end
-			if vap.ft_over_ds then extra.ft_over_ds = vap.ft_over_ds end
-
-			-- Resolve VLAN: prefer the linked network_table entry, fall back
-			-- to a vlan/vlan_enabled set directly on the vap itself.
-			local net = vap.networkconf_id and network_by_id[vap.networkconf_id]
-			local vlan_enabled = (net and net.vlan_enabled) or vap.vlan_enabled
-			local vlan_id      = (net and net.vlan) or vap.vlan
+			-- VLAN comes off the vap itself: the controller derives it from
+			-- aaa.<n>.br.devname ("br0.20"), not from a linked network object.
+			local vlan_enabled = vap.vlan_enabled
+			local vlan_id      = vap.vlan
 
 			local network = "lan"
 			if vlan_enabled and vlan_id and cpueth then
@@ -452,7 +426,7 @@ function M.apply_config(resp, cfg, opts)
 			end
 
 			M.wlan_add(vap.radio, vap.ssid, vap.security, vap.x_passphrase, extra,
-				network, vap.networkconf_id, vap.wlanconf_id)
+				network, vap.wlanconf_id)
 		end
 	end
 

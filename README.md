@@ -35,7 +35,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | WPA2 / WPA3 / WPA2-WPA3 mixed security | ✅ Working — derived from the pushed AKM set |
 | PMF / 802.11w (`ieee80211w`) | ✅ Working — from `aaa.<n>.pmf.status`/`pmf.mode`; also what carries WPA3-transition intent on a mixed WLAN |
 | Fast Roaming (802.11r) | ✅ Working |
-| VLAN-tagged SSIDs (`network_table` join) | ✅ Working — bridges onto a per-VLAN `br0.<vlan>` device |
+| VLAN-tagged SSIDs | ✅ Working — from `aaa.<n>.br.devname` (`br0.<vlan>`), the wire's only VLAN signal; bridges onto a matching per-VLAN device |
 | Channel and TX power per radio | ✅ Working (Low/Medium/High/Custom) |
 | Channel width per radio | ✅ Working — from `radio.<n>.ieee_mode` (`11nght20`/`11naht40`/…) → `htmode`. This is also the only 802.11n/ac/ax mode signal the wire carries |
 | IoT Optimization: Lock 2.4 GHz to Channel 6 / DTIM Interval Lock | ✅ Working — both are controller-side shortcuts that arrive as an ordinary `radio.<n>.channel=6` and `dtim_period=3`, needing no dedicated handling |

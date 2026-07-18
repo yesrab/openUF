@@ -158,8 +158,8 @@ config = {
 `debug_dump_file` — opt-in, off by default. When set to a path (e.g.
 `"/var/log/openuf-informs.log"`), every decrypted controller inform response is
 appended verbatim, with a UTC timestamp, before it's dispatched. Used to capture
-ground-truth payload shapes when validating field assumptions (`vap_table`,
-`network_table`, `cmd` dispatch, etc.) against a real UniFi controller — see
+ground-truth payload shapes when validating field assumptions (`system_cfg`,
+`cmd` dispatch, etc.) against a real UniFi controller — see
 [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md).
 
 `bootstrap_adopt_user` — set by `install.sh install --bootstrap-adopt`, not by

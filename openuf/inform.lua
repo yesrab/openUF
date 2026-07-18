@@ -1599,21 +1599,14 @@ function M.handle_response(json_str, st, cfg)
 		return true
 	end
 
-	-- Config update: check cfgversion
+	-- Config update: check cfgversion. WiFi config itself is applied from
+	-- system_cfg above, not here -- a real controller never sends the
+	-- resp.vap_table/radio_table/network_table JSON this branch used to gate
+	-- on, so all that is left to do is record the version we have caught up to.
 	if type(resp.cfgversion) == "string" and resp.cfgversion ~= st.cfgversion then
-		local ufuci = M._ucihelper
-		if ufuci and resp.network_table then
-			local ok_apply = pcall(ufuci.apply_config, resp, cfg)
-			if ok_apply then
-				st.cfgversion = resp.cfgversion
-				M._state.save(st)
-				return true  -- signal: send follow-up inform immediately
-			end
-		elseif ufuci and resp.cfgversion then
-			st.cfgversion = resp.cfgversion
-			M._state.save(st)
-			return true
-		end
+		st.cfgversion = resp.cfgversion
+		M._state.save(st)
+		return true  -- signal: send follow-up inform immediately
 	end
 
 	return false

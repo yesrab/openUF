@@ -1,4 +1,4 @@
--- Tests for openuf/ucihelper.lua (UCI-backed WiFi provisioning, VLAN join).
+-- Tests for openuf/ucihelper.lua (UCI-backed WiFi provisioning, VLAN tagging).
 -- Run from project root: lua tests/run_tests.lua
 --
 -- Uses an in-memory mock UCI cursor (mirrors the subset of the real `uci`
@@ -73,14 +73,13 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: wlan_add sets explicit network, networkconf_id and wlanconf_id",
+		name = "ucihelper: wlan_add sets explicit network and wlanconf_id",
 		fn = function()
 			with_ucihelper(function(db)
 				ucihelper.wlan_add("radio0", "guest", "open", nil, nil,
-					"openuf_vlan20", "net-abc123", "6a540dd2ffb26b8537ec967d")
+					"openuf_vlan20", "6a540dd2ffb26b8537ec967d")
 				local s = db.wireless.openuf_radio0_guest
 				assert_eq(s.network, "openuf_vlan20", "network set")
-				assert_eq(s.openuf_networkconf_id, "net-abc123", "networkconf_id stashed")
 				assert_eq(s.openuf_wlanconf_id, "6a540dd2ffb26b8537ec967d", "wlanconf_id stashed")
 			end)
 		end
@@ -132,18 +131,20 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: apply_config tags a VAP via network_table join",
+		name = "ucihelper: apply_config tags a VAP from the vlan set on the vap itself",
 		fn = function()
+			-- The controller derives the VLAN from aaa.<n>.br.devname
+			-- ("br0.20") onto the vap; there is no separate network object on
+			-- the wire. (This test used to feed a resp.network_table that a
+			-- real controller never sends, so it pinned a join that could
+			-- never run in production.)
 			with_ucihelper(function(db)
 				local resp = {
 					cfgversion = "2",
 					radio_table = {},
-					network_table = {
-						{_id = "net-1", vlan = 20, vlan_enabled = true, purpose = "corporate"},
-					},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
-						 x_passphrase = "hunter22", networkconf_id = "net-1"},
+						 x_passphrase = "hunter22", vlan = 20, vlan_enabled = true},
 					},
 				}
 				ucihelper.apply_config(resp, {net = {lan_cpueth = "eth1"}})
@@ -159,12 +160,9 @@ return {
 			with_ucihelper(function(db)
 				local resp = {
 					radio_table = {},
-					network_table = {
-						{_id = "net-1", vlan = 20, vlan_enabled = false},
-					},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "open",
-						 networkconf_id = "net-1"},
+						 vlan = 20, vlan_enabled = false},
 					},
 				}
 				ucihelper.apply_config(resp, {net = {lan_cpueth = "eth1"}})
@@ -178,12 +176,9 @@ return {
 			with_ucihelper(function(db)
 				local resp = {
 					radio_table = {},
-					network_table = {
-						{_id = "net-1", vlan = 20, vlan_enabled = true},
-					},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "open",
-						 networkconf_id = "net-1"},
+						 vlan = 20, vlan_enabled = true},
 					},
 				}
 				ucihelper.apply_config(resp, nil)
@@ -198,18 +193,16 @@ return {
 			with_ucihelper(function(db)
 				local resp = {
 					radio_table = {},
-					network_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
-						 x_passphrase = "hunter22", networkconf_id = "net-1",
-						 fast_roaming_enabled = true},
+						 x_passphrase = "hunter22", fast_roaming_enabled = true},
 					},
 				}
 				ucihelper.apply_config(resp, nil)
 				local s = db.wireless.openuf_radio0_corp
 				assert_eq(s.ieee80211r, "1", "FT enabled")
-				assert_eq(s.mobility_domain, ucihelper.derive_mobility_domain("net-1"),
-					"mobility_domain derived from networkconf_id")
+				assert_eq(s.mobility_domain, ucihelper.derive_mobility_domain("corp"),
+					"mobility_domain derived from the ssid")
 				assert_eq(#s.mobility_domain, 4, "mobility_domain is 4 hex chars")
 				assert_eq(s.ft_psk_generate_local, "1", "local PMK generation enabled")
 				assert_eq(s.ft_over_ds, "0", "over-DS disabled by default")
@@ -221,46 +214,23 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp1 = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {{ssid = "corp", radio = "radio0", security = "wpa2",
-						x_passphrase = "hunter22", networkconf_id = "net-1",
-						fast_roaming_enabled = true}},
+						x_passphrase = "hunter22", fast_roaming_enabled = true}},
 				}
 				ucihelper.apply_config(resp1, nil)
 				local first = db.wireless.openuf_radio0_corp.mobility_domain
 
 				local resp2 = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {{ssid = "corp", radio = "radio1", security = "wpa2",
-						x_passphrase = "hunter22", networkconf_id = "net-1",
-						fast_roaming_enabled = true}},
+						x_passphrase = "hunter22", fast_roaming_enabled = true}},
 				}
 				ucihelper.apply_config(resp2, nil)
 				local second = db.wireless.openuf_radio1_corp.mobility_domain
 
 				assert_eq(first, second,
-					"same networkconf_id yields same mobility_domain regardless of radio")
-			end)
-		end
-	},
-	{
-		name = "ucihelper: apply_config lets controller-sent FT fields override derived defaults",
-		fn = function()
-			with_ucihelper(function(db)
-				local resp = {
-					radio_table = {},
-					network_table = {},
-					vap_table = {
-						{ssid = "corp", radio = "radio0", security = "wpa2",
-						 x_passphrase = "hunter22", networkconf_id = "net-1",
-						 fast_roaming_enabled = true,
-						 mobility_domain = "abcd", ft_over_ds = "1"},
-					},
-				}
-				ucihelper.apply_config(resp, nil)
-				local s = db.wireless.openuf_radio0_corp
-				assert_eq(s.mobility_domain, "abcd", "explicit mobility_domain wins")
-				assert_eq(s.ft_over_ds, "1", "explicit ft_over_ds wins")
+					"same ssid yields same mobility_domain regardless of radio")
 			end)
 		end
 	},
@@ -269,7 +239,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", bss_transition = true},
@@ -287,7 +257,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", bss_transition = false},
@@ -304,7 +274,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22"},
@@ -321,7 +291,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", dtim_period = 3},
@@ -338,7 +308,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22"},
@@ -355,7 +325,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", pmf_status = "enabled", pmf_mode = 1},
@@ -372,7 +342,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa3",
 						 x_passphrase = "hunter22", pmf_status = "enabled", pmf_mode = 2},
@@ -389,7 +359,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", pmf_status = "disabled", pmf_mode = 0},
@@ -406,7 +376,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22"},
@@ -423,7 +393,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", mcast_enhance = true},
@@ -440,7 +410,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", mcast_enhance = false},
@@ -457,7 +427,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22"},
@@ -474,7 +444,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2/wpa3",
 						 x_passphrase = "hunter22"},
@@ -492,7 +462,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa3",
 						 x_passphrase = "hunter22"},
@@ -509,7 +479,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", bss_transition = false},
@@ -530,7 +500,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", bss_transition = false},
@@ -548,7 +518,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", bss_transition = false},
@@ -565,7 +535,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", advertise_ap_name = true},
@@ -583,7 +553,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", advertise_ap_name = true},
@@ -600,7 +570,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22"},
@@ -618,7 +588,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa3",
 						 x_passphrase = "hunter22", sae_anti_clogging = 12, sae_sync = 20},
@@ -636,7 +606,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22"},
@@ -660,7 +630,7 @@ return {
 			-- not the networkconf id this field used to (mis)carry.
 			with_ucihelper(function(db)
 				ucihelper.wlan_add("radio0", "corp", "wpa2", "hunter22", nil,
-					"openuf_vlan20", "net-1", "wlan-1")
+					"openuf_vlan20", "wlan-1")
 				local vaps = ucihelper.get_vap_table()
 				assert_eq(#vaps, 1, "one vap")
 				assert_eq(vaps[1].id, "wlan-1", "id echoes the wlanconf id")
@@ -739,7 +709,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					vap_table = {}, network_table = {},
+					vap_table = {},
 					radio_table = {
 						{name = "radio0", min_rssi_enabled = true, min_rssi = 15},
 					},
@@ -756,7 +726,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					vap_table = {}, network_table = {},
+					vap_table = {},
 					radio_table = {{name = "radio0", channel = 6}},
 				}
 				ucihelper.apply_config(resp, nil)
@@ -770,7 +740,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					vap_table = {}, network_table = {},
+					vap_table = {},
 					radio_table = {
 						{name = "radio0", htmode = "HT40", channel = 6},
 						{name = "radio1", htmode = "VHT80", channel = 36},
@@ -790,7 +760,7 @@ return {
 				cursor:set("wireless", "radio0", "wifi-device")
 				cursor:set("wireless", "radio0", "htmode", "VHT80")
 				local resp = {
-					vap_table = {}, network_table = {},
+					vap_table = {},
 					radio_table = {{name = "radio0", channel = 6}},
 				}
 				ucihelper.apply_config(resp, nil)
@@ -807,7 +777,7 @@ return {
 			-- key, so this regression-locks the plain channel path it rides.
 			with_ucihelper(function(db)
 				local resp = {
-					vap_table = {}, network_table = {},
+					vap_table = {},
 					radio_table = {{name = "radio0", channel = 6}},
 				}
 				ucihelper.apply_config(resp, nil)
@@ -820,7 +790,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22", iot = true, qbssload = false},
@@ -838,7 +808,7 @@ return {
 		fn = function()
 			with_ucihelper(function(db)
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22"},
@@ -862,7 +832,7 @@ return {
 				-- rf_config only mutates it.
 				ucihelper._uci.cursor():set("wireless", "radio0", "wifi-device")
 				local resp = {
-					vap_table = {}, network_table = {},
+					vap_table = {},
 					radio_table = {{name = "radio0", htmode = "HT40", channel = 6}},
 				}
 				ucihelper.apply_config(resp, nil)
@@ -879,7 +849,7 @@ return {
 				cursor:set("wireless", "default_radio0", "wifi-iface")
 				cursor:set("wireless", "default_radio0", "ssid", "MyOwnWiFi")
 				local resp = {
-					radio_table = {}, network_table = {},
+					radio_table = {},
 					vap_table = {
 						{ssid = "corp", radio = "radio0", security = "wpa2",
 						 x_passphrase = "hunter22"},
@@ -900,7 +870,7 @@ return {
 				local cursor = ucihelper._uci.cursor()
 				cursor:set("wireless", "default_radio0", "wifi-iface")
 				cursor:set("wireless", "default_radio0", "ssid", "MyOwnWiFi")
-				ucihelper.apply_config({radio_table = {}, network_table = {}, vap_table = {}},
+				ucihelper.apply_config({radio_table = {}, vap_table = {}},
 					{config = {use_only_unifi_wlan = false}})
 				assert_eq(db.wireless.default_radio0.disabled, nil, "left untouched")
 			end)
@@ -935,7 +905,7 @@ return {
 			with_ucihelper(function(db)
 				local cursor = ucihelper._uci.cursor()
 				cursor:set("wireless", "default_radio0", "wifi-iface")
-				ucihelper.apply_config({radio_table = {}, network_table = {}, vap_table = {}}, nil)
+				ucihelper.apply_config({radio_table = {}, vap_table = {}}, nil)
 				assert_eq(db.wireless.default_radio0.disabled, nil,
 					"no cfg threaded through -- must not disable a stranger's SSID")
 			end)
