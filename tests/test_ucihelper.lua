@@ -389,6 +389,40 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: get_ifname_for_vap matches the VAP by SSID, not radio position",
+		fn = function()
+			local orig = ucihelper._popen
+			ucihelper._popen = function()
+				return '{"radio0":{"interfaces":['
+					.. '{"ifname":"wlan0","config":{"ssid":"corp"}},'
+					.. '{"ifname":"wlan0-1","config":{"ssid":"guest"}}]}}'
+			end
+			local corp  = ucihelper.get_ifname_for_vap("radio0", "corp")
+			local guest = ucihelper.get_ifname_for_vap("radio0", "guest")
+			local miss  = ucihelper.get_ifname_for_vap("radio0", "nosuch")
+			ucihelper._popen = orig
+			assert_eq(corp, "wlan0", "first VAP resolved by its SSID")
+			assert_eq(guest, "wlan0-1", "second VAP resolved by its SSID")
+			-- Ambiguous: two interfaces, neither matching. Guessing would apply
+			-- one SSID's filter to another.
+			assert_eq(miss, nil, "no guess when the SSID is absent and >1 candidate")
+		end
+	},
+	{
+		name = "ucihelper: get_ifname_for_vap falls back to a radio's only interface",
+		fn = function()
+			local orig = ucihelper._popen
+			-- No config.ssid reported at all -- but with a single VAP on the
+			-- radio there is no other interface it could be.
+			ucihelper._popen = function()
+				return '{"radio0":{"interfaces":[{"ifname":"wlan0"}]}}'
+			end
+			local got = ucihelper.get_ifname_for_vap("radio0", "corp")
+			ucihelper._popen = orig
+			assert_eq(got, "wlan0", "unambiguous single interface is used")
+		end
+	},
+	{
 		name = "ucihelper: apply_config records the blocker on the section and reconciles nft",
 		fn = function()
 			with_ucihelper(function(db)

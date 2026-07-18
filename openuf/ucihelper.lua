@@ -698,13 +698,22 @@ function M.get_ifname_for_vap(radio, ssid)
 	local ok_d, status = pcall(cjson.decode, output)
 	if not ok_d or type(status) ~= "table" then return nil end
 	local dev = status[radio]
-	if type(dev) == "table" and type(dev.interfaces) == "table" then
-		for _, iface in ipairs(dev.interfaces) do
-			if type(iface) == "table" and iface.ifname
-				and type(iface.config) == "table" and iface.config.ssid == ssid then
-				return iface.ifname
-			end
+	if type(dev) ~= "table" or type(dev.interfaces) ~= "table" then return nil end
+	for _, iface in ipairs(dev.interfaces) do
+		if type(iface) == "table" and iface.ifname
+			and type(iface.config) == "table" and iface.config.ssid == ssid then
+			return iface.ifname
 		end
+	end
+	-- Fall back to the radio's only interface when the SSID could not be
+	-- matched but there is exactly one candidate: netifd does report
+	-- config.ssid per interface, but nothing guarantees every build/version
+	-- does, and with a single VAP on the radio there is no other interface it
+	-- could be. Deliberately not extended to the multi-interface case -- there
+	-- a wrong guess would apply one SSID's filter to another, which is worse
+	-- than not applying it at all.
+	if #dev.interfaces == 1 and type(dev.interfaces[1]) == "table" then
+		return dev.interfaces[1].ifname
 	end
 	return nil
 end
