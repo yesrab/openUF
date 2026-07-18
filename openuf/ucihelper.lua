@@ -319,6 +319,14 @@ function M.apply_config(resp, cfg, opts)
 				if vap.pmf_status == "enabled" then w = vap.pmf_mode or 1 end
 				extra.ieee80211w = tostring(w)
 			end
+			if vap.mcast_enhance ~= nil then
+				-- Multicast Enhancement: multicast_to_unicast is the
+				-- OpenWrt/mac80211 wifi-iface option that proxies multicast
+				-- frames as unicast at the AP (the mechanism UniFi's
+				-- "Multicast Enhancement" / "Multicast to Unicast" provides).
+				-- Written explicitly on/off, mirroring bss_transition.
+				extra.multicast_to_unicast = vap.mcast_enhance and "1" or "0"
+			end
 			if vap.advertise_ap_name then
 				-- "Show Access Point Name in Beacon" -- CONFIRMED (via
 				-- decompiling the controller) to require a device-reported

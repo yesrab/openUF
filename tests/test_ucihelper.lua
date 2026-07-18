@@ -419,6 +419,57 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes multicast_to_unicast from vap.mcast_enhance",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", mcast_enhance = true},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.multicast_to_unicast, "1", "mcast enhancement enabled")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes multicast_to_unicast=0 (explicit off)",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", mcast_enhance = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.multicast_to_unicast, "0", "mcast enhancement explicitly off")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config omits multicast_to_unicast when absent",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.multicast_to_unicast, nil, "no mcast field -> option unset")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config forces 802.11k/BSS-Transition on when band steering is active",
 		fn = function()
 			with_ucihelper(function(db)

@@ -1010,11 +1010,19 @@ local function _wire_bool(v)
 end
 
 function M._parse_wifi_system_cfg(sys_raw)
-	local aaa, wireless, radio, stamgr = {}, {}, {}, {}
+	local aaa, wireless, radio, stamgr, nwireless = {}, {}, {}, {}, {}
 	for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
 		local section, idx, key, v = line:match("^(aaa)%.(%d+)%.(.+)=(.*)$")
 		if not section then section, idx, key, v = line:match("^(wireless)%.(%d+)%.(.+)=(.*)$") end
 		if not section then section, idx, key, v = line:match("^(radio)%.(%d+)%.(.+)=(.*)$") end
+		-- nwireless.<n>: a second per-WLAN block (indexed the same as
+		-- wireless.<n>/aaa.<n>) carrying multicast/rate knobs -- confirmed
+		-- live 2026-07-18 (Humans+IoT validation): enabling "Multicast
+		-- Enhancement" ("Multicast to Unicast") on a WLAN sets
+		-- nwireless.<n>.mcast.enhance=1 (0 otherwise), alongside
+		-- nwireless.<n>.mcastrate and nwireless.<n>.multicast.inspect. The
+		-- leading "n" means the ^-anchored wireless pattern above never
+		-- matches these lines, so they were being dropped entirely.
 		-- stamgr.<n>: per-radio "Station Manager" block, indexed the same as
 		-- radio.<n> -- confirmed live 2026-07-14 (Devices -> [AP] -> Radios ->
 		-- "Minimum RSSI" checkbox+slider, NOT a WLAN-level setting): toggling
@@ -1024,9 +1032,11 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- The whole block is simply absent when disabled (no explicit
 		-- status=false), same convention as every other optional section here.
 		if not section then section, idx, key, v = line:match("^(stamgr)%.(%d+)%.(.+)=(.*)$") end
+		if not section then section, idx, key, v = line:match("^(nwireless)%.(%d+)%.(.+)=(.*)$") end
 		if section then
 			local tbl = (section == "aaa" and aaa) or (section == "wireless" and wireless)
-				or (section == "radio" and radio) or stamgr
+				or (section == "radio" and radio) or (section == "stamgr" and stamgr)
+				or nwireless
 			idx = tonumber(idx)
 			tbl[idx] = tbl[idx] or {}
 			tbl[idx][key] = v
@@ -1068,6 +1078,7 @@ function M._parse_wifi_system_cfg(sys_raw)
 	for _, idx in ipairs(sorted_indices(wireless)) do
 		local w = wireless[idx]
 		local a = aaa[idx] or {}
+		local nw = nwireless[idx] or {}
 		if w.ssid and w.parent then
 			local security = "open"
 			if a.wpa == "2" then security = "wpa2"
@@ -1122,6 +1133,13 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- AES-128-CMAC, so there is nothing to translate.
 					pmf_status            = a["pmf.status"],
 					pmf_mode              = tonumber(a["pmf.mode"]),
+					-- nwireless.<n>.mcast.enhance: "Multicast Enhancement" /
+					-- "Multicast to Unicast" -- CONFIRMED live 2026-07-18
+					-- (Humans+IoT validation): the controller correctly sent
+					-- =1 on the toggled WLAN's ifaces and =0 elsewhere; openUF
+					-- had no handler and wrote no multicast_to_unicast. 0|1 on
+					-- the wire, so _wire_bool handles it directly.
+					mcast_enhance         = _wire_bool(nw["mcast.enhance"]),
 				-- wireless.<n>.dtim_period: CONFIRMED live 2026-07-15 --
 				-- always present as a plain integer regardless of the
 				-- WLAN's Auto/Custom DTIM toggle (toggling "Auto 802.11
