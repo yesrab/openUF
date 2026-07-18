@@ -12,6 +12,9 @@ local M = {}
 
 -- Injectable seams for tests
 M._uci        = nil  -- override with a mock UCI table; nil = require("uci")
+-- "Multicast and Broadcast Blocker" enforcement (nftables). Injectable so
+-- tests can capture the reconciled rules without shelling out to real nft.
+M._bcfilter   = nil  -- nil = load openuf/bcfilter.lua on first use
 M._run_cmd    = function(cmd) return os.execute(cmd) end
 
 -- Injectable: command execution that captures stdout (for read-only introspection,
@@ -45,6 +48,24 @@ M.RADIO_DEFAULTS = {
 local function get_uci()
 	if M._uci then return M._uci end
 	return require("uci")
+end
+
+-- Load bcfilter.lua by path, mirroring inform.lua's _require_sibling: openUF's
+-- modules are not on package.path, and the working directory differs between
+-- running from openuf/ and from an install root. Returns nil rather than
+-- erroring if it cannot be found, so a missing module degrades to "blocker not
+-- enforced" instead of taking the whole config apply down with it.
+local function get_bcfilter()
+	if M._bcfilter then return M._bcfilter end
+	for _, p in ipairs({"bcfilter.lua", "openuf/bcfilter.lua"}) do
+		local f = io.open(p, "r")
+		if f then
+			f:close()
+			local ok, mod = pcall(dofile, p)
+			if ok and type(mod) == "table" then return mod end
+		end
+	end
+	return nil
 end
 
 -- Map a UCI wifi-device's channel number to the controller's band identifier.
@@ -502,6 +523,17 @@ function M.apply_config(resp, cfg, opts)
 				-- and off, mirroring bss_transition/mcast_enhance.
 				extra.proxy_arp = vap.proxy_arp and "1" or "0"
 			end
+			if vap.bcfilt_enabled ~= nil then
+				-- "Multicast and Broadcast Blocker". Recorded on the section so
+				-- the configured state is visible in `uci show` and survives to
+				-- be re-derived later; the actual enforcement is nftables, done
+				-- after the wifi reload below (see bcfilter.lua for why hostapd
+				-- cannot express it).
+				extra.openuf_bcfilt = vap.bcfilt_enabled and "1" or "0"
+				if vap.bcfilt_macs and #vap.bcfilt_macs > 0 then
+					extra.openuf_bcfilt_macs = table.concat(vap.bcfilt_macs, " ")
+				end
+			end
 			if vap.l2_isolation ~= nil then
 				-- "Client Isolation": drop station-to-station frames inside the
 				-- BSS. OpenWrt's wifi-iface option is spelled "isolate" (it maps
@@ -575,6 +607,26 @@ function M.apply_config(resp, cfg, opts)
 
 	-- Reload wireless
 	M._run_cmd("wifi reload")
+
+	-- "Multicast and Broadcast Blocker" enforcement. Deliberately after the
+	-- reload: the rules key off each VAP's live netdev name, which only exists
+	-- (and can change) once netifd has brought the interfaces back up. Always
+	-- reconciled, even with no filtered VAPs, so turning the control off in the
+	-- controller tears the previous ruleset down rather than leaving it in
+	-- place -- the same reason firewall.lua rebuilds from scratch every time.
+	local bcfilter = get_bcfilter()
+	if bcfilter then
+		local rules = {}
+		for _, vap in ipairs(vap_table) do
+			if vap.bcfilt_enabled and vap.ssid and vap.radio then
+				local ifname = M.get_ifname_for_vap(vap.radio, vap.ssid)
+				if ifname then
+					rules[#rules + 1] = {ifname = ifname, macs = vap.bcfilt_macs or {}}
+				end
+			end
+		end
+		bcfilter.reconcile(rules)
+	end
 end
 
 -- ─── Read helpers (for inform payload builder) ───────────────────────────────
@@ -624,6 +676,32 @@ function M.get_ifname_for_radio(radio)
 	if type(dev) == "table" and type(dev.interfaces) == "table" then
 		for _, iface in ipairs(dev.interfaces) do
 			if type(iface) == "table" and iface.ifname then
+				return iface.ifname
+			end
+		end
+	end
+	return nil
+end
+
+-- Resolve a specific VAP to its live wireless netdev name, by matching the
+-- SSID within the radio's interface list. get_ifname_for_radio() above returns
+-- the radio's FIRST interface, which is the same thing only when the radio
+-- hosts a single SSID -- not good enough for per-WLAN features like the
+-- Multicast and Broadcast Blocker, where picking the wrong VAP's netdev would
+-- silently apply one SSID's filter to another. Returns nil if unresolvable.
+function M.get_ifname_for_vap(radio, ssid)
+	if not radio or not ssid then return nil end
+	local output = M._popen("ubus call network.wireless status")
+	if output == "" then return nil end
+	local ok_j, cjson = pcall(require, "cjson")
+	if not ok_j then return nil end
+	local ok_d, status = pcall(cjson.decode, output)
+	if not ok_d or type(status) ~= "table" then return nil end
+	local dev = status[radio]
+	if type(dev) == "table" and type(dev.interfaces) == "table" then
+		for _, iface in ipairs(dev.interfaces) do
+			if type(iface) == "table" and iface.ifname
+				and type(iface.config) == "table" and iface.config.ssid == ssid then
 				return iface.ifname
 			end
 		end

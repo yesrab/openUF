@@ -310,6 +310,7 @@ Settings carried through from the controller:
 | Auto/Custom DTIM Period | `dtim_period` |
 | Multicast Enhancement | `multicast_to_unicast` |
 | Minimum Data Rate | per-**radio** `basic_rate` / `supported_rates` / `legacy_rates` / `beacon_rate` |
+| Multicast and Broadcast Blocker | nftables rules, not a hostapd option (plus `openuf_bcfilt`/`openuf_bcfilt_macs` on the section for visibility) |
 | Proxy ARP | `proxy_arp` — **needs a full `wpad` build** |
 | Client Isolation | `isolate` (hostapd `ap_isolate`) |
 | Network / VLAN assignment | a `br0.<vlan>` bridge + tagged sub-interface |
@@ -319,6 +320,19 @@ Settings carried through from the controller:
 | IoT Optimization: DTIM Interval Lock | nothing new — arrives as `dtim_period=3` on the 2.4 GHz SSID |
 | IoT Optimization: Force WiFi 4 Mode | `bss_load_update_period=0` (suppresses the QBSS Load IE) + an `openuf_iot` marker |
 | Minimum RSSI | per-**radio**; enforced by openUF deauthenticating clients below the threshold, not by hostapd |
+
+The **Multicast and Broadcast Blocker** has no hostapd or OpenWrt equivalent — hostapd
+can suppress group-addressed frames wholesale but has no notion of an allow-list — so
+openUF enforces it with nftables, in its own `bridge openuf_bcfilt` table (separate
+from the client-blocking `bridge openuf` table, which is rebuilt wholesale on every
+block/unblock and would otherwise wipe these rules). Frames leaving a filtered SSID are
+dropped unless the *sender's* MAC is allow-listed.
+
+> **This deliberately breaks DHCP for wireless clients unless you add the DHCP server's
+> MAC to the excepted-devices list.** That is Ubiquiti's own documented behavior for
+> this control, so openUF reproduces it faithfully rather than adding DHCP/ARP
+> exemptions of its own — a silent exemption would be harder to debug than the
+> documented breakage. Inspect the live rules with `nft list table bridge openuf_bcfilt`.
 
 **Minimum Data Rate** is set per WLAN in the controller but OpenWrt's rate options
 (`basic_rate`, `supported_rates`, `legacy_rates`, `beacon_rate`) are `wifi-device`

@@ -389,6 +389,63 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config records the blocker on the section and reconciles nft",
+		fn = function()
+			with_ucihelper(function(db)
+				local got
+				ucihelper._bcfilter = {reconcile = function(rules) got = rules end}
+				-- get_ifname_for_vap goes through _popen, stubbed to "" by the
+				-- harness, so resolve it directly here instead.
+				local orig = ucihelper.get_ifname_for_vap
+				ucihelper.get_ifname_for_vap = function(radio, ssid)
+					if radio == "radio0" and ssid == "corp" then return "wlan0" end
+				end
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", bcfilt_enabled = true,
+						 bcfilt_macs = {"01:00:5e:00:00:fb", "aa:bb:cc:dd:ee:ff"}},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				ucihelper.get_ifname_for_vap = orig
+				ucihelper._bcfilter = nil
+
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.openuf_bcfilt, "1", "blocker state recorded in UCI")
+				assert_eq(s.openuf_bcfilt_macs, "01:00:5e:00:00:fb aa:bb:cc:dd:ee:ff",
+					"allow-list recorded in UCI")
+				assert_eq(#got, 1, "one nft rule reconciled")
+				assert_eq(got[1].ifname, "wlan0", "rule targets the vap's own netdev")
+				assert_eq(#got[1].macs, 2, "both allow-listed MACs carried through")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config reconciles an empty ruleset when the blocker is off",
+		fn = function()
+			with_ucihelper(function(db)
+				-- Must still reconcile: turning the control off has to tear the
+				-- previous ruleset down, not leave it silently in force.
+				local got
+				ucihelper._bcfilter = {reconcile = function(rules) got = rules end}
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", bcfilt_enabled = false},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				ucihelper._bcfilter = nil
+				assert_eq(db.wireless.openuf_radio0_corp.openuf_bcfilt, "0", "recorded off")
+				assert_true(got ~= nil, "reconcile still called")
+				assert_eq(#got, 0, "no rules")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: derive_rates makes the floor the sole basic rate",
 		fn = function()
 			local r = ucihelper.derive_rates(12000, false, false)

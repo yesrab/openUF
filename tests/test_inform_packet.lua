@@ -745,6 +745,61 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg collects the bcfilt allow-list",
+		fn = function()
+			-- The wire index is 1-based and does not follow the REST list's
+			-- order, so the parser sorts -- assert the sorted result.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.bcfilt.status=enabled\n"
+				.. "wireless.1.bcfilt.1.mac=bb:bb:bb:bb:bb:bb\n"
+				.. "wireless.1.bcfilt.1.status=enabled\n"
+				.. "wireless.1.bcfilt.2.mac=aa:aa:aa:aa:aa:aa\n"
+				.. "wireless.1.bcfilt.2.status=enabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			local v = vap_table[1]
+			assert_eq(v.bcfilt_enabled, true, "bcfilt.status=enabled -> true")
+			assert_eq(#v.bcfilt_macs, 2, "both MACs collected")
+			assert_eq(v.bcfilt_macs[1], "aa:aa:aa:aa:aa:aa", "sorted, not wire order")
+			assert_eq(v.bcfilt_macs[2], "bb:bb:bb:bb:bb:bb", "sorted, not wire order")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg skips bcfilt entries that are not enabled",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.bcfilt.status=enabled\n"
+				.. "wireless.1.bcfilt.1.mac=aa:aa:aa:aa:aa:aa\n"
+				.. "wireless.1.bcfilt.1.status=disabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].bcfilt_macs, nil, "disabled entry not collected")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg handles the blocker on with an empty list",
+		fn = function()
+			-- Confirmed live: enabling the control with no excepted devices
+			-- emits bcfilt.status and no entry keys at all.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.bcfilt.status=enabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].bcfilt_enabled, true, "still enabled")
+			assert_eq(vap_table[1].bcfilt_macs, nil, "no allow-list")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves bcfilt fields nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].bcfilt_enabled, nil, "no bcfilt.status -> nil")
+			assert_eq(vap_table[1].bcfilt_macs, nil, "no allow-list -> nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses the Minimum Data Rate keys",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"

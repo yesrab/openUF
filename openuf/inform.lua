@@ -1142,6 +1142,35 @@ function M._parse_wifi_system_cfg(sys_raw)
 			-- so only the VLAN id itself needs extracting here).
 			local vlan_id = tonumber((a["br.devname"] or ""):match("^br0%.(%d+)$"))
 
+			-- "Multicast and Broadcast Blocker" (REST bc_filter_enabled /
+			-- bc_filter_list). CONFIRMED live 2026-07-18 by REST-toggling it
+			-- and diffing system_cfg -- the whole block appeared at once:
+			--   wireless.<n>.bcfilt.status=enabled
+			--   wireless.<n>.bcfilt.<k>.mac=01:00:5e:00:00:fb
+			--   wireless.<n>.bcfilt.<k>.status=enabled
+			-- on BOTH band entries of the WLAN. <k> is 1-based and does NOT
+			-- follow the REST list's order (adding a second MAC renumbered the
+			-- first), so the index carries no meaning beyond grouping and the
+			-- list is sorted here for a stable, comparable result.
+			--
+			-- Two candidate keys that were already on the wire turned out NOT
+			-- to be this feature -- radio.<n>.bcmc_l2_filter.status (sits at
+			-- enabled with the control off) and wireless.<n>.multicast.inspect
+			-- -- neither moved in the diff.
+			--
+			-- bcfilt.status is emitted whenever the control is on, including
+			-- with an empty allow-list; the per-entry keys only appear once
+			-- the list is non-empty.
+			local bcfilt_macs
+			for k, val in pairs(w) do
+				local idx = k:match("^bcfilt%.(%d+)%.mac$")
+				if idx and _wire_bool(w["bcfilt." .. idx .. ".status"]) then
+					bcfilt_macs = bcfilt_macs or {}
+					bcfilt_macs[#bcfilt_macs + 1] = val
+				end
+			end
+			if bcfilt_macs then table.sort(bcfilt_macs) end
+
 			vap_table[#vap_table + 1] = {
 				ssid                  = w.ssid,
 				radio                 = w.parent,
@@ -1328,6 +1357,9 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- (association still requires it) from "also stop
 					-- advertising every rate below the floor".
 					minrate_below_disable = _wire_bool(w.minrate_below_disable),
+					-- See the bcfilt derivation above the vap literal.
+					bcfilt_enabled        = _wire_bool(w["bcfilt.status"]),
+					bcfilt_macs           = bcfilt_macs,
 			}
 		end
 	end

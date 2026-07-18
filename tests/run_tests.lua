@@ -109,6 +109,7 @@ local test_files = {
 	"tests/test_usteer.lua",
 	"tests/test_netconfig.lua",
 	"tests/test_firewall.lua",
+	"tests/test_bcfilter.lua",
 }
 
 for _, filepath in ipairs(test_files) do
