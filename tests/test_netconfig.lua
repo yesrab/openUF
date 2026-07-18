@@ -71,6 +71,70 @@ return {
 		end
 	},
 	{
+		name = "netconfig: apply_dns writes nameservers in controller order",
+		fn = function()
+			with_capture(function(cmds)
+				local ok = netconfig.apply_dns({"192.168.1.1", "8.8.8.8"})
+				assert_true(ok, "apply_dns returns true")
+				assert_eq(#cmds, 1, "one shell command")
+				assert_contains(cmds[1], "'nameserver 192.168.1.1' 'nameserver 8.8.8.8'",
+					"both servers, primary first")
+				assert_contains(cmds[1], "> /etc/resolv.conf", "writes resolv.conf")
+			end)
+		end
+	},
+	{
+		name = "netconfig: apply_dns is a no-op for nil/empty input",
+		fn = function()
+			with_capture(function(cmds)
+				-- The controller omitting nameservers must never blank out
+				-- working resolution.
+				assert_false(netconfig.apply_dns(nil), "nil is a no-op")
+				assert_false(netconfig.apply_dns({}), "empty list is a no-op")
+				assert_eq(#cmds, 0, "no shell command issued")
+			end)
+		end
+	},
+	{
+		name = "netconfig: apply_dns drops non-IPv4 entries rather than shelling them out",
+		fn = function()
+			with_capture(function(cmds)
+				-- These values come straight off the wire and are interpolated
+				-- into a shell command, so they must never reach it.
+				assert_false(netconfig.apply_dns({"'; touch /tmp/pwned; '"}),
+					"injection attempt rejected")
+				assert_false(netconfig.apply_dns({"999.1.1.1"}), "out-of-range octet rejected")
+				assert_false(netconfig.apply_dns({"not-an-ip"}), "garbage rejected")
+				assert_eq(#cmds, 0, "no shell command issued")
+
+				netconfig.apply_dns({"192.168.1.1", "nope"})
+				assert_eq(#cmds, 1, "valid entry still applied")
+				assert_contains(cmds[1], "'nameserver 192.168.1.1'", "valid server kept")
+				assert_nil(cmds[1]:find("nope", 1, true), "invalid server dropped")
+			end)
+		end
+	},
+	{
+		name = "netconfig: apply_static applies DNS alongside the address",
+		fn = function()
+			with_capture(function(cmds)
+				netconfig.apply_static("eth0", "172.19.0.50", "255.255.255.0",
+					"172.19.0.1", {"172.19.0.1"})
+				assert_eq(#cmds, 4, "flush, add, route, resolv.conf")
+				assert_contains(cmds[4], "'nameserver 172.19.0.1'", "DNS written last")
+			end)
+		end
+	},
+	{
+		name = "netconfig: apply_static without DNS leaves resolv.conf alone",
+		fn = function()
+			with_capture(function(cmds)
+				netconfig.apply_static("eth0", "172.19.0.50", "255.255.255.0", "172.19.0.1")
+				assert_eq(#cmds, 3, "no resolv.conf write without DNS servers")
+			end)
+		end
+	},
+	{
 		name = "netconfig: apply_dhcp returns false without iface",
 		fn = function()
 			assert_false(netconfig.apply_dhcp(nil), "no-op without iface")

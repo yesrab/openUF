@@ -408,6 +408,64 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response setparam applies DNS servers in wire order",
+		fn = function()
+			-- resolv.nameserver.<k>.ip is part of the same "IP Settings" push as
+			-- netconf/route (PROTOCOL-VALIDATION.md). <k> is the controller's
+			-- primary/secondary ordering and is load-bearing -- resolv.conf's
+			-- line order is the resolver's preference order -- so the blob
+			-- below deliberately lists index 2 before index 1.
+			--
+			-- Note this does NOT prove the parser's table.sort: for contiguous
+			-- keys 1..n Lua's pairs() walks the array part in order anyway, so
+			-- this passes with the sort removed (mutation-tested). The sort is
+			-- there for SPARSE indices (1 and 5, say), where the hash part's
+			-- iteration order is unspecified and genuinely needs it -- a case
+			-- no deterministic test can pin down.
+			local st = sample_state()
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.50\\n'
+				.. 'netconf.1.netmask=255.255.255.0\\nroute.1.gateway=172.19.0.1\\n'
+				.. 'resolv.nameserver.2.ip=8.8.8.8\\nresolv.nameserver.1.ip=192.168.1.1\\n"}'
+			inform.handle_response(resp, st, cfg)
+			inform._netconfig._exec = orig
+			assert_eq(#cmds, 4, "flush, add, route, resolv.conf")
+			assert_contains(cmds[4], "'nameserver 192.168.1.1' 'nameserver 8.8.8.8'",
+				"emitted in wire-index order")
+			assert_eq(st.static_dns[1], "192.168.1.1", "primary DNS persisted first")
+			assert_eq(st.static_dns[2], "8.8.8.8", "secondary DNS persisted second")
+		end
+	},
+	{
+		name = "inform packet: handle_response leaves DNS alone on the dhcp path",
+		fn = function()
+			-- The lease supplies DNS. Rewriting resolv.conf on every
+			-- steady-state "still DHCP" push would fight the DHCP client for
+			-- ownership -- same hazard as the flush+re-lease guard above.
+			local st = sample_state({ip_mode = "static", static_dns = {"1.1.1.1"}})
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.2\\n'
+				.. 'dhcpc.1.status=enabled\\nresolv.nameserver.1.ip=192.168.1.1\\n"}'
+			inform.handle_response(resp, st, {net = {lan_cpueth = "eth0"}})
+			inform._netconfig._exec = orig
+			assert_eq(st.static_dns, nil, "stale static DNS cleared from state")
+			for _, cmd in ipairs(cmds) do
+				assert_nil(cmd:find("resolv.conf", 1, true), "resolv.conf never written on dhcp")
+			end
+		end
+	},
+	{
 		name = "inform packet: handle_response setparam ignores system_cfg without cfg.net",
 		fn = function()
 			-- Same nil-safety convention as cfg.led -- absent per-model

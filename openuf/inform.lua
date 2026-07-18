@@ -1568,10 +1568,18 @@ function M.handle_response(json_str, st, cfg)
 			local ip, netmask, gateway
 			local dhcp = false
 			local device_name
+			-- DNS servers, keyed by their wire index so the controller's
+			-- ordering (primary/secondary) survives -- resolv.conf's order is
+			-- the resolver's preference order, so it is load-bearing. Same
+			-- index-keyed-then-sorted treatment as macacl's acl.<k> list.
+			local dns_by_idx = {}
 			for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
 				local k, v = line:match("^([^=]+)=(.*)$")
 				if k and v then
-					if k == "netconf.1.ip" then ip = v
+					local dns_idx = k:match("^resolv%.nameserver%.(%d+)%.ip$")
+					if dns_idx then
+						if v ~= "" then dns_by_idx[tonumber(dns_idx)] = v end
+					elseif k == "netconf.1.ip" then ip = v
 					elseif k == "netconf.1.netmask" then netmask = v
 					elseif k == "route.1.gateway" then gateway = v
 					elseif k == "dhcpc.1.status" then dhcp = true
@@ -1587,6 +1595,15 @@ function M.handle_response(json_str, st, cfg)
 					end
 				end
 			end
+			-- Flatten the index-keyed DNS table into controller order.
+			local dns = {}
+			do
+				local idxs = {}
+				for i in pairs(dns_by_idx) do idxs[#idxs + 1] = i end
+				table.sort(idxs)
+				for _, i in ipairs(idxs) do dns[#dns + 1] = dns_by_idx[i] end
+			end
+
 			if ip then
 				local iface = cfg and cfg.net and cfg.net.lan_cpueth
 				if dhcp then
@@ -1606,10 +1623,16 @@ function M.handle_response(json_str, st, cfg)
 					end
 					st.ip_mode = "dhcp"
 					st.static_ip, st.static_netmask, st.static_gateway = nil, nil, nil
+					-- DNS is deliberately NOT touched here: the lease supplies
+					-- it, and rewriting resolv.conf on every steady-state "still
+					-- DHCP" push would fight the DHCP client for ownership --
+					-- the same hazard as the flush+re-lease guarded above.
+					st.static_dns = nil
 				else
 					st.ip_mode = "static"
 					st.static_ip, st.static_netmask, st.static_gateway = ip, netmask, gateway
-					if M._netconfig.apply_static(iface, ip, netmask, gateway) then
+					st.static_dns = (#dns > 0) and dns or nil
+					if M._netconfig.apply_static(iface, ip, netmask, gateway, dns) then
 						st.ip = ip  -- known directly, no need to re-read the interface
 					end
 				end
