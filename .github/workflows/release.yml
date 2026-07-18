@@ -14,9 +14,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build openuf.tar.gz
+      - name: Install Lua and dependencies
         run: |
-          tar czf openuf.tar.gz openuf install.sh README.md USAGE.md LICENSE
+          sudo apt-get update -qq
+          sudo apt-get install -y lua5.1 liblua5.1-dev lua-bitop luarocks openssl
+          sudo ln -sf /usr/bin/lua5.1 /usr/local/bin/lua
+          sudo luarocks --lua-version 5.1 install lua-cjson LUA_INCDIR=/usr/include/lua5.1
+
+      # dist.sh ships a comment-stripped tree (roughly half the bytes; OpenWrt
+      # flash is scarce) and --verify proves it is bytecode-identical to the
+      # source and still passes the suite before anything is published.
+      - name: Build openuf.tar.gz
+        run: sh tools/dist.sh --verify
 
       - name: Generate checksum
         run: sha256sum openuf.tar.gz > openuf.tar.gz.sha256

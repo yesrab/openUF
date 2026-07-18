@@ -54,9 +54,26 @@ case "$1" in
 				|| echo "WARNING: failed to install a full wpad build -- BSS Transition and Band Steering will not function (wpad-basic-* lacks 802.11v support)."
 		fi
 
-		# Copy Lua source
+		# Copy Lua source. etc/ is excluded deliberately: the init script
+		# belongs in /etc/init.d (installed further down) and a second copy
+		# under $INSTALL_DIR would never be executed.
 		mkdir -p "$INSTALL_DIR"
 		cp -r openuf/* "$INSTALL_DIR/"
+		rm -rf "$INSTALL_DIR/etc"
+
+		# Release tarballs arrive already comment-stripped (tools/dist.sh).
+		# When installing from a git clone, strip on the way in using the same
+		# tool so the device gets the same lean tree -- roughly half the bytes,
+		# and flash is scarce. conf.lua and the modelmaps keep their comments:
+		# they are the files meant to be hand-edited on the device.
+		if [ -f tools/strip.lua ] && command -v lua >/dev/null 2>&1; then
+			echo "Stripping comments from installed Lua ..."
+			for f in $(find "$INSTALL_DIR" -name '*.lua' \
+				! -name conf.lua ! -path "$INSTALL_DIR/modelmap/*"); do
+				lua tools/strip.lua "$f" > "$f.stripped" \
+					&& mv "$f.stripped" "$f"
+			done
+		fi
 
 		# Create state directory
 		mkdir -p "$STATE_DIR"
