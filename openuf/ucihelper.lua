@@ -307,6 +307,18 @@ function M.apply_config(resp, cfg, opts)
 				end
 			end
 			if vap.dtim_period then extra.dtim_period = vap.dtim_period end
+			if vap.pmf_status ~= nil then
+				-- 802.11w PMF. ieee80211w: 0=disabled, 1=optional, 2=required
+				-- (hostapd's own option, madwifi/mac80211 alike). The
+				-- controller signals this via aaa.<n>.pmf.status+pmf.mode; a
+				-- disabled block is mode 0. Written explicitly for both
+				-- enabled and disabled so the applied value always reflects
+				-- the controller's intent (a WPA2-only WLAN gets an explicit
+				-- ieee80211w=0, a WPA2/WPA3 mixed WLAN gets 1/2).
+				local w = 0
+				if vap.pmf_status == "enabled" then w = vap.pmf_mode or 1 end
+				extra.ieee80211w = tostring(w)
+			end
 			if vap.advertise_ap_name then
 				-- "Show Access Point Name in Beacon" -- CONFIRMED (via
 				-- decompiling the controller) to require a device-reported

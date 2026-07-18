@@ -550,6 +550,40 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.pmf.status/mode (802.11w)",
+		fn = function()
+			-- CONFIRMED live 2026-07-18 (Humans+IoT validation): a WPA2/WPA3
+			-- mixed WLAN's PMF-optional intent rides these two fields.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "aaa.1.pmf.status=enabled\naaa.1.pmf.mode=1\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].pmf_status, "enabled", "pmf.status read verbatim")
+			assert_eq(vap_table[1].pmf_mode, 1, "pmf.mode parsed as int")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses pmf.status=disabled/mode=0",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "aaa.1.pmf.status=disabled\naaa.1.pmf.mode=0\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].pmf_status, "disabled", "pmf.status=disabled")
+			assert_eq(vap_table[1].pmf_mode, 0, "pmf.mode=0")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg leaves pmf fields nil when absent",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].pmf_status, nil, "no pmf.status -> nil")
+			assert_eq(vap_table[1].pmf_mode, nil, "no pmf.mode -> nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.no2ghz_oui (Band Steering)",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"

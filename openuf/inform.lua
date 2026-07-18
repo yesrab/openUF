@@ -1106,6 +1106,22 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- translation needed, unlike the deprecated ieee80211v
 				-- alias ucihelper used to (incorrectly) emit.
 				bss_transition        = _wire_bool(a.bss_transition),
+					-- aaa.<n>.pmf.status / pmf.mode: 802.11w Protected
+					-- Management Frames. CONFIRMED live 2026-07-18 (Humans+IoT
+					-- validation, diffed system_cfg via debug_dump_file): the
+					-- controller always emits these on the aaa.<n> block --
+					-- status="enabled"/"disabled", mode=0|1|2 (0=disabled,
+					-- 1=optional, 2=required, mapping 1:1 onto hostapd's
+					-- ieee80211w). For a "WPA2/WPA3" mixed WLAN on this madwifi
+					-- model the WPA3-transition intent is carried entirely by
+					-- these fields (wpa stays =2, wpa.key.1.mgmt stays WPA-PSK),
+					-- so dropping them silently collapsed mixed-mode to plain
+					-- WPA2 -- the reason this WLAN got no PMF at all before.
+					-- pmf.cipher (AES-128-CMAC) is not carried through:
+					-- hostapd's default BIP group-mgmt cipher already is
+					-- AES-128-CMAC, so there is nothing to translate.
+					pmf_status            = a["pmf.status"],
+					pmf_mode              = tonumber(a["pmf.mode"]),
 				-- wireless.<n>.dtim_period: CONFIRMED live 2026-07-15 --
 				-- always present as a plain integer regardless of the
 				-- WLAN's Auto/Custom DTIM toggle (toggling "Auto 802.11

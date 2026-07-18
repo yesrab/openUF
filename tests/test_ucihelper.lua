@@ -351,6 +351,74 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes ieee80211w from vap.pmf (enabled/optional)",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", pmf_status = "enabled", pmf_mode = 1},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.ieee80211w, "1", "PMF optional -> ieee80211w=1")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes ieee80211w=2 for PMF required",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa3",
+						 x_passphrase = "hunter22", pmf_status = "enabled", pmf_mode = 2},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.ieee80211w, "2", "PMF required -> ieee80211w=2")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes explicit ieee80211w=0 when PMF disabled",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", pmf_status = "disabled", pmf_mode = 0},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.ieee80211w, "0", "PMF disabled -> explicit ieee80211w=0")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config omits ieee80211w when no pmf block present",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.ieee80211w, nil, "no pmf -> ieee80211w unset")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config forces 802.11k/BSS-Transition on when band steering is active",
 		fn = function()
 			with_ucihelper(function(db)
