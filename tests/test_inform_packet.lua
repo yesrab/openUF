@@ -629,6 +629,54 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg maps WPA-PSK akm to wpa2",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].security, "wpa2", "WPA-PSK only -> wpa2")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg maps WPA-PSK+SAE akm to wpa2/wpa3 (mixed)",
+		fn = function()
+			-- transition mode, space-joined on a single key
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK SAE\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].security, "wpa2/wpa3", "WPA-PSK+SAE -> mixed")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg maps split WPA-PSK/SAE keys to wpa2/wpa3",
+		fn = function()
+			-- transition mode, listed across separate wpa.key.<k>.mgmt entries
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "aaa.1.wpa.key.1.mgmt=WPA-PSK\naaa.1.wpa.key.2.mgmt=SAE\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].security, "wpa2/wpa3", "split PSK/SAE keys -> mixed")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg maps SAE-only akm to wpa3",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=SAE\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].security, "wpa3", "SAE only -> wpa3")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg wpa=2 without any key.mgmt stays wpa2",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].security, "wpa2", "wpa=2, no akm -> wpa2 (unchanged)")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg parses wireless.<n>.no2ghz_oui (Band Steering)",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"

@@ -470,6 +470,41 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config maps security=wpa2/wpa3 to encryption sae-mixed",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2/wpa3",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.encryption, "sae-mixed", "mixed -> sae-mixed")
+				assert_eq(s.key, "hunter22", "passphrase still written for sae-mixed")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config maps security=wpa3 to encryption sae",
+		fn = function()
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {}, network_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa3",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.encryption, "sae", "wpa3 -> sae")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config forces 802.11k/BSS-Transition on when band steering is active",
 		fn = function()
 			with_ucihelper(function(db)

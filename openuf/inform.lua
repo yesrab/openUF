@@ -1001,9 +1001,13 @@ end
 -- VLAN-join/fast-roaming/mobility-domain logic can be reused unchanged
 -- rather than reimplemented against the raw wire format.
 --
--- Security derivation is confirmed only for the plain WPA2-PSK case seen
--- live (aaa.<n>.wpa=2 + wpa.key.1.mgmt=WPA-PSK -> "wpa2"); WPA3/mixed/
--- enterprise are best-effort guesses pending a live capture of those modes.
+-- Security derivation reads the akm set from aaa.<n>.wpa.key.<k>.mgmt (not
+-- just aaa.<n>.wpa, which is only the WPA protocol version and stays "2"
+-- even for a WPA2/WPA3 transition WLAN): SAE present -> sae/sae-mixed,
+-- else WPA2-PSK. Confirmed live for the WPA2-PSK case (wpa=2 +
+-- wpa.key.1.mgmt=WPA-PSK -> "wpa2"); the SAE branches are correct-by-
+-- construction but not yet live-captured -- this environment's controller
+-- signals WPA3-mixed via PMF for this madwifi model, never SAE key-mgmt.
 local function _wire_bool(v)
 	if v == nil then return nil end
 	return v == "1" or v == "true" or v == "enabled"
@@ -1081,8 +1085,20 @@ function M._parse_wifi_system_cfg(sys_raw)
 		local nw = nwireless[idx] or {}
 		if w.ssid and w.parent then
 			local security = "open"
-			if a.wpa == "2" then security = "wpa2"
-			elseif a.wpa == "3" then security = "wpa3"
+			if a.wpa == "2" or a.wpa == "3" then
+				-- Aggregate every aaa.<n>.wpa.key.<k>.mgmt entry (transition
+				-- mode can list WPA-PSK and SAE either space-joined on one
+				-- key or across separate keys).
+				local akm = ""
+				for k, val in pairs(a) do
+					if k:match("^wpa%.key%.%d+%.mgmt$") then akm = akm .. " " .. val end
+				end
+				local has_sae = akm:find("SAE", 1, true) ~= nil
+				local has_psk = akm:find("PSK", 1, true) ~= nil
+				if has_sae and has_psk then security = "wpa2/wpa3"
+				elseif has_sae then security = "wpa3"
+				elseif a.wpa == "3" then security = "wpa3"
+				else security = "wpa2" end
 			end
 			-- VLAN-tagged SSIDs bridge onto a per-VLAN bridge device named
 			-- "br0.<vlan>" (vs. plain "br0" for untagged) -- confirmed live:
