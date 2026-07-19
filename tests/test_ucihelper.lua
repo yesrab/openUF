@@ -54,9 +54,15 @@ local function new_mock_uci()
 		return s and s[option]
 	end
 
-	function cursor:commit(config) end
+	-- Commits are recorded, not applied (the mock db is always-live): the
+	-- counter is the only way any test can notice a DROPPED commit, which
+	-- on a real device strands staged config in the cursor.
+	local commits = {}
+	function cursor:commit(config)
+		commits[config] = (commits[config] or 0) + 1
+	end
 
-	return {mock = {cursor = function() return cursor end}, db = db}
+	return {mock = {cursor = function() return cursor end}, db = db, commits = commits}
 end
 
 -- Fresh mock UCI + neutral injectable seams for each test.
@@ -83,7 +89,7 @@ local function with_ucihelper(fn)
 	ucihelper._run_cmd = function(cmd) cmds[#cmds + 1] = cmd; return true end
 	ucihelper._bcfilter = {reconcile = function() end}
 	ucihelper._shaper   = {reconcile = function() end}
-	local ok, err = pcall(fn, m.db, cmds)
+	local ok, err = pcall(fn, m.db, cmds, m.commits)
 	ucihelper._uci, ucihelper._popen, ucihelper._read_file, ucihelper._run_cmd =
 		orig_uci, orig_popen, orig_read, orig_run
 	ucihelper._bcfilter, ucihelper._shaper, ucihelper.get_ifname_for_vap =
@@ -575,6 +581,29 @@ return {
 				assert_true(by_if.wlan1 ~= nil, "uncapped VAP still present for teardown")
 				assert_nil(by_if.wlan1.down_kbps, "uncapped VAP has no down rate")
 				assert_nil(by_if.wlan1.up_kbps, "uncapped VAP has no up rate")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: rf_config and apply_config commit the wireless config",
+		fn = function()
+			-- The mock db is always-live, so a dropped cursor:commit is
+			-- invisible to every value assertion -- on a real device it
+			-- strands the whole push in the uncommitted cursor. The counter
+			-- is the only signal.
+			with_ucihelper(function(db, cmds, commits)
+				ucihelper.rf_config("radio0", "HT40", 6, 20)
+				assert_eq(commits.wireless, 1, "rf_config commits wireless")
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_true((commits.wireless or 0) >= 2,
+					"apply_config commits wireless before the wifi reload")
 			end)
 		end
 	},

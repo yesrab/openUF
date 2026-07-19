@@ -28,9 +28,13 @@ local function new_mock_uci()
 		return s and s[option]
 	end
 
-	function cursor:commit(config) end
+	-- Recorded, not applied -- the counter lets tests catch a dropped commit.
+	local commits = {}
+	function cursor:commit(config)
+		commits[config] = (commits[config] or 0) + 1
+	end
 
-	return {mock = {cursor = function() return cursor end}, db = db}
+	return {mock = {cursor = function() return cursor end}, db = db, commits = commits}
 end
 
 -- Fresh mock UCI + captured commands for each test.
@@ -40,7 +44,7 @@ local function with_usteer(fn)
 	local orig_uci, orig_run = usteer._uci, usteer._run_cmd
 	usteer._uci = m.mock
 	usteer._run_cmd = function(cmd) cmds[#cmds + 1] = cmd; return true end
-	local ok, err = pcall(fn, m.db, cmds)
+	local ok, err = pcall(fn, m.db, cmds, m.commits)
 	usteer._uci, usteer._run_cmd = orig_uci, orig_run
 	if not ok then error(err, 2) end
 end
@@ -88,11 +92,13 @@ return {
 			-- set_enabled runs on every WiFi setparam; before the guard each
 			-- steady-state inform restarted the daemon, dropping its learned
 			-- station table.
-			with_usteer(function(db, cmds)
+			with_usteer(function(db, cmds, commits)
 				assert_true(usteer.set_enabled(true, nil), "first call writes")
 				local after_first = #cmds
+				assert_eq(commits.usteer, 1, "first call commits")
 				assert_true(usteer.set_enabled(true, nil), "second call still reports success")
 				assert_eq(#cmds, after_first, "no second enable/restart issued")
+				assert_eq(commits.usteer, 1, "steady state issues no further commits")
 
 				usteer.set_enabled(false, nil)
 				local after_disable = #cmds

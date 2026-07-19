@@ -40,9 +40,14 @@ local function new_mock_uci()
 		end
 	end
 
-	function cursor:commit() end
+	-- Recorded, not applied -- the counter lets tests catch a dropped commit.
+	local commits = {}
+	function cursor:commit(config)
+		commits[config] = (commits[config] or 0) + 1
+	end
 
-	return {mock = {cursor = function() return cursor end}, db = db, cursor = cursor}
+	return {mock = {cursor = function() return cursor end}, db = db, cursor = cursor,
+		commits = commits}
 end
 
 -- A board with a real swconfig switch and a stock VLAN 1 section.
@@ -144,8 +149,10 @@ return {
 				local st = {}
 				switchvlan.apply(override(), CFG, st)
 				assert_eq(#cmds, 1, "first apply reloads")
+				assert_eq(u.commits.network, 1, "first apply commits network")
 				assert_false(switchvlan.apply(override(), CFG, st), "second apply is a no-op")
 				assert_eq(#cmds, 1, "no second reload")
+				assert_eq(u.commits.network, 1, "no second commit either")
 			end)
 		end
 	},
@@ -304,6 +311,7 @@ return {
 				assert_false(switchvlan.restore({}), "nothing to restore")
 				assert_false(switchvlan.restore(nil), "nil state tolerated")
 				assert_eq(#cmds, 0, "no reload issued")
+				assert_nil(u.commits.network, "no commit issued either")
 			end)
 		end
 	},
