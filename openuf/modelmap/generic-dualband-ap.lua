@@ -22,9 +22,15 @@ dev.conf.net = {
 	-- swconfig physical-switch-port numbering, not UniFi's port_idx).
 	-- This board exposes only two netdevs (no per-physical-port netdevs),
 	-- so the single "lan" entry reports every downstream host behind eth1.
+	--
+	-- `swport` bridges the two numbering spaces: it names a key in
+	-- dev.conf.vlan.ports below (or a physical port number outright), and is
+	-- what per-port VLAN assignment (switchvlan.lua) joins on. Without it that
+	-- port is skipped rather than guessed at. Uplink ports never get one --
+	-- reassigning the uplink's VLAN would strand the device.
 	ports = {
 		{idx = 1, ifname = "eth0", uplink = true},
-		{idx = 2, ifname = "eth1"},
+		{idx = 2, ifname = "eth1", swport = "lan1"},
 	},
 }
 

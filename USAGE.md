@@ -299,6 +299,7 @@ Persistent state is stored at `/etc/openuf/state.json`:
 | `inform_url` | URL for the 10-second inform heartbeat |
 | `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
 | `blocked_stas` | MACs blocked from the controller's Clients view; re-applied to nftables on startup so blocks survive restarts |
+| `swvlan_backup` | Original `ports` strings of the stock `switch_vlan` sections, snapshotted before per-port VLAN assignment first modifies them; used to restore them (see § 6) |
 | `ip_mode`, `static_ip`, `static_netmask`, `static_gateway`, `static_dns` | The last "IP Settings" push. `ip_mode` is `"static"` or `"dhcp"`; the `static_*` fields are set only in static mode and cleared on a revert to DHCP. `static_dns` is an array in the controller's primary/secondary order, written to `/etc/resolv.conf`. On DHCP, DNS is left to the lease and openUF does not touch `resolv.conf` |
 
 To reset to factory defaults:
@@ -341,6 +342,39 @@ Settings carried through from the controller:
 | IoT Optimization: DTIM Interval Lock | nothing new — arrives as `dtim_period=3` on the 2.4 GHz SSID |
 | IoT Optimization: Force WiFi 4 Mode | `bss_load_update_period=0` (suppresses the QBSS Load IE) + an `openuf_iot` marker |
 | Minimum RSSI | per-**radio**; enforced by openUF deauthenticating clients below the threshold, not by hostapd |
+| Per-port VLAN (Ports → *port* → Native VLAN) | swconfig `switch_vlan` sections named `openuf_swvlan<id>` — see below |
+
+**Per-port VLAN assignment** must be switched on twice: once on the device
+(Devices → *AP* → Settings → IP Settings → **Port VLAN**, which is what flips the wire's
+`switch.status`/`switch.vlan.status` gates), then per port under **Ports**. Until the
+device-level box is ticked the per-port VLAN controls stay greyed out and nothing reaches
+the wire.
+
+openUF applies it only on **swconfig** boards (ath79-era). It writes one
+`config switch_vlan` section per VLAN, named `openuf_swvlan<id>`, translating the
+controller's `untagged`/`tagged`/`exclude` per-port modes into swconfig's port syntax
+(`1`, `1t`, omitted) with the CPU port always tagged in. On a DSA board (OpenWrt 21.02+,
+where this would be `config bridge-vlan`) it logs and does nothing rather than emitting
+config nobody has verified.
+
+Three things must line up or the port is skipped rather than guessed at:
+
+- `dev.conf.vlan` must exist in your modelmap (`cpu_lan` + a `ports` name→number map).
+  Without it openUF has no idea what the physical switch ports are, and guessing strands
+  the device.
+- the port needs a `swport` in `dev.conf.net.ports`, naming its `dev.conf.vlan.ports` key.
+- the port must not be the uplink — reassigning the uplink's VLAN would cut the device off
+  the network, so that is refused outright.
+
+Because assigning a port to a VLAN means removing it from the stock VLAN's port list,
+this is the one place openUF modifies UCI sections it did not create. It snapshots their
+original `ports` strings into `state.json` (`swvlan_backup`) before the first change, and
+`switchvlan.restore()` puts them back. Inspect the result with `uci show network` and
+`swconfig dev switch0 show`.
+
+> The generated UCI is unit-tested, but **openUF has no switch hardware to verify against** —
+> that these sections actually program the switch ASIC, and that
+> `/etc/init.d/network reload` behaves on real ath79, are unconfirmed.
 
 The **Multicast and Broadcast Blocker** has no hostapd or OpenWrt equivalent — hostapd
 can suppress group-addressed frames wholesale but has no notion of an allow-list — so

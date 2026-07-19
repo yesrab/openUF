@@ -419,6 +419,70 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_switch_system_cfg treats the gated-off baseline as disabled",
+		fn = function()
+			-- B0, verbatim from the live capture 2026-07-19. The port entries
+			-- are ALWAYS present -- one per the controller's model-registry
+			-- port count -- so the block's presence must never be read as
+			-- "enabled". Same trap as bcfilt/macacl/qos.vap.
+			local sw = inform._parse_switch_system_cfg(
+				"switch.dot1x.status=disabled\nswitch.jumboframes=disabled\n"
+				.. "switch.port.1.name=PoE Out + Data\nswitch.port.1.opmode=switch\n"
+				.. "switch.port.2.name=Data\nswitch.port.2.opmode=switch\n"
+				.. "switch.status=disabled\nswitch.vlan.status=disabled\n")
+			assert_not_nil(sw, "block was present")
+			assert_false(sw.enabled, "gated off -- presence is not the discriminator")
+			assert_nil(next(sw.ports), "inventory-only ports carry no override")
+		end
+	},
+	{
+		name = "inform packet: _parse_switch_system_cfg returns nil when no switch block is sent",
+		fn = function()
+			assert_nil(inform._parse_switch_system_cfg("radio.1.phyname=radio0\n"),
+				"absent block is distinct from a gated-off one")
+		end
+	},
+	{
+		name = "inform packet: _parse_switch_system_cfg extracts the per-port VLAN override",
+		fn = function()
+			-- C2/C3, verbatim from the live capture: port 2 native VLAN 20,
+			-- VLAN 1 excluded from it. Slot numbers (vlan.1/vlan.2) are NOT
+			-- VLAN ids -- vlan.2 is VLAN 20 -- so the resolution through .id
+			-- is load-bearing.
+			local sw = inform._parse_switch_system_cfg(
+				"switch.status=enabled\nswitch.vlan.status=enabled\n"
+				.. "switch.port.1.name=PoE Out + Data\nswitch.port.1.opmode=switch\n"
+				.. "switch.port.2.name=Data\nswitch.port.2.opmode=switch\n"
+				.. "switch.port.2.pvid=20\n"
+				.. "switch.vlan.1.id=1\nswitch.vlan.1.mode=untagged\nswitch.vlan.1.status=enabled\n"
+				.. "switch.vlan.1.port.2.mode=exclude\n"
+				.. "switch.vlan.2.id=20\nswitch.vlan.2.mode=tagged\nswitch.vlan.2.status=enabled\n"
+				.. "switch.vlan.2.port.2.mode=untagged\n")
+			assert_true(sw.enabled, "both gates enabled")
+			assert_eq(sw.ports[2].pvid, 20, "native VLAN read off the port")
+			assert_eq(sw.ports[2].vlans[20], "untagged", "membership keyed by VLAN id, not slot")
+			assert_eq(sw.ports[2].vlans[1], "exclude", "Block All maps to exclude")
+			assert_nil(sw.ports[1], "untouched port carries no override")
+			assert_true(sw.vlans[20].enabled, "VLAN 20 resolved from slot 2")
+			assert_eq(sw.vlans[1].mode, "untagged", "VLAN 1 device-wide default")
+		end
+	},
+	{
+		name = "inform packet: _parse_switch_system_cfg reads teardown as the absence of port keys",
+		fn = function()
+			-- C4: reverting a port drops its three keys entirely and the blob
+			-- returns byte-identical to the gate-on baseline. Teardown is
+			-- therefore expressible -- absence means default.
+			local sw = inform._parse_switch_system_cfg(
+				"switch.status=enabled\nswitch.vlan.status=enabled\n"
+				.. "switch.port.2.name=Data\nswitch.port.2.opmode=switch\n"
+				.. "switch.vlan.1.id=1\nswitch.vlan.1.mode=untagged\nswitch.vlan.1.status=enabled\n"
+				.. "switch.vlan.2.id=20\nswitch.vlan.2.mode=tagged\nswitch.vlan.2.status=enabled\n")
+			assert_true(sw.enabled, "feature still on")
+			assert_nil(next(sw.ports), "no port overrides remain")
+		end
+	},
+	{
 		name = "inform packet: _report_dropped_keys summarizes unrecognized keys by prefix",
 		fn = function()
 			-- The feedback loop that macacl.*/qos.vap.* needed: no tokenizer
@@ -483,9 +547,10 @@ return {
 	{
 		name = "inform packet: handle_response reports dropped keys only with the debug gate on",
 		fn = function()
-			-- End-to-end through the real RECOGNIZED_* lists: switch.* is a
-			-- block openUF genuinely drops today, so it is the honest probe.
-			local sys_cfg = "netconf.1.ip=172.19.0.50\\nswitch.port.1.name=Port 1\\n"
+			-- End-to-end through the real RECOGNIZED_* lists. qos.if.* is a
+			-- genuine never-consumed block (the interface inventory that
+			-- accompanies qos.vap.*), so it is the honest probe.
+			local sys_cfg = "netconf.1.ip=172.19.0.50\\nqos.if.1.devname=eth0\\n"
 			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg)
 
 			local out = with_stderr(function()
@@ -500,7 +565,7 @@ return {
 				})
 			end)
 			assert_contains(out, "system_cfg:", "reports against the real recognized list")
-			assert_contains(out, "switch.port.<n>.name", "surfaces the block openUF drops")
+			assert_contains(out, "qos.if.<n>.devname", "surfaces a block openUF drops")
 			assert_nil(out:find("netconf", 1, true), "a consumed key is not reported")
 
 			inform._debug_dropped_keys = false
