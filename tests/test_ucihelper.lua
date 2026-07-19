@@ -2,7 +2,8 @@
 -- Run from project root: lua tests/run_tests.lua
 --
 -- Uses an in-memory mock UCI cursor (mirrors the subset of the real `uci`
--- Lua binding's API that ucihelper.lua relies on: cursor:foreach/set/delete/commit).
+-- Lua binding's API that ucihelper.lua relies on: cursor:foreach/set/get/delete/commit,
+-- including option-level delete(config, section, option)).
 
 local ucihelper = dofile("openuf/ucihelper.lua")
 
@@ -33,13 +34,24 @@ local function new_mock_uci()
 		end
 	end
 
-	function cursor:delete(config, section)
+	function cursor:delete(config, section, option)
+		if option ~= nil then
+			if db[config] and db[config][section] then
+				db[config][section][option] = nil
+			end
+			return
+		end
 		if db[config] then db[config][section] = nil end
 		if section_order[config] then
 			for i, name in ipairs(section_order[config]) do
 				if name == section then table.remove(section_order[config], i); break end
 			end
 		end
+	end
+
+	function cursor:get(config, section, option)
+		local s = db[config] and db[config][section]
+		return s and s[option]
 	end
 
 	function cursor:commit(config) end

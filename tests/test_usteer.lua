@@ -2,7 +2,7 @@
 -- Run from project root: lua tests/run_tests.lua
 --
 -- Uses the same in-memory mock UCI cursor shape as test_ucihelper.lua
--- (cursor:foreach/set/delete/commit).
+-- (cursor:set/get/commit).
 
 local usteer = dofile("openuf/usteer.lua")
 
@@ -21,6 +21,11 @@ local function new_mock_uci()
 		else
 			db[config][section][a] = b
 		end
+	end
+
+	function cursor:get(config, section, option)
+		local s = db[config] and db[config][section]
+		return s and s[option]
 	end
 
 	function cursor:commit(config) end
