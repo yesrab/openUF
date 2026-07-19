@@ -70,18 +70,25 @@ return {
 		end
 	},
 	{
-		name = "announce: length field high byte is non-zero for typical packet (>= 256 bytes)",
+		name = "announce: length field high byte is actually used for a >= 256-byte payload",
 		fn = function()
-			-- A real announce packet is typically 100-200 bytes total;
-			-- the 2-byte length field must be able to represent lengths up to 65535.
-			-- More importantly, the high byte must NOT be discarded (the original bug).
-			-- We verify the round-trip: encoded length == actual payload byte count.
-			local pkt = announce.build_packet(sample_cfg())
+			-- The one test that genuinely guards the historical 2-byte-length
+			-- regression. The default sample packet is ~154 bytes, so its high
+			-- byte is legitimately 0 and the identity `hi*256+lo == #pkt-4`
+			-- held even under the original low-byte-only bug -- the previous
+			-- version of this test could never catch it. Force the payload
+			-- past 256 with a long hostname and pin a NON-ZERO high byte.
+			local pkt = announce.build_packet(sample_cfg({
+				hostname = string.rep("a", 210),
+			}))
 			local payload_len = #pkt - 4
+			assert_true(payload_len >= 256,
+				"fixture sanity: payload crosses the 8-bit boundary (got " .. payload_len .. ")")
 			local len_hi = string.byte(pkt, 3)
 			local len_lo = string.byte(pkt, 4)
+			assert_true(len_hi ~= 0, "high byte non-zero (the original bug zeroed it)")
 			assert_eq(len_hi * 256 + len_lo, payload_len,
-				"full 16-bit length correctly encoded (original bug: only low byte was set)")
+				"full 16-bit length correctly encoded")
 		end
 	},
 	{
