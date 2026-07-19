@@ -63,6 +63,11 @@ local switchvlan = _require_sibling("switchvlan")
 local M = {}
 
 -- Injectable: expose internal modules so tests can inject fixtures
+-- _crypto included: without the seam, a test file's own crypto instance (its
+-- separate dofile) is stubbed while build_packet/parse_packet keep using this
+-- private one -- which once made a fixed-IV stub silently ineffective and a
+-- whole encryption assertion vacuous.
+M._crypto    = crypto
 M._state     = state
 M._sysinfo   = sysinfo
 M._ucihelper = ucihelper
@@ -188,6 +193,7 @@ end
 -- st: state table (authkey, mac, use_gcm)
 -- GCM AAD = first 40 bytes of the packet header (per amd989/unifi-gateway encode_inform)
 function M.build_packet(json_str, st)
+	local crypto = M._crypto  -- injectable seam, see the module top
 	local use_gcm = st.use_gcm and crypto.gcm_available()
 	local payload = json_str
 
@@ -232,6 +238,7 @@ end
 -- Parse and decrypt a TNBU binary packet.
 -- Returns json_str, flags.  Raises on magic mismatch or decryption failure.
 function M.parse_packet(raw, st)
+	local crypto = M._crypto  -- injectable seam, see the module top
 	if #raw < 40 then
 		error("inform: packet too short (" .. #raw .. " bytes)")
 	end

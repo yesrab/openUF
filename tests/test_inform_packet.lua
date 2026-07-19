@@ -18,7 +18,11 @@ inform._firewall = {
 	deauth = function() end,
 }
 
--- Deterministic IV for reproducible packets
+-- Deterministic IV for the TEST FILE's own crypto instance -- affects only
+-- tests that call crypto.* directly (e.g. the zlib round-trip). inform's
+-- packet paths use inform._crypto, a SEPARATE instance: tests that need a
+-- pinned IV inside build_packet must stub inform._crypto._random_bytes
+-- (see "different authkeys produce different ciphertext").
 local FIXED_IV = string.rep("\0", 16)
 crypto._random_bytes = function(n) return string.rep("\0", n) end
 
@@ -235,13 +239,27 @@ return {
 	{
 		name = "inform packet: different authkeys produce different ciphertext",
 		fn = function()
+			-- The IV must be pinned via inform's OWN crypto instance
+			-- (inform._crypto): the file-top _random_bytes stub lives on the
+			-- test file's separate crypto dofile and never reaches
+			-- build_packet. Before this seam existed, the two packets always
+			-- differed merely because each got a fresh random IV -- a
+			-- hardcoded key inside build_packet passed this test.
+			local orig_rand = inform._crypto._random_bytes
+			inform._crypto._random_bytes = function(n) return string.rep("\0", n) end
 			local json = '{"_type":"state"}'
 			local st1 = sample_state({authkey = state.DEFAULT_KEY})
 			local st2 = sample_state({authkey = "ffffffffffffffffffffffffffffffff"})
-			local pkt1 = inform.build_packet(json, st1)
-			local pkt2 = inform.build_packet(json, st2)
-			-- Headers are the same; payloads differ
-			assert_neq(pkt1:sub(41), pkt2:sub(41), "ciphertexts differ with different keys")
+			local ok, err = pcall(function()
+				local pkt1 = inform.build_packet(json, st1)
+				local pkt2 = inform.build_packet(json, st2)
+				assert_eq(pkt1:sub(1, 40), pkt2:sub(1, 40),
+					"identical headers (incl. the pinned IV) -- only the key can differ")
+				assert_neq(pkt1:sub(41), pkt2:sub(41),
+					"ciphertexts differ with different keys under an identical IV")
+			end)
+			inform._crypto._random_bytes = orig_rand
+			if not ok then error(err, 0) end
 		end
 	},
 	{
