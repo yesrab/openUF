@@ -134,4 +134,33 @@ return {
 			end)
 		end
 	},
+	{
+		name = "state: blocked_stas and upgrade_requested_* round-trip type-checked",
+		fn = function()
+			-- These load() type-checks existed but were never exercised: a
+			-- valid table/string round-trips, a wrong-typed value on disk
+			-- falls back to the default instead of poisoning the state.
+			with_tmp(function()
+				local st = state.load()
+				st.adopted = true
+				st.blocked_stas = {"aa:bb:cc:dd:ee:ff"}
+				st.upgrade_requested_version = "6.8.2"
+				st.upgrade_requested_url = "http://x/fw.bin"
+				state.save(st)
+				local loaded = state.load()
+				assert_eq(loaded.blocked_stas[1], "aa:bb:cc:dd:ee:ff", "block list round-trips")
+				assert_eq(loaded.upgrade_requested_version, "6.8.2", "version round-trips")
+				assert_eq(loaded.upgrade_requested_url, "http://x/fw.bin", "url round-trips")
+
+				local f = io.open(TMP, "w")
+				f:write('{"adopted":false,"blocked_stas":"not-a-table",'
+					.. '"upgrade_requested_version":42}')
+				f:close()
+				local bad = state.load()
+				assert_eq(type(bad.blocked_stas), "table", "wrong-typed block list -> default table")
+				assert_eq(#bad.blocked_stas, 0, "default block list is empty")
+				assert_eq(bad.upgrade_requested_version, "", "wrong-typed version -> default")
+			end)
+		end
+	},
 }

@@ -636,6 +636,71 @@ return {
 		end
 	},
 	{
+		name = "inform packet: minrssi survives the triple rename (wire -> UCI -> readback -> dBm)",
+		fn = function()
+			-- The value crosses three renames no per-side test covers as one
+			-- chain: parse emits radio_table[].min_rssi (raw wire units),
+			-- apply_config writes UCI minrssi_rssi, get_radio_table reads it
+			-- back as min_rssi_raw, and build_json converts it to the
+			-- outbound min_rssi dBm with the live noise floor. A rename on
+			-- any hop keeps every per-side test green while the feature dies
+			-- silently -- this drives one value through all four.
+			local ucihelper, db = new_apply_env()
+			-- The wifi-device section exists on any real device (board
+			-- config); rf_config only sets options and the mock's foreach
+			-- filters on .type, so pre-create it here.
+			ucihelper._uci.cursor():set("wireless", "radio0", "wifi-device")
+			local rt, vt = inform._parse_wifi_system_cfg(
+				"radio.1.phyname=radio0\nradio.1.channel=6\n"
+				.. "stamgr.1.status=true\nstamgr.1.radio=ng\n"
+				.. "stamgr.1.minrssi.status=true\nstamgr.1.minrssi.rssi=15\n")
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			assert_eq(db.wireless.radio0.minrssi_rssi, "15", "wire raw value landed in UCI")
+
+			ucihelper._popen = function(cmd)
+				if cmd:find("network.wireless", 1, true) then
+					return '{"radio0":{"interfaces":[{"ifname":"wlan0"}]}}'
+				end
+				return ""
+			end
+			local orig_uci   = inform._ucihelper
+			local orig_stats = inform._sysinfo.radio_stats
+			local orig_run   = inform._sysinfo._run_cmd
+			local orig_read  = inform._sysinfo._read_file
+			inform._ucihelper = ucihelper
+			inform._sysinfo.radio_stats = function()
+				return {{freq = 2437, noise = -90, channel_time = 100, channel_time_busy = 10}}
+			end
+			inform._sysinfo._run_cmd = function() return "" end
+			inform._sysinfo._read_file = function() return "" end
+			local ok, err = pcall(function()
+				local d = require("cjson").decode(inform.build_json(sample_state(), nil, nil))
+				assert_true(d.radio_table[1].min_rssi_enabled, "enabled flag survived the chain")
+				assert_eq(d.radio_table[1].min_rssi, -75, "15 raw + (-90 live noise) = -75 dBm")
+			end)
+			inform._ucihelper = orig_uci
+			inform._sysinfo.radio_stats = orig_stats
+			inform._sysinfo._run_cmd = orig_run
+			inform._sysinfo._read_file = orig_read
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: use_aes_gcm is tri-state -- absent leaves st.use_gcm alone, false clears",
+		fn = function()
+			-- Every wifi field got tri-state coverage; this mgmt_cfg one
+			-- never did. Absent must not clobber a previously negotiated GCM
+			-- mode; an explicit false must clear it.
+			local st = sample_state({use_gcm = true, adopted = true})
+			inform.handle_response(
+				'{"_type":"setparam","mgmt_cfg":"cfgversion=9\\n"}', st)
+			assert_true(st.use_gcm, "absent key leaves the negotiated mode alone")
+			inform.handle_response(
+				'{"_type":"setparam","mgmt_cfg":"use_aes_gcm=false\\n"}', st)
+			assert_false(st.use_gcm, "explicit false clears it")
+		end
+	},
+	{
 		name = "inform packet: handle_response restores stock switch VLANs on an explicit Port VLAN disable",
 		fn = function()
 			-- Unticking the device-level "Port VLAN" box keeps the switch.*

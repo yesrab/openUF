@@ -78,6 +78,12 @@ return {
 				local ok = usteer.set_enabled(true, nil)
 				assert_true(ok, "set_enabled returns true")
 				local s = db.usteer["local"]
+				-- NB: this pins the option NAME as a regression lock only --
+				-- usteer.lua's header flags `band_steering_threshold` and its
+				-- default as BEST-EFFORT/UNCONFIRMED against the real usteer
+				-- schema. If a real-deploy verification renames the option,
+				-- update this assertion together with the source; a red here
+				-- after such a change is expected, not a regression.
 				assert_eq(s.band_steering_threshold,
 					tostring(usteer.USTEER_DEFAULTS.band_steering_threshold),
 					"nonzero band-preference threshold")

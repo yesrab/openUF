@@ -37,7 +37,9 @@ return {
 				assert_eq(writes[1].path, "/sys/class/leds/test/trigger", "trigger path")
 				assert_eq(writes[1].contents, "timer", "trigger set to timer")
 				assert_eq(writes[2].path, "/sys/class/leds/test/delay_on", "delay_on path")
+				assert_eq(writes[2].contents, "250", "blink on-phase is 250ms")
 				assert_eq(writes[3].path, "/sys/class/leds/test/delay_off", "delay_off path")
+				assert_eq(writes[3].contents, "250", "blink off-phase is 250ms")
 			end)
 		end
 	},

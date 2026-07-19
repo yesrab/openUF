@@ -98,12 +98,16 @@ return {
 			with_cmd(fixture("lldpctl_output.json"), function()
 				local nbrs = lldp.neighbors()
 				assert_true(#nbrs[1].capabilities >= 1, "at least one capability")
-				-- The fixture has Bridge enabled and Router disabled
-				local has_bridge = false
+				-- The fixture has Bridge enabled and Router disabled -- the
+				-- `if cap.enabled` filter must include one and EXCLUDE the
+				-- other, or a regression emitting disabled caps passes.
+				local has_bridge, has_router = false, false
 				for _, cap in ipairs(nbrs[1].capabilities) do
 					if cap == "Bridge" then has_bridge = true end
+					if cap == "Router" then has_router = true end
 				end
-				assert_true(has_bridge, "Bridge capability present")
+				assert_true(has_bridge, "enabled Bridge capability present")
+				assert_false(has_router, "disabled Router capability excluded")
 			end)
 		end
 	},

@@ -36,6 +36,11 @@ return {
 					"recreates the table")
 				assert_true(contains(cmds, "nft add chain bridge openuf_bcfilt bcfilt"),
 					"creates the filter chain")
+				-- The hook spec is what makes the chain filter anything at
+				-- all -- a chain with a corrupted hook/priority passes every
+				-- other assertion while filtering nothing.
+				assert_true(contains(cmds, "'{ type filter hook forward priority 0; }'"),
+					"chain is hooked into forward at priority 0")
 			end)
 		end
 	},

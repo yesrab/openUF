@@ -115,6 +115,8 @@ return {
 				assert_eq(stas[1].rx_mcs, 7,                     "first client rx_mcs from 'MCS 7'")
 				assert_eq(stas[1].tx_generation, "n",            "first client is plain HT (bare MCS)")
 				assert_eq(stas[1].tx_nss, 2,                     "first client nss from MCS 15 -> floor(15/8)+1")
+				assert_eq(stas[1].rx_generation, "n",            "rx generation parsed from the rx bitrate line")
+				assert_eq(stas[1].rx_nss, 1,                     "rx nss from the rx line's own MCS 7 -> floor(7/8)+1")
 				assert_eq(stas[2].mac,      "11:22:33:44:55:66", "second client MAC")
 				assert_eq(stas[2].signal,   -75,                 "second client signal")
 				assert_eq(stas[2].connected_sec, 42,              "second client connected_sec")
