@@ -167,6 +167,54 @@ return {
 		end
 	},
 	{
+		name = "switchvlan: apply deletes an orphaned openuf_swvlan section when its VLAN leaves the wire",
+		fn = function()
+			-- Removing a per-port override in the controller drops the port's
+			-- keys from the wire (the C4 capture shape) while the feature
+			-- stays enabled. Before the fix the push early-returned on "no
+			-- overrides" and the orphan section kept programming VLAN 20.
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(override(), CFG, st)
+				assert_not_nil(u.db.network.openuf_swvlan20, "section exists after the first push")
+				assert_eq(#cmds, 1, "first apply reloads")
+
+				local shrunk = {enabled = true,
+					vlans = {[1] = {mode = "untagged", enabled = true}},
+					ports = {}}
+				assert_true(switchvlan.apply(shrunk, CFG, st), "reconcile reports a change")
+				assert_nil(u.db.network.openuf_swvlan20, "orphan section deleted")
+				assert_eq(#cmds, 2, "reconcile reloads once")
+
+				assert_false(switchvlan.apply(shrunk, CFG, st), "steady-state stays a no-op")
+				assert_eq(#cmds, 2, "no third reload")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: apply deletes a section whose VLAN shrank to exclusions-only",
+		fn = function()
+			-- A VLAN still on the wire but with every member excluded renders
+			-- to no ports string at all -- its section must go the same way
+			-- as one whose VLAN left the wire entirely.
+			with_capture(function()
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(override(), CFG, st)
+				assert_not_nil(u.db.network.openuf_swvlan20, "section exists after the first push")
+
+				local excluded = {enabled = true,
+					vlans = {[20] = {mode = "tagged", enabled = true}},
+					ports = {[2] = {vlans = {[20] = "exclude"}}}}
+				assert_true(switchvlan.apply(excluded, CFG, st), "reconcile reports a change")
+				assert_nil(u.db.network.openuf_swvlan20, "exclusions-only VLAN loses its section")
+			end)
+		end
+	},
+	{
 		name = "switchvlan: restore is a no-op with nothing to undo",
 		fn = function()
 			-- handle_response now routes every explicit-disable push here, so

@@ -122,7 +122,10 @@ function M.apply(sw, cfg, st)
 			.. "per-port VLAN not applied (a guessed switch port map strands the device)\n")
 		return false
 	end
-	if not next(sw.ports) then return false end
+	-- No early return on empty sw.ports: an enabled push whose last per-port
+	-- override was removed must still reach the reconcile below, or the
+	-- now-orphaned openuf_swvlan* sections would keep programming VLANs the
+	-- controller no longer defines.
 
 	local uci = get_uci()
 	local cursor = uci.cursor()
@@ -148,8 +151,6 @@ function M.apply(sw, cfg, st)
 			end
 		end
 	end
-	if not next(members_by_vlan) then return false end
-
 	-- Refuse to strand management: the CPU port must keep the management VLAN.
 	local mgmt_vlan = (cfg.net and cfg.net.lan_vlanid) or 1
 	local mgmt = members_by_vlan[mgmt_vlan]
@@ -167,20 +168,44 @@ function M.apply(sw, cfg, st)
 		end
 	end
 
-	-- Snapshot the stock sections' port strings once, before the first
-	-- mutation, so restore() can put them back.
-	st.swvlan_backup = st.swvlan_backup or (function()
-		local snap = {}
-		cursor:foreach("network", "switch_vlan", function(s)
-			if s.vlan and s.ports then snap[tostring(s.vlan)] = s.ports end
-		end)
-		return snap
-	end)()
-
-	local changed = false
+	-- The sections this push wants to exist. Keyed on the rendered result,
+	-- not on members_by_vlan: a VLAN that shrank to exclusions-only renders
+	-- to nil and must lose its section just like a VLAN that left the wire.
+	local desired = {}
 	for vlan_id, members in pairs(members_by_vlan) do
-		local ports = M.build_ports(cfg, vlan_id, members)
-		if ports then
+		desired[vlan_id] = M.build_ports(cfg, vlan_id, members)
+	end
+
+	-- Reconcile: drop every openuf_swvlan* section this push no longer
+	-- wants. Without this, removing a VLAN in the controller left its
+	-- orphan section programming the switch forever.
+	local changed = false
+	local doomed = {}
+	cursor:foreach("network", "switch_vlan", function(s)
+		local vid = s[".name"] and s[".name"]:match("^" .. OPENUF_VLAN_PREFIX .. "(%d+)$")
+		if vid and desired[tonumber(vid)] == nil then
+			doomed[#doomed + 1] = s[".name"]
+		end
+	end)
+	for _, name in ipairs(doomed) do
+		cursor:delete("network", name)
+		changed = true
+	end
+
+	if next(desired) then
+		-- Snapshot the stock sections' port strings once, before the first
+		-- mutation, so restore() can put them back. Only taken when we are
+		-- about to write sections -- a reconcile-only pass has no new
+		-- mutation to ledger.
+		st.swvlan_backup = st.swvlan_backup or (function()
+			local snap = {}
+			cursor:foreach("network", "switch_vlan", function(s)
+				if s.vlan and s.ports then snap[tostring(s.vlan)] = s.ports end
+			end)
+			return snap
+		end)()
+
+		for vlan_id, ports in pairs(desired) do
 			local section = OPENUF_VLAN_PREFIX .. tostring(vlan_id)
 			if cursor:get("network", section, "ports") ~= ports then
 				cursor:set("network", section, "switch_vlan")
