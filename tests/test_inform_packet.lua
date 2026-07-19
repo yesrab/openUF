@@ -60,6 +60,12 @@ local function new_apply_env()
 			section_order[config][#section_order[config] + 1] = section
 		end
 		if b == nil then db[config][section][".type"] = a
+		elseif type(b) == "table" then
+			-- Real libuci stringifies list elements; mirror it (see
+			-- test_ucihelper.lua's mock for the rationale).
+			local list = {}
+			for i, v in ipairs(b) do list[i] = tostring(v) end
+			db[config][section][a] = list
 		else db[config][section][a] = b end
 	end
 	function cursor:foreach(config, stype, fn)
@@ -1564,7 +1570,7 @@ return {
 			-- Minimum Data Rate lands on the RADIO section, not the vap.
 			local r = db.wireless.radio0
 			assert_true(r ~= nil, "radio section created")
-			assert_eq(r.basic_rate[1], 12000, "minrate_data reached UCI basic_rate")
+			assert_eq(r.basic_rate[1], "12000", "minrate_data reached UCI basic_rate")
 			assert_eq(r.legacy_rates, "0", "cck status reached UCI legacy_rates")
 			assert_eq(r.beacon_rate, "120", "beacon_rate converted to 100-kbps units")
 		end

@@ -22,6 +22,13 @@ local function new_mock_uci()
 		end
 		if b == nil then
 			db[config][section][".type"] = a
+		elseif type(b) == "table" then
+			-- Real libuci stringifies list elements on the way through UCI;
+			-- mirror that, so no test can pin a native-number representation
+			-- the production binding never returns.
+			local list = {}
+			for i, v in ipairs(b) do list[i] = tostring(v) end
+			db[config][section][a] = list
 		else
 			db[config][section][a] = b
 		end
@@ -660,7 +667,7 @@ return {
 				}
 				ucihelper.apply_config(resp, nil)
 				local r = db.wireless.radio0
-				assert_eq(r.basic_rate[1], 12000, "floor written as the basic rate")
+				assert_eq(r.basic_rate[1], "12000", "floor written as the basic rate")
 				assert_eq(r.legacy_rates, "0", "CCK off")
 				-- beacon_rate is the one option OpenWrt does NOT divide by 100.
 				assert_eq(r.beacon_rate, "120", "12000 kb/s -> 120 (100-kbps units)")
@@ -687,7 +694,7 @@ return {
 				}
 				ucihelper.apply_config(resp, nil)
 				local r = db.wireless.radio0
-				assert_eq(r.basic_rate[1], 1000, "lowest floor wins")
+				assert_eq(r.basic_rate[1], "1000", "lowest floor wins")
 				assert_eq(r.legacy_rates, "1", "CCK allowed because one WLAN allows it")
 				assert_eq(r.supported_rates, nil, "not all WLANs asked to drop lower rates")
 			end)
@@ -731,7 +738,7 @@ return {
 				}
 				ucihelper.apply_config(on, nil)
 				assert_eq(db.wireless.radio0.openuf_rates, "1", "managed section marked")
-				assert_eq(db.wireless.radio0.basic_rate[1], 12000, "floor applied")
+				assert_eq(db.wireless.radio0.basic_rate[1], "12000", "floor applied")
 
 				local off = {
 					radio_table = {{name = "radio0"}},
@@ -769,7 +776,7 @@ return {
 					},
 				}
 				ucihelper.apply_config(resp, nil)
-				assert_eq(db.wireless.radio0.basic_rate[1], 6000,
+				assert_eq(db.wireless.radio0.basic_rate[1], "6000",
 					"hand-tuned basic_rate preserved on an unmarked section")
 			end)
 		end
@@ -803,7 +810,7 @@ return {
 				ucihelper.apply_config(relaxed, nil)
 				local r = db.wireless.radio0
 				assert_eq(r.supported_rates, nil, "supported_rates deleted when drop-below reverts")
-				assert_eq(r.basic_rate[1], 12000, "floor still applied")
+				assert_eq(r.basic_rate[1], "12000", "floor still applied")
 				assert_eq(r.openuf_rates, "1", "section still marked while the floor is on")
 			end)
 		end
@@ -829,7 +836,7 @@ return {
 				local r = db.wireless.radio0
 				assert_eq(r.supported_rates, nil,
 					"absent drop-below key -> advertised set not trimmed")
-				assert_eq(r.basic_rate[1], 12000, "floor still applied")
+				assert_eq(r.basic_rate[1], "12000", "floor still applied")
 			end)
 		end
 	},
@@ -849,8 +856,8 @@ return {
 					},
 				}
 				ucihelper.apply_config(resp, nil)
-				assert_eq(db.wireless.radio0.basic_rate[1], 1000, "2.4GHz floor")
-				assert_eq(db.wireless.radio1.basic_rate[1], 24000, "5GHz floor")
+				assert_eq(db.wireless.radio0.basic_rate[1], "1000", "2.4GHz floor")
+				assert_eq(db.wireless.radio1.basic_rate[1], "24000", "5GHz floor")
 			end)
 		end
 	},
