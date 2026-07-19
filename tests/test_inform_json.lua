@@ -537,6 +537,55 @@ return {
 		end
 	},
 	{
+		-- Inconsistent UCI (flag set, threshold missing -- hand-edit or an
+		-- interrupted write) used to be `nil + noise`, killing the whole
+		-- inform build.
+		name = "inform json: min_rssi_enabled without a raw value doesn't kill the build",
+		fn = function()
+			inject_sysinfo(true)
+			inject_ucihelper()
+			inform._ucihelper.get_radio_table = function()
+				return {
+					{ name = "radio0", radio = "ng", channel = "6",
+					  min_rssi_enabled = true },  -- no min_rssi_raw
+				}
+			end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			assert_eq(d.radio_table[1].min_rssi_enabled, true, "flag still echoed")
+			assert_nil(d.radio_table[1].min_rssi, "no min_rssi emitted without a raw value")
+		end
+	},
+	{
+		-- The raw-units cleanup used to sit inside the ifname-resolved branch,
+		-- so a radio whose netdev couldn't be resolved (radio down, ubus
+		-- unavailable) leaked the internal wire-units field to the controller.
+		name = "inform json: min_rssi_raw doesn't leak into the payload when ifname is unresolvable",
+		fn = function()
+			inject_sysinfo(true)
+			inject_ucihelper()
+			inform._ucihelper.get_radio_table = function()
+				return {
+					-- "radio9": the mock get_ifname_for_radio resolves only
+					-- radio0, so this radio's ifname lookup fails.
+					{ name = "radio9", radio = "ng", channel = "6",
+					  min_rssi_enabled = true, min_rssi_raw = 15 },
+				}
+			end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			assert_nil(d.radio_table[1].min_rssi_raw, "internal raw field stripped even without an ifname")
+		end
+	},
+	{
 		-- Enforcement: a station below the radio's minrssi threshold gets a
 		-- single deauth via ucihelper.kick_station -- confirmed via web
 		-- research this is a one-shot roaming-assist kick, not a persistent

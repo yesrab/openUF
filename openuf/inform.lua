@@ -456,11 +456,14 @@ function M.build_json(st, cfg, ufhw)
 				-- consistent with raw = dbm + 95). Falls back to that -95
 				-- assumption only when a live noise reading isn't available.
 				local noise = (ok_rs and stats[1] and stats[1].noise) or -95
-				if radio.min_rssi_enabled then
+				-- min_rssi_raw can legitimately be missing with the flag set
+				-- (inconsistent UCI, e.g. a hand-edit or interrupted write) --
+				-- without the guard this was `nil + noise`, killing the whole
+				-- inform build.
+				if radio.min_rssi_enabled and radio.min_rssi_raw then
 					radio.min_rssi = radio.min_rssi_raw + noise
 					minrssi_threshold_by_radio[radio.name] = radio.min_rssi
 				end
-				radio.min_rssi_raw = nil
 				if ok_rs and stats[1] then
 					local s     = stats[1]  -- in-use channel's survey entry
 					local total = s.channel_time or 0
@@ -587,6 +590,10 @@ function M.build_json(st, cfg, ufhw)
 					}
 				end
 			end
+			-- Internal wire-units field, never a payload member. Cleared out
+			-- here (not inside the ifname branch above) so it can't leak into
+			-- the serialized radio_table when ifname resolution fails.
+			radio.min_rssi_raw = nil
 		end
 
 		-- Live connected-client counts, nested per-vap as sta_table -- matches
