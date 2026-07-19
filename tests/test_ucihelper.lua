@@ -60,17 +60,34 @@ local function new_mock_uci()
 end
 
 -- Fresh mock UCI + neutral injectable seams for each test.
+-- fn receives (db, cmds): db is the mock UCI backing store, cmds the list of
+-- shell commands ucihelper._run_cmd was asked to execute (e.g. "wifi reload")
+-- -- capture, don't discard: the reload and its ordering are load-bearing.
+-- _bcfilter/_shaper are stubbed to no-ops BY DEFAULT: without stubs
+-- apply_config get_sibling()-loads the real openuf/bcfilter.lua + shaper.lua
+-- from disk, whose default _exec is os.execute -- i.e. this suite used to
+-- run real `nft`/`tc` commands on any Linux host. Tests that need to capture
+-- the enforcement calls override the stubs inside fn; every seam (including
+-- those and get_ifname_for_vap) is restored here even when fn raises, so a
+-- failing test cannot leak its stubs into later ones.
 local function with_ucihelper(fn)
 	local m = new_mock_uci()
+	local cmds = {}
 	local orig_uci, orig_popen, orig_read, orig_run =
 		ucihelper._uci, ucihelper._popen, ucihelper._read_file, ucihelper._run_cmd
+	local orig_bcf, orig_shaper, orig_ifname_vap =
+		ucihelper._bcfilter, ucihelper._shaper, ucihelper.get_ifname_for_vap
 	ucihelper._uci = m.mock
 	ucihelper._popen = function() return "" end       -- no live ifname resolution in tests
 	ucihelper._read_file = function() return nil end
-	ucihelper._run_cmd = function() return true end
-	local ok, err = pcall(fn, m.db)
+	ucihelper._run_cmd = function(cmd) cmds[#cmds + 1] = cmd; return true end
+	ucihelper._bcfilter = {reconcile = function() end}
+	ucihelper._shaper   = {reconcile = function() end}
+	local ok, err = pcall(fn, m.db, cmds)
 	ucihelper._uci, ucihelper._popen, ucihelper._read_file, ucihelper._run_cmd =
 		orig_uci, orig_popen, orig_read, orig_run
+	ucihelper._bcfilter, ucihelper._shaper, ucihelper.get_ifname_for_vap =
+		orig_bcf, orig_shaper, orig_ifname_vap
 	if not ok then error(err, 2) end
 end
 
@@ -488,6 +505,76 @@ return {
 				assert_eq(db.wireless.openuf_radio0_corp.openuf_bcfilt, "0", "recorded off")
 				assert_true(got ~= nil, "reconcile still called")
 				assert_eq(#got, 0, "no rules")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config issues wifi reload BEFORE the bcfilter/shaper reconciles",
+		fn = function()
+			-- The ordering is load-bearing: both enforcements resolve live
+			-- netdev names that only exist after netifd brings the interfaces
+			-- back up. Reconciling first would resolve nothing and silently
+			-- skip every rule. Record shell commands and reconcile calls into
+			-- ONE ordered list to pin the sequence.
+			with_ucihelper(function(db, cmds)
+				ucihelper._bcfilter = {reconcile = function()
+					cmds[#cmds + 1] = "<bcfilter.reconcile>" end}
+				ucihelper._shaper = {reconcile = function()
+					cmds[#cmds + 1] = "<shaper.reconcile>" end}
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local pos = {}
+				for i, c in ipairs(cmds) do
+					if c:find("wifi reload", 1, true) then pos.reload = pos.reload or i end
+					if c == "<bcfilter.reconcile>" then pos.bcf = i end
+					if c == "<shaper.reconcile>" then pos.shaper = i end
+				end
+				assert_true(pos.reload ~= nil, "wifi reload issued")
+				assert_true(pos.bcf ~= nil and pos.reload < pos.bcf,
+					"bcfilter reconciled after the reload")
+				assert_true(pos.shaper ~= nil and pos.reload < pos.shaper,
+					"shaper reconciled after the reload")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config hands the shaper every managed VAP, uncapped ones included",
+		fn = function()
+			-- shaper.reconcile clears each interface it is handed before
+			-- reshaping, so a VAP whose limit was just removed must appear
+			-- with both rates nil -- omitting it would strand the old qdisc.
+			with_ucihelper(function(db)
+				local got
+				ucihelper._shaper = {reconcile = function(rules) got = rules end}
+				ucihelper.get_ifname_for_vap = function(radio, ssid)
+					if ssid == "capped" then return "wlan0" end
+					if ssid == "uncapped" then return "wlan1" end
+				end
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "capped", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22",
+						 ratelimit_down_kbps = 33000, ratelimit_up_kbps = 17000},
+						{ssid = "uncapped", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(#got, 2, "both VAPs handed to the shaper")
+				local by_if = {}
+				for _, r in ipairs(got) do by_if[r.ifname] = r end
+				assert_eq(by_if.wlan0.down_kbps, 33000, "capped VAP carries its down rate")
+				assert_eq(by_if.wlan0.up_kbps, 17000, "capped VAP carries its up rate")
+				assert_true(by_if.wlan1 ~= nil, "uncapped VAP still present for teardown")
+				assert_nil(by_if.wlan1.down_kbps, "uncapped VAP has no down rate")
+				assert_nil(by_if.wlan1.up_kbps, "uncapped VAP has no up rate")
 			end)
 		end
 	},
