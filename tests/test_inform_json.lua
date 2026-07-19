@@ -771,6 +771,57 @@ return {
 		end
 	},
 	{
+		name = "inform json: a 5GHz ACS radio's band re-derives to na from the live channel",
+		fn = function()
+			-- The na twin of the "ng" re-derivation test above: without it an
+			-- inverted band mapping on the 5GHz side passes the whole suite.
+			-- Same real-ucihelper wiring, but the live iw fixture negotiated
+			-- channel 36 (5180 MHz).
+			inject_sysinfo(false, false, false, true)
+			inform._sysinfo._run_cmd = function(cmd)
+				if cmd:find("dev wlan0 info") then return fixture("iw_dev_info_5g.txt") end
+				if cmd:find("phy phy0 info") then return fixture("iw_phy_info_5g.txt") end
+				return ""
+			end
+			local real_uci = dofile("openuf/ucihelper.lua")
+			local sections = {
+				{[".name"] = "radio1", [".type"] = "wifi-device", channel = "auto"},
+			}
+			real_uci._uci = {cursor = function() return {
+				foreach = function(_, config, stype, fn)
+					if config ~= "wireless" then return end
+					for _, s in ipairs(sections) do
+						if s[".type"] == stype then fn(s) end
+					end
+				end,
+				get = function() return nil end,
+				set = function() end,
+				delete = function() end,
+				commit = function() end,
+			} end}
+			real_uci._popen = function(cmd)
+				if cmd:find("network.wireless", 1, true) then
+					return '{"radio1":{"interfaces":[{"ifname":"wlan0"}]}}'
+				end
+				return ""
+			end
+			real_uci._read_file = function() return nil end
+			real_uci._run_cmd = function() return true end
+
+			local orig = inform._ucihelper
+			inform._ucihelper = real_uci
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			inform._ucihelper = orig
+			assert_eq(d.radio_table[1].channel, 36, "live negotiated 5GHz channel reported")
+			assert_eq(d.radio_table[1].radio, "na", "band re-derived to na from channel 36")
+		end
+	},
+	{
 		name = "inform json: radio_table_stats includes spectrum_table when cached from a prior spectrum-scan cmd",
 		fn = function()
 			inform._spectrum_cache = {
@@ -820,7 +871,24 @@ return {
 			-- entry, independent of radio_caps/radio_caps2 -- without these,
 			-- the Radios (channel-planning) tab's MIMO/capability filters
 			-- excluded the device entirely, "We Couldn't Find a Match".
-			local d = build({with_uci = true, with_radio_caps = true})
+			inject_sysinfo(false, false, false, true)
+			inject_ucihelper()
+			-- Mock channel deliberately 11 while the iw fixture negotiated 6:
+			-- with both at 6 (the old shape) the "live overrides UCI" claim
+			-- below was indistinguishable from a plain echo of the mock.
+			inform._ucihelper.get_radio_table = function()
+				return {
+					{ name = "radio0", radio = "ng", channel = 11, ht = "HT20", tx_power = "20",
+					  disabled = false, builtin_antenna = true, builtin_ant_gain = 3,
+					  max_txpower = 20 },
+				}
+			end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
 			local r = d.radio_table[1]
 			assert_true(r.is_11ac, "VHT Capabilities present in the 5GHz fixture")
 			assert_true(r.is_11ax, "HE PHY Capabilities present")
@@ -829,7 +897,7 @@ return {
 			assert_true(r.has_fccdfs, "has_fccdfs mirrors has_dfs")
 			assert_true(r.has_ht160, "'Supported Channel Width: 160 MHz, 80+80 MHz'")
 			assert_eq(r.nss, 2, "nss from 'HT TX Max spatial streams: 2'")
-			assert_eq(r.channel, 6, "live channel from 'iw dev' overrides UCI's config value")
+			assert_eq(r.channel, 6, "live channel from 'iw dev' overrides UCI's 11")
 		end
 	},
 	{

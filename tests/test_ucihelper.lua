@@ -1448,6 +1448,19 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: band_for_channel boundaries -- 14 stays ng, 36 is na",
+		fn = function()
+			-- Only the 2.4GHz side was ever pinned end-to-end; an inverted
+			-- mapping on the 5GHz side would have passed the whole suite.
+			assert_eq(ucihelper.band_for_channel(1), "ng", "channel 1 (2.4GHz lower edge)")
+			assert_eq(ucihelper.band_for_channel(14), "ng", "channel 14 (2.4GHz upper edge, JP)")
+			assert_eq(ucihelper.band_for_channel(36), "na", "channel 36 (5GHz lower edge)")
+			assert_eq(ucihelper.band_for_channel(165), "na", "channel 165 (5GHz upper)")
+			assert_eq(ucihelper.band_for_channel("auto"), "na",
+				"non-numeric falls back to na (config-first band_for_device handles it upstream)")
+		end
+	},
+	{
 		name = "ucihelper: a missing cjson disables ifname lookups with ONE loud warning",
 		fn = function()
 			-- Without cjson the ubus JSON can't be parsed: every ifname
