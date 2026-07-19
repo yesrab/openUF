@@ -1,6 +1,23 @@
 -- Pure Lua 5.1 test runner. Run from project root: lua tests/run_tests.lua
--- No external deps. Exit code 0 = all pass, 1 = any failure.
+-- The runner itself has no external deps, but most test files require cjson --
+-- see the preflight below. Exit code 0 = all pass, 1 = any failure.
 -- Each test file must return a list of {name=..., fn=...} tables.
+
+-- Dependency preflight. Most test files require("cjson") at LOAD time; when it
+-- is unresolvable each such file dies with a single "ERROR running <file>"
+-- line and ALL of its tests silently never run -- a past incident made "182
+-- passed, 7 failed" look plausible while ~200 tests in 5 files had not
+-- executed at all. Fail fast and loudly instead.
+do
+	local ok = pcall(require, "cjson")
+	if not ok then
+		print("FATAL: lua-cjson is not resolvable from this interpreter.")
+		print("       Without it most test files would silently not run at all.")
+		print("       Run the suite as:")
+		print("           eval $(luarocks path --local) && lua tests/run_tests.lua")
+		os.exit(1)
+	end
+end
 
 local passed = 0
 local failed = 0
@@ -76,19 +93,31 @@ function assert_bytes_eq(got, expected, label)
 	end
 end
 
--- Run a list of {name, fn} test entries
+-- Run a list of {name, fn} test entries. Returns the file's own pass/fail
+-- counts so the per-file summary can make a silently-vanished file visible.
+local seen_names = {}
 local function run_suite(tests)
+	local file_passed, file_failed = 0, 0
 	for _, t in ipairs(tests) do
+		-- A copy-pasted duplicate name makes two results indistinguishable in
+		-- the output (and hides one of them from anyone grepping a name).
+		if seen_names[t.name] then
+			print("WARN  duplicate test name: " .. tostring(t.name))
+		end
+		seen_names[t.name] = true
 		local ok, err = pcall(t.fn)
 		if ok then
-			passed = passed + 1
+			file_passed = file_passed + 1
 			print("PASS  " .. t.name)
 		else
-			failed = failed + 1
+			file_failed = file_failed + 1
 			print("FAIL  " .. t.name)
 			print("      " .. tostring(err):gsub("\n", "\n      "))
 		end
 	end
+	passed = passed + file_passed
+	failed = failed + file_failed
+	return file_passed, file_failed
 end
 
 -- Test files to run in order.
@@ -125,10 +154,21 @@ for _, filepath in ipairs(test_files) do
 	else
 		local ok, result = pcall(fn)
 		if not ok then
+			-- Loud on purpose: one counted failure, but the real damage is
+			-- every test in the file silently not running.
 			print("ERROR running " .. filepath .. ": " .. tostring(result))
+			print("      ALL of this file's tests were SKIPPED and did not run")
 			failed = failed + 1
-		elseif type(result) == "table" then
-			run_suite(result)
+		elseif type(result) ~= "table" then
+			-- A file that forgets `return {...}` (or returns a function) used
+			-- to vanish with ZERO failures recorded -- strictly worse than a
+			-- load error, since there was no signal at all.
+			print("ERROR " .. filepath .. " returned " .. type(result)
+				.. " instead of a test table -- its tests did not run")
+			failed = failed + 1
+		else
+			local fp, ff = run_suite(result)
+			print(("      %s: %d passed, %d failed"):format(filepath, fp, ff))
 		end
 	end
 end
