@@ -446,6 +446,32 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response reads dhcpc.1.status=disabled as static, not DHCP",
+		fn = function()
+			-- The key's mere presence used to set dhcp=true regardless of its
+			-- value: a dhcpc.1.status=disabled alongside netconf.1.ip would
+			-- have misread a static push as DHCP and flushed the working
+			-- static address. Defensive -- every capture so far carries
+			-- =enabled, and a static push may simply omit the key (the test
+			-- above) -- but the fix is correct under either wire shape.
+			local st = sample_state()
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.50\\n'
+				.. 'netconf.1.netmask=255.255.255.0\\nroute.1.gateway=172.19.0.1\\n'
+				.. 'dhcpc.1.status=disabled\\ndhcpc.1.devname=br0\\n"}'
+			inform.handle_response(resp, st, cfg)
+			inform._netconfig._exec = orig
+			assert_eq(st.ip_mode, "static", "explicitly disabled dhcpc -> static path")
+			assert_eq(st.static_ip, "172.19.0.50", "static address applied")
+		end
+	},
+	{
 		name = "inform packet: handle_response setparam does NOT flush dhcp on first contact",
 		fn = function()
 			-- A fresh device's very first system_cfg (and every steady-state

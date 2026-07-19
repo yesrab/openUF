@@ -1922,7 +1922,16 @@ function M.handle_response(json_str, st, cfg)
 					elseif k == "netconf.1.ip" then ip = v
 					elseif k == "netconf.1.netmask" then netmask = v
 					elseif k == "route.1.gateway" then gateway = v
-					elseif k == "dhcpc.1.status" then dhcp = true
+					elseif k == "dhcpc.1.status" then
+						-- Only an enabled-ish value means DHCP. The key's
+						-- presence alone used to set dhcp=true, so a
+						-- hypothetical dhcpc.1.status=disabled alongside a
+						-- netconf.1.ip would have misread a static push as
+						-- DHCP and flushed the working static address. Every
+						-- capture so far carries =enabled; this is defensive
+						-- for the static-mode shape that hasn't been
+						-- captured yet.
+						dhcp = _wire_bool(v) == true
 					elseif k == "resolv.host.1.name" then
 						-- The controller's own idea of this device's name
 						-- (its local network hostname) -- already present
