@@ -782,7 +782,8 @@ return {
 			assert_eq(radio_table[1].name, "radio0", "radio 1 name from phyname")
 			assert_eq(radio_table[1].channel, "auto",
 				"channel=auto passes through verbatim (UCI auto -> hostapd ACS; nil would strand a stale fixed channel)")
-			assert_eq(radio_table[1].tx_power, nil, "txpower=auto -> nil (UCI has no auto txpower value)")
+			assert_eq(radio_table[1].tx_power, "auto",
+				"txpower=auto passes through as a sentinel (rf_config deletes the UCI option for it)")
 			assert_eq(radio_table[2].name, "radio1", "radio 2 name from phyname")
 			assert_eq(radio_table[2].channel, 36, "explicit channel parsed as a number")
 			assert_eq(radio_table[2].tx_power, 17, "explicit tx_power parsed as a number")

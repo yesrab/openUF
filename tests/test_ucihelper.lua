@@ -1322,6 +1322,27 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config deletes a stale fixed txpower when the controller reverts to Auto",
+		fn = function()
+			-- "Transmit Power: Auto" arrives as the literal radio.<n>.txpower=auto.
+			-- UCI has no auto txpower value (absent option = driver default),
+			-- so the revert must DELETE the option -- skipping the write left
+			-- the old fixed dBm silently overriding the user's Auto choice.
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "txpower", "17")
+				local resp = {
+					vap_table = {},
+					radio_table = {{name = "radio0", tx_power = "auto"}},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.radio0.txpower, nil,
+					"stale fixed txpower deleted on revert to Auto")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes bss_load_update_period/openuf_iot (Force WiFi 4)",
 		fn = function()
 			with_ucihelper(function(db)

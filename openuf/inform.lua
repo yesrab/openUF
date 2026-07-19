@@ -1142,7 +1142,13 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- overriding the user's switch back to Auto. Absent/garbage
 				-- still -> nil, leaving UCI alone.
 				channel  = tonumber(r.channel) or (r.channel == "auto" and "auto" or nil),
-				tx_power = tonumber(r.txpower),   -- "auto" -> nil, leaves tx_power unchanged
+				-- "auto" passes through as a sentinel like channel above, but
+				-- lands differently: UCI has no auto txpower value (absent
+				-- option = driver default/max), so rf_config DELETES the
+				-- option for it. Dropping it to nil instead stranded the last
+				-- fixed dBm in UCI, silently overriding the user's switch
+				-- back to Auto. Absent/garbage still -> nil, leaving UCI alone.
+				tx_power = tonumber(r.txpower) or (r.txpower == "auto" and "auto" or nil),
 				-- nil for an absent/unrecognized token, leaving htmode alone.
 				htmode   = _htmode_from_ieee_mode(r.ieee_mode),
 				-- Per-radio disable (Devices -> [AP] -> Radios -> Transmit

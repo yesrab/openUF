@@ -334,7 +334,9 @@ end
 -- and the controller's channel-width setting silently did nothing.
 -- chan:   channel number, or the string "auto" (written verbatim -- UCI
 -- channel=auto makes OpenWrt engage hostapd ACS at radio bring-up)
--- txpwr: TX power in dBm (or nil to leave unchanged)
+-- txpwr: TX power in dBm, the string "auto" (deletes the UCI option --
+-- absent txpower = driver default/max, the closest UCI has to Auto), or
+-- nil to leave unchanged
 -- minrssi_enabled/minrssi_raw: "Minimum RSSI" (Devices -> [AP] -> Radios),
 -- a per-radio (not per-SSID) setting -- confirmed live 2026-07-14 via the
 -- controller's stamgr.<n>.minrssi.* wire keys, a section separate from and
@@ -371,7 +373,12 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 	if htmode then
 		cursor:set("wireless", radio, "htmode", htmode)
 	end
-	if txpwr then
+	if txpwr == "auto" then
+		-- UCI has no auto txpower value: absent option = driver default/max.
+		-- Deleting is what makes "Transmit Power: Auto" actually revert a
+		-- previously pushed fixed dBm instead of stranding it.
+		cursor:delete("wireless", radio, "txpower")
+	elseif txpwr then
 		cursor:set("wireless", radio, "txpower", tostring(txpwr))
 	end
 	if minrssi_enabled ~= nil then
