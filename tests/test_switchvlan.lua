@@ -167,6 +167,21 @@ return {
 		end
 	},
 	{
+		name = "switchvlan: restore is a no-op with nothing to undo",
+		fn = function()
+			-- handle_response now routes every explicit-disable push here, so
+			-- a steady-state disabled controller must not bounce the network:
+			-- no openuf_ sections, no ledger -> no commit, no reload.
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				assert_false(switchvlan.restore({}), "nothing to restore")
+				assert_false(switchvlan.restore(nil), "nil state tolerated")
+				assert_eq(#cmds, 0, "no reload issued")
+			end)
+		end
+	},
+	{
 		name = "switchvlan: apply refuses on a DSA board",
 		fn = function()
 			with_capture(function(cmds)

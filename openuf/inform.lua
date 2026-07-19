@@ -1950,7 +1950,24 @@ function M.handle_response(json_str, st, cfg)
 			-- before a switch port is put on the same VLAN.
 			if M._switchvlan then
 				pcall(function()
-					M._switchvlan.apply(M._parse_switch_system_cfg(sys_raw), cfg, st)
+					local sw = M._parse_switch_system_cfg(sys_raw)
+					if sw and not sw.enabled then
+						-- Explicit disable: unticking the device-level "Port
+						-- VLAN" box keeps the switch.* block on the wire with
+						-- both gates at =disabled (confirmed live -- the
+						-- baseline capture carries them that way). Tear our
+						-- sections down and put the stock port strings back,
+						-- or the switch stays segmented forever after the
+						-- user turns the feature off. A blob with no switch.*
+						-- lines at all (sw == nil: older controller, partial
+						-- push) still leaves everything alone -- restore only
+						-- ever runs on an affirmative off signal, and its own
+						-- empty-ledger no-op keeps steady-state disabled
+						-- pushes free of switch reloads.
+						M._switchvlan.restore(st)
+					else
+						M._switchvlan.apply(sw, cfg, st)
+					end
 				end)
 			end
 		end

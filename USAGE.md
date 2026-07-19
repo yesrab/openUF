@@ -370,8 +370,11 @@ Three things must line up or the port is skipped rather than guessed at:
 Because assigning a port to a VLAN means removing it from the stock VLAN's port list,
 this is the one place openUF modifies UCI sections it did not create. It snapshots their
 original `ports` strings into `state.json` (`swvlan_backup`) before the first change, and
-`switchvlan.restore()` puts them back. Inspect the result with `uci show network` and
-`swconfig dev switch0 show`.
+`switchvlan.restore()` puts them back. Unticking the device-level **Port VLAN** box runs
+that restore automatically (the wire keeps the `switch.*` block with both gates at
+`disabled`, which openUF treats as the explicit off signal); a push that carries no
+`switch.*` block at all leaves the switch untouched. Inspect the result with
+`uci show network` and `swconfig dev switch0 show`.
 
 > The generated UCI is unit-tested, but **openUF has no switch hardware to verify against** —
 > that these sections actually program the switch ASIC, and that

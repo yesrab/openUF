@@ -586,6 +586,50 @@ return {
 		end
 	},
 	{
+		name = "inform packet: handle_response restores stock switch VLANs on an explicit Port VLAN disable",
+		fn = function()
+			-- Unticking the device-level "Port VLAN" box keeps the switch.*
+			-- block on the wire with both gates at =disabled (the live-captured
+			-- baseline shape). That must route to switchvlan.restore(st) --
+			-- before the fix apply() just early-returned and the openuf_swvlan*
+			-- sections plus the mutated stock port strings survived forever.
+			local st = sample_state()
+			local calls = {}
+			local orig = inform._switchvlan
+			inform._switchvlan = {
+				apply   = function() calls[#calls + 1] = "apply" end,
+				restore = function(got_st) calls[#calls + 1] = "restore"
+					assert_eq(got_st, st, "restore gets the state ledger") end,
+			}
+			local sys_cfg = "switch.status=disabled\nswitch.vlan.status=disabled\n"
+				.. "switch.port.1.name=Data\nswitch.port.1.opmode=switch\n"
+			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg:gsub("\n", "\\n"))
+			inform.handle_response(resp, st, nil)
+			inform._switchvlan = orig
+			assert_eq(table.concat(calls, ","), "restore", "restore called, apply not")
+		end
+	},
+	{
+		name = "inform packet: handle_response leaves the switch alone when no switch block is sent",
+		fn = function()
+			-- Absent block (older controller, partial push) is tri-state
+			-- "no opinion": apply(nil, ...) -- itself a no-op -- and never
+			-- restore, which would tear down state the push said nothing about.
+			local st = sample_state()
+			local calls = {}
+			local orig = inform._switchvlan
+			inform._switchvlan = {
+				apply   = function(sw) calls[#calls + 1] = "apply"
+					assert_nil(sw, "no switch keys -> parsed nil") end,
+				restore = function() calls[#calls + 1] = "restore" end,
+			}
+			local resp = '{"_type":"setparam","system_cfg":"aaa.1.ssid=x\\nwireless.1.ssid=x\\nwireless.1.parent=radio0\\n"}'
+			inform.handle_response(resp, st, nil)
+			inform._switchvlan = orig
+			assert_eq(table.concat(calls, ","), "apply", "apply called with nil, restore never")
+		end
+	},
+	{
 		name = "inform packet: _report_dropped_keys summarizes unrecognized keys by prefix",
 		fn = function()
 			-- The feedback loop that macacl.*/qos.vap.* needed: no tokenizer
