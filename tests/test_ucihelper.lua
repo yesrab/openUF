@@ -1192,6 +1192,28 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes the literal channel=auto (ACS) over a stale fixed channel",
+		fn = function()
+			-- The controller sends radio.<n>.channel=auto for the Auto
+			-- setting; the parser passes it through verbatim so this write
+			-- replaces any previously pushed fixed channel -- skipping the
+			-- write here would leave the old number silently overriding the
+			-- user's switch back to Auto.
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "channel", "11")
+				local resp = {
+					vap_table = {},
+					radio_table = {{name = "radio0", channel = "auto"}},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.radio0.channel, "auto",
+					"stale fixed channel replaced by auto (hostapd ACS)")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes bss_load_update_period/openuf_iot (Force WiFi 4)",
 		fn = function()
 			with_ucihelper(function(db)

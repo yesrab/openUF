@@ -1128,7 +1128,13 @@ function M._parse_wifi_system_cfg(sys_raw)
 		if r.phyname then
 			local entry = {
 				name     = r.phyname,
-				channel  = tonumber(r.channel),   -- "auto" -> nil, leaves channel unchanged
+				-- "auto" passes through verbatim: UCI channel=auto is OpenWrt's
+				-- ACS request (hostapd surveys the band at bring-up and picks
+				-- the least-busy channel). Dropping it to nil instead would
+				-- leave a previously pushed fixed channel in UCI, silently
+				-- overriding the user's switch back to Auto. Absent/garbage
+				-- still -> nil, leaving UCI alone.
+				channel  = tonumber(r.channel) or (r.channel == "auto" and "auto" or nil),
 				tx_power = tonumber(r.txpower),   -- "auto" -> nil, leaves tx_power unchanged
 				-- nil for an absent/unrecognized token, leaving htmode alone.
 				htmode   = _htmode_from_ieee_mode(r.ieee_mode),

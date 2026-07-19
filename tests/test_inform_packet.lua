@@ -728,7 +728,9 @@ return {
 
 			assert_eq(#radio_table, 2, "two radios parsed")
 			assert_eq(radio_table[1].name, "radio0", "radio 1 name from phyname")
-			assert_eq(radio_table[1].channel, nil, "auto channel left unset")
+			assert_eq(radio_table[1].channel, "auto",
+				"channel=auto passes through verbatim (UCI auto -> hostapd ACS; nil would strand a stale fixed channel)")
+			assert_eq(radio_table[1].tx_power, nil, "txpower=auto -> nil (UCI has no auto txpower value)")
 			assert_eq(radio_table[2].name, "radio1", "radio 2 name from phyname")
 			assert_eq(radio_table[2].channel, 36, "explicit channel parsed as a number")
 			assert_eq(radio_table[2].tx_power, 17, "explicit tx_power parsed as a number")
@@ -821,8 +823,9 @@ return {
 		name = "inform packet: _parse_wifi_system_cfg leaves htmode nil for absent/garbage ieee_mode",
 		fn = function()
 			-- nil means "leave the radio's current width alone", the same
-			-- convention channel=auto/txpower=auto already use. Garbage must
-			-- never reach UCI as an htmode value.
+			-- convention txpower=auto uses (channel=auto instead passes through
+			-- verbatim to engage ACS). Garbage must never reach UCI as an
+			-- htmode value.
 			local absent = inform._parse_wifi_system_cfg("radio.1.phyname=radio0\n")
 			assert_eq(absent[1].htmode, nil, "no ieee_mode key -> nil")
 			for _, token in ipairs({ "auto", "11ng", "11nght", "nght20", "11nght33", "" }) do

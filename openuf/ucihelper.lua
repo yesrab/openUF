@@ -332,7 +332,8 @@ end
 -- 2026-07-18). Until then this argument was a "11n"/"11ac"/"11ax" token that
 -- nothing on the parse side ever produced, so htmode was never written at all
 -- and the controller's channel-width setting silently did nothing.
--- chan:   channel number or "auto"
+-- chan:   channel number, or the string "auto" (written verbatim -- UCI
+-- channel=auto makes OpenWrt engage hostapd ACS at radio bring-up)
 -- txpwr: TX power in dBm (or nil to leave unchanged)
 -- minrssi_enabled/minrssi_raw: "Minimum RSSI" (Devices -> [AP] -> Radios),
 -- a per-radio (not per-SSID) setting -- confirmed live 2026-07-14 via the
