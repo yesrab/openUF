@@ -641,6 +641,54 @@ return {
 		end
 	},
 	{
+		name = "inform json: empty list fields serialize as JSON arrays, not objects",
+		fn = function()
+			-- cjson encodes an empty Lua table as {} (a JSON object); the
+			-- controller's DTOs type these fields as lists. Only a raw-string
+			-- assertion can see the difference -- every other test in this
+			-- file decodes first, which erases exactly this distinction.
+			inject_sysinfo(false)
+			-- A previously injected _ucihelper mock would populate the very
+			-- tables this test needs empty -- park it for the duration.
+			local orig_uci = inform._ucihelper
+			inform._ucihelper = nil
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local ok, json_str = pcall(inform.build_json, st, nil, ufhw)
+			inform._ucihelper = orig_uci
+			assert_true(ok, "build_json succeeded: " .. tostring(json_str))
+			for _, field in ipairs({"vap_table", "radio_table", "radio_table_stats",
+					"scan_radio_table", "lldp_table"}) do
+				assert_contains(json_str, '"' .. field .. '":[]',
+					field .. " serializes as an empty ARRAY")
+			end
+		end
+	},
+	{
+		name = "inform json: _fix_empty_arrays rewrites {} to [] on old-cjson targets",
+		fn = function()
+			-- The validation container's lua-cjson has neither empty_array_mt
+			-- nor the empty_array sentinel, so the metatable route degrades
+			-- to {} exactly on the real target -- the string post-pass is
+			-- what actually fixes the wire there. Pin it directly.
+			local fixed = inform._fix_empty_arrays(
+				'{"vap_table":{},"sta_table":{},"x":1,"nested":{"mac_table":{}}}')
+			assert_eq(fixed,
+				'{"vap_table":[],"sta_table":[],"x":1,"nested":{"mac_table":[]}}',
+				"every known list field rewritten, other keys untouched")
+			-- A non-list field named similarly must be untouched, and a quoted
+			-- occurrence inside a STRING VALUE cannot match (cjson escapes the
+			-- quotes there).
+			local hostile = '{"ssid":"evil\\"sta_table\\":{}","sta_table":{}}'
+			assert_eq(inform._fix_empty_arrays(hostile),
+				'{"ssid":"evil\\"sta_table\\":{}","sta_table":[]}',
+				"escaped quotes inside string values never match")
+		end
+	},
+	{
 		name = "inform json: country_code derived from the radio's UCI regdomain",
 		fn = function()
 			inject_sysinfo(false)

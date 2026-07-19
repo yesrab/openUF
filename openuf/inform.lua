@@ -342,6 +342,40 @@ local ISO3166_NUMERIC = {
 	VN = 704, IL = 376, AE = 784, SA = 682, AR = 32, CL = 152, CO = 170,
 }
 
+-- cjson encodes an empty Lua table as a JSON OBJECT ({}), but the payload's
+-- list fields (vap_table, scan_radio_table, mac_table, ...) must serialize
+-- as ARRAYS ([]) -- the controller's DTOs type them as lists, and {} for an
+-- empty list is a wire-format ambiguity no decoded-side test could ever see.
+-- empty_array_mt is feature-detected: a modern lua-cjson tags the table so
+-- it encodes as []; an older target build silently keeps the old behavior
+-- rather than erroring. Non-empty tables are unambiguous either way.
+local _EMPTY_ARRAY_MT = type(cjson) == "table" and cjson.empty_array_mt or nil
+local function arr(t)
+	if _EMPTY_ARRAY_MT and next(t) == nil then
+		return setmetatable(t, _EMPTY_ARRAY_MT)
+	end
+	return t
+end
+
+-- Belt for arr()'s braces: the TARGET's lua-cjson (OpenWrt's 2.1.0-era build,
+-- confirmed on the validation container) has neither empty_array_mt nor the
+-- empty_array sentinel, so the metatable route degrades to {} exactly where
+-- it matters most. This post-pass rewrites '"<field>":{}' to '"<field>":[]'
+-- for the known list fields on the ENCODED string -- version-independent.
+-- Safe against false positives: cjson escapes quotes inside string values,
+-- so the unescaped '"field":{}' shape cannot occur inside one.
+local _ARRAY_FIELDS = {
+	"if_table", "radio_table", "radio_table_stats", "vap_table",
+	"scan_radio_table", "port_table", "lldp_table",
+	"sta_table", "mac_table", "scan_table",
+}
+function M._fix_empty_arrays(json_str)
+	for _, f in ipairs(_ARRAY_FIELDS) do
+		json_str = json_str:gsub('("' .. f .. '"):{}', '%1:[]')
+	end
+	return json_str
+end
+
 -- Build the inform JSON payload.
 -- st: current state table
 -- cfg: device configuration (from conf.lua)
@@ -632,7 +666,7 @@ function M.build_json(st, cfg, ufhw)
 					scan_radio_table[#scan_radio_table + 1] = {
 						radio      = radio.radio,
 						name       = radio.name,
-						scan_table = scan_table,
+						scan_table = arr(scan_table),
 					}
 				end
 			end
@@ -837,7 +871,7 @@ function M.build_json(st, cfg, ufhw)
 					satisfaction_now = satisfaction_now,
 				}
 			end
-			vap.sta_table  = sta_table
+			vap.sta_table  = arr(sta_table)
 			vap.rx_bytes   = vap_rx_bytes
 			vap.tx_bytes   = vap_tx_bytes
 			vap.rx_packets = vap_rx_packets
@@ -927,7 +961,7 @@ function M.build_json(st, cfg, ufhw)
 					end
 				end
 			end
-			entry.mac_table = mac_table
+			entry.mac_table = arr(mac_table)
 		end
 		port_table[#port_table + 1] = entry
 	end
@@ -1042,16 +1076,16 @@ function M.build_json(st, cfg, ufhw)
 			mem    = tostring(mem_pct),
 			uptime = tostring(uptime),
 		},
-		if_table         = if_table,
-		radio_table      = radio_table,
-		radio_table_stats = radio_table_stats,
-		vap_table        = vap_table,
-		scan_radio_table = scan_radio_table,
-		port_table       = port_table,
-		lldp_table       = lldp_table,
+		if_table         = arr(if_table),
+		radio_table      = arr(radio_table),
+		radio_table_stats = arr(radio_table_stats),
+		vap_table        = arr(vap_table),
+		scan_radio_table = arr(scan_radio_table),
+		port_table       = arr(port_table),
+		lldp_table       = arr(lldp_table),
 	}
 
-	return cjson.encode(payload)
+	return M._fix_empty_arrays(cjson.encode(payload))
 end
 
 -- Maps an OpenWrt htmode ("HT20", "HT40+", "VHT80", "HE160", ...) to a
