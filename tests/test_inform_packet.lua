@@ -39,6 +39,17 @@ local function sample_state(overrides)
 	return st
 end
 
+-- Capture what fn() writes to stderr, restoring the real handle afterwards.
+local function with_stderr(fn)
+	local buf = {}
+	local real = io.stderr
+	io.stderr = {write = function(_, s) buf[#buf + 1] = s end}
+	local ok, err = pcall(fn)
+	io.stderr = real
+	if not ok then error(err, 0) end
+	return table.concat(buf)
+end
+
 local MAGIC = "TNBU"
 
 -- Parse header fields from a raw TNBU packet for assertions
@@ -405,6 +416,94 @@ return {
 			inform._netconfig._exec = orig
 			assert_eq(st.ip_mode, "dhcp", "ip_mode still recorded as dhcp")
 			assert_eq(#cmds, 0, "apply_dhcp NOT called -- nothing to revert")
+		end
+	},
+	{
+		name = "inform packet: _report_dropped_keys summarizes unrecognized keys by prefix",
+		fn = function()
+			-- The feedback loop that macacl.*/qos.vap.* needed: no tokenizer
+			-- here has an else branch, so a whole feature can sit in every
+			-- capture unnoticed. Indices collapse to <n> so a multi-VAP blob
+			-- reports one line per key SHAPE, not one per instance.
+			local out = with_stderr(function()
+				inform._debug_dropped_keys = true
+				inform._report_dropped_keys("system_cfg",
+					"aaa.1.ssid=known\nswitch.port.1.name=Port 1\nswitch.port.2.name=Port 2\n"
+					.. "switch.status=enabled\n",
+					{"^aaa%.%d+%."})
+			end)
+			assert_contains(out, "3 dropped key(s)", "counts every dropped key")
+			assert_contains(out, "switch.port.<n>.name x2", "indices collapsed, instances counted")
+			assert_contains(out, "switch.status x1", "non-indexed key reported as-is")
+			assert_nil(out:find("aaa", 1, true), "recognized keys are not reported")
+		end
+	},
+	{
+		name = "inform packet: _report_dropped_keys never emits values",
+		fn = function()
+			-- These blobs carry aaa.<n>.wpa.psk and mgmt_cfg's authkey, and
+			-- this goes to the log. Prefixes and counts only.
+			local out = with_stderr(function()
+				inform._debug_dropped_keys = true
+				inform._report_dropped_keys("mgmt_cfg",
+					"authkey=ccc32a3bbe40157773294de8ed683627\nsecret.thing=hunter2\n",
+					{})
+			end)
+			assert_contains(out, "authkey x1", "key name reported")
+			assert_nil(out:find("ccc32a3b", 1, true), "authkey value never logged")
+			assert_nil(out:find("hunter2", 1, true), "no value of any key is logged")
+		end
+	},
+	{
+		name = "inform packet: _report_dropped_keys is silent when off, clean, or comment-only",
+		fn = function()
+			local out = with_stderr(function()
+				inform._debug_dropped_keys = false
+				inform._report_dropped_keys("system_cfg", "switch.status=enabled\n", {})
+			end)
+			assert_eq(out, "", "silent when the debug gate is off")
+
+			out = with_stderr(function()
+				inform._debug_dropped_keys = true
+				inform._report_dropped_keys("system_cfg", "aaa.1.ssid=x\n", {"^aaa%.%d+%."})
+			end)
+			assert_eq(out, "", "silent when every key is recognized")
+
+			out = with_stderr(function()
+				inform._debug_dropped_keys = true
+				-- A radio-less blob carries this literal comment.
+				inform._report_dropped_keys("system_cfg",
+					"# no wlan provisioned as no radio found\n\n", {})
+			end)
+			assert_eq(out, "", "comments and blank lines are not keys")
+
+			inform._debug_dropped_keys = false  -- don't leak the gate into later tests
+		end
+	},
+	{
+		name = "inform packet: handle_response reports dropped keys only with the debug gate on",
+		fn = function()
+			-- End-to-end through the real RECOGNIZED_* lists: switch.* is a
+			-- block openUF genuinely drops today, so it is the honest probe.
+			local sys_cfg = "netconf.1.ip=172.19.0.50\\nswitch.port.1.name=Port 1\\n"
+			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg)
+
+			local out = with_stderr(function()
+				inform.handle_response(resp, sample_state(), {net = {lan_cpueth = "eth0"}})
+			end)
+			assert_eq(out, "", "silent without cfg.config.debug_dump_file")
+
+			out = with_stderr(function()
+				inform.handle_response(resp, sample_state(), {
+					net = {lan_cpueth = "eth0"},
+					config = {debug_dump_file = "/dev/null"},
+				})
+			end)
+			assert_contains(out, "system_cfg:", "reports against the real recognized list")
+			assert_contains(out, "switch.port.<n>.name", "surfaces the block openUF drops")
+			assert_nil(out:find("netconf", 1, true), "a consumed key is not reported")
+
+			inform._debug_dropped_keys = false
 		end
 	},
 	{

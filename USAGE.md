@@ -161,6 +161,22 @@ ground-truth payload shapes when validating field assumptions (`system_cfg`,
 `cmd` dispatch, etc.) against a real UniFi controller — see
 [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md).
 
+The same flag also turns on a **dropped-key report** on stderr: one line per
+config blob listing the keys no parser consumed, collapsed to key shapes with
+counts, e.g.
+
+```
+inform: mgmt_cfg: 5 dropped key(s): capability x1, mgmt_url x1, report_crash x1, selfrun_guest_mode x1, stun_url x1
+inform: system_cfg: 12 dropped key(s): switch.port.<n>.name x5, switch.vlan.<n>.id x4, ...
+```
+
+Most of what it lists is dropped deliberately (each case is explained in
+PROTOCOL-VALIDATION.md's `system_cfg` section) — its value is showing you when
+the controller starts sending something openUF has *never* seen, which is how
+two whole features sat unnoticed in every capture for months. Key names and
+counts only: these blobs carry passphrases and the adoption key, so no value is
+ever logged.
+
 `bootstrap_adopt_user` — set by `install.sh install --bootstrap-adopt`, not by
 hand. Names the temporary SSH bootstrap account (see § SSH prerequisite below)
 that `inform.lua` should lock/unlock as the device's adopted state changes.

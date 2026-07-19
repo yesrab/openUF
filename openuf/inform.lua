@@ -1498,6 +1498,84 @@ function M._parse_wifi_system_cfg(sys_raw)
 	return radio_table, vap_table
 end
 
+-- ─── Dropped-key visibility ──────────────────────────────────────────────────
+
+-- Key shapes some pass in openUF actually reads. Everything else in a config
+-- blob is dropped on the floor.
+--
+-- Until 2026-07-18 that included macacl.* and qos.vap.* -- two whole features
+-- sitting in every capture, unnoticed for months, because no tokenizer here
+-- has an `else` branch and nothing ever counted what fell through. This list
+-- plus _report_dropped_keys() is the missing feedback loop.
+--
+-- The keys openUF drops ON PURPOSE (switch.*, qos.if.*, qos.ebt.*, vlan.*,
+-- bridge.*, mcastrate, cwm.mode, pmf.cipher, mac_acl.* and the other decoys)
+-- are deliberately NOT listed here: they show up in the report, which is the
+-- honest picture of what is ignored. Each one's reasoning is in
+-- PROTOCOL-VALIDATION.md's `system_cfg` section.
+local RECOGNIZED_SYSTEM_CFG = {
+	"^aaa%.%d+%.",       -- per-SSID security
+	"^wireless%.%d+%.",  -- per-SSID radio binding and behavior
+	"^radio%.%d+%.",     -- per-radio config
+	"^stamgr%.%d+%.",    -- Minimum RSSI
+	"^macacl%.%d+%.",    -- MAC Address Filter
+	"^qos%.vap%.%d+%.",  -- WiFi Speed Limit
+	"^netconf%.1%.",     -- IP Settings
+	"^route%.1%.gateway$",
+	"^dhcpc%.1%.",
+	"^resolv%.nameserver%.%d+%.ip$",
+	"^resolv%.host%.1%.name$",
+}
+
+local RECOGNIZED_MGMT_CFG = {
+	"^inform_url$", "^use_aes_gcm$", "^cfgversion$", "^led_enabled$", "^authkey$",
+}
+
+-- Set from handle_response when cfg.config.debug_dump_file is on -- the
+-- dropped-key report is a diagnostic for exactly the same workflow (diffing
+-- full captures against what openUF acts on), so it shares that gate rather
+-- than adding a second knob.
+M._debug_dropped_keys = false
+
+-- Summarize the keys in a config blob that no pass recognized.
+--
+-- Emits key PREFIXES and counts only, never values: these blobs carry
+-- aaa.<n>.wpa.psk and mgmt_cfg's authkey, and this goes to the log.
+-- Numeric indices are collapsed to <n> so a four-VAP blob reports one line
+-- per key shape rather than one per instance.
+function M._report_dropped_keys(label, raw, recognized)
+	if not M._debug_dropped_keys or type(raw) ~= "string" then return end
+	local counts, order, total = {}, {}, 0
+	for line in (raw .. "\n"):gmatch("([^\n]*)\n") do
+		-- Skip blanks and the literal comment a radio-less blob carries
+		-- ("# no wlan provisioned as no radio found").
+		if line ~= "" and not line:match("^%s*#") then
+			local k = line:match("^([^=]+)=")
+			if k then
+				local known = false
+				for _, pat in ipairs(recognized) do
+					if k:match(pat) then known = true break end
+				end
+				if not known then
+					local prefix = k:gsub("%.%d+%.", ".<n>."):gsub("%.%d+$", ".<n>")
+					if not counts[prefix] then
+						counts[prefix] = 0
+						order[#order + 1] = prefix
+					end
+					counts[prefix] = counts[prefix] + 1
+					total = total + 1
+				end
+			end
+		end
+	end
+	if total == 0 then return end
+	table.sort(order)
+	local parts = {}
+	for _, p in ipairs(order) do parts[#parts + 1] = p .. " x" .. counts[p] end
+	io.stderr:write(("inform: %s: %d dropped key(s): %s\n")
+		:format(label, total, table.concat(parts, ", ")))
+end
+
 -- ─── Response dispatcher ─────────────────────────────────────────────────────
 
 -- Handle a parsed controller response JSON string.
@@ -1506,6 +1584,10 @@ end
 --      control becomes a no-op without cfg.led)
 -- Returns true if config was applied (caller should send follow-up inform).
 function M.handle_response(json_str, st, cfg)
+	-- Tracks the config rather than latching on: a caller that stops passing
+	-- debug_dump_file stops getting dropped-key reports too.
+	M._debug_dropped_keys = not not (cfg and cfg.config and cfg.config.debug_dump_file)
+
 	if cfg and cfg.config and cfg.config.debug_dump_file then
 		local f = io.open(cfg.config.debug_dump_file, "a")
 		if f then
@@ -1582,8 +1664,12 @@ function M.handle_response(json_str, st, cfg)
 		-- key=value blob, confirmed live against a real controller (see
 		-- PROTOCOL-VALIDATION.md). Only present when the controller is
 		-- actually pushing a network-config change, not on every inform.
+		M._report_dropped_keys("mgmt_cfg", mgmt_raw, RECOGNIZED_MGMT_CFG)
+
 		local sys_raw = resp.system_cfg
 		if type(sys_raw) == "string" then
+			M._report_dropped_keys("system_cfg", sys_raw, RECOGNIZED_SYSTEM_CFG)
+
 			local ip, netmask, gateway
 			local dhcp = false
 			local device_name
