@@ -824,6 +824,30 @@ function M.get_radio_table()
 	return radios
 end
 
+-- The cjson binding used to parse `ubus call network.wireless status` for
+-- the live ifname lookups below. Injectable (M._load_cjson) and cached; a
+-- missing binding warns ONCE, loudly: without it every ifname resolution
+-- returns nil and the Multicast/Broadcast Blocker AND the WiFi Speed Limit
+-- silently become no-ops while apply_config still reports success -- the
+-- kind of quiet degradation nothing would ever surface otherwise.
+M._load_cjson = function()
+	local ok, mod = pcall(require, "cjson")
+	return ok and mod or nil
+end
+local cjson_checked, cjson_mod = false, nil
+local function get_cjson()
+	if not cjson_checked then
+		cjson_checked = true
+		cjson_mod = M._load_cjson()
+		if not cjson_mod then
+			io.stderr:write("ucihelper: lua-cjson unavailable -- live ifname "
+				.. "resolution disabled; Multicast/Broadcast Blocker and WiFi "
+				.. "Speed Limit will NOT be enforced\n")
+		end
+	end
+	return cjson_mod
+end
+
 -- Resolve a UCI radio name (e.g. "radio0") to its live wireless netdev name
 -- (e.g. "wlan0"), as assigned at runtime by netifd. Needed because sta_table()/
 -- radio_stats() operate on the live `iw`-visible interface, not the UCI config
@@ -832,8 +856,8 @@ function M.get_ifname_for_radio(radio)
 	if not radio then return nil end
 	local output = M._popen("ubus call network.wireless status")
 	if output == "" then return nil end
-	local ok_j, cjson = pcall(require, "cjson")
-	if not ok_j then return nil end
+	local cjson = get_cjson()
+	if not cjson then return nil end
 	local ok_d, status = pcall(cjson.decode, output)
 	if not ok_d or type(status) ~= "table" then return nil end
 	local dev = status[radio]
@@ -857,8 +881,8 @@ function M.get_ifname_for_vap(radio, ssid)
 	if not radio or not ssid then return nil end
 	local output = M._popen("ubus call network.wireless status")
 	if output == "" then return nil end
-	local ok_j, cjson = pcall(require, "cjson")
-	if not ok_j then return nil end
+	local cjson = get_cjson()
+	if not cjson then return nil end
 	local ok_d, status = pcall(cjson.decode, output)
 	if not ok_d or type(status) ~= "table" then return nil end
 	local dev = status[radio]

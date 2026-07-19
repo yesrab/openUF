@@ -1325,6 +1325,32 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: a missing cjson disables ifname lookups with ONE loud warning",
+		fn = function()
+			-- Without cjson the ubus JSON can't be parsed: every ifname
+			-- lookup returns nil and the Multicast/Broadcast Blocker + WiFi
+			-- Speed Limit silently no-op while apply_config reports success.
+			-- The degradation must be loud (once), never silent. Fresh module
+			-- instance: the cjson probe is cached per instance.
+			local fresh = dofile("openuf/ucihelper.lua")
+			fresh._load_cjson = function() return nil end
+			fresh._popen = function() return '{"radio0":{"interfaces":[{"ifname":"wlan0"}]}}' end
+			local buf = {}
+			local real = io.stderr
+			io.stderr = {write = function(_, s) buf[#buf + 1] = s end}
+			local r1 = fresh.get_ifname_for_radio("radio0")
+			local r2 = fresh.get_ifname_for_vap("radio0", "corp")
+			io.stderr = real
+			local out = table.concat(buf)
+			assert_nil(r1, "radio lookup degrades to nil")
+			assert_nil(r2, "vap lookup degrades to nil")
+			assert_contains(out, "lua-cjson unavailable", "warning names the cause")
+			assert_contains(out, "NOT be enforced", "warning names the consequence")
+			local _, count = out:gsub("lua%-cjson unavailable", "")
+			assert_eq(count, 1, "warned exactly once, not per call")
+		end
+	},
+	{
 		name = "ucihelper: get_radio_table derives the band config-first when channel is auto",
 		fn = function()
 			-- With channel=auto (ACS) the channel number can't identify the
