@@ -39,6 +39,58 @@ local function sample_state(overrides)
 	return st
 end
 
+-- Fresh ucihelper instance wired to an in-memory mock UCI cursor, for
+-- parse -> apply_config integration tests (same mock shape as
+-- test_ucihelper.lua's, including option-level delete and cursor:get).
+-- Returns the ucihelper module and the backing db table.
+local function new_apply_env()
+	local ucihelper = dofile("openuf/ucihelper.lua")
+	local db = {}
+	local section_order = {}
+	local cursor = {}
+	function cursor:set(config, section, a, b)
+		db[config] = db[config] or {}
+		if not db[config][section] then
+			db[config][section] = {[".name"] = section}
+			section_order[config] = section_order[config] or {}
+			section_order[config][#section_order[config] + 1] = section
+		end
+		if b == nil then db[config][section][".type"] = a
+		else db[config][section][a] = b end
+	end
+	function cursor:foreach(config, stype, fn)
+		for _, name in ipairs(section_order[config] or {}) do
+			local s = db[config][name]
+			if s and s[".type"] == stype then fn(s) end
+		end
+	end
+	function cursor:delete(config, section, option)
+		if option ~= nil then
+			if db[config] and db[config][section] then
+				db[config][section][option] = nil
+			end
+			return
+		end
+		if db[config] then db[config][section] = nil end
+		if section_order[config] then
+			for i, name in ipairs(section_order[config]) do
+				if name == section then table.remove(section_order[config], i); break end
+			end
+		end
+	end
+	function cursor:get(config, section, option)
+		local s = db[config] and db[config][section]
+		return s and s[option]
+	end
+	function cursor:commit() end
+
+	ucihelper._uci       = {cursor = function() return cursor end}
+	ucihelper._popen     = function() return "" end
+	ucihelper._read_file = function() return nil end
+	ucihelper._run_cmd   = function() return true end
+	return ucihelper, db
+end
+
 -- Capture what fn() writes to stderr, restoring the real handle afterwards.
 local function with_stderr(fn)
 	local buf = {}
@@ -783,8 +835,37 @@ return {
 			assert_eq(#radio_table, 2, "two radios parsed")
 			assert_eq(radio_table[1].min_rssi_enabled, true, "radio0 minrssi enabled")
 			assert_eq(radio_table[1].min_rssi, 15, "radio0 minrssi raw wire value (not dBm)")
-			assert_eq(radio_table[2].min_rssi_enabled, nil, "radio1 has no stamgr block -> not enabled")
+			-- Explicit false, not nil: an absent stamgr block is the wire's
+			-- disable signal, and nil would let a stale minrssi_enabled=1
+			-- survive in UCI (rf_config skips nil), keeping the deauth
+			-- enforcement running after the user turned the feature off.
+			assert_eq(radio_table[2].min_rssi_enabled, false, "radio1 has no stamgr block -> explicitly off")
 			assert_eq(radio_table[2].min_rssi, nil, "radio1 has no minrssi value")
+		end
+	},
+	{
+		name = "inform packet: disabling Minimum RSSI clears the UCI flag (parse -> apply, two pushes)",
+		fn = function()
+			-- Mutation test for the stale-enforcement bug: push #1 enables
+			-- Minimum RSSI, push #2's blob has no stamgr block (the wire's
+			-- disable convention). Before the fix, push #2 parsed to nil,
+			-- rf_config skipped the write, and UCI kept minrssi_enabled=1 --
+			-- so openUF kept one-shot-deauthing weak clients forever.
+			local ucihelper, db = new_apply_env()
+			local on_blob = "radio.1.phyname=radio0\nradio.1.channel=6\n"
+				.. "stamgr.1.status=true\nstamgr.1.radio=ng\n"
+				.. "stamgr.1.minrssi.status=true\nstamgr.1.minrssi.rssi=15\n"
+			local off_blob = "radio.1.phyname=radio0\nradio.1.channel=6\n"
+
+			local rt, vt = inform._parse_wifi_system_cfg(on_blob)
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			assert_eq(db.wireless.radio0.minrssi_enabled, "1", "push 1: enforcement enabled")
+			assert_eq(db.wireless.radio0.minrssi_rssi, "15", "push 1: raw threshold stored")
+
+			rt, vt = inform._parse_wifi_system_cfg(off_blob)
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			assert_eq(db.wireless.radio0.minrssi_enabled, "0",
+				"push 2 (stamgr absent): enforcement flag explicitly cleared")
 		end
 	},
 	{
@@ -1333,35 +1414,7 @@ return {
 		-- fails here.
 		name = "inform packet: system_cfg -> parse -> apply_config reaches UCI (producer/consumer link)",
 		fn = function()
-			local ucihelper = dofile("openuf/ucihelper.lua")
-			local db = {}
-			local section_order = {}
-			local cursor = {}
-			function cursor:set(config, section, a, b)
-				db[config] = db[config] or {}
-				if not db[config][section] then
-					db[config][section] = {[".name"] = section}
-					section_order[config] = section_order[config] or {}
-					section_order[config][#section_order[config] + 1] = section
-				end
-				if b == nil then db[config][section][".type"] = a
-				else db[config][section][a] = b end
-			end
-			function cursor:foreach(config, stype, fn)
-				for _, name in ipairs(section_order[config] or {}) do
-					local s = db[config][name]
-					if s and s[".type"] == stype then fn(s) end
-				end
-			end
-			function cursor:delete(config, section)
-				if db[config] then db[config][section] = nil end
-			end
-			function cursor:commit() end
-
-			ucihelper._uci      = {cursor = function() return cursor end}
-			ucihelper._popen    = function() return "" end
-			ucihelper._read_file = function() return nil end
-			ucihelper._run_cmd  = function() return true end
+			local ucihelper, db = new_apply_env()
 
 			local sys_cfg = table.concat({
 				"aaa.1.ssid=openuf-test", "aaa.1.wpa=2",

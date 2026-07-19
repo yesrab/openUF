@@ -342,7 +342,9 @@ end
 -- units, an offset from the driver's noise floor, NOT plain dBm -- see
 -- inform.lua's M._parse_wifi_system_cfg for the conversion math), since the
 -- dBm conversion needs a live noise-floor reading only available later, at
--- enforcement/readback time.
+-- enforcement/readback time. On disable only the flag is written to 0;
+-- minrssi_rssi stays parked in UCI (harmless -- every consumer gates on the
+-- flag first) so a later re-enable without a threshold change reuses it.
 -- rates: optional table from M.derive_rates() plus an optional beacon_rate,
 -- i.e. the "Minimum Data Rate" settings. These are wifi-DEVICE options in
 -- OpenWrt, not wifi-iface ones (confirmed in OpenWrt's hostapd.sh: basic_rate,

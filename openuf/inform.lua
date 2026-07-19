@@ -1174,9 +1174,21 @@ function M._parse_wifi_system_cfg(sys_raw)
 			-- dbm + 95). Kept as raw wire units here; converted to dBm only
 			-- where a live noise-floor reading is available (apply_config/
 			-- enforcement), not at parse time.
-			if sm and sm["minrssi.status"] == "true" then
-				entry.min_rssi_enabled = true
-				entry.min_rssi         = tonumber(sm["minrssi.rssi"])
+			-- Explicit tri-state, never nil for a parsed radio: an absent
+			-- stamgr block is the wire's disable convention (the whole block
+			-- simply disappears when the checkbox is off), so it must produce
+			-- an explicit `false` -> rf_config writes minrssi_enabled=0.
+			-- Leaving it nil instead let a stale minrssi_enabled=1 from an
+			-- earlier push survive in UCI -- and since build_json derives its
+			-- enforcement thresholds from UCI (get_radio_table), openUF kept
+			-- deauthing weak clients forever after the user turned the
+			-- feature off. Writing the explicit off is safe here:
+			-- minrssi_enabled/minrssi_rssi are openUF-invented options nothing
+			-- else configures, and the radio-less "# no wlan provisioned" blob
+			-- never reaches apply_config (gated on a nonempty radio_table).
+			entry.min_rssi_enabled = (sm ~= nil and sm["minrssi.status"] == "true")
+			if entry.min_rssi_enabled then
+				entry.min_rssi = tonumber(sm["minrssi.rssi"])
 			end
 			radio_table[#radio_table + 1] = entry
 		end
