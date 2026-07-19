@@ -83,6 +83,26 @@ return {
 		end
 	},
 	{
+		name = "usteer: a repeated set_enabled is a no-op (no restart churn)",
+		fn = function()
+			-- set_enabled runs on every WiFi setparam; before the guard each
+			-- steady-state inform restarted the daemon, dropping its learned
+			-- station table.
+			with_usteer(function(db, cmds)
+				assert_true(usteer.set_enabled(true, nil), "first call writes")
+				local after_first = #cmds
+				assert_true(usteer.set_enabled(true, nil), "second call still reports success")
+				assert_eq(#cmds, after_first, "no second enable/restart issued")
+
+				usteer.set_enabled(false, nil)
+				local after_disable = #cmds
+				assert_true(after_disable > after_first, "transition to disabled acts")
+				usteer.set_enabled(false, nil)
+				assert_eq(#cmds, after_disable, "repeated disable issues no further commands")
+			end)
+		end
+	},
+	{
 		name = "usteer: set_enabled uses cfg.net.lan_name when present",
 		fn = function()
 			with_usteer(function(db, cmds)
