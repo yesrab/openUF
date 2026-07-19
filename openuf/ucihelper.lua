@@ -349,9 +349,16 @@ end
 -- hostapd_common_add_device_config and appended to the radio's base_cfg), even
 -- though the controller sends Minimum Data Rate per WLAN. apply_config()
 -- therefore aggregates the radio's VAPs down to one setting -- see there.
-function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates)
+-- disabled: tri-state per-radio enable, from the controller's
+-- radio.<n>.status (Radios -> Transmit Power -> Disabled). nil leaves UCI
+-- alone -- a blob that never carries the key must not re-enable a radio the
+-- user disabled by hand; only an explicit enabled/disabled writes.
+function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates, disabled)
 	local uci = get_uci()
 	local cursor = uci.cursor()
+	if disabled ~= nil then
+		cursor:set("wireless", radio, "disabled", disabled and "1" or "0")
+	end
 	if chan then
 		cursor:set("wireless", radio, "channel", tostring(chan))
 	end
@@ -453,7 +460,7 @@ function M.apply_config(resp, cfg, opts)
 				if rates then rates.beacon_rate = agg.beacon_rate end
 			end
 			M.rf_config(radio.name, radio.htmode, radio.channel, radio.tx_power,
-				radio.min_rssi_enabled, radio.min_rssi, rates)
+				radio.min_rssi_enabled, radio.min_rssi, rates, radio.disabled)
 		end
 	end
 
@@ -462,6 +469,15 @@ function M.apply_config(resp, cfg, opts)
 	for _, vap in ipairs(vap_table) do
 		if vap.ssid and vap.radio then
 			local extra = {}
+			-- Per-VAP enable, from the controller's wireless.<n>.status. A
+			-- disabled WLAN is still provisioned, just with disabled=1, so its
+			-- whole config survives a re-enable. These sections are openUF's
+			-- own and are rebuilt by wlan_clear() on every push, so there is no
+			-- stale state to strand and no need for the autodisabled stamp
+			-- set_wlan_exclusive() uses for the user's sections.
+			if vap.disabled ~= nil then
+				extra.disabled = vap.disabled and "1" or "0"
+			end
 			if vap.fast_roaming_enabled then
 				extra.ieee80211r = "1"
 				extra.mobility_domain = M.derive_mobility_domain(vap.ssid)

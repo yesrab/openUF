@@ -1228,6 +1228,46 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config disables a radio and its VAP, and round-trips it back",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._uci.cursor():set("wireless", "radio0", "wifi-device")
+				ucihelper.apply_config({
+					radio_table = {{name = "radio0", disabled = true}},
+					vap_table   = {{ssid = "net", radio = "radio0",
+						security = "wpa2", x_passphrase = "hunter22", disabled = true}},
+				}, nil)
+				assert_eq(db.wireless.radio0.disabled, "1", "wifi-device disabled")
+				assert_eq(db.wireless.openuf_radio0_net.disabled, "1", "wifi-iface disabled")
+				-- The outbound radio_table/vap_table already read `disabled`
+				-- off UCI, so the controller sees its own push reflected back.
+				assert_true(ucihelper.get_radio_table()[1].disabled, "reported back as disabled")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config re-enables explicitly, but leaves UCI alone when unset",
+		fn = function()
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "disabled", "1")
+
+				-- nil means "the wire did not say" -- a radio the user disabled
+				-- by hand must survive a push that never mentions status.
+				ucihelper.apply_config({radio_table = {{name = "radio0", channel = 6}},
+					vap_table = {}}, nil)
+				assert_eq(db.wireless.radio0.disabled, "1", "untouched when disabled is nil")
+
+				-- An explicit enabled must clear it, or a radio could never be
+				-- switched back on from the controller.
+				ucihelper.apply_config({radio_table = {{name = "radio0", disabled = false}},
+					vap_table = {}}, nil)
+				assert_eq(db.wireless.radio0.disabled, "0", "explicit enable clears it")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: an applied htmode round-trips back out via get_radio_table().ht",
 		fn = function()
 			-- radio_table[].ht is what build_json turns into the outbound

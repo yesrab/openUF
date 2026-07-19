@@ -419,6 +419,57 @@ return {
 		end
 	},
 	{
+		name = "inform packet: _parse_wifi_system_cfg reads per-radio and per-VAP disable",
+		fn = function()
+			-- CONFIRMED live 2026-07-19: Radios -> Transmit Power -> Disabled
+			-- moves radio.<n>.status enabled->disabled together with
+			-- txpower_mode and every wireless.<n>.status on that radio.
+			local sys_cfg = "radio.1.phyname=radio0\nradio.1.status=disabled\n"
+				.. "radio.1.txpower_mode=disabled\n"
+				.. "radio.2.phyname=radio1\nradio.2.status=enabled\n"
+				.. "aaa.1.ssid=net\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "wireless.1.ssid=net\nwireless.1.parent=radio0\nwireless.1.status=disabled\n"
+				.. "aaa.2.ssid=net\naaa.2.wpa=2\naaa.2.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "wireless.2.ssid=net\nwireless.2.parent=radio1\nwireless.2.status=enabled\n"
+			local radio_table, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_true(radio_table[1].disabled, "2.4 GHz radio disabled")
+			assert_false(radio_table[2].disabled, "5 GHz radio explicitly enabled")
+			assert_true(vap_table[1].disabled, "the disabled radio's VAP goes down with it")
+			assert_false(vap_table[2].disabled, "the other radio's VAP stays up")
+		end
+	},
+	{
+		name = "inform packet: radio/VAP disable is nil when the wire omits status",
+		fn = function()
+			-- Tri-state on purpose: a blob that never carries the key must not
+			-- re-enable a radio or SSID the user disabled by hand in
+			-- /etc/config/wireless. Only an explicit value writes.
+			local radio_table, vap_table = inform._parse_wifi_system_cfg(
+				"radio.1.phyname=radio0\n"
+				.. "aaa.1.ssid=net\nwireless.1.ssid=net\nwireless.1.parent=radio0\n")
+			assert_nil(radio_table[1].disabled, "absent radio status leaves UCI alone")
+			assert_nil(vap_table[1].disabled, "absent vap status leaves UCI alone")
+		end
+	},
+	{
+		name = "inform packet: the radio-less blob's unindexed radio.status disables nothing",
+		fn = function()
+			-- The "# no wlan provisioned as no radio found" blob carries a bare
+			-- radio.status=disabled with no phyname anywhere. Reading that as a
+			-- per-radio signal would take every radio on the device down.
+			--
+			-- This is a regression pin, not a live guard: the tokenizer's
+			-- ^(radio)%.(%d+)%.(.+)= shape cannot match a two-component key at
+			-- all, so the protection is structural. Kept so that loosening the
+			-- pattern later fails here rather than in the field.
+			local radio_table = inform._parse_wifi_system_cfg(
+				"# no wlan provisioned as no radio found\nradio.status=disabled\n"
+				.. "radio.1.phyname=radio0\nradio.1.channel=6\n")
+			assert_eq(#radio_table, 1, "the real radio is still parsed")
+			assert_nil(radio_table[1].disabled, "unindexed radio.status is not a per-radio signal")
+		end
+	},
+	{
 		name = "inform packet: _parse_switch_system_cfg treats the gated-off baseline as disabled",
 		fn = function()
 			-- B0, verbatim from the live capture 2026-07-19. The port entries

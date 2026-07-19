@@ -640,9 +640,24 @@ wireless.2.status=disabled
 
 This corrects an earlier reading of this document, which recorded `radio.status=disabled`
 only as part of the radio-less `# no wlan provisioned as no radio found` case and concluded
-the key carried no per-radio signal. **The indexed `radio.<n>.status` is a real control**, and
-openUF currently ignores it along with `wireless.<n>.status` — so disabling a radio in the
-controller UI has no effect on the device.
+the key carried no per-radio signal. **The indexed `radio.<n>.status` is a real control.**
+
+openUF maps `radio.<n>.status` onto UCI `wifi-device.disabled` and `wireless.<n>.status` onto
+each `wifi-iface.disabled`, and reports both back out (`radio_table[].disabled` /
+`vap_table[].disabled` already read them off UCI), so the controller sees its own push
+reflected. Two details worth keeping:
+
+- The read is **tri-state**. An absent `status` key writes nothing, so a blob that never
+  carries it cannot re-enable a radio or SSID the operator disabled by hand in
+  `/etc/config/wireless`; only an explicit `enabled`/`disabled` writes. An explicit
+  `enabled` must clear the flag, or a radio could never be switched back on.
+- Only the **indexed** key is read. The unindexed `radio.status=disabled` in the radio-less
+  blob would otherwise take every radio on the device down — the tokenizer's
+  `radio.<n>.<key>` shape cannot match a two-component key, so this is structural, but it is
+  pinned by a test.
+
+A disabled WLAN is still provisioned, just with `disabled=1`, so its configuration survives
+a re-enable.
 
 ---
 

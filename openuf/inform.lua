@@ -1056,6 +1056,17 @@ local function _wire_bool(v)
 	return v == "1" or v == "true" or v == "enabled"
 end
 
+-- Tri-state read of a `status` key for the radio/VAP disable controls:
+--   nil       -> the key was absent; leave whatever UCI already has alone
+--   false     -> explicitly enabled
+--   true      -> explicitly disabled
+-- The absent case matters: a blob that never carries the key must not
+-- re-enable a radio or SSID the user disabled by hand in /etc/config/wireless.
+local function _wire_status_disabled(v)
+	if v == nil then return nil end
+	return v == "disabled"
+end
+
 function M._parse_wifi_system_cfg(sys_raw)
 	local aaa, wireless, radio, stamgr, macacl = {}, {}, {}, {}, {}
 	local qos_vap = {}
@@ -1121,6 +1132,27 @@ function M._parse_wifi_system_cfg(sys_raw)
 				tx_power = tonumber(r.txpower),   -- "auto" -> nil, leaves tx_power unchanged
 				-- nil for an absent/unrecognized token, leaving htmode alone.
 				htmode   = _htmode_from_ieee_mode(r.ieee_mode),
+				-- Per-radio disable (Devices -> [AP] -> Radios -> Transmit
+				-- Power -> Disabled). CONFIRMED live 2026-07-19: that control
+				-- moves radio.<n>.status enabled->disabled together with
+				-- txpower_mode=disabled, virtual.1.status and every
+				-- wireless.<n>.status on the radio.
+				--
+				-- Deliberately tri-state: nil when the key is ABSENT, so a
+				-- capture that never carries it cannot re-enable a radio the
+				-- user disabled by hand in /etc/config/wireless. Only an
+				-- explicit enabled/disabled writes anything.
+				--
+				-- Reading r.status (indexed) and never the unindexed
+				-- radio.status is what keeps the radio-less
+				-- "# no wlan provisioned as no radio found" blob -- which
+				-- carries radio.status=disabled with no phyname anywhere --
+				-- from disabling every radio on the device.
+				--
+				-- NB: written as a statement below rather than inline, because
+				-- `(x ~= nil) and (x == "disabled") or nil` silently collapses
+				-- the enabled case to nil in Lua's and/or.
+				disabled = _wire_status_disabled(r.status),
 			}
 			local sm = stamgr[idx]
 			-- minrssi.rssi is NOT plain dBm -- confirmed live: UI "-80 dBm"
@@ -1493,6 +1525,12 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- See the bcfilt derivation above the vap literal.
 					bcfilt_enabled        = _wire_bool(w["bcfilt.status"]),
 					bcfilt_macs           = bcfilt_macs,
+					-- Per-VAP disable. Moves with the parent radio's
+					-- radio.<n>.status (disabling a radio disables every VAP
+					-- on it), but is an independent key -- confirmed live
+					-- 2026-07-19. The VAP is still provisioned when disabled,
+					-- just with disabled=1, so its config survives a re-enable.
+					disabled              = _wire_status_disabled(w.status),
 			}
 		end
 	end

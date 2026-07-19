@@ -37,6 +37,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | Fast Roaming (802.11r) | ✅ Working |
 | VLAN-tagged SSIDs | ✅ Working — from `aaa.<n>.br.devname` (`br0.<vlan>`), the wire's only VLAN signal; bridges onto a matching per-VLAN device |
 | Channel and TX power per radio | ✅ Working (Low/Medium/High/Custom) |
+| Radio enable / disable | ✅ Working — Transmit Power → **Disabled** arrives as `radio.<n>.status=disabled` (plus `wireless.<n>.status` on each of that radio's WLANs) → UCI `disabled`. Only an explicit value is written, so a push that omits the key leaves a hand-disabled radio alone |
 | Channel width per radio | ✅ Working — from `radio.<n>.ieee_mode` (`11nght20`/`11naht40`/…) → `htmode`. This is also the only 802.11n/ac/ax mode signal the wire carries |
 | IoT Optimization: Lock 2.4 GHz to Channel 6 / DTIM Interval Lock | ✅ Working — both are controller-side shortcuts that arrive as an ordinary `radio.<n>.channel=6` and `dtim_period=3`, needing no dedicated handling |
 | IoT Optimization: Force WiFi 4 Mode | ✅ Wire protocol confirmed live (`wireless.<n>.iot` + `qbssload`); most of the mode arrives as ordinary keys (2.4 GHz-only, WPA2, PMF/BSS-transition/proxy-ARP off). Its one distinct effect, suppressing the QBSS Load IE via `bss_load_update_period`, is not verified against real hardware |

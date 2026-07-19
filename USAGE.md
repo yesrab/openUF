@@ -337,6 +337,7 @@ Settings carried through from the controller:
 | Client Isolation | `isolate` (hostapd `ap_isolate`) |
 | Network / VLAN assignment | a `br0.<vlan>` bridge + tagged sub-interface |
 | Channel, TX power | `wifi-device` channel/txpower |
+| Radio enable/disable (TX Power → Disabled) | `wifi-device` `disabled`; the radio's WLANs get `wifi-iface` `disabled` too, keeping their config for a later re-enable |
 | Channel width | `wifi-device` htmode, from the radio's `ieee_mode` token |
 | IoT Optimization: Lock 2.4 GHz to Channel 6 | nothing new — arrives as `channel=6` on the 2.4 GHz radio |
 | IoT Optimization: DTIM Interval Lock | nothing new — arrives as `dtim_period=3` on the 2.4 GHz SSID |
