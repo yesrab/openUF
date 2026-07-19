@@ -206,10 +206,10 @@ return {
 			local st = sample_state()
 			local pkt = inform.build_packet(json, st)
 			local recovered, _ = inform.parse_packet(pkt, st)
-			-- recovered may be the JSON directly (no compression on dev machine)
-			-- or may differ slightly due to PKCS7 padding; check it contains key data
-			assert_contains(recovered, '"_type"', "recovered contains _type")
-			assert_contains(recovered, '"state"', "recovered contains state value")
+			-- parse_packet unpads PKCS7 exactly, so the round-trip is
+			-- byte-identical -- pin it. (A substring check here would pass
+			-- for any implementation returning garbage around the payload.)
+			assert_eq(recovered, json, "round-trip is byte-identical")
 		end
 	},
 	{
@@ -726,6 +726,12 @@ return {
 			local sys_cfg = "netconf.1.ip=172.19.0.50\\nqos.if.1.devname=eth0\\n"
 			local resp = ('{"_type":"setparam","system_cfg":"%s"}'):format(sys_cfg)
 
+			-- The blob's netconf key reaches the real static-IP apply path
+			-- (cfg.net is present), whose default _exec is os.execute -- left
+			-- unstubbed this test ran real `ip addr` commands on the host.
+			local orig_exec = inform._netconfig._exec
+			inform._netconfig._exec = function() return true end
+
 			local out = with_stderr(function()
 				inform.handle_response(resp, sample_state(), {net = {lan_cpueth = "eth0"}})
 			end)
@@ -737,6 +743,7 @@ return {
 					config = {debug_dump_file = "/dev/null"},
 				})
 			end)
+			inform._netconfig._exec = orig_exec
 			assert_contains(out, "system_cfg:", "reports against the real recognized list")
 			assert_contains(out, "qos.if.<n>.devname", "surfaces a block openUF drops")
 			assert_nil(out:find("netconf", 1, true), "a consumed key is not reported")
@@ -823,14 +830,26 @@ return {
 		end
 	},
 	{
-		name = "inform packet: handle_response setparam ignores system_cfg without cfg.net",
+		name = "inform packet: handle_response records but does not apply a static IP without cfg.net",
 		fn = function()
 			-- Same nil-safety convention as cfg.led -- absent per-model
-			-- interface config means a safe no-op, not an error.
+			-- interface config means nothing touches the host. The blob is
+			-- NOT fully ignored, though (the old test name overstated): the
+			-- static intent is still recorded in state so a later push/reload
+			-- knows the controller's assignment. Pin both halves: recorded
+			-- yes, applied no.
 			local st = sample_state()
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd) cmds[#cmds + 1] = cmd; return true end
 			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.50\\n"}'
 			local ok = pcall(inform.handle_response, resp, st, nil)
+			inform._netconfig._exec = orig
 			assert_true(ok, "no error without cfg")
+			assert_eq(st.ip_mode, "static", "static intent still recorded in state")
+			assert_eq(st.static_ip, "172.19.0.50", "static address recorded")
+			assert_eq(#cmds, 0, "no interface command issued without cfg.net")
+			assert_eq(st.ip, "192.168.1.100", "live st.ip untouched")
 		end
 	},
 	{
@@ -1904,6 +1923,11 @@ return {
 		name = "inform packet: handle_response cmd spectrum-scan builds spectrum_table from survey dump",
 		fn = function()
 			local st = sample_state()
+			-- Save/restore everything this test stubs: these are module-level
+			-- seams, and leaking them would make any later build_json/
+			-- radio_stats test silently run against this test's fixtures.
+			local orig_uci, orig_stats = inform._ucihelper, inform._sysinfo.radio_stats
+			local orig_cache = inform._spectrum_cache
 			inform._spectrum_cache = {}
 			inform._ucihelper = {
 				get_radio_table = function()
@@ -1919,17 +1943,22 @@ return {
 				}
 			end
 
-			local result = inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
-			assert_true(result, "re-inform immediately after executing a command")
+			local ok, err = pcall(function()
+				local result = inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
+				assert_true(result, "re-inform immediately after executing a command")
 
-			local cached = inform._spectrum_cache.radio0
-			assert_true(cached ~= nil, "spectrum-scan cmd populates _spectrum_cache for the radio")
-			assert_true(#cached.table == 2, "one spectrum_table entry per survey-dump frequency")
-			assert_true(cached.table[1].channel == 6, "channel derived from 2437MHz")
-			assert_true(cached.table[1].center_freq == 2437, "center_freq passed through from survey dump")
-			assert_true(cached.table[1].width == 40, "width derived from radio's HT40 htmode")
-			assert_true(cached.table[1].utilization == 37, "utilization = channel_time_busy/channel_time * 100")
-			assert_true(cached.table[1].interference == -95, "interference is best-effort noise-floor passthrough")
+				local cached = inform._spectrum_cache.radio0
+				assert_true(cached ~= nil, "spectrum-scan cmd populates _spectrum_cache for the radio")
+				assert_true(#cached.table == 2, "one spectrum_table entry per survey-dump frequency")
+				assert_true(cached.table[1].channel == 6, "channel derived from 2437MHz")
+				assert_true(cached.table[1].center_freq == 2437, "center_freq passed through from survey dump")
+				assert_true(cached.table[1].width == 40, "width derived from radio's HT40 htmode")
+				assert_true(cached.table[1].utilization == 37, "utilization = channel_time_busy/channel_time * 100")
+				assert_true(cached.table[1].interference == -95, "interference is best-effort noise-floor passthrough")
+			end)
+			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
+			inform._spectrum_cache = orig_cache
+			if not ok then error(err, 0) end
 		end
 	},
 	{
