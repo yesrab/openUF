@@ -614,8 +614,23 @@ function M.build_json(st, cfg, ufhw)
 		-- (confirmed against unifi-network-application:10.4.57's own
 		-- bytecode; see PROTOCOL-VALIDATION.md's outbound payload
 		-- field reference).
+		-- Live-corrected per-radio entries, keyed by UCI device name, for the
+		-- vap loop below. The radio loop above overwrote each entry's channel
+		-- with the live negotiated iw value and re-derived its band from it;
+		-- vap_table's own channel/radio are still UCI config echoes (possibly
+		-- the literal "auto", and stringly-typed), which left vap_table/
+		-- sta_table disagreeing with radio_table inside one payload.
+		local radio_live_by_name = {}
+		for _, radio in ipairs(radio_table) do
+			radio_live_by_name[radio.name] = radio
+		end
 		local now = M._time()
 		for _, vap in ipairs(vap_table) do
+			local live = radio_live_by_name[vap.radio_name]
+			if live then
+				if live.channel then vap.channel = live.channel end
+				if live.radio then vap.radio = live.radio end
+			end
 			-- get_ifname_for_radio() resolves a UCI radio device name
 			-- ("radio0"/"radio1"), not the band vap.radio now reports
 			-- ("ng"/"na") -- using vap.radio here always missed, silently

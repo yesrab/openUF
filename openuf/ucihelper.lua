@@ -791,7 +791,10 @@ function M.get_radio_table()
 		radios[#radios + 1] = {
 			name             = s[".name"],
 			radio            = band_for_device(s),
-			channel          = s.channel,
+			-- Numbers as numbers; the literal "auto" passes through as the
+			-- honest config intent until build_json overrides it with the
+			-- live negotiated channel.
+			channel          = tonumber(s.channel) or s.channel,
 			ht               = s.htmode,
 			tx_power         = s.txpower,
 			disabled         = (s.disabled == "1"),

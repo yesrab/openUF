@@ -67,7 +67,10 @@ local function inject_ucihelper()
 	inform._ucihelper = {
 		get_radio_table = function()
 			return {
-				{ name = "radio0", radio = "ng", channel = "6", ht = "HT20", tx_power = "20",
+				-- channel is numeric, mirroring the real get_radio_table's
+				-- tonumber coercion (the literal "auto" is the only
+				-- non-numeric value that passes through).
+				{ name = "radio0", radio = "ng", channel = 6, ht = "HT20", tx_power = "20",
 				  disabled = false, builtin_antenna = true, builtin_ant_gain = 3,
 				  max_txpower = 20 },
 			}
@@ -76,7 +79,7 @@ local function inject_ucihelper()
 			return {
 				{ name = "openuf_test", essid = "test", radio = "ng", radio_name = "radio0",
 				  encryption = "psk2", disabled = false, bssid = "aa:bb:cc:00:00:01",
-				  channel = "6", tx_power = "20", usage = "user" },
+				  channel = 6, tx_power = "20", usage = "user" },
 			}
 		end,
 		-- Strict on purpose: real get_ifname_for_radio() resolves a UCI
@@ -356,7 +359,10 @@ return {
 			assert_eq(#sta_table, 2, "two entries in sta_table")
 			assert_eq(sta_table[1].mac, "aa:bb:cc:dd:ee:ff", "first client mac")
 			assert_eq(sta_table[1].ap_mac, "aa:bb:cc:dd:ee:ff", "ap_mac from device mac")
-			assert_eq(sta_table[1].channel, "6", "channel from vap")
+			-- Numeric, matching radio_table: the payload used to mix a live
+			-- numeric radio_table channel with a raw UCI *string* here
+			-- (including the literal "auto" on ACS radios).
+			assert_eq(sta_table[1].channel, 6, "channel from vap, numeric")
 			assert_eq(sta_table[1].radio, "ng", "radio from vap (the band, matching vap.radio)")
 			assert_true(sta_table[1].active, "active true for a station iw actually lists")
 			assert_eq(sta_table[1].signal, -62, "signal from station dump")
@@ -648,6 +654,8 @@ return {
 			local real_uci = dofile("openuf/ucihelper.lua")
 			local sections = {
 				{[".name"] = "radio0", [".type"] = "wifi-device", channel = "auto"},
+				{[".name"] = "openuf_radio0_test", [".type"] = "wifi-iface",
+				 device = "radio0", ssid = "test", encryption = "psk2"},
 			}
 			real_uci._uci = {cursor = function() return {
 				foreach = function(_, config, stype, fn)
@@ -681,6 +689,10 @@ return {
 			inform._ucihelper = orig
 			assert_eq(d.radio_table[1].channel, 6, "live negotiated channel reported, not 'auto'")
 			assert_eq(d.radio_table[1].radio, "ng", "band re-derived from the live channel")
+			-- The vap inherits the same live correction -- its UCI echo was
+			-- the literal string "auto" here, and used to go out as-is.
+			assert_eq(d.vap_table[1].channel, 6, "vap channel overridden with the live value")
+			assert_eq(d.vap_table[1].radio, "ng", "vap band matches the corrected radio band")
 		end
 	},
 	{
