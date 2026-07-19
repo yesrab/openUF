@@ -641,6 +641,33 @@ return {
 		end
 	},
 	{
+		name = "inform json: country_code derived from the radio's UCI regdomain",
+		fn = function()
+			inject_sysinfo(false)
+			inject_ucihelper()
+			inform._ucihelper.get_radio_table = function()
+				return {
+					{ name = "radio0", radio = "ng", channel = 6, country = "CZ" },
+				}
+			end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			assert_eq(d.country_code, 203, "UCI country=CZ -> ISO numeric 203 (was hardcoded 840)")
+			assert_nil(d.radio_table[1].country, "internal country field stripped from the payload")
+		end
+	},
+	{
+		name = "inform json: country_code falls back to 840 without a UCI regdomain",
+		fn = function()
+			local d = build({with_uci = true})
+			assert_eq(d.country_code, 840, "no country option anywhere -> historic US default")
+		end
+	},
+	{
 		name = "inform json: ACS radio's band is re-derived from the live channel (real ucihelper)",
 		fn = function()
 			-- The inject_ucihelper mock hardcodes radio="ng" and so bypasses

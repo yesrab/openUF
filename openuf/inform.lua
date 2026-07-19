@@ -319,6 +319,22 @@ end
 
 -- ─── JSON payload builder ────────────────────────────────────────────────────
 
+-- ISO 3166-1 alpha-2 -> numeric, for the payload's country_code field. The
+-- wifi-device's UCI `country` option (the regdomain OpenWrt programs) is the
+-- source; best-effort coverage of common regulatory domains -- an unlisted
+-- code falls back to 840 (US), the old hardcoded value, rather than sending
+-- nothing.
+local ISO3166_NUMERIC = {
+	US = 840, CA = 124, MX = 484, BR = 76, AU = 36, NZ = 554, JP = 392,
+	CN = 156, KR = 410, IN = 356, GB = 826, IE = 372, DE = 276, FR = 250,
+	NL = 528, BE = 56, LU = 442, AT = 40, CH = 756, IT = 380, ES = 724,
+	PT = 620, DK = 208, SE = 752, NO = 578, FI = 246, IS = 352, PL = 616,
+	CZ = 203, SK = 703, HU = 348, SI = 705, HR = 191, RO = 642, BG = 100,
+	GR = 300, EE = 233, LV = 428, LT = 440, UA = 804, TR = 792, ZA = 710,
+	SG = 702, TW = 158, HK = 344, TH = 764, MY = 458, ID = 360, PH = 608,
+	VN = 704, IL = 376, AE = 784, SA = 682, AR = 32, CL = 152, CO = 170,
+}
+
 -- Build the inform JSON payload.
 -- st: current state table
 -- cfg: device configuration (from conf.lua)
@@ -356,6 +372,7 @@ function M.build_json(st, cfg, ufhw)
 	local radio_table_stats = {}
 	local vap_table         = {}
 	local scan_radio_table  = {}
+	local derived_country   = nil  -- from the radios' UCI regdomain, below
 
 	local mac_str = st.mac or "00:00:00:00:00:00"
 
@@ -380,6 +397,16 @@ function M.build_json(st, cfg, ufhw)
 		if ok_v then vap_table = rv end
 		local ok_r, rr = pcall(ufuci.get_radio_table)
 		if ok_r then radio_table = rr end
+
+		-- Regulatory domain for the payload's country_code, off the first
+		-- radio that declares one (UCI sets the same country on every
+		-- wifi-device). Was hardcoded 840 (US) for every deployment.
+		for _, r in ipairs(radio_table) do
+			if r.country then
+				derived_country = ISO3166_NUMERIC[tostring(r.country):upper()]
+				break
+			end
+		end
 
 		-- Live per-radio channel utilization, parallel to radio_table (matches
 		-- real UniFi's split of static config vs. live stats). Also kept in
@@ -602,10 +629,11 @@ function M.build_json(st, cfg, ufhw)
 					}
 				end
 			end
-			-- Internal wire-units field, never a payload member. Cleared out
-			-- here (not inside the ifname branch above) so it can't leak into
-			-- the serialized radio_table when ifname resolution fails.
+			-- Internal fields, never payload members. Cleared out here (not
+			-- inside the ifname branch above) so they can't leak into the
+			-- serialized radio_table when ifname resolution fails.
 			radio.min_rssi_raw = nil
+			radio.country      = nil  -- consumed into country_code above
 		end
 
 		-- Live connected-client counts, nested per-vap as sta_table -- matches
@@ -950,7 +978,7 @@ function M.build_json(st, cfg, ufhw)
 		version          = uap.fw and uap.fw.ver or "6.6.55",
 		required_version = uap.required_version or "6.0.0",
 		bootrom_version  = uap.bootver or "",
-		country_code     = st.country_code or 840,
+		country_code     = st.country_code or derived_country or 840,
 		mem_total        = meminfo.total_kb * 1024,
 		mem_used         = (meminfo.total_kb - meminfo.free_kb) * 1024,
 		-- Bit 0x10 (16): Device.hasQCASwitch() in the decompiled controller

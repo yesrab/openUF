@@ -797,6 +797,9 @@ function M.get_radio_table()
 			channel          = tonumber(s.channel) or s.channel,
 			ht               = s.htmode,
 			tx_power         = s.txpower,
+			-- UCI regdomain (e.g. "CZ"); build_json maps it to the numeric
+			-- ISO 3166 country_code. Internal -- stripped before serializing.
+			country          = s.country,
 			disabled         = (s.disabled == "1"),
 			builtin_antenna  = M.RADIO_DEFAULTS.builtin_antenna,
 			builtin_ant_gain = M.RADIO_DEFAULTS.builtin_ant_gain,
