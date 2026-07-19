@@ -367,10 +367,14 @@ Three things must line up or the port is skipped rather than guessed at:
 - the port must not be the uplink — reassigning the uplink's VLAN would cut the device off
   the network, so that is refused outright.
 
-Because assigning a port to a VLAN means removing it from the stock VLAN's port list,
-this is the one place openUF modifies UCI sections it did not create. It snapshots their
-original `ports` strings into `state.json` (`swvlan_backup`) before the first change, and
-`switchvlan.restore()` puts them back. Unticking the device-level **Port VLAN** box runs
+Because assigning a port to a VLAN means removing it from the stock VLAN's port list
+(swconfig allows one *untagged* VLAN per port), this is the one place openUF modifies UCI
+sections it did not create: a port moved untagged onto an openUF VLAN loses its untagged
+membership in every other `switch_vlan` section, and an explicit *exclude* drops the
+port's membership from that VLAN. Two safety refusals apply — an exclude that would leave
+the port untagged **nowhere** is ignored, and the management VLAN is never stripped of
+its last downstream port. openUF snapshots the original `ports` strings into `state.json`
+(`swvlan_backup`) before the first change, and `switchvlan.restore()` puts them back. Unticking the device-level **Port VLAN** box runs
 that restore automatically (the wire keeps the `switch.*` block with both gates at
 `disabled`, which openUF treats as the explicit off signal); a push that carries no
 `switch.*` block at all leaves the switch untouched. Inspect the result with

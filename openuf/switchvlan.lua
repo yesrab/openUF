@@ -176,6 +176,83 @@ function M.apply(sw, cfg, st)
 		desired[vlan_id] = M.build_ports(cfg, vlan_id, members)
 	end
 
+	-- Stock-section strips: moving a port onto an openuf VLAN means it must
+	-- LEAVE the stock VLAN's port list too -- swconfig allows one untagged
+	-- VLAN per port, and a port left untagged in stock VLAN 1 while also
+	-- untagged in openuf_swvlan20 is an invalid config the ASIC cannot
+	-- honor. (This forward mutation is what st.swvlan_backup/restore() were
+	-- always documented for; until now it was never actually performed, so
+	-- the restore machinery was dead code and port moves could not work.)
+	--
+	-- Rules, per managed physical port P and stock VLAN section V:
+	--   * exclude(P, V) on the wire  -> drop P's tokens from V, but drop an
+	--     UNTAGGED membership only when P gains an untagged home elsewhere
+	--     in this push (never strand a port with no untagged VLAN at all);
+	--     a tagged membership is always safe to drop.
+	--   * P untagged in some pushed VLAN W -> drop P's untagged token from
+	--     every OTHER stock section (the one-untagged-VLAN rule).
+	--   * CPU ports are never touched; the uplink cannot appear (its
+	--     port_idx is unmappable by design).
+	--   * The management VLAN is never stripped of its last downstream
+	--     port (same survival principle as the members_by_vlan guard).
+	local untagged_home = {}  -- phys -> vlan_id it becomes untagged in
+	local excluded      = {}  -- vlan_id -> { [phys] = true }
+	for port_idx, p in pairs(sw.ports) do
+		local phys = M.physical_port(cfg, port_idx)
+		if phys then
+			for vlan_id, mode in pairs(p.vlans) do
+				if mode == "untagged" and desired[vlan_id] then
+					untagged_home[phys] = vlan_id
+				elseif mode == "exclude" then
+					excluded[vlan_id] = excluded[vlan_id] or {}
+					excluded[vlan_id][phys] = true
+				end
+			end
+		end
+	end
+
+	local cpu_ports = {[tostring(cfg.vlan.cpu_lan)] = true}
+	if cfg.vlan.cpu_wan then cpu_ports[tostring(cfg.vlan.cpu_wan)] = true end
+
+	local stock_edits = {}  -- section name -> new ports string
+	cursor:foreach("network", "switch_vlan", function(s)
+		local name = s[".name"]
+		if not name or name:match("^" .. OPENUF_VLAN_PREFIX) then return end
+		local vid = tonumber(s.vlan)
+		if not vid or not s.ports then return end
+		local out, changed_here, non_cpu_left = {}, false, false
+		for tok in tostring(s.ports):gmatch("%S+") do
+			local num, tag = tok:match("^(%d+)(t?)$")
+			local keep = true
+			if num and not cpu_ports[num] then
+				local phys = tonumber(num)
+				local home = untagged_home[phys]
+				if excluded[vid] and excluded[vid][phys] then
+					if tag == "t" or (home and home ~= vid) then
+						keep = false
+					end
+				elseif tag == "" and home and home ~= vid then
+					keep = false
+				end
+			end
+			if keep then
+				out[#out + 1] = tok
+				if num and not cpu_ports[num] then non_cpu_left = true end
+			else
+				changed_here = true
+			end
+		end
+		if changed_here then
+			if vid == mgmt_vlan and not non_cpu_left then
+				io.stderr:write(("switchvlan: not stripping %s (management "
+					.. "VLAN %d) -- it would lose its last downstream port\n")
+					:format(name, vid))
+			else
+				stock_edits[name] = table.concat(out, " ")
+			end
+		end
+	end)
+
 	-- Reconcile: drop every openuf_swvlan* section this push no longer
 	-- wants. Without this, removing a VLAN in the controller left its
 	-- orphan section programming the switch forever.
@@ -192,11 +269,11 @@ function M.apply(sw, cfg, st)
 		changed = true
 	end
 
-	if next(desired) then
+	if next(desired) or next(stock_edits) then
 		-- Snapshot the stock sections' port strings once, before the first
 		-- mutation, so restore() can put them back. Only taken when we are
-		-- about to write sections -- a reconcile-only pass has no new
-		-- mutation to ledger.
+		-- about to write or strip sections -- a reconcile-only pass has no
+		-- new mutation to ledger.
 		st.swvlan_backup = st.swvlan_backup or (function()
 			local snap = {}
 			cursor:foreach("network", "switch_vlan", function(s)
@@ -204,6 +281,11 @@ function M.apply(sw, cfg, st)
 			end)
 			return snap
 		end)()
+
+		for name, ports in pairs(stock_edits) do
+			cursor:set("network", name, "ports", ports)
+			changed = true
+		end
 
 		for vlan_id, ports in pairs(desired) do
 			local section = OPENUF_VLAN_PREFIX .. tostring(vlan_id)

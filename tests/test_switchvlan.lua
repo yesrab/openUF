@@ -150,19 +150,97 @@ return {
 		end
 	},
 	{
-		name = "switchvlan: apply snapshots stock sections and restore puts them back",
+		name = "switchvlan: apply strips the moved port from the stock VLAN; restore puts it back",
 		fn = function()
+			-- The C3 override moves physical port 1 to native VLAN 20 and
+			-- excludes it from VLAN 1. swconfig allows ONE untagged VLAN per
+			-- port, so the port must leave stock VLAN 1's list -- before the
+			-- fix it stayed untagged in both sections (invalid config, the
+			-- port move could not work) and restore()'s stock-rewrite branch
+			-- was dead code, with this very test pinning the broken state.
 			with_capture(function()
 				local u = swconfig_board()
 				switchvlan._uci = u.mock
 				local st = {}
 				switchvlan.apply(override(), CFG, st)
-				assert_eq(st.swvlan_backup["1"], "0t 1 2 3 4", "stock VLAN 1 snapshotted")
+				assert_eq(st.swvlan_backup["1"], "0t 1 2 3 4",
+					"stock VLAN 1 snapshotted BEFORE the strip")
+				assert_eq(u.db.network.stock_vlan1.ports, "0t 2 3 4",
+					"moved port removed from the stock VLAN's list")
+				assert_eq(u.db.network.openuf_swvlan20.ports, "0t 1",
+					"port untagged in its new VLAN")
 
 				assert_true(switchvlan.restore(st), "restore reports a change")
 				assert_nil(u.db.network.openuf_swvlan20, "openUF's section removed")
-				assert_eq(u.db.network.stock_vlan1.ports, "0t 1 2 3 4", "stock ports intact")
+				assert_eq(u.db.network.stock_vlan1.ports, "0t 1 2 3 4",
+					"stock ports restored from the ledger (branch finally live)")
 				assert_nil(st.swvlan_backup, "ledger cleared")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: exclude drops a tagged stock membership even without a new untagged home",
+		fn = function()
+			-- "Block All" on a tagged VLAN: the port keeps its untagged home
+			-- in VLAN 1, so dropping the tagged membership strands nothing.
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				u.cursor:set("network", "stock_vlan30", "switch_vlan")
+				u.cursor:set("network", "stock_vlan30", "vlan", "30")
+				u.cursor:set("network", "stock_vlan30", "ports", "0t 1t 2t")
+				switchvlan._uci = u.mock
+				local sw = {enabled = true,
+					vlans = {[30] = {mode = "tagged", enabled = true}},
+					ports = {[2] = {vlans = {[30] = "exclude"}}}}
+				assert_true(switchvlan.apply(sw, CFG, {}), "strip reports a change")
+				assert_eq(u.db.network.stock_vlan30.ports, "0t 2t",
+					"tagged membership dropped on exclude")
+				assert_eq(u.db.network.stock_vlan1.ports, "0t 1 2 3 4",
+					"untagged home untouched")
+				assert_eq(#cmds, 1, "one reload")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: an untagged membership is never stripped without a new untagged home",
+		fn = function()
+			-- exclude from the port's ONLY untagged VLAN, with no new home in
+			-- the push: honoring it would leave the port untagged nowhere.
+			-- Refuse rather than strand.
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				local sw = {enabled = true,
+					vlans = {[1] = {mode = "untagged", enabled = true}},
+					ports = {[2] = {vlans = {[1] = "exclude"}}}}
+				assert_false(switchvlan.apply(sw, CFG, {}), "nothing to change")
+				assert_eq(u.db.network.stock_vlan1.ports, "0t 1 2 3 4",
+					"homeless exclude leaves the untagged membership alone")
+				assert_eq(#cmds, 0, "no reload")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: the management VLAN keeps its last downstream port",
+		fn = function()
+			-- A one-port board: stripping the sole downstream port off the
+			-- management VLAN would cut the switch off the network even
+			-- though the port has a new untagged home.
+			with_capture(function()
+				local u = new_mock_uci()
+				u.cursor:set("network", "sw0", "switch")
+				u.cursor:set("network", "sw0", "name", "switch0")
+				u.cursor:set("network", "stock_vlan1", "switch_vlan")
+				u.cursor:set("network", "stock_vlan1", "vlan", "1")
+				u.cursor:set("network", "stock_vlan1", "ports", "0t 1")
+				switchvlan._uci = u.mock
+				silently(function()
+					switchvlan.apply(override(), CFG, {})
+				end)
+				assert_eq(u.db.network.stock_vlan1.ports, "0t 1",
+					"management VLAN strip refused, not applied")
+				assert_eq(u.db.network.openuf_swvlan20.ports, "0t 1",
+					"the new VLAN section is still written")
 			end)
 		end
 	},
