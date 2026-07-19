@@ -16,12 +16,16 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y lua5.1 lua-bitop luarocks openssl
-          # lua-cjson requires lua5.1 dev headers
-          sudo apt-get install -y liblua5.1-dev
+          # lua-cjson requires lua5.1 dev headers; lua-openssl needs libssl-dev
+          sudo apt-get install -y liblua5.1-dev libssl-dev
           sudo luarocks --lua-version 5.1 install lua-cjson
+          # lua-openssl (rock name "openssl"): the GCM backend. Without it the
+          # AES-GCM tests skip -- OPENUF_REQUIRE_GCM below turns that skip into
+          # a hard failure so CI can never silently lose GCM coverage.
+          sudo luarocks --lua-version 5.1 install openssl LUA_INCDIR=/usr/include/lua5.1
 
       - name: Run tests
-        run: lua5.1 tests/run_tests.lua
+        run: OPENUF_REQUIRE_GCM=1 lua5.1 tests/run_tests.lua
 
   simulate:
     name: End-to-end adoption simulation

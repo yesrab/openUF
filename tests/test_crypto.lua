@@ -134,49 +134,77 @@ return {
 		end
 	},
 	{
-		name = "crypto: CBC decrypt with wrong key produces garbage (not original)",
+		name = "crypto: CBC decrypt with wrong key never recovers the plaintext",
 		fn = function()
+			-- One deterministic assertion. The old shape ("if ok then
+			-- assert_neq") took the pkcs7-unpad error path on almost every run
+			-- and asserted nothing at all.
 			local pt = "secret message!!"
 			local ct = crypto.aes_cbc_encrypt(crypto.DEFAULT_KEY, FIXED_IV, pt)
-			-- Decrypting with wrong key should either error or return wrong data
 			local ok, result = pcall(crypto.aes_cbc_decrypt,
 				"ffffffffffffffffffffffffffffffff", FIXED_IV, ct)
-			if ok then
-				assert_neq(result, pt, "wrong key produces different result")
-			end
-			-- error path is also acceptable
+			assert_true((not ok) or (result ~= pt),
+				"wrong key must error or produce different data, never the plaintext")
 		end
 	},
 	{
-		-- GCM needs a Lua crypto binding (lua-openssl/luacrypto). When neither is
-		-- present (e.g. the CLI-only dev host) the round-trip is skipped, but the
-		-- no-backend contract is still asserted.
-		name = "crypto: GCM encrypt + decrypt round-trip with AAD (or errors cleanly)",
+		-- The GCM path (the post-adoption inform crypto) needs a Lua binding
+		-- (lua-openssl/luacrypto). Locally a missing binding downgrades the
+		-- GCM tests to a LOUD skip; in CI OPENUF_REQUIRE_GCM=1 turns a
+		-- missing backend into a hard failure, so the pipeline can never
+		-- silently lose GCM coverage again (it did: for a long stretch no
+		-- environment executed the GCM code at all -- the old tests quietly
+		-- returned without asserting).
+		name = "crypto: GCM known-answer vector (16-byte IV, 40-byte AAD, cross-implementation)",
 		fn = function()
-			local key = crypto.DEFAULT_KEY
-			local pt  = "GCM secret body!"
-			local aad = string.rep("\1", 40)  -- 40-byte TNBU header, as on the wire
 			if not crypto.gcm_available() then
-				assert_error(function()
-					crypto.aes_gcm_encrypt(key, FIXED_IV, pt, aad)
-				end, "gcm_encrypt errors when no backend is available")
+				if os.getenv("OPENUF_REQUIRE_GCM") == "1" then
+					error("OPENUF_REQUIRE_GCM=1 but no GCM backend -- CI must install lua-openssl")
+				end
+				print("SKIP  GCM known-answer vector (no backend -- luarocks install --local openssl)")
 				return
 			end
-			local ct, tag = crypto.aes_gcm_encrypt(key, FIXED_IV, pt, aad)
-			assert_eq(#tag, 16, "GCM tag is 16 bytes")
-			assert_neq(ct, pt, "ciphertext differs from plaintext")
-			local out = crypto.aes_gcm_decrypt(key, FIXED_IV, ct, tag, aad)
-			assert_eq(out, pt, "GCM round-trip plaintext")
+			-- Vector generated once with pycryptodome (an independent AES-GCM
+			-- implementation, the same library tools/test_controller.py runs
+			-- on), so a shared misunderstanding on both sides -- dropped AAD,
+			-- mishandled 16-byte IV (OpenSSL's GCM default is 12; SET_IVLEN
+			-- is load-bearing) -- cannot round-trip its way past this test.
+			--   key = 000102...0f, iv = 101112...1f (16 bytes),
+			--   aad = bytes 0x00..0x27 (40 bytes, the TNBU header length)
+			local key_hex = "000102030405060708090a0b0c0d0e0f"
+			local iv      = crypto.hex_to_bin("101112131415161718191a1b1c1d1e1f")
+			local aad_b = {}
+			for i = 0, 39 do aad_b[#aad_b + 1] = string.char(i) end
+			local aad = table.concat(aad_b)
+			local pt  = '{"_type":"state","probe":42}'
+			local want_ct  = crypto.hex_to_bin(
+				"bebca8c204c241aaec3ab0f6c05b4af5d9df50ed0264c2da93b2b5eb")
+			local want_tag = crypto.hex_to_bin("245b6d60f69b94d3d94bc4e46ac809a7")
+
+			local ct, tag = crypto.aes_gcm_encrypt(key_hex, iv, pt, aad)
+			assert_bytes_eq(ct, want_ct, "ciphertext matches the pycryptodome vector")
+			assert_bytes_eq(tag, want_tag, "auth tag matches the pycryptodome vector")
+			assert_eq(crypto.aes_gcm_decrypt(key_hex, iv, want_ct, want_tag, aad), pt,
+				"decrypt of the vector recovers the exact plaintext")
 		end
 	},
 	{
 		name = "crypto: GCM decrypt fails on tampered AAD or tag",
 		fn = function()
-			if not crypto.gcm_available() then return end  -- covered by the test above
+			if not crypto.gcm_available() then
+				if os.getenv("OPENUF_REQUIRE_GCM") == "1" then
+					error("OPENUF_REQUIRE_GCM=1 but no GCM backend -- CI must install lua-openssl")
+				end
+				print("SKIP  GCM tamper test (no backend)")
+				return
+			end
 			local key = crypto.DEFAULT_KEY
 			local pt  = "GCM secret body!"
 			local aad = string.rep("\1", 40)
 			local ct, tag = crypto.aes_gcm_encrypt(key, FIXED_IV, pt, aad)
+			assert_eq(#tag, 16, "GCM tag is 16 bytes")
+			assert_eq(crypto.aes_gcm_decrypt(key, FIXED_IV, ct, tag, aad), pt,
+				"round-trip sanity before tampering")
 			assert_error(function()
 				crypto.aes_gcm_decrypt(key, FIXED_IV, ct, tag, string.rep("\2", 40))
 			end, "wrong AAD must fail verification")
@@ -184,6 +212,19 @@ return {
 			assert_error(function()
 				crypto.aes_gcm_decrypt(key, FIXED_IV, ct, bad_tag, aad)
 			end, "wrong tag must fail verification")
+		end
+	},
+	{
+		name = "crypto: GCM without a backend raises a clear error (never silent garbage)",
+		fn = function()
+			if crypto.gcm_available() then
+				print("SKIP  no-backend contract (a GCM backend is installed here)")
+				return
+			end
+			local ok, err = pcall(crypto.aes_gcm_encrypt,
+				crypto.DEFAULT_KEY, FIXED_IV, "x", string.rep("\1", 40))
+			assert_false(ok, "gcm_encrypt must error without a backend")
+			assert_contains(tostring(err), "no GCM backend", "actionable error message")
 		end
 	},
 	{
