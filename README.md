@@ -75,7 +75,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | Manage → LED steady on/off toggle | ✅ Working — same `dev.conf.led` requirement |
 | Client block / unblock | ✅ Working — enforced via nftables, persists across restarts |
 | IP Settings (DHCP / static) | ✅ Working — reconfigures the device's own management interface, including the DNS servers (`resolv.nameserver.<k>.ip` → `/etc/resolv.conf`, in the controller's primary/secondary order). DNS is applied on the static path only; on DHCP the lease supplies it |
-| Per-port VLAN assignment | ✅ Working — requires reporting the `hasOWRTSwitch` capability bit |
+| Per-port VLAN assignment | ⚠️ Wire format fully mapped live (`switch.*`: device-level gate, per-VLAN table, per-port `pvid` plus a tagged/untagged/exclude matrix joined on `port_table[].port_idx`); requires reporting the `hasOWRTSwitch` capability bit. Device-side apply is **swconfig boards only** and is not verified against real switch hardware — see below |
 | Set Replacement Device / Load Configuration | ✅ Working — both are controller-side clones; no device-side protocol involved |
 | Power / PoE reporting | Not applicable — the flagged UI field belongs to the upstream parent device, not the AP |
 | Speed test | Not applicable — gateway-only feature in current UniFi Network |

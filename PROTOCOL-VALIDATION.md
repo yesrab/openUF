@@ -424,9 +424,14 @@ server-side. openUF maps these to hostapd's `sae_anti_clogging_threshold` / `sae
 ### `radio.<n>.*` — per-radio config
 
 `phyname` (`radio0`), `channel` (integer or the literal `auto`), `txpower` (integer or `auto`),
-`txpower_mode` (`custom`), `status`, `ieee_mode`. When no radio is provisionable the blob contains the
-literal comment `# no wlan provisioned as no radio found` and `radio.status=disabled` — see
+`txpower_mode` (`auto`/`custom`/`disabled`), `status`, `ieee_mode`. When no radio is
+provisionable the blob contains the literal comment `# no wlan provisioned as no radio found`
+and the **unindexed** `radio.status=disabled` — see
 [`radio_table` must not be empty](#radio_table-entry).
+
+Do not confuse that unindexed key with the **indexed** `radio.<n>.status`, which is the real
+per-radio enable/disable control — see
+[`radio.<n>.status` — per-radio disable](#radionstatus--per-radio-disable).
 
 `ieee_mode` is **the wire's only channel-width signal**: a compound `11` + band (`ng`/`na`) +
 PHY and width token — `11nght20`, `11nght40`, `11naht40`, `11acvht80`, `11axhe80`. Changing
@@ -548,12 +553,96 @@ real hardware's continuously-running DHCP client needs no manual re-invocation.
 
 ### `switch.*` — per-port VLAN
 
-Appears only once the device declares switch capability. `switch.status`,
-`switch.vlan.status`, `switch.vlan.N.id/mode/status`, `switch.port.N.name/opmode` — one entry
-per the model registry's port count, **not** per whatever `port_table` openUF actually reports.
+Appears only once the device declares switch capability. Fully mapped live 2026-07-19 by
+diffing `system_cfg` across five states. An earlier version of this section claimed the
+controller "manages VLAN membership server-side and only needs the device to *accept* the
+push" — **that was wrong**, and it is why README claimed the feature worked while no code
+existed. The device is sent a complete, actionable VLAN table.
 
-openUF does not parse or apply this block. Nothing depends on it: the controller manages VLAN
-membership server-side and only needs the device to *accept* the port-override push.
+**Baseline (B0) — Port VLAN off**, the state every device sits in until the control is
+enabled:
+
+```
+switch.status=disabled
+switch.vlan.status=disabled
+switch.dot1x.status=disabled
+switch.jumboframes=disabled
+switch.port.1.name=PoE Out + Data   / .opmode=switch
+switch.port.2.name=Data             / .opmode=switch     # ... through port 5
+```
+
+The `switch.port.N` entries are always present — one per the **model registry's** port count
+(5 for U6IW), not per whatever `port_table` openUF reports. They carry only `name`/`opmode`
+and never move; they are inventory, not control.
+
+**The discriminator is `switch.status` / `switch.vlan.status` flipping to `enabled`.** Both
+sit at `disabled` in B0, so — unlike `wireless.<n>.mac_acl.*` or `radio.<n>.bcmc_l2_filter.status`
+— these are genuine gates, not decoys. They are driven by a **device-level** checkbox
+(Devices → [AP] → Settings → IP Settings → **Port VLAN**), not by anything per-port, and until
+it is ticked the whole per-port VLAN UI is greyed out.
+
+**C1 — Port VLAN enabled, no port override.** The site's VLANs appear as a table:
+
+```
+switch.status=enabled
+switch.vlan.status=enabled
+switch.vlan.1.id=1      / .mode=untagged / .status=enabled
+switch.vlan.2.id=20     / .mode=tagged   / .status=enabled
+```
+
+`switch.vlan.<m>` is a slot number; `.id` is the real VLAN id. `.mode` here is the VLAN's
+device-wide default.
+
+**C2 — port 2's Native VLAN set to the VLAN-20 network.** Three keys are added:
+
+```
+switch.port.2.pvid=20              # the port's untagged/native VLAN
+switch.vlan.1.port.2.mode=tagged   # VLAN 1 is tagged on port 2
+switch.vlan.2.port.2.mode=untagged # VLAN 20 is untagged on port 2
+```
+
+So membership is expressed **twice, redundantly**: once per-port (`pvid`) and once as a
+per-VLAN-per-port matrix (`switch.vlan.<m>.port.<n>.mode`). The matrix is the authoritative
+one — it is what carries tagging, and `pvid` is derivable from it (the VLAN whose mode is
+`untagged`).
+
+**`switch.port.<n>` joins directly to `port_table[].port_idx`** — no devname indirection,
+unlike `macacl.*`/`qos.vap.*`. Confirmed by the Port Manager UI listing exactly the two ports
+openUF reports (not the registry's five) and the override landing on wire index 2, openUF's
+port_idx 2.
+
+**C3 — Tagged VLAN Management → Block All.** One key changes:
+
+```
+switch.vlan.1.port.2.mode=exclude   # was "tagged"
+```
+
+giving the full mode vocabulary: **`untagged` | `tagged` | `exclude`**, which maps 1:1 onto
+swconfig's untagged/tagged/absent port membership.
+
+**C4 — port reverted to default.** The three per-port keys from C2 simply **disappear**, and
+the blob returns byte-identical to C1. Teardown is therefore expressible: absence means
+default (untagged on the management VLAN, all others tagged), the same "absent block means
+disabled" convention used everywhere else in this format.
+
+### `radio.<n>.status` — per-radio disable
+
+Also settled 2026-07-19, in the same session. Setting a radio's **Transmit Power → Disabled**
+(Devices → [AP] → Settings → Radios) moves four keys:
+
+```
+radio.1.status=disabled            # was enabled
+radio.1.txpower_mode=disabled      # was auto
+radio.1.virtual.1.status=disabled  # was enabled
+wireless.1.status=disabled         # and every other vap on that radio
+wireless.2.status=disabled
+```
+
+This corrects an earlier reading of this document, which recorded `radio.status=disabled`
+only as part of the radio-less `# no wlan provisioned as no radio found` case and concluded
+the key carried no per-radio signal. **The indexed `radio.<n>.status` is a real control**, and
+openUF currently ignores it along with `wireless.<n>.status` — so disabling a radio in the
+controller UI has no effect on the device.
 
 ---
 
@@ -914,7 +1003,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 15 | Power / PoE | `power_source`, `power_source_voltage`, `psu_table`, `power-monitor`, `total_max_power`, `led_state`, `outlet_table` — copied straight off the inform when present | 🔍 Not implemented. The "Power: -" element lives in the **Parent Device** subsection (properties of the upstream LLDP-linked switch), and this environment has no PoE switch. Field names confirmed; values/format not researched, and openUF has no local signal for a real PoE class. |
 | 16 | Set Replacement Device / Load Configuration | **None** — controller-side Mongo document clone (`commonDeviceCloneConfigService`), then an ordinary adopt + `setparam` | ✅ Both confirmed live; zero product code needed. Replacement auto-adopts the target ~50 s after the source goes away. |
 | 17 | Wired clients | `port_table[]` + per-port `mac_table[]` | ✅ Confirmed live: both fake hosts under Connection → Wired, on the correct port; Ports view renders them |
-| 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ✅ Confirmed live; verified twice (direct REST and full UI round-trip) |
+| 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ⚠️ Wire format fully mapped live 2026-07-19 (gate, per-VLAN table, per-port `pvid` + tagged/untagged/exclude matrix, teardown). The **controller side** is confirmed — it accepts the assignment and pushes an actionable table. Device-side apply is swconfig-only and unverifiable here (the validation AP has no switch) |
 | 19 | Client block / unblock | `cmd:"block-sta"` / `"unblock-sta"` | ✅ Confirmed live including real nftables enforcement and survival across a simulated reboot. `hostapd_cli` deauth is unit-tested only (no real hostapd here). |
 | 20 | Environment / rogue-AP scan | `scan_radio_table[]` | ✅ openUF's payload and the controller's ingestion both confirmed correct (10/10 direct API polls). The tab's own display bug is [controller-side](#controller-side-ui-quirks). |
 | 21 | Radios tab + client MIMO/generation | `radio_table` capability fields; per-station `nss`/`is_11*` | ✅ Confirmed live on four stations spanning HT/VHT/HE/legacy |
