@@ -1300,6 +1300,34 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: get_radio_table derives the band config-first when channel is auto",
+		fn = function()
+			-- With channel=auto (ACS) the channel number can't identify the
+			-- band, and the old channel-only mapping reported every ACS radio
+			-- as "na" (5GHz). The section's own declaration is authoritative:
+			-- `band` on modern OpenWrt, `hwmode` on older releases.
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "channel", "auto")
+				cursor:set("wireless", "radio0", "band", "2g")
+				cursor:set("wireless", "radio1", "wifi-device")
+				cursor:set("wireless", "radio1", "channel", "auto")
+				cursor:set("wireless", "radio1", "hwmode", "11g")
+				cursor:set("wireless", "radio2", "wifi-device")
+				cursor:set("wireless", "radio2", "channel", "auto")
+				cursor:set("wireless", "radio2", "band", "5g")
+				cursor:set("wireless", "radio3", "wifi-device")
+				cursor:set("wireless", "radio3", "channel", "6")
+				local radios = ucihelper.get_radio_table()
+				assert_eq(radios[1].radio, "ng", "band=2g wins over channel=auto (was misreported na)")
+				assert_eq(radios[2].radio, "ng", "hwmode=11g wins over channel=auto")
+				assert_eq(radios[3].radio, "na", "band=5g respected")
+				assert_eq(radios[4].radio, "ng", "numeric channel fallback unchanged")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes the literal channel=auto (ACS) over a stale fixed channel",
 		fn = function()
 			-- The controller sends radio.<n>.channel=auto for the Auto

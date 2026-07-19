@@ -411,6 +411,18 @@ function M.build_json(st, cfg, ufhw)
 				local ok_caps, caps = pcall(M._sysinfo.radio_caps, ifname)
 				if ok_caps and caps then
 					for k, v in pairs(caps) do radio[k] = v end
+					-- The live negotiated channel is band-authoritative once
+					-- ACS has picked one: UCI's config value may be the
+					-- literal "auto", for which get_radio_table's config-first
+					-- derivation can still misreport the band when the
+					-- section carries neither `band` nor `hwmode`. Re-derive
+					-- here so every downstream consumer of radio.radio in
+					-- this loop (scan_radio_table band, athstats bucketing)
+					-- inherits the correction. Feature-detected: test mocks
+					-- inject a ucihelper without band_for_channel.
+					if caps.channel and ufuci.band_for_channel then
+						radio.radio = ufuci.band_for_channel(caps.channel)
+					end
 					-- radio_caps: a genuine SEPARATE integer field on
 					-- radio_table (confirmed via decompile,
 					-- com.ubnt.service.devmgr.PGOcbDWlbnYQdFW/

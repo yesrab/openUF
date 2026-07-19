@@ -91,6 +91,26 @@ local function band_for_channel(channel)
 	if ch and ch >= 1 and ch <= 14 then return "ng" end
 	return "na"
 end
+-- Exported for inform.lua's build_json, which re-derives the band from the
+-- LIVE negotiated channel (iw) after the radio-caps merge -- authoritative
+-- once ACS has picked a channel, when UCI itself may only say "auto".
+M.band_for_channel = band_for_channel
+
+-- Band for a UCI wifi-device SECTION: config-first, channel-number fallback.
+-- The channel value alone is not enough -- with channel=auto (ACS)
+-- tonumber() is nil and the pure channel mapping above misreports a 2.4GHz
+-- radio as "na" (5GHz). The section's own band declaration is authoritative:
+-- `band` ("2g"/"5g"/"6g") on modern OpenWrt, `hwmode` ("11g"/"11a"/...) on
+-- older releases. 6GHz maps to "na" only because openUF targets dual-band
+-- 2.4/5GHz hardware (see band_for_channel's comment); a 6E target would need
+-- the "6e" identifier and its own model capabilities.
+local function band_for_device(s)
+	if s.band == "2g" then return "ng" end
+	if s.band == "5g" or s.band == "6g" then return "na" end
+	if s.hwmode == "11b" or s.hwmode == "11g" or s.hwmode == "11ng" then return "ng" end
+	if s.hwmode == "11a" or s.hwmode == "11na" or s.hwmode == "11ac" then return "na" end
+	return band_for_channel(s.channel)
+end
 
 -- The UCI prefix applied to all openuf-managed wireless sections
 local OPENUF_PREFIX = "openuf_"
@@ -770,7 +790,7 @@ function M.get_radio_table()
 	cursor:foreach("wireless", "wifi-device", function(s)
 		radios[#radios + 1] = {
 			name             = s[".name"],
-			radio            = band_for_channel(s.channel),
+			radio            = band_for_device(s),
 			channel          = s.channel,
 			ht               = s.htmode,
 			tx_power         = s.txpower,

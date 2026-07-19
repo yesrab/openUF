@@ -635,6 +635,55 @@ return {
 		end
 	},
 	{
+		name = "inform json: ACS radio's band is re-derived from the live channel (real ucihelper)",
+		fn = function()
+			-- The inject_ucihelper mock hardcodes radio="ng" and so bypasses
+			-- the real band derivation entirely -- this test wires the REAL
+			-- ucihelper to a minimal mock cursor instead. Worst case on
+			-- purpose: UCI holds only channel=auto (no band, no hwmode), for
+			-- which the config-first derivation still guesses "na" -- but the
+			-- live iw fixture has negotiated channel 6, which must win.
+			-- Pre-fix the payload reported this 2.4GHz radio as "na" (5GHz).
+			inject_sysinfo(false, false, false, true)  -- with_radio_caps
+			local real_uci = dofile("openuf/ucihelper.lua")
+			local sections = {
+				{[".name"] = "radio0", [".type"] = "wifi-device", channel = "auto"},
+			}
+			real_uci._uci = {cursor = function() return {
+				foreach = function(_, config, stype, fn)
+					if config ~= "wireless" then return end
+					for _, s in ipairs(sections) do
+						if s[".type"] == stype then fn(s) end
+					end
+				end,
+				get = function() return nil end,
+				set = function() end,
+				delete = function() end,
+				commit = function() end,
+			} end}
+			real_uci._popen = function(cmd)
+				if cmd:find("network.wireless", 1, true) then
+					return '{"radio0":{"interfaces":[{"ifname":"wlan0"}]}}'
+				end
+				return ""
+			end
+			real_uci._read_file = function() return nil end
+			real_uci._run_cmd = function() return true end
+
+			local orig = inform._ucihelper
+			inform._ucihelper = real_uci
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			inform._ucihelper = orig
+			assert_eq(d.radio_table[1].channel, 6, "live negotiated channel reported, not 'auto'")
+			assert_eq(d.radio_table[1].radio, "ng", "band re-derived from the live channel")
+		end
+	},
+	{
 		name = "inform json: radio_table_stats includes spectrum_table when cached from a prior spectrum-scan cmd",
 		fn = function()
 			inform._spectrum_cache = {
