@@ -182,6 +182,29 @@ function M.get_ip(iface)
 	return nil
 end
 
+-- Injectable: command execution that captures stdout (same seam convention
+-- as ucihelper._popen), so tests can feed get_hostname() without a shell.
+M._popen = function(cmd)
+	local h = io.popen(cmd .. " 2>/dev/null")
+	if not h then return "" end
+	local s = h:read("*a")
+	h:close()
+	return s or ""
+end
+
+-- The device's real system hostname, or nil when unavailable/empty.
+-- Used by the L2-discovery entry point below and by inform.lua's
+-- _populate_net_info (the inform payload's top-level "hostname" field --
+-- without it every openUF device shows up in the controller as "openUF").
+function M.get_hostname()
+	local out = M._popen("hostname")
+	if type(out) ~= "string" then return nil end
+	local line = out:match("([^\r\n]+)")          -- first line
+	line = line and line:match("^%s*(.-)%s*$")    -- trimmed
+	if not line or line == "" then return nil end
+	return line
+end
+
 -- Start the main announce loop (blocks forever).
 -- cfg: same table as build_packet() requires, plus:
 --   interval  number  seconds between sends (default 10)
@@ -229,9 +252,7 @@ if not OPENUF_TEST_MODE then
 		local iface = dev.conf.net.lan_cpueth or "eth1"
 		local mac   = M.get_mac(iface) or {0x24, 0xa4, 0x3c, 0x00, 0xd3, 0xad}
 		local ip    = M.get_ip(iface)  or {192, 168, 1, 1}
-		local h     = io.popen("hostname 2>/dev/null")
-		local hostname = h and h:read("*l") or "openUF"
-		if h then h:close() end
+		local hostname = M.get_hostname() or "openUF"
 
 		M.run({
 			mac           = mac,

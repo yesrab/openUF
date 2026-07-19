@@ -194,4 +194,27 @@ return {
 			assert_eq(string.byte(val, 1), 0x00, "IsDefault=0 when adopted")
 		end
 	},
+	{
+		name = "announce: get_hostname returns the trimmed first line of `hostname`",
+		fn = function()
+			local orig = announce._popen
+			announce._popen = function() return "myap\n" end
+			local got = announce.get_hostname()
+			announce._popen = orig
+			assert_eq(got, "myap", "hostname read and trimmed")
+		end
+	},
+	{
+		name = "announce: get_hostname returns nil for empty or failed output",
+		fn = function()
+			local orig = announce._popen
+			announce._popen = function() return "" end
+			local empty = announce.get_hostname()
+			announce._popen = function() return "   \n" end
+			local blank = announce.get_hostname()
+			announce._popen = orig
+			assert_nil(empty, "empty output -> nil (caller falls back to openUF)")
+			assert_nil(blank, "whitespace-only output -> nil")
+		end
+	},
 }

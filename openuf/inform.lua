@@ -2302,6 +2302,12 @@ function M._populate_net_info(st, cfg)
 		st.ip = string.format("%d.%d.%d.%d",
 			ip_tbl[1], ip_tbl[2], ip_tbl[3], ip_tbl[4])
 	end
+	-- Without this the payload's top-level hostname fell back to "openUF"
+	-- for every device (the doc comments always claimed hostname was
+	-- populated here, but only mac/ip ever were). Feature-detected so an
+	-- older announce module without get_hostname degrades to the fallback.
+	local hostname = announce.get_hostname and announce.get_hostname()
+	if hostname then st.hostname = hostname end
 end
 
 -- Detects an out-of-process change to the on-disk state file -- written by

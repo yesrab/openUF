@@ -1928,6 +1928,20 @@ return {
 		end
 	},
 	{
+		name = "inform: _populate_net_info fills st.hostname from the real system hostname",
+		fn = function()
+			-- The doc comments always claimed mac/ip/hostname were populated
+			-- here, but hostname never was -- so build_json's
+			-- `st.hostname or "openUF"` fallback labeled every device
+			-- "openUF" in the controller. Runs against the dev machine's real
+			-- `hostname` binary (get_mac/get_ip harmlessly find nothing).
+			local st = {}
+			inform._populate_net_info(st, nil)
+			assert_true(type(st.hostname) == "string" and st.hostname ~= "",
+				"st.hostname populated with a nonempty string")
+		end
+	},
+	{
 		name = "inform packet: handle_response dumps raw JSON when debug_dump_file set",
 		fn = function()
 			local st = sample_state()
