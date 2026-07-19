@@ -398,7 +398,10 @@ it — because the stricter choice would silently lock clients out of a co-hoste
 that was meant to admit them. Give a WLAN its own radio if it needs its floor enforced
 exactly. Note also that the floor is enforced by making it the sole *basic* rate (a
 station must support every basic rate to associate); the "advertising rates" sub-toggle
-additionally trims `supported_rates`.
+additionally trims `supported_rates`. Rate options openUF writes are stamped with an
+`openuf_rates` marker on the radio section: turning the control off (the wire simply
+omits every `minrate_*` key) tears down exactly the marked options, while rate options
+you hand-tuned on an unmarked radio are never touched.
 
 Minimum RSSI is a *radio* setting in the controller UI (Devices → AP → Radios), not a per-WLAN one, and the wire value is an offset from an assumed noise floor rather than a dBm figure — openUF converts it using a live noise reading. The controller signals *disable* by omitting the whole `stamgr.<n>` block from the next config push; openUF treats that as an explicit off and clears `minrssi_enabled` in UCI (the stored threshold stays parked for a later re-enable).
 

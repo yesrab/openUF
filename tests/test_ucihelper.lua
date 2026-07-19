@@ -597,6 +597,102 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config tears down rate options when Minimum Data Rate is turned off",
+		fn = function()
+			-- The wire signals "control off" by omitting every minrate_* key,
+			-- so the off-push arrives with no floor on any VAP. Before the
+			-- fix that meant rates=nil -> skip -> the old basic_rate kept
+			-- excluding slow clients forever.
+			with_ucihelper(function(db)
+				local on = {
+					radio_table = {{name = "radio0"}},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", minrate_data = 12000,
+						 minrate_cck = false, beacon_rate = 12000,
+						 minrate_below_disable = true},
+					},
+				}
+				ucihelper.apply_config(on, nil)
+				assert_eq(db.wireless.radio0.openuf_rates, "1", "managed section marked")
+				assert_eq(db.wireless.radio0.basic_rate[1], 12000, "floor applied")
+
+				local off = {
+					radio_table = {{name = "radio0"}},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(off, nil)
+				local r = db.wireless.radio0
+				assert_eq(r.basic_rate, nil, "basic_rate torn down")
+				assert_eq(r.supported_rates, nil, "supported_rates torn down")
+				assert_eq(r.legacy_rates, nil, "legacy_rates torn down")
+				assert_eq(r.beacon_rate, nil, "beacon_rate torn down")
+				assert_eq(r.openuf_rates, nil, "marker removed")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config never touches hand-tuned rates on an unmarked radio",
+		fn = function()
+			-- A user's own basic_rate in /etc/config/wireless, never written
+			-- by openUF (no openuf_rates marker), must survive a floor-less
+			-- push -- absent-when-off is indistinguishable from never-managed
+			-- without the marker, so only marked sections are torn down.
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "basic_rate", {6000})
+				local resp = {
+					radio_table = {{name = "radio0"}},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22"},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				assert_eq(db.wireless.radio0.basic_rate[1], 6000,
+					"hand-tuned basic_rate preserved on an unmarked section")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config drops supported_rates when only the drop-below sub-toggle reverts",
+		fn = function()
+			-- The sub-toggle can turn off while the floor stays on: the next
+			-- push has minrate_data but no drop-below. supported_rates from
+			-- the stricter earlier push must be deleted, not skipped.
+			with_ucihelper(function(db)
+				local strict = {
+					radio_table = {{name = "radio0"}},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", minrate_data = 12000,
+						 minrate_cck = false, minrate_below_disable = true},
+					},
+				}
+				ucihelper.apply_config(strict, nil)
+				assert_true(db.wireless.radio0.supported_rates ~= nil, "strict push trims the advertised set")
+
+				local relaxed = {
+					radio_table = {{name = "radio0"}},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", minrate_data = 12000,
+						 minrate_cck = false, minrate_below_disable = false},
+					},
+				}
+				ucihelper.apply_config(relaxed, nil)
+				local r = db.wireless.radio0
+				assert_eq(r.supported_rates, nil, "supported_rates deleted when drop-below reverts")
+				assert_eq(r.basic_rate[1], 12000, "floor still applied")
+				assert_eq(r.openuf_rates, "1", "section still marked while the floor is on")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config keeps each radio's floor separate",
 		fn = function()
 			with_ucihelper(function(db)

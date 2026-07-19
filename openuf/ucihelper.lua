@@ -352,6 +352,9 @@ end
 -- hostapd_common_add_device_config and appended to the radio's base_cfg), even
 -- though the controller sends Minimum Data Rate per WLAN. apply_config()
 -- therefore aggregates the radio's VAPs down to one setting -- see there.
+-- Writes are stamped with an openuf_rates marker; rates == nil on a marked
+-- section tears all four options down (the wire signals "control off" by
+-- omitting every minrate_* key), while unmarked sections are left alone.
 -- disabled: tri-state per-radio enable, from the controller's
 -- radio.<n>.status (Radios -> Transmit Power -> Disabled). nil leaves UCI
 -- alone -- a blob that never carries the key must not re-enable a radio the
@@ -378,17 +381,34 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 		cursor:set("wireless", radio, "minrssi_rssi", tostring(minrssi_raw))
 	end
 	if rates then
+		-- Stamp the sections we rate-manage: "Minimum Data Rate off" arrives
+		-- as the minrate_* keys simply vanishing from the wire, which is
+		-- indistinguishable from "never managed / user hand-tuned basic_rate"
+		-- without a ledger. The marker (same template as set_wlan_exclusive's
+		-- openuf_autodisabled stamp) confines the teardown below to options
+		-- openUF itself wrote.
+		cursor:set("wireless", radio, "openuf_rates", "1")
 		-- basic_rate/supported_rates are UCI *list* options carrying kb/s
 		-- values; OpenWrt divides each by 100 itself (hostapd_add_rate) to
 		-- reach hostapd's 100-kbps units, so they are set in kb/s as received.
+		-- Each absent field is DELETED, not skipped: supported_rates and
+		-- beacon_rate can legitimately drop out while the feature stays on
+		-- (the drop-below/beacon sub-toggles), and a skip would strand the
+		-- previous stricter push.
 		if rates.basic_rate then
 			cursor:set("wireless", radio, "basic_rate", rates.basic_rate)
+		else
+			cursor:delete("wireless", radio, "basic_rate")
 		end
 		if rates.supported_rates then
 			cursor:set("wireless", radio, "supported_rates", rates.supported_rates)
+		else
+			cursor:delete("wireless", radio, "supported_rates")
 		end
 		if rates.legacy_rates then
 			cursor:set("wireless", radio, "legacy_rates", rates.legacy_rates)
+		else
+			cursor:delete("wireless", radio, "legacy_rates")
 		end
 		if rates.beacon_rate then
 			-- beacon_rate is the exception: OpenWrt appends it to the hostapd
@@ -398,6 +418,18 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 			-- be converted here, or a 12000 kb/s floor would ask for 1.2 Gbps.
 			cursor:set("wireless", radio, "beacon_rate",
 				tostring(math.floor(rates.beacon_rate / 100)))
+		else
+			cursor:delete("wireless", radio, "beacon_rate")
+		end
+	elseif cursor:get("wireless", radio, "openuf_rates") == "1" then
+		-- Minimum Data Rate reverted to off: no VAP on this radio carries a
+		-- floor anymore, so tear down exactly the options the marker says we
+		-- wrote. Without this, the old basic_rate/supported_rates kept
+		-- excluding slow clients forever after the control was turned off.
+		-- Hand-tuned rate options on unmarked sections are never touched.
+		for _, opt in ipairs({"basic_rate", "supported_rates", "legacy_rates",
+				"beacon_rate", "openuf_rates"}) do
+			cursor:delete("wireless", radio, opt)
 		end
 	end
 	cursor:commit("wireless")
