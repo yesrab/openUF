@@ -497,8 +497,15 @@ function M.apply_config(resp, cfg, opts)
 		if vap.radio and vap.minrate_data then
 			local agg = rates_by_radio[vap.radio]
 			if not agg then
+				-- drop_below is `== true`, not `~= false`: an absent
+				-- minrate_below_disable key must count as permissive (don't
+				-- trim the advertised set), matching both the most-permissive
+				-- contract above and the `if not ...` fold below -- the old
+				-- `~= false` made a single VAP with the key absent STRICT,
+				-- and flipped to permissive when a second identical VAP
+				-- appeared.
 				agg = {floor = vap.minrate_data, allow_cck = vap.minrate_cck,
-					drop_below = vap.minrate_below_disable ~= false,
+					drop_below = vap.minrate_below_disable == true,
 					beacon_rate = vap.beacon_rate}
 				rates_by_radio[vap.radio] = agg
 			else

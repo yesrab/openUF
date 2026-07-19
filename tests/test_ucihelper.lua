@@ -693,6 +693,31 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: a single VAP with minrate_below_disable absent stays permissive",
+		fn = function()
+			-- The wire can carry minrate_data without minrate_below_disable
+			-- (absent -> nil at parse). Absent must mean "don't trim the
+			-- advertised set" -- the old init read it as strict for a single
+			-- VAP and then flipped to permissive when a second identical VAP
+			-- joined the radio, contradicting the most-permissive contract.
+			with_ucihelper(function(db)
+				local resp = {
+					radio_table = {{name = "radio0"}},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", minrate_data = 12000,
+						 minrate_cck = false},  -- no minrate_below_disable
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local r = db.wireless.radio0
+				assert_eq(r.supported_rates, nil,
+					"absent drop-below key -> advertised set not trimmed")
+				assert_eq(r.basic_rate[1], 12000, "floor still applied")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config keeps each radio's floor separate",
 		fn = function()
 			with_ucihelper(function(db)
