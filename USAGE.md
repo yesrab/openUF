@@ -101,12 +101,20 @@ sh install.sh uninstall
 Select the modelmap that matches your hardware:
 
 ```lua
--- For TP-Link WDR3500, Archer C5 v1, or any dual-band OpenWrt AP:
+-- For TP-Link Archer C5 v1 (dual-band, board-specific):
+dev = dofile("modelmap/archer-c5-v1.lua")
+
+-- For TP-Link WDR3500 or any other dual-band OpenWrt AP:
 dev = dofile("modelmap/generic-dualband-ap.lua")
 
 -- For TP-Link WR1043ND v2 (single-band):
 dev = dofile("modelmap/tl-wr1043ndv2.lua")
 ```
+
+Prefer a board-specific map where one exists. A generic profile cannot know your
+board's LED name (so Locate and the LED toggle do nothing) or which of its ports
+is the uplink — and it gets the uplink wrong on an Archer C5 deployed as an AP,
+which uses `eth1` and never touches `eth0`.
 
 The modelmap sets:
 - `dev.conf.net.lan_cpueth` — LAN CPU ethernet port (e.g. `eth1`); also the trunk port

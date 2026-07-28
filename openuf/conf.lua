@@ -3,8 +3,13 @@
 
 	Select the modelmap that matches your hardware (see openuf/modelmap/).
 	Known-working modelmap files:
-	  generic-dualband-ap.lua — TP-Link WDR3500, Archer C5 v1 (dual-band)
+	  archer-c5-v1.lua        — TP-Link Archer C5 v1 (dual-band, board-specific)
+	  generic-dualband-ap.lua — TP-Link WDR3500 and other dual-band boards
 	  tl-wr1043ndv2.lua       — TP-Link WR1043ND v2 (single-band)
+
+	Prefer a board-specific map where one exists: the generic profile cannot
+	know the board's LED name or which of its ports is the uplink, and gets
+	both wrong on an Archer C5.
 
 	The modelmap drives:
 	  • dev.conf.net.*          network interface assignments

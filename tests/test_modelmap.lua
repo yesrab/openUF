@@ -1,0 +1,139 @@
+-- Structural tests for every file in openuf/modelmap/.
+-- Run from project root: lua tests/run_tests.lua
+--
+-- Nothing loaded the modelmaps before this file existed, so a syntax error or
+-- a structural mistake in one shipped silently and only surfaced on the device
+-- -- as a daemon that dies at startup, an LED that never lights, or, worst,
+-- a per-port VLAN push landing on the uplink. These are cheap invariants that
+-- every board profile has to hold, checked for all of them at once so a newly
+-- added map cannot skip them.
+
+local lfs_ls = function(dir)
+	local names = {}
+	local h = io.popen("ls " .. dir .. " 2>/dev/null")
+	if not h then return names end
+	for line in h:lines() do
+		if line:match("%.lua$") then names[#names + 1] = line end
+	end
+	h:close()
+	return names
+end
+
+local MODELMAP_DIR = "openuf/modelmap"
+
+local function each_modelmap(fn)
+	local files = lfs_ls(MODELMAP_DIR)
+	assert_true(#files > 0, "modelmap directory is not empty (found " .. #files .. ")")
+	for _, name in ipairs(files) do
+		local path = MODELMAP_DIR .. "/" .. name
+		local ok, dev = pcall(dofile, path)
+		assert_true(ok, path .. " loads: " .. tostring(dev))
+		assert_true(type(dev) == "table", path .. " returns a table")
+		fn(name, dev)
+	end
+end
+
+return {
+	{
+		name = "modelmap: every map loads and declares conf + a ufmodel that exists",
+		fn = function()
+			each_modelmap(function(name, dev)
+				assert_true(type(dev.conf) == "table", name .. ": has dev.conf")
+				assert_true(type(dev.openuf) == "table", name .. ": has dev.openuf")
+				assert_true(type(dev.openuf.uap) == "table", name .. ": has dev.openuf.uap")
+				local ufmodel = dev.openuf.uap.ufmodel
+				assert_true(type(ufmodel) == "string" and ufmodel ~= "",
+					name .. ": names a ufmodel")
+				-- conf.lua dofiles "ufmodel/<name>.lua"; a typo here is a
+				-- startup crash on the device, not a warning.
+				local f = io.open("openuf/ufmodel/" .. ufmodel .. ".lua", "r")
+				assert_not_nil(f, name .. ": ufmodel file openuf/ufmodel/" .. ufmodel .. ".lua exists")
+				if f then f:close() end
+			end)
+		end
+	},
+	{
+		name = "modelmap: net.ports entries are well-formed and never VLAN-assign the uplink",
+		fn = function()
+			each_modelmap(function(name, dev)
+				local net = dev.conf.net
+				assert_true(type(net) == "table", name .. ": has dev.conf.net")
+				assert_true(type(net.lan_cpueth) == "string",
+					name .. ": names a LAN CPU port")
+				if net.ports == nil then return end   -- optional; inform.lua defaults
+				assert_true(type(net.ports) == "table", name .. ": net.ports is a table")
+				local seen_idx = {}
+				for _, p in ipairs(net.ports) do
+					assert_true(type(p.idx) == "number", name .. ": port has a numeric idx")
+					assert_nil(seen_idx[p.idx], name .. ": port_idx " .. tostring(p.idx) .. " is unique")
+					seen_idx[p.idx] = true
+					assert_true(type(p.ifname) == "string" and p.ifname ~= "",
+						name .. ": port " .. p.idx .. " names an ifname")
+					-- The load-bearing invariant: reassigning the uplink's VLAN
+					-- strands the device on the far side of its own switch, so
+					-- an uplink port must never be VLAN-assignable. Enforced by
+					-- convention in switchvlan.lua; pinned here at the source.
+					if p.uplink then
+						assert_nil(p.swport,
+							name .. ": uplink port " .. p.idx .. " must not carry a swport")
+					end
+					-- A swport either names a dev.conf.vlan.ports key or is a
+					-- physical port number outright; anything else is silently
+					-- skipped at apply time, i.e. a control that does nothing.
+					if p.swport ~= nil then
+						local vlan = dev.conf.vlan
+						assert_true(type(vlan) == "table" and type(vlan.ports) == "table",
+							name .. ": swport requires dev.conf.vlan.ports")
+						local ok = type(p.swport) == "number"
+							or vlan.ports[p.swport] ~= nil
+						assert_true(ok, name .. ": swport " .. tostring(p.swport)
+							.. " resolves to a physical port")
+					end
+				end
+			end)
+		end
+	},
+	{
+		name = "modelmap: led is a usable shape and hwassign a non-empty list of names",
+		fn = function()
+			each_modelmap(function(name, dev)
+				local led = dev.conf.led
+				-- led.lua accepts a bare name, a full sysfs path, or the legacy
+				-- {sysfs=...} table; nil means "no LED on this profile".
+				if led ~= nil then
+					local ok = type(led) == "string"
+						or (type(led) == "table" and type(led.sysfs) == "string")
+					assert_true(ok, name .. ": led is a string or {sysfs=...}")
+					if type(led) == "string" then
+						assert_true(led ~= "", name .. ": led name is not empty")
+					end
+				end
+				local hwassign = dev.openuf.uap.hwassign
+				if hwassign ~= nil then
+					assert_true(type(hwassign) == "table", name .. ": hwassign is a table")
+					assert_true(#hwassign > 0,
+						name .. ": hwassign is non-empty (an empty list means 'unset')")
+					for _, r in ipairs(hwassign) do
+						assert_true(type(r) == "string" and r ~= "",
+							name .. ": hwassign entries are radio names")
+					end
+				end
+			end)
+		end
+	},
+	{
+		name = "modelmap: archer-c5-v1 reports its real uplink and a driveable LED",
+		fn = function()
+			-- Board-specific regression guard, from the live install on this
+			-- hardware: deployed as an AP it uplinks through eth1 (CPU switch
+			-- port 0) and never uses eth0, and it has a green:system LED --
+			-- the generic profile gets both wrong.
+			local dev = dofile(MODELMAP_DIR .. "/archer-c5-v1.lua")
+			assert_eq(dev.conf.net.lan_cpueth, "eth1", "LAN CPU port")
+			assert_eq(#dev.conf.net.ports, 1, "one reported port")
+			assert_eq(dev.conf.net.ports[1].ifname, "eth1", "the uplink is eth1, not eth0")
+			assert_true(dev.conf.net.ports[1].uplink, "flagged as the uplink")
+			assert_eq(dev.conf.led, "green:system", "LED name set so Locate works")
+		end
+	},
+}

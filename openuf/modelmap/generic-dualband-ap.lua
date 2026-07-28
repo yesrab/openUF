@@ -1,9 +1,17 @@
 --[[
 	Generic dual-band OpenWrt AP hardware profile.
-	Tested with: TP-Link WDR3500, TP-Link Archer C5 v1.
+	Tested with: TP-Link WDR3500.
 
 	Adjust radio names if your device uses different UCI radio identifiers.
 	Run `uci show wireless` on the device to confirm interface names.
+
+	A generic profile cannot know a board's LED name or which of its ports is
+	the uplink, and the assumptions below (eth0 = WAN uplink, eth1 = a
+	downstream LAN port) are wrong on plenty of boards -- an Archer C5 v1
+	deployed as an AP uses eth1 as its uplink and never touches eth0, which is
+	why it has its own map (modelmap/archer-c5-v1.lua). Prefer a board-specific
+	map where one exists, and check these values against your hardware before
+	trusting them.
 ]]--
 
 local dev = {}
@@ -60,7 +68,10 @@ dev.openuf = {}
 
 dev.openuf.uap = {
 	ufmodel		= "u6iw",
-	hwassign	= {"radio0", "radio1"},	-- radio0 = 2.4 GHz, radio1 = 5 GHz
+	-- Both radios reported. Which of them is 2.4 vs 5 GHz is NOT implied by the
+	-- order here -- it varies by board (an Archer C5 v1 has radio0 = 5 GHz) and
+	-- openUF reads each radio's band from its own UCI `band`/`hwmode` anyway.
+	hwassign	= {"radio0", "radio1"},
 }
 
 return dev
