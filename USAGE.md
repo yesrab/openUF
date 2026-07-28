@@ -8,7 +8,7 @@ OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
 
 ```sh
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftables usteer wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftables hostapd-utils usteer wpad-wolfssl
 ```
 
 | Package | Purpose |
@@ -22,16 +22,15 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftab
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
 | `nftables` | Client block/unblock enforcement (`openuf/firewall.lua`) |
+| `hostapd-utils` | `hostapd_cli` — immediate deauth of a just-blocked wireless client, client kick (Roaming Assistance) and Minimum RSSI enforcement |
 | `usteer` | Band Steering (Behavior Controls) — ubus-based client-steering daemon, driven by `openuf/usteer.lua` |
-| `wpad-wolfssl` (or `wpad-openssl`) | Full hostapd build with 802.11k/v support — required for BSS Transition and Band Steering. `wpad-basic-*` lacks `bss_transition` entirely and errors with "unknown configuration item 'bss_transition'" |
+| `wpad-wolfssl` (or `wpad-openssl`, `wpad-mbedtls`, `wpad`) | Full hostapd build with 802.11k/v support — required for BSS Transition and Band Steering. Any of the full builds will do; `wpad-basic-*` lacks `bss_transition` entirely and errors with "unknown configuration item 'bss_transition'" |
 
-`install.sh install` installs `usteer` and a full `wpad` build automatically if
-either is missing (falling back from `wpad-wolfssl` to `wpad-openssl`), so a
-manual `apk add` is only needed if you're not using the installer.
-
-`hostapd_cli` (used to immediately deauthenticate a just-blocked wireless client,
-and to enforce Minimum RSSI) is not a separate dependency — any device running a
-wireless AP already has `hostapd` providing it.
+`install.sh install` installs all of the above automatically when missing, so a
+manual `apk add` is only needed if you're not using the installer. It treats any
+full `wpad` build as sufficient and leaves an existing one alone — notably
+`wpad-mbedtls`, which is what OpenWrt 25.12 ships on ath79 — rather than swapping
+it for `wpad-wolfssl` and bouncing every SSID on the device for no gain.
 
 > **AES-GCM is required for adoption.** UniFi Network Application 10.4.57 will
 > not finish provisioning a device until it has received a genuine

@@ -19,37 +19,58 @@ case "$1" in
 	install)
 		echo "Installing openUF to $INSTALL_DIR ..."
 
-		# Check required apk packages (OpenWrt 25.12+ uses apk, not opkg).
+		# Install the required apk packages (OpenWrt 25.12+ uses apk, not opkg).
 		# lua-openssl provides AES-128-CBC/GCM (luacrypto was dropped from the feeds);
 		# there is no Lua zlib binding in 25.12, so inform-response decompression is
 		# handled in-tree by openuf/inflate.lua and no zlib package is required.
+		# hostapd-utils supplies hostapd_cli (Minimum RSSI enforcement, client kick
+		# and block); nftables backs firewall.lua's client blocking. Every one of
+		# these is a silent degradation when absent -- provisioning still "succeeds"
+		# while the feature does nothing -- so they are installed rather than merely
+		# reported, same as usteer/wpad below. A failed install is a warning, not a
+		# hard stop: openUF starts and reports honestly without the optional ones.
 		MISSING=""
-		for pkg in lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util; do
+		for pkg in lua lua-cjson luasocket lua-openssl luabitop iw lldpd \
+			openssl-util hostapd-utils nftables; do
 			if ! apk info -e "$pkg" >/dev/null 2>&1; then
 				MISSING="$MISSING $pkg"
 			fi
 		done
 		if [ -n "$MISSING" ]; then
-			echo "WARNING: missing apk packages:$MISSING"
-			echo "  Install them with: apk update && apk add$MISSING"
+			echo "Installing missing apk packages:$MISSING"
+			apk add $MISSING || {
+				echo "WARNING: failed to install:$MISSING"
+				echo "  Install them by hand with: apk update && apk add$MISSING"
+				echo "  Without lua-openssl in particular, adoption cannot complete"
+				echo "  (the controller requires a genuine AES-128-GCM inform)."
+			}
 		fi
 
-		# usteer (Band Steering) + a full wpad build (BSS Transition /
-		# Band Steering both need real 802.11k/v support -- wpad-basic-*
-		# lacks bss_transition entirely and errors with "unknown
-		# configuration item 'bss_transition'"). Unlike the base packages
-		# above, these are actually installed (not just warned about) so
-		# both features work out of the box.
+		# usteer (Band Steering) + a full wpad build. BSS Transition and Band
+		# Steering both need real 802.11k/v support: wpad-basic-* lacks
+		# bss_transition entirely and errors with "unknown configuration item
+		# 'bss_transition'". Any of the full builds provides it -- checking only
+		# for wolfssl/openssl would miss a device that already ships
+		# wpad-mbedtls (the OpenWrt 25.12 ath79 default) and needlessly swap out
+		# a working hostapd, bouncing every SSID on the device for no gain.
 		if ! apk info -e usteer >/dev/null 2>&1; then
 			echo "Installing usteer (Band Steering support) ..."
 			apk add usteer \
 				|| echo "WARNING: failed to install usteer -- Band Steering will not function."
 		fi
 
-		if ! apk info -e wpad-wolfssl >/dev/null 2>&1 && ! apk info -e wpad-openssl >/dev/null 2>&1; then
+		HAVE_WPAD=0
+		for pkg in wpad wpad-wolfssl wpad-openssl wpad-mbedtls; do
+			if apk info -e "$pkg" >/dev/null 2>&1; then
+				HAVE_WPAD=1
+				break
+			fi
+		done
+		if [ "$HAVE_WPAD" = "0" ]; then
 			echo "Installing a full wpad build (required for BSS Transition / Band Steering) ..."
 			apk add wpad-wolfssl \
 				|| apk add wpad-openssl \
+				|| apk add wpad-mbedtls \
 				|| echo "WARNING: failed to install a full wpad build -- BSS Transition and Band Steering will not function (wpad-basic-* lacks 802.11v support)."
 		fi
 

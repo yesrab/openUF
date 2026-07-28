@@ -97,7 +97,7 @@ The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi ident
 ```sh
 # 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk)
 apk update
-apk add lua lua-cjson luasocket lua-openssl iw lldpd openssl-util usteer wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftables hostapd-utils usteer wpad-wolfssl
 
 # 2. Download and install the latest release (no git client or scp needed)
 mkdir openuf-install && cd openuf-install
@@ -119,12 +119,13 @@ Both adoption paths complete to **Connected**.  L2 requires the controller to
 SSH in (set a root password first, or use `--bootstrap-adopt`); L3 skips SSH
 entirely and delivers the adoption key over the inform channel.
 
-`install.sh install` automatically installs `usteer` and a full `wpad` build
-(`wpad-wolfssl`, falling back to `wpad-openssl`) if either is missing — both are
-required for BSS Transition (802.11v) and Band Steering to work at all.
-`wpad-basic-*` builds lack 802.11v support entirely and will error with
-"unknown configuration item 'bss_transition'"; if you've manually installed a
-basic wpad build, replace it with `apk add wpad-wolfssl` first.
+Step 1 is optional: `install.sh install` installs every dependency that is
+missing, including `usteer` and a full `wpad` build — both required for BSS
+Transition (802.11v) and Band Steering to work at all. Any full build counts
+(`wpad`, `wpad-wolfssl`, `wpad-openssl`, `wpad-mbedtls`), and an existing one is
+left in place. `wpad-basic-*` builds lack 802.11v support entirely and will error
+with "unknown configuration item 'bss_transition'"; if you've manually installed
+a basic build, replace it with `apk add wpad-wolfssl` first.
 
 Installing from a git checkout instead (for contributors/dev builds) still works — `scp -r
 openuf/ install.sh root@<device>:/tmp/openuf/` and run `install.sh` from there.
