@@ -15,12 +15,27 @@ start_service() {
 	# The Lua scripts (and conf.lua's modelmap dofile) load siblings with
 	# cwd-relative paths, but procd starts services with cwd "/". Run each from
 	# $OPENUF_DIR via `sh -c "cd ... && exec lua ..."` so those loads resolve.
-	procd_open_instance announce
-	procd_set_param command /bin/sh -c "cd '$OPENUF_DIR' && exec lua announce.lua"
-	procd_set_param respawn 3600 5 0
-	procd_set_param stdout 1
-	procd_set_param stderr 1
-	procd_close_instance
+	#
+	# config.l2_announce = false (conf.lua) skips the broadcaster entirely,
+	# for L3-only adoption. The instance is not started rather than started
+	# and exited: procd would respawn a self-exiting process forever.
+	#
+	# conf.lua dofiles its modelmap by relative path, so the check has to run
+	# from $OPENUF_DIR. Anything unexpected (missing lua, unreadable conf)
+	# leaves the value empty and the broadcaster starts -- fail open, since
+	# that is the documented default.
+	l2=$(cd "$OPENUF_DIR" 2>/dev/null && lua -e 'dofile("conf.lua")
+		print((config and config.l2_announce == false) and "off" or "on")' 2>/dev/null)
+	if [ "$l2" != "off" ]; then
+		procd_open_instance announce
+		procd_set_param command /bin/sh -c "cd '$OPENUF_DIR' && exec lua announce.lua"
+		procd_set_param respawn 3600 5 0
+		procd_set_param stdout 1
+		procd_set_param stderr 1
+		procd_close_instance
+	else
+		echo "openuf: L2 announce disabled (config.l2_announce = false)"
+	fi
 
 	procd_open_instance inform
 	procd_set_param command /bin/sh -c "cd '$OPENUF_DIR' && exec lua inform.lua"

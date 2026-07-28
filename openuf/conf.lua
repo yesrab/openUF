@@ -44,6 +44,20 @@ config = {
 	-- Path for persistent state (authkey, adopted flag, cfgversion, inform_url).
 	state_file = "/etc/openuf/state.json",
 
+	-- L2 discovery broadcasts (announce.lua, UDP port 10001). On by default:
+	-- it is how the device shows up in UniFi Discover without any set-inform.
+	--
+	-- Set false to adopt over L3 only. This is not just noise reduction: a
+	-- controller that discovers a device via L2 adopts it by SSHing in and
+	-- running `syswrapper.sh set-adopt`, and if that login cannot succeed
+	-- (no password auth, no bootstrap account -- see install.sh's
+	-- --bootstrap-adopt) adoption fails with "Connection Interrupted" no
+	-- matter how healthy the inform loop is. With broadcasts off the
+	-- controller treats the device as L3-discovered instead and delivers the
+	-- adoption key over the inform channel, needing no SSH at all.
+	-- Takes effect on service restart (the init script reads it).
+	l2_announce = true,
+
 	-- Opt-in: when set, every decrypted controller inform response is appended
 	-- verbatim (with a UTC timestamp) to this file, before dispatch. Off by
 	-- default. Used to capture ground-truth payload shapes when validating

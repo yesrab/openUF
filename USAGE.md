@@ -162,10 +162,19 @@ config = {
     use_only_unifi_wlan = true,  -- disable non-openuf_ SSIDs during provisioning
     inform_url  = "http://unifi:8080/inform",   -- default URL (overwritten at adoption)
     state_file  = "/etc/openuf/state.json",
+    l2_announce = true,          -- see below
     debug_dump_file = nil,       -- see below
     bootstrap_adopt_user = nil,  -- see below
 }
 ```
+
+`l2_announce` — on by default; sends the UDP discovery broadcasts that make the
+device appear in UniFi Discover with no `set-inform` at all. Set it to `false`
+to be adopted over L3 only, and restart the service (the init script reads this
+and simply doesn't start the broadcaster). The reason to turn it off isn't
+noise: a controller that discovered a device via L2 adopts it *by SSHing in*,
+so on a device that can't accept that login, adoption fails while the inform
+loop looks perfectly healthy — see § 4.
 
 `debug_dump_file` — opt-in, off by default. When set to a path (e.g.
 `"/var/log/openuf-informs.log"`), every decrypted controller inform response is
@@ -260,6 +269,18 @@ whether `--bootstrap-adopt` is passed to it.
    ```
 6. `syswrapper.lua` stores the new authkey and sets `adopted = true` in `/etc/openuf/state.json`
 7. The device appears as **Connected** in the controller
+
+> **The controller picks the adoption path from how it discovered the device,
+> not from where it is.** A device it heard via L2 broadcast gets the SSH
+> treatment above even when it sits on the controller's own subnet and informs
+> perfectly — confirmed against a real UniFi OS gateway, which SSHed in three
+> times on the Adopt click, failed (`Login attempt for nonexistent user`), and
+> parked the device at **Connection Interrupted** while the inform loop kept
+> running normally. If SSH can't succeed on your device, set
+> `config.l2_announce = false` in `conf.lua` and restart: with no broadcasts the
+> controller treats it as L3-discovered and delivers the key over the inform
+> channel instead. Forget any device record created while broadcasts were on
+> first — the controller remembers how it found it.
 
 ### L3 adoption (device and controller on different subnets)
 

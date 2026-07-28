@@ -20,7 +20,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | TNBU inform protocol | ✅ Working — AES-128-CBC and AES-128-GCM |
 | AES-128-GCM | ✅ Working — **required**: 10.4.57 will not finish provisioning a device until it receives a genuine GCM inform. Needs a GCM-capable `lua-openssl` build |
 | L2 adoption (SSH `syswrapper.sh set-adopt`) | ✅ Working — completes to **Connected** |
-| L3 adoption (`set-inform`, different subnets) | ✅ Working — the controller skips SSH entirely and delivers the new authkey in the `setparam` `mgmt_cfg`; openUF accepts it only while unadopted |
+| L3 adoption (`set-inform`, no SSH) | ✅ Working — the controller skips SSH entirely and delivers the new authkey in the `setparam` `mgmt_cfg`; openUF accepts it only while unadopted. The controller chooses this path when it has *not* discovered the device via broadcast, which is what `config.l2_announce = false` is for — same-subnet devices that can't accept an SSH login need it |
 | Zero-touch bootstrap adoption | ✅ Optional (`install.sh install --bootstrap-adopt`) — a locked-down, non-root SSH account auto-disabled after adoption |
 | Forget device / factory reset | ✅ Working (`syswrapper.sh reset-inform`) |
 | Restart / reboot command | ✅ Working |
