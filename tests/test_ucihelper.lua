@@ -138,6 +138,9 @@ Wiphy phy1
 			* 2412.0 MHz [1] (20.0 dBm)
 			* 2437.0 MHz [6] (20.0 dBm)
 			* 2472.0 MHz [13] (20.0 dBm)
+	Supported extended features:
+		* [ RRM ]: RRM
+		* [ CAN_REPLACE_PTK0 ]: can replace PTK 0 when rekeying
 Wiphy phy0
 	Band 2:
 		Capabilities: 0x19ef
@@ -151,7 +154,20 @@ Wiphy phy0
 			* 5260.0 MHz [52] (24.0 dBm) (radar detection)
 			* 5745.0 MHz [149] (30.0 dBm)
 			* 5845.0 MHz [169] (27.0 dBm) (no IR)
+	Supported extended features:
+		* [ VHT_IBSS ]: VHT-IBSS
+		* [ RRM ]: RRM
+		* [ AIRTIME_FAIRNESS ]: airtime fairness
 ]]
+
+-- The same board if its 2.4GHz driver COULD set the beacon frame rate, to pin
+-- the capability gate in both directions. Only that phy's extended-feature
+-- list differs -- BEACON_RATE_LEGACY is reported per phy, and the gate has to
+-- read the flag off the phy serving the band being configured, not off any
+-- phy in the device.
+local IW_PHY_WITH_BEACON_RATE = (ARCHER_C5_IW_PHY:gsub(
+	"%* %[ CAN_REPLACE_PTK0 %]: can replace PTK 0 when rekeying",
+	"* [ BEACON_RATE_LEGACY ]: legacy beacon rate"))
 
 return {
 	{
@@ -1053,9 +1069,18 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: apply_config writes macfilter=disable when the filter is off",
+		name = "ucihelper: apply_config OMITS macfilter when the filter is off",
 		fn = function()
 			with_ucihelper(function(db)
+				-- Not macfilter="disable": OpenWrt's own schema declares this
+				-- option as enum ["allow","deny"], and 25.12's validator does
+				-- not ignore an out-of-enum value -- it aborts the entire radio
+				-- setup, so both radios come up with no interfaces and not one
+				-- SSID reaches the air. Seen for real on an Archer C5 v1
+				-- running 25.12.5:
+				--   wifi-scripts: macfilter: disable has to be one of
+				--     [ "allow", "deny" ]
+				--   netifd: radio0 (4179): Died
 				local resp = {
 					radio_table = {},
 					vap_table = {
@@ -1064,8 +1089,30 @@ return {
 					},
 				}
 				ucihelper.apply_config(resp, nil)
-				assert_eq(db.wireless.openuf_radio0_corp.macfilter, "disable",
-					"no filter -> explicitly disabled")
+				local s = db.wireless.openuf_radio0_corp
+				assert_true(s ~= nil, "vap section still created")
+				assert_nil(s.macfilter, "no filter -> option absent, never 'disable'")
+				assert_nil(s.maclist, "and no stale maclist left behind")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: turning the MAC filter off lifts a previously pushed one",
+		fn = function()
+			with_ucihelper(function(db)
+				local function push(vap)
+					ucihelper.apply_config({radio_table = {}, vap_table = {vap}}, nil)
+				end
+				push({ssid = "corp", radio = "radio0", security = "wpa2",
+					x_passphrase = "hunter22", mac_filter_policy = "allow",
+					mac_filter_list = {"02:11:22:33:44:55"}})
+				assert_eq(db.wireless.openuf_radio0_corp.macfilter, "allow",
+					"filter applied on the first push")
+				push({ssid = "corp", radio = "radio0", security = "wpa2",
+					x_passphrase = "hunter22"})
+				local s = db.wireless.openuf_radio0_corp
+				assert_nil(s.macfilter, "second push lifts the filter")
+				assert_nil(s.maclist, "and clears the list it was filtering on")
 			end)
 		end
 	},
@@ -1875,6 +1922,59 @@ return {
 				assert_eq(caps.na.max_txpower, 30, "5GHz max dBm across usable channels")
 				assert_eq(tostring(caps.na.max_txpower), "30",
 					"whole dBm, not the 30.0 float `iw` prints")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: rf_config skips beacon_rate on a driver that cannot set it",
+		fn = function()
+			with_ucihelper(function(db)
+				-- hostapd does not ignore an unsupported beacon rate, it
+				-- refuses to start the interface -- one option takes the whole
+				-- band off the air. Real Archer C5 v1, 2.4GHz ath9k:
+				--   nl80211: Driver does not support setting Beacon frame rate
+				--   Failed to set beacon parameters
+				--   Interface initialization failed
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio1"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio1", "band", "2g")
+				ucihelper.rf_config("radio1", nil, nil, nil, nil, nil,
+					{basic_rate = {"1000"}, beacon_rate = 1000})
+				assert_eq(db.wireless.radio1.basic_rate[1], "1000",
+					"the rate floor itself still applies")
+				assert_nil(db.wireless.radio1.beacon_rate,
+					"beacon_rate withheld from a driver without BEACON_RATE_LEGACY")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: rf_config writes beacon_rate where the driver supports it",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return IW_PHY_WITH_BEACON_RATE end
+				seed_radios({"radio1"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio1", "band", "2g")
+				ucihelper.rf_config("radio1", nil, nil, nil, nil, nil,
+					{basic_rate = {"12000"}, beacon_rate = 12000})
+				assert_eq(db.wireless.radio1.beacon_rate, "120",
+					"written, and converted to hostapd's 100-kbps units")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: rf_config writes beacon_rate when capability is unknown",
+		fn = function()
+			with_ucihelper(function(db)
+				-- No iw output: do what the controller asked rather than
+				-- withhold config on a guess.
+				ucihelper._popen = function() return "" end
+				seed_radios({"radio1"})
+				ucihelper.rf_config("radio1", nil, nil, nil, nil, nil,
+					{basic_rate = {"12000"}, beacon_rate = 12000})
+				assert_eq(db.wireless.radio1.beacon_rate, "120",
+					"unknown capability -> unchanged behavior")
 			end)
 		end
 	},

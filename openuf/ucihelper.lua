@@ -138,15 +138,31 @@ M._phy_caps_cache = nil
 -- driver (this project's ath9k radio reports 2.4GHz as Band 1, its ath10k
 -- radio reports 5GHz as Band 2) and means nothing on its own.
 local function parse_phy_caps(out)
-	local bands, cur = {}, nil
+	local bands, cur, phy = {}, nil, nil
 	for line in (tostring(out) .. "\n"):gmatch("([^\n]*)\n") do
-		if line:match("^%s*Band %d+:") then
+		-- Phy-level lines carry exactly one leading tab; a Band block's
+		-- contents are indented deeper. That is what marks the end of a band
+		-- block -- without it, phy-level sections listed after the bands (the
+		-- extended-feature list below) would be attributed to whichever band
+		-- happened to be last.
+		if line:match("^%s*Wiphy%s") then
+			phy = {beacon_rate = false, bands = {}}
+			cur = nil
+		elseif line:match("^\tBand %d+:") then
 			cur = {ht40 = false, vht = false, he = false, eht = false,
-				w160 = false, w320 = false, freq = nil, txpower = nil}
+				w160 = false, w320 = false, freq = nil, txpower = nil,
+				phy = phy}
 			bands[#bands + 1] = cur
-		elseif line:match("^%s*Wiphy%s") then
-			cur = nil  -- capabilities outside a Band block belong to no band
-		elseif cur then
+			if phy then phy.bands[#phy.bands + 1] = cur end
+		elseif line:match("^\t[^\t]") then
+			cur = nil
+		end
+		-- Driver support for setting the beacon frame rate, reported per phy.
+		-- hostapd treats a beacon_rate it cannot program as FATAL ("Failed to
+		-- set beacon parameters" -> "Interface initialization failed"), so the
+		-- radio never starts -- see rf_config.
+		if phy and line:match("BEACON_RATE_LEGACY") then phy.beacon_rate = true end
+		if cur then
 			if line:match("HT20/HT40") then cur.ht40 = true end
 			if line:match("^%s*VHT Capabilities") then cur.vht = true end
 			if line:match("^%s*HE Iftypes") or line:match("^%s*HE PHY Capabilities") then
@@ -194,6 +210,7 @@ local function parse_phy_caps(out)
 				max_kind = (b.eht and 4) or (b.he and 3) or (b.vht and 2) or 1,
 				max_width = width,
 				max_txpower = b.txpower,
+				beacon_rate = (b.phy and b.phy.beacon_rate) or false,
 			}
 			if prev then
 				caps[key].max_kind  = math.max(prev.max_kind, caps[key].max_kind)
@@ -201,6 +218,7 @@ local function parse_phy_caps(out)
 				caps[key].max_txpower = math.max(prev.max_txpower or 0,
 					caps[key].max_txpower or 0)
 				if caps[key].max_txpower == 0 then caps[key].max_txpower = nil end
+				caps[key].beacon_rate = prev.beacon_rate or caps[key].beacon_rate
 			end
 		end
 	end
@@ -242,6 +260,12 @@ end
 
 -- The UCI prefix applied to all openuf-managed wireless sections
 local OPENUF_PREFIX = "openuf_"
+
+-- Sentinel for an `extra` value meaning "delete this option", as distinct from
+-- both "set it to something" and "leave it alone". Needed because several
+-- OpenWrt wifi controls are expressed as the option's absence rather than an
+-- off value -- see wlan_add()'s macfilter handling.
+M.DELETE = setmetatable({}, {__tostring = function() return "<delete>" end})
 
 -- Map from UniFi security type strings to UCI encryption values.
 --
@@ -430,11 +454,19 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	-- 802.11r/k/v
 	if extra then
 		for k, v in pairs(extra) do
+			-- M.DELETE means "this option must not be present", which is not
+			-- the same as "don't touch it": OpenWrt expresses several controls
+			-- (macfilter above all) as the option's ABSENCE, and an
+			-- out-of-enum stand-in value like "disable" is rejected by the
+			-- 25.12 config validator hard enough to abort the radio.
+			-- Deleting is also what lifts a previously pushed value.
+			if v == M.DELETE then
+				cursor:delete("wireless", section_name, k)
 			-- A table value is a UCI *list* option (e.g. maclist) and must be
 			-- handed to the binding as-is -- tostring() would write the
 			-- literal "table: 0x...". Same convention rf_config already uses
 			-- for basic_rate/supported_rates.
-			if type(v) == "table" then
+			elseif type(v) == "table" then
 				cursor:set("wireless", section_name, k, v)
 			else
 				cursor:set("wireless", section_name, k, tostring(v))
@@ -596,15 +628,39 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 		else
 			cursor:delete("wireless", radio, "legacy_rates")
 		end
-		if rates.beacon_rate then
-			-- beacon_rate is the exception: OpenWrt appends it to the hostapd
-			-- config verbatim, with NO /100 conversion, and hostapd documents
-			-- its beacon_rate as a legacy rate in 100-kbps units. So this one
-			-- option -- unlike basic_rate/supported_rates right above -- has to
-			-- be converted here, or a 12000 kb/s floor would ask for 1.2 Gbps.
+		-- beacon_rate is only written where the driver can actually program it.
+		-- hostapd does not degrade gracefully here: on a driver without
+		-- NL80211_EXT_FEATURE_BEACON_RATE_LEGACY it logs
+		--   nl80211: Driver does not support setting Beacon frame rate (legacy)
+		--   Failed to set beacon parameters / Interface initialization failed
+		-- and the radio never comes up at all -- one unsupported option takes
+		-- the whole band off the air. Confirmed on a real Archer C5 v1: its
+		-- ath9k 2.4GHz radio died on exactly this while the ath10k 5GHz radio
+		-- (which the controller sent no beacon_rate for) came up fine.
+		local band_caps = M.phy_caps()[band_for_device({
+			band    = cursor:get("wireless", radio, "band"),
+			hwmode  = cursor:get("wireless", radio, "hwmode"),
+			channel = cursor:get("wireless", radio, "channel"),
+		})]
+		-- Unknown capability (no iw, unparseable output) writes the option:
+		-- the honest default is to do what the controller asked, as before.
+		local beacon_ok = (band_caps == nil) or band_caps.beacon_rate
+		if rates.beacon_rate and beacon_ok then
+			-- beacon_rate is the exception among these options: OpenWrt appends
+			-- it to the hostapd config verbatim, with NO /100 conversion, and
+			-- hostapd documents its beacon_rate as a legacy rate in 100-kbps
+			-- units. So this one -- unlike basic_rate/supported_rates above --
+			-- has to be converted here, or a 12000 kb/s floor would ask for
+			-- 1.2 Gbps.
 			cursor:set("wireless", radio, "beacon_rate",
 				tostring(math.floor(rates.beacon_rate / 100)))
 		else
+			if rates.beacon_rate then
+				io.stderr:write(string.format(
+					"openuf: %s: driver cannot set a beacon rate -- skipping " ..
+					"beacon_rate=%s (hostapd would refuse to start the radio)\n",
+					radio, tostring(rates.beacon_rate)))
+			end
 			cursor:delete("wireless", radio, "beacon_rate")
 		end
 	elseif cursor:get("wireless", radio, "openuf_rates") == "1" then
@@ -815,16 +871,30 @@ function M.apply_config(resp, cfg, opts)
 				-- key and un-hiding has to actually take effect.
 				extra.hidden = vap.hide_ssid and "1" or "0"
 			end
-			-- "MAC Address Filter". OpenWrt's wifi-iface options are macfilter
-			-- (disable|allow|deny) plus a maclist list, and the policy
-			-- vocabulary lines up 1:1 with the controller's: allow = maclist is
-			-- a whitelist, deny = blacklist. Written as "disable" when the
-			-- control is off so turning it off actually lifts the filter.
+			-- "MAC Address Filter". OpenWrt's wifi-iface option is macfilter
+			-- plus a maclist list, and the policy vocabulary lines up 1:1 with
+			-- the controller's: allow = maclist is a whitelist, deny =
+			-- blacklist.
+			--
+			-- "Off" is the ABSENCE of the option, not macfilter="disable".
+			-- OpenWrt's own schema (/usr/share/schema/wireless.wifi-iface.json)
+			-- declares macfilter as enum ["allow","deny"], and 25.12's ucode
+			-- validator does not merely ignore an out-of-enum value -- it
+			-- aborts the whole radio setup with die(), so BOTH radios come up
+			-- with no interfaces at all and not one SSID reaches the air:
+			--   wifi-scripts: macfilter: disable has to be one of [ "allow", "deny" ]
+			--   netifd: radio0 (4179): Died
+			-- Confirmed on a real Archer C5 v1 running OpenWrt 25.12.5, where
+			-- this alone sank an otherwise perfect config push. Deleting is
+			-- also what actually lifts a previously pushed filter: ap.uc's
+			-- iface_macfilter() emits accept_mac_file/deny_mac_file only for
+			-- the two enum values and returns for anything else.
 			if vap.mac_filter_policy then
 				extra.macfilter = vap.mac_filter_policy
 				extra.maclist   = vap.mac_filter_list or {}
 			else
-				extra.macfilter = "disable"
+				extra.macfilter = M.DELETE
+				extra.maclist   = M.DELETE
 			end
 			-- "WiFi Speed Limit". Recorded on the section so the configured
 			-- state shows up in `uci show`; the actual enforcement is tc, done
