@@ -337,12 +337,31 @@ Settings carried through from the controller:
 | Network / VLAN assignment | a `br0.<vlan>` bridge + tagged sub-interface |
 | Channel, TX power | `wifi-device` channel/txpower; the controller's **Auto** channel is written as the literal `channel=auto`, engaging hostapd ACS (the AP surveys the band at radio bring-up and picks the least-busy channel). **Auto** TX power *deletes* the `txpower` option (UCI has no auto value; absent = driver default/max), so reverting from a fixed dBm actually takes effect |
 | Radio enable/disable (TX Power → Disabled) | `wifi-device` `disabled`; the radio's WLANs get `wifi-iface` `disabled` too, keeping their config for a later re-enable |
-| Channel width | `wifi-device` htmode, from the radio's `ieee_mode` token |
+| Channel width | `wifi-device` htmode, from the radio's `ieee_mode` token, **clamped to what the radio can actually do** — see below |
 | IoT Optimization: Lock 2.4 GHz to Channel 6 | nothing new — arrives as `channel=6` on the 2.4 GHz radio |
 | IoT Optimization: DTIM Interval Lock | nothing new — arrives as `dtim_period=3` on the 2.4 GHz SSID |
 | IoT Optimization: Force WiFi 4 Mode | `bss_load_update_period=0` (suppresses the QBSS Load IE) + an `openuf_iot` marker |
 | Minimum RSSI | per-**radio**; enforced by openUF deauthenticating clients below the threshold, not by hostapd |
 | Per-port VLAN (Ports → *port* → Native VLAN) | swconfig `switch_vlan` sections named `openuf_swvlan<id>` — see below |
+
+**Channel width is clamped to the hardware.** openUF presents itself as a
+U6-InWall (802.11ax) whatever the host radios really are, so a controller will
+happily push `ieee_mode=11nahe80` at an 802.11n/ac radio. Written to UCI
+verbatim that produces a config file that looks perfectly correct and a hostapd
+that refuses to start — no SSID on the air, and nothing in the config to explain
+why. openUF therefore probes `iw phy` for each band's real PHY and maximum
+width and clamps the request **downward only** (`HE80` → `VHT80` on an ac
+radio, `HE40` → `HT40` on an n-only 2.4 GHz radio); a request the hardware can
+already satisfy is never touched, and every clamp is logged:
+
+```
+openuf: radio0: controller asked for htmode HE80, hardware supports VHT80 -- clamped
+```
+
+If `iw` is unavailable or its output can't be parsed, the controller's value is
+written through unchanged rather than clamped to a guess. The same probe supplies
+each radio's real `max_txpower` (the ceiling the controller's TX Power slider
+uses) instead of a static default.
 
 **Per-port VLAN assignment** must be switched on twice: once on the device
 (Devices → *AP* → Settings → IP Settings → **Port VLAN**, which is what flips the wire's

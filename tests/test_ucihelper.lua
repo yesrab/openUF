@@ -92,6 +92,10 @@ local function with_ucihelper(fn)
 		ucihelper._bcfilter, ucihelper._shaper, ucihelper.get_ifname_for_vap
 	ucihelper._uci = m.mock
 	ucihelper._popen = function() return "" end       -- no live ifname resolution in tests
+	-- Hardware capability probing is cached (it describes hardware); clear it
+	-- so a test that feeds a canned `iw phy` dump can't leak those caps into
+	-- every later test's clamping decisions.
+	ucihelper._phy_caps_cache = nil
 	ucihelper._read_file = function() return nil end
 	ucihelper._run_cmd = function(cmd) cmds[#cmds + 1] = cmd; return true end
 	ucihelper._bcfilter = {reconcile = function() end}
@@ -101,8 +105,40 @@ local function with_ucihelper(fn)
 		orig_uci, orig_popen, orig_read, orig_run
 	ucihelper._bcfilter, ucihelper._shaper, ucihelper.get_ifname_for_vap =
 		orig_bcf, orig_shaper, orig_ifname_vap
+	ucihelper._phy_caps_cache = nil
 	if not ok then error(err, 2) end
 end
+
+-- Real `iw phy` output from the project's target hardware (TP-Link Archer C5
+-- v1, OpenWrt 25.12.5): an ath9k 2.4GHz radio (HT40, no VHT/HE) reporting as
+-- "Band 1", and an ath10k 5GHz radio (VHT80, explicitly NOT 160, no HE)
+-- reporting as "Band 2". Trimmed to the lines the parser reads -- the band
+-- indexes are deliberately kept in their real, inverted-looking order.
+local ARCHER_C5_IW_PHY = [[
+Wiphy phy1
+	Band 1:
+		Capabilities: 0x11ef
+			RX LDPC
+			HT20/HT40
+		HT TX/RX MCS rate indexes supported: 0-15
+		Frequencies:
+			* 2412.0 MHz [1] (20.0 dBm)
+			* 2437.0 MHz [6] (20.0 dBm)
+			* 2472.0 MHz [13] (20.0 dBm)
+Wiphy phy0
+	Band 2:
+		Capabilities: 0x19ef
+			RX LDPC
+			HT20/HT40
+		VHT Capabilities (0x338001b2):
+			Max MPDU length: 11454
+			Supported Channel Width: neither 160 nor 80+80
+		Frequencies:
+			* 5180.0 MHz [36] (23.0 dBm)
+			* 5260.0 MHz [52] (24.0 dBm) (radar detection)
+			* 5745.0 MHz [149] (30.0 dBm)
+			* 5845.0 MHz [169] (27.0 dBm) (no IR)
+]]
 
 return {
 	{
@@ -1740,6 +1776,119 @@ return {
 				assert_eq(radios[1].min_rssi_raw, 15, "radio0 minrssi raw wire value")
 				assert_eq(radios[2].min_rssi_enabled, false, "radio1 minrssi not enabled")
 				assert_eq(radios[2].min_rssi_raw, nil, "radio1 has no minrssi_rssi set")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: phy_caps parses real iw phy output per band, not per Band index",
+		fn = function()
+			with_ucihelper(function()
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				local caps = ucihelper.phy_caps()
+				assert_not_nil(caps.ng, "2.4GHz band recognized from its frequencies")
+				assert_not_nil(caps.na, "5GHz band recognized from its frequencies")
+				assert_eq(caps.ng.max_kind, 1, "ath9k 2.4GHz is HT-only")
+				assert_eq(caps.ng.max_width, 40, "ath9k 2.4GHz tops out at HT40")
+				assert_eq(caps.na.max_kind, 2, "ath10k 5GHz is VHT, not HE")
+				assert_eq(caps.na.max_width, 80,
+					"'neither 160 nor 80+80' must not be read as 160 support")
+				assert_eq(caps.ng.max_txpower, 20, "2.4GHz max dBm")
+				assert_eq(caps.na.max_txpower, 30, "5GHz max dBm across usable channels")
+				assert_eq(tostring(caps.na.max_txpower), "30",
+					"whole dBm, not the 30.0 float `iw` prints")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: clamp_htmode drops HE/VHT the hardware cannot do",
+		fn = function()
+			with_ucihelper(function()
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				-- The whole point of the fix: openUF claims to be a WiFi-6
+				-- U6-InWall, so an HE push at ath9k/ath10k is the expected
+				-- case, not an edge case.
+				assert_eq(ucihelper.clamp_htmode("na", "HE80"), "VHT80",
+					"HE80 -> VHT80 on a VHT-only 5GHz radio")
+				assert_eq(ucihelper.clamp_htmode("ng", "HE40"), "HT40",
+					"HE40 -> HT40 on an HT-only 2.4GHz radio")
+				assert_eq(ucihelper.clamp_htmode("ng", "VHT80"), "HT40",
+					"width clamps too: no VHT and no 80MHz on 2.4GHz")
+				assert_eq(ucihelper.clamp_htmode("na", "HE160"), "VHT80",
+					"160MHz clamps to the radio's real 80MHz ceiling")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: clamp_htmode never widens or upgrades what was asked for",
+		fn = function()
+			with_ucihelper(function()
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				local hit, orig = ucihelper.clamp_htmode("na", "HT20")
+				assert_eq(hit, "HT20", "a request below the ceiling is left alone")
+				assert_nil(orig, "no clamp reported when nothing changed")
+				assert_eq(ucihelper.clamp_htmode("na", "VHT40"), "VHT40", "VHT40 fits")
+				assert_eq(ucihelper.clamp_htmode("na", "NOHT"), "NOHT",
+					"non <PHY><width> values pass through untouched")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: clamp_htmode leaves the request alone when caps are unknown",
+		fn = function()
+			with_ucihelper(function()
+				-- No `iw`, or output this parser doesn't understand: the
+				-- controller's request must survive unmodified rather than be
+				-- clamped to a guess.
+				ucihelper._popen = function() return "" end
+				assert_eq(ucihelper.clamp_htmode("na", "HE80"), "HE80",
+					"unknown capability -> unchanged")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: rf_config writes the clamped htmode to UCI",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "band", "5g")
+				cursor:set("wireless", "radio1", "wifi-device")
+				cursor:set("wireless", "radio1", "band", "2g")
+				ucihelper.rf_config("radio0", "HE80", 36)
+				ucihelper.rf_config("radio1", "HE20", 6)
+				assert_eq(db.wireless.radio0.htmode, "VHT80",
+					"5GHz radio gets the clamped mode, not the pushed HE80")
+				assert_eq(db.wireless.radio1.htmode, "HT20", "2.4GHz radio clamped to HT20")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: get_radio_table reports the driver's real max_txpower",
+		fn = function()
+			with_ucihelper(function()
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "band", "5g")
+				cursor:set("wireless", "radio1", "wifi-device")
+				cursor:set("wireless", "radio1", "band", "2g")
+				local radios = ucihelper.get_radio_table()
+				assert_eq(radios[1].max_txpower, 30, "5GHz radio reports its own ceiling")
+				assert_eq(radios[2].max_txpower, 20, "2.4GHz radio reports its own ceiling")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: get_radio_table falls back to the static max_txpower default",
+		fn = function()
+			with_ucihelper(function()
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "wifi-device")
+				cursor:set("wireless", "radio0", "band", "5g")
+				local radios = ucihelper.get_radio_table()
+				assert_eq(radios[1].max_txpower, ucihelper.RADIO_DEFAULTS.max_txpower,
+					"no iw output -> documented default, not nil")
 			end)
 		end
 	},

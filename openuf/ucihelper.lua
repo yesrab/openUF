@@ -112,6 +112,134 @@ local function band_for_device(s)
 	return band_for_channel(s.channel)
 end
 
+-- ─── Radio hardware capabilities ─────────────────────────────────────────────
+--
+-- openUF presents itself as a U6-InWall (802.11ax) no matter what the host
+-- radios actually are, so a controller is entitled to push
+-- radio.<n>.ieee_mode=11nahe80 at hardware that has never heard of HE -- as it
+-- will at every one of this project's documented targets, which are 802.11n/ac.
+-- Writing that htmode into UCI verbatim yields a config file that looks
+-- perfectly correct and a hostapd that refuses to start: no SSID on the air at
+-- all, and nothing in UCI to explain why. So probe what the hardware can
+-- really do and clamp DOWNWARD only -- a controller asking for less than the
+-- radio supports is a legitimate request, never something to "correct".
+local PHY_RANK = {HT = 1, VHT = 2, HE = 3, EHT = 4}
+local RANK_PHY = {"HT", "VHT", "HE", "EHT"}
+
+-- Cached because it describes hardware, which does not change while openUF
+-- runs. Reset it (M._phy_caps_cache = nil) after anything that changes what
+-- the driver reports -- notably a regdomain change, which moves the per-channel
+-- TX power limits below.
+M._phy_caps_cache = nil
+
+-- Parse `iw phy` output into per-band capabilities, keyed by band_for_device's
+-- own vocabulary ("ng"/"na"). Each band is identified by the frequencies it
+-- actually lists, NOT by its "Band N:" index -- that index is assigned per
+-- driver (this project's ath9k radio reports 2.4GHz as Band 1, its ath10k
+-- radio reports 5GHz as Band 2) and means nothing on its own.
+local function parse_phy_caps(out)
+	local bands, cur = {}, nil
+	for line in (tostring(out) .. "\n"):gmatch("([^\n]*)\n") do
+		if line:match("^%s*Band %d+:") then
+			cur = {ht40 = false, vht = false, he = false, eht = false,
+				w160 = false, w320 = false, freq = nil, txpower = nil}
+			bands[#bands + 1] = cur
+		elseif line:match("^%s*Wiphy%s") then
+			cur = nil  -- capabilities outside a Band block belong to no band
+		elseif cur then
+			if line:match("HT20/HT40") then cur.ht40 = true end
+			if line:match("^%s*VHT Capabilities") then cur.vht = true end
+			if line:match("^%s*HE Iftypes") or line:match("^%s*HE PHY Capabilities") then
+				cur.he = true
+			end
+			if line:match("^%s*EHT Iftypes") or line:match("^%s*EHT PHY Capabilities") then
+				cur.eht = true
+			end
+			-- "Supported Channel Width: neither 160 nor 80+80" must NOT count
+			-- as 160 support, hence the explicit negative check.
+			if line:match("Supported Channel Width:") and line:match("160")
+				and not line:match("neither 160") then
+				cur.w160 = true
+			end
+			if line:match("320 MHz") then cur.w320 = true end
+			-- "\t\t\t* 5180.0 MHz [36] (23.0 dBm)"; disabled channels carry no
+			-- usable power and are skipped.
+			local mhz, dbm = line:match("^%s*%*%s+([%d%.]+) MHz.*%(([%d%.]+) dBm%)")
+			if mhz and not line:match("disabled") then
+				cur.freq = cur.freq or tonumber(mhz)
+				-- `iw` prints one decimal ("23.0 dBm"); floored to an integer
+				-- so the payload carries 23 rather than 23.0 -- max_txpower is
+				-- a whole-dBm field, and flooring never claims more than the
+				-- driver allows.
+				local p = tonumber(dbm)
+				p = p and math.floor(p) or nil
+				if p and (not cur.txpower or p > cur.txpower) then cur.txpower = p end
+			end
+		end
+	end
+
+	local caps = {}
+	for _, b in ipairs(bands) do
+		local key = b.freq and ((b.freq < 3000) and "ng" or "na") or nil
+		if key then
+			local width = 20
+			if b.ht40 then width = 40 end
+			if b.vht or b.he then width = math.max(width, 80) end
+			if b.w160 then width = math.max(width, 160) end
+			if b.eht and b.w320 then width = math.max(width, 320) end
+			local prev = caps[key]
+			-- Two radios can serve the same band (rare, but a 2.4GHz-only and a
+			-- dual-band phy in one device do it); keep the more capable view.
+			caps[key] = {
+				max_kind = (b.eht and 4) or (b.he and 3) or (b.vht and 2) or 1,
+				max_width = width,
+				max_txpower = b.txpower,
+			}
+			if prev then
+				caps[key].max_kind  = math.max(prev.max_kind, caps[key].max_kind)
+				caps[key].max_width = math.max(prev.max_width, caps[key].max_width)
+				caps[key].max_txpower = math.max(prev.max_txpower or 0,
+					caps[key].max_txpower or 0)
+				if caps[key].max_txpower == 0 then caps[key].max_txpower = nil end
+			end
+		end
+	end
+	return caps
+end
+
+-- Per-band hardware capabilities: {ng = {max_kind, max_width, max_txpower}, ...}
+-- An empty table (no `iw`, unparseable output) means "unknown", which every
+-- caller must treat as "leave the controller's request alone".
+function M.phy_caps()
+	if not M._phy_caps_cache then
+		M._phy_caps_cache = parse_phy_caps(M._popen("iw phy") or "")
+	end
+	return M._phy_caps_cache
+end
+
+-- Clamp an OpenWrt htmode ("HE80", "VHT40", "HT20", ...) to what the given
+-- band's hardware can actually do. Returns the (possibly adjusted) htmode and,
+-- when it was adjusted, the original -- callers log the pair, because a
+-- silently rewritten channel width is exactly the kind of change that turns
+-- into an unexplainable bug report months later.
+function M.clamp_htmode(band, htmode)
+	if type(htmode) ~= "string" then return htmode, nil end
+	local caps = M.phy_caps()[band]
+	if not caps then return htmode, nil end
+	-- Anything that isn't <PHY><width> (e.g. "NOHT") passes through untouched.
+	local kind, width = htmode:match("^(%u+)(%d+)$")
+	local rank = kind and PHY_RANK[kind]
+	if not rank then return htmode, nil end
+
+	local out_kind = RANK_PHY[math.min(rank, caps.max_kind)]
+	local out_width = math.min(tonumber(width), caps.max_width)
+	-- HT tops out at 40MHz: there is no such thing as HT80.
+	if out_kind == "HT" then out_width = math.min(out_width, 40) end
+	local out = out_kind .. tostring(out_width)
+	if out == htmode then return htmode, nil end
+	return out, htmode
+end
+
 -- The UCI prefix applied to all openuf-managed wireless sections
 local OPENUF_PREFIX = "openuf_"
 
@@ -391,7 +519,21 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 		cursor:set("wireless", radio, "channel", tostring(chan))
 	end
 	if htmode then
-		cursor:set("wireless", radio, "htmode", htmode)
+		-- The radio's band comes from its own UCI declaration, not from the
+		-- channel being pushed alongside: a radio's band is fixed by hardware,
+		-- and `chan` can be the literal "auto".
+		local band = band_for_device({
+			band    = cursor:get("wireless", radio, "band"),
+			hwmode  = cursor:get("wireless", radio, "hwmode"),
+			channel = cursor:get("wireless", radio, "channel") or chan,
+		})
+		local clamped, requested = M.clamp_htmode(band, htmode)
+		if requested then
+			io.stderr:write(string.format(
+				"openuf: %s: controller asked for htmode %s, hardware supports %s -- clamped\n",
+				radio, requested, clamped))
+		end
+		cursor:set("wireless", radio, "htmode", clamped)
 	end
 	if txpwr == "auto" then
 		-- UCI has no auto txpower value: absent option = driver default/max.
@@ -810,7 +952,12 @@ function M.get_radio_table()
 			disabled         = (s.disabled == "1"),
 			builtin_antenna  = M.RADIO_DEFAULTS.builtin_antenna,
 			builtin_ant_gain = M.RADIO_DEFAULTS.builtin_ant_gain,
-			max_txpower      = M.RADIO_DEFAULTS.max_txpower,
+			-- Real per-band driver limit where `iw` can supply one: this is
+			-- what bounds the controller's TX Power slider, so the static
+			-- default made every radio claim 20 dBm regardless of hardware
+			-- and regdomain. Falls back to the default when unknown.
+			max_txpower      = (M.phy_caps()[band_for_device(s)] or {}).max_txpower
+				or M.RADIO_DEFAULTS.max_txpower,
 			-- min_rssi_enabled/min_rssi_raw: raw UCI echo of rf_config()'s
 			-- minrssi_enabled/minrssi_rssi options. min_rssi_raw is still
 			-- wire-encoded units at this point (not dBm) -- inform.lua's
