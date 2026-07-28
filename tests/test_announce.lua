@@ -224,4 +224,63 @@ return {
 			assert_nil(blank, "whitespace-only output -> nil")
 		end
 	},
+	{
+		name = "announce: get_ip reads the address off the interface itself",
+		fn = function()
+			local orig, seen = announce._popen, {}
+			announce._popen = function(cmd)
+				seen[#seen + 1] = cmd
+				if cmd:match("addr show dev eth1") then
+					return "    inet 192.168.200.3/24 brd 192.168.200.255 scope global eth1\n"
+				end
+				return ""
+			end
+			local ip = announce.get_ip("eth1")
+			announce._popen = orig
+			assert_not_nil(ip, "address found")
+			assert_eq(table.concat(ip, "."), "192.168.200.3", "octets parsed")
+			assert_eq(#seen, 1, "no bridge lookup when the port has its own address")
+		end
+	},
+	{
+		name = "announce: get_ip falls back to the bridge when the port has no address",
+		fn = function()
+			-- The real target layout: lan_cpueth names eth1, but eth1 is a
+			-- br-lan member and carries no address -- without the fallback,
+			-- announce broadcasts 192.168.1.1 and inform reports "0.0.0.0".
+			local orig = announce._popen
+			announce._popen = function(cmd)
+				if cmd:match("addr show dev eth1") then return "" end
+				if cmd:match("readlink /sys/class/net/eth1/master") then
+					return "../../../../../virtual/net/br-lan\n"
+				end
+				if cmd:match("addr show dev br%-lan") then
+					return "    inet 192.168.200.3/24 brd 192.168.200.255 scope global br-lan\n"
+				end
+				return ""
+			end
+			local ip = announce.get_ip("eth1")
+			announce._popen = orig
+			assert_not_nil(ip, "bridge address found via master symlink")
+			assert_eq(table.concat(ip, "."), "192.168.200.3", "bridge octets parsed")
+		end
+	},
+	{
+		name = "announce: get_ip returns nil when neither port nor bridge has an address",
+		fn = function()
+			local orig = announce._popen
+			announce._popen = function() return "" end
+			local unbridged = announce.get_ip("eth1")
+			announce._popen = function(cmd)
+				if cmd:match("readlink") then
+					return "../../../../../virtual/net/br-lan\n"
+				end
+				return ""
+			end
+			local bridged = announce.get_ip("eth1")
+			announce._popen = orig
+			assert_nil(unbridged, "no address and no bridge -> nil")
+			assert_nil(bridged, "bridge exists but has no address -> nil")
+		end
+	},
 }

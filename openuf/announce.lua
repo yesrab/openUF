@@ -166,18 +166,37 @@ function M.get_mac(iface)
 	return #mac == 6 and mac or nil
 end
 
+-- Primary IPv4 of one netdev, as a 4-element byte table, or nil if it has none.
+local function ipv4_of(iface)
+	local out = M._popen("ip -4 addr show dev " .. iface)
+	if type(out) ~= "string" then return nil end
+	local a, b, c, d = out:match("inet (%d+)%.(%d+)%.(%d+)%.(%d+)")
+	if not a then return nil end
+	return {tonumber(a), tonumber(b), tonumber(c), tonumber(d)}
+end
+
 -- Read primary IPv4 address for the given interface.
 -- Returns a 4-element byte table or nil on failure.
+--
+-- The configured interface (dev.conf.net.lan_cpueth) names the LAN *port* --
+-- which is what VLAN provisioning and the port_table need -- but on any AP
+-- whose LAN port is enslaved to a bridge (the normal OpenWrt layout: eth1 in
+-- br-lan) that port carries no address at all: the L3 address lives on the
+-- bridge. Asking only the port yields nil, and the callers' fallbacks are
+-- silent and wrong -- announce.run() broadcasts 192.168.1.1 and inform.lua's
+-- build_json reports ip "0.0.0.0", which a controller cannot adopt.
+-- So: try the port, then the bridge it is a member of, before giving up.
 function M.get_ip(iface)
 	iface = iface or "eth0"
-	local handle = io.popen("ip -4 addr show dev " .. iface ..
-		" 2>/dev/null | grep -m1 'inet '")
-	if not handle then return nil end
-	local line = handle:read("*l"); handle:close()
-	if not line then return nil end
-	local a, b, c, d = line:match("inet (%d+)%.(%d+)%.(%d+)%.(%d+)")
-	if a then
-		return {tonumber(a), tonumber(b), tonumber(c), tonumber(d)}
+	local ip = ipv4_of(iface)
+	if ip then return ip end
+
+	-- /sys/class/net/<if>/master symlinks to the enslaving device (e.g.
+	-- "../../../../../virtual/net/br-lan"); the basename is the bridge name.
+	local master = M._popen("readlink /sys/class/net/" .. iface .. "/master")
+	master = type(master) == "string" and master:match("([^/%s]+)%s*$") or nil
+	if master and master ~= iface then
+		return ipv4_of(master)
 	end
 	return nil
 end
