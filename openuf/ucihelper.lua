@@ -512,6 +512,23 @@ end
 function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates, disabled)
 	local uci = get_uci()
 	local cursor = uci.cursor()
+	-- Every write below is cursor:set on a named section, which in UCI CREATES
+	-- that section when it does not exist. A controller naming a phy this
+	-- device does not have (a stale device record, a config cloned from
+	-- another AP, an emulated model whose radio count differs from the real
+	-- hardware's) would therefore materialize a phantom `wifi-device` that no
+	-- driver backs -- carried into every later get_radio_table() and reported
+	-- to the controller as a real radio. Refuse instead.
+	local exists = false
+	cursor:foreach("wireless", "wifi-device", function(s)
+		if s[".name"] == radio then exists = true end
+	end)
+	if not exists then
+		io.stderr:write(string.format(
+			"openuf: rf_config: no wifi-device section %q on this device -- ignoring\n",
+			tostring(radio)))
+		return false
+	end
 	if disabled ~= nil then
 		cursor:set("wireless", radio, "disabled", disabled and "1" or "0")
 	end
@@ -602,6 +619,7 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 		end
 	end
 	cursor:commit("wireless")
+	return true
 end
 
 -- ─── Config apply ────────────────────────────────────────────────────────────

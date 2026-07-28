@@ -98,6 +98,13 @@ local function new_apply_env()
 	ucihelper._popen     = function() return "" end
 	ucihelper._read_file = function() return nil end
 	ucihelper._run_cmd   = function() return true end
+	-- The wifi-device sections a real /etc/config/wireless always has. Radio
+	-- config is refused for a radio with no section (writing one would create
+	-- a phantom radio no driver backs), and the controller's radio names are
+	-- echoes of phynames openUF read out of UCI in the first place -- so an
+	-- apply-path environment without radios is a state hardware never reaches.
+	cursor:set("wireless", "radio0", "wifi-device")
+	cursor:set("wireless", "radio1", "wifi-device")
 	return ucihelper, db
 end
 

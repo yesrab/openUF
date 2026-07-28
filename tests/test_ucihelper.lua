@@ -109,6 +109,19 @@ local function with_ucihelper(fn)
 	if not ok then error(err, 2) end
 end
 
+-- Seed the `wifi-device` sections every real device already has in
+-- /etc/config/wireless. rf_config refuses to touch a radio with no section
+-- (writing one would CREATE a phantom radio no driver backs), so any test
+-- driving radio config has to start from radios that exist -- which is also
+-- the only state apply_config ever sees on hardware: the controller's radio
+-- names are echoes of the phynames openUF itself reported from UCI.
+local function seed_radios(names)
+	local cursor = ucihelper._uci.cursor()
+	for _, r in ipairs(names or {"radio0", "radio1"}) do
+		cursor:set("wireless", r, "wifi-device")
+	end
+end
+
 -- Real `iw phy` output from the project's target hardware (TP-Link Archer C5
 -- v1, OpenWrt 25.12.5): an ath9k 2.4GHz radio (HT40, no VHT/HE) reporting as
 -- "Band 1", and an ath10k 5GHz radio (VHT80, explicitly NOT 160, no HE)
@@ -635,6 +648,7 @@ return {
 			-- strands the whole push in the uncommitted cursor. The counter
 			-- is the only signal.
 			with_ucihelper(function(db, cmds, commits)
+				seed_radios()
 				ucihelper.rf_config("radio0", "HT40", 6, 20)
 				assert_eq(commits.wireless, 1, "rf_config commits wireless")
 				local resp = {
@@ -692,6 +706,7 @@ return {
 		name = "ucihelper: apply_config writes radio-level rates from a vap's minrate_data",
 		fn = function()
 			with_ucihelper(function(db)
+				seed_radios()
 				local resp = {
 					radio_table = {{name = "radio0"}},
 					vap_table = {
@@ -714,6 +729,7 @@ return {
 		name = "ucihelper: apply_config takes the lowest floor across VAPs on one radio",
 		fn = function()
 			with_ucihelper(function(db)
+				seed_radios()
 				-- Two WLANs share radio0 with different floors. Applying the
 				-- stricter 12 Mbps would lock out clients the 1 Mbps WLAN is
 				-- meant to admit, so the permissive floor has to win.
@@ -763,6 +779,7 @@ return {
 			-- fix that meant rates=nil -> skip -> the old basic_rate kept
 			-- excluding slow clients forever.
 			with_ucihelper(function(db)
+				seed_radios()
 				local on = {
 					radio_table = {{name = "radio0"}},
 					vap_table = {
@@ -824,6 +841,7 @@ return {
 			-- push has minrate_data but no drop-below. supported_rates from
 			-- the stricter earlier push must be deleted, not skipped.
 			with_ucihelper(function(db)
+				seed_radios()
 				local strict = {
 					radio_table = {{name = "radio0"}},
 					vap_table = {
@@ -860,6 +878,7 @@ return {
 			-- VAP and then flipped to permissive when a second identical VAP
 			-- joined the radio, contradicting the most-permissive contract.
 			with_ucihelper(function(db)
+				seed_radios()
 				local resp = {
 					radio_table = {{name = "radio0"}},
 					vap_table = {
@@ -880,6 +899,7 @@ return {
 		name = "ucihelper: apply_config keeps each radio's floor separate",
 		fn = function()
 			with_ucihelper(function(db)
+				seed_radios()
 				local resp = {
 					radio_table = {{name = "radio0"}, {name = "radio1"}},
 					vap_table = {
@@ -1406,6 +1426,7 @@ return {
 		name = "ucihelper: apply_config writes minrssi UCI options from radio_table",
 		fn = function()
 			with_ucihelper(function(db)
+				seed_radios()
 				local resp = {
 					vap_table = {},
 					radio_table = {
@@ -1423,6 +1444,7 @@ return {
 		name = "ucihelper: apply_config omits minrssi UCI options when disabled/absent",
 		fn = function()
 			with_ucihelper(function(db)
+				seed_radios()
 				local resp = {
 					vap_table = {},
 					radio_table = {{name = "radio0", channel = 6}},
@@ -1437,6 +1459,7 @@ return {
 		name = "ucihelper: apply_config writes htmode from radio.htmode (channel width)",
 		fn = function()
 			with_ucihelper(function(db)
+				seed_radios()
 				local resp = {
 					vap_table = {},
 					radio_table = {
@@ -1474,6 +1497,7 @@ return {
 			-- radio.<n>.channel=6 (CONFIRMED live 2026-07-18) -- no dedicated
 			-- key, so this regression-locks the plain channel path it rides.
 			with_ucihelper(function(db)
+				seed_radios()
 				local resp = {
 					vap_table = {},
 					radio_table = {{name = "radio0", channel = 6}},
@@ -1776,6 +1800,45 @@ return {
 				assert_eq(radios[1].min_rssi_raw, 15, "radio0 minrssi raw wire value")
 				assert_eq(radios[2].min_rssi_enabled, false, "radio1 minrssi not enabled")
 				assert_eq(radios[2].min_rssi_raw, nil, "radio1 has no minrssi_rssi set")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: rf_config refuses to create a radio this device does not have",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				-- Every rf_config write is a cursor:set on a named section,
+				-- which in UCI CREATES it. A controller naming a phy we don't
+				-- have (stale device record, config cloned off another AP, a
+				-- model whose radio count differs from the real hardware)
+				-- would otherwise materialize a phantom wifi-device that no
+				-- driver backs -- and get_radio_table would then report it
+				-- back as a real radio, forever.
+				local ok = ucihelper.rf_config("radio7", "HT20", 11, 20)
+				assert_eq(ok, false, "reports the refusal to its caller")
+				assert_nil(db.wireless.radio7, "no phantom section created")
+				assert_true(ucihelper.rf_config("radio0", "HT20", 11, 20) ~= false,
+					"a radio that exists is still configured")
+				assert_eq(db.wireless.radio0.channel, "11", "real radio written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config skips unknown radios but still applies known ones",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				ucihelper.apply_config({
+					vap_table = {},
+					radio_table = {
+						{name = "radio9", htmode = "HT20", channel = 1},
+						{name = "radio0", htmode = "HT40", channel = 11},
+					},
+				}, nil)
+				assert_nil(db.wireless.radio9, "unknown radio ignored")
+				assert_eq(db.wireless.radio0.htmode, "HT40",
+					"one bad entry does not abort the rest of the push")
 			end)
 		end
 	},
