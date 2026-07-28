@@ -950,11 +950,25 @@ end
 -- ─── Read helpers (for inform payload builder) ───────────────────────────────
 
 -- Return a table of radio info for the inform payload.
-function M.get_radio_table()
+-- hwassign: the modelmap's dev.openuf.uap.hwassign -- the radio names to
+-- report. Documented since the first release as controlling exactly this, but
+-- read by nothing until now, so every wifi-device in UCI was reported no matter
+-- what the modelmap said. That matters on a board with a radio openUF should
+-- not present as part of the emulated model (a third radio, a mesh-only or
+-- monitor phy): the controller would show and try to configure a radio the
+-- emulated model does not have. nil/empty keeps the report-everything
+-- behavior, which is what a modelmap without hwassign means.
+function M.get_radio_table(hwassign)
 	local uci = get_uci()
 	local cursor = uci.cursor()
+	local allowed = nil
+	if type(hwassign) == "table" and #hwassign > 0 then
+		allowed = {}
+		for _, name in ipairs(hwassign) do allowed[name] = true end
+	end
 	local radios = {}
 	cursor:foreach("wireless", "wifi-device", function(s)
+		if allowed and not allowed[s[".name"]] then return end
 		radios[#radios + 1] = {
 			name             = s[".name"],
 			radio            = band_for_device(s),

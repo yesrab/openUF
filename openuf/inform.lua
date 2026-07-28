@@ -436,7 +436,12 @@ function M.build_json(st, cfg, ufhw)
 	if ufuci and ufuci.get_vap_table then
 		local ok_v, rv = pcall(ufuci.get_vap_table)
 		if ok_v then vap_table = rv end
-		local ok_r, rr = pcall(ufuci.get_radio_table)
+		-- The modelmap's hwassign restricts which radios are reported; absent,
+		-- every wifi-device in UCI is (see get_radio_table). It lives at
+		-- dev.openuf.uap in the modelmap while cfg here is dev.conf, so the
+		-- entry point merges it in as cfg.uap -- same pattern as cfg.config.
+		local hwassign = cfg and cfg.uap and cfg.uap.hwassign
+		local ok_r, rr = pcall(ufuci.get_radio_table, hwassign)
 		if ok_r then radio_table = rr end
 
 		-- Regulatory domain for the payload's country_code, off the first
@@ -2470,6 +2475,10 @@ if not OPENUF_TEST_MODE then
 		-- conf.lua, not a field of dev.conf -- merge it in under .config so
 		-- handle_response's cfg.config.debug_dump_file check can see it.
 		dev.conf.config = config
+		-- Same treatment for the modelmap's UniFi block (dev.openuf.uap): only
+		-- dev.conf is passed down, so hwassign is otherwise unreachable from
+		-- build_json.
+		dev.conf.uap = dev.openuf and dev.openuf.uap
 		M.run(dev.conf, ufhw)
 	end)
 	if not ok then

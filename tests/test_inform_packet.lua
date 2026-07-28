@@ -1935,6 +1935,43 @@ return {
 		end
 	},
 	{
+		name = "inform packet: build_json passes the modelmap's hwassign to get_radio_table",
+		fn = function()
+			-- The knob is documented in USAGE.md and conf.lua and was read by
+			-- nothing at all. Pin the whole path, not just get_radio_table's
+			-- filtering: hwassign lives at dev.openuf.uap in the modelmap while
+			-- build_json only ever receives dev.conf, so a lookup on the wrong
+			-- table would leave it just as dead as before while looking wired.
+			local seen = "not called"
+			inform._ucihelper = {
+				get_vap_table   = function() return {} end,
+				get_radio_table = function(hwassign) seen = hwassign; return {} end,
+			}
+			inform.build_json(sample_state(), {
+				net = {lan_cpueth = "eth0"},
+				uap = {hwassign = {"radio0", "radio1"}},
+			})
+			inform._ucihelper = nil
+			assert_true(type(seen) == "table", "hwassign reached get_radio_table")
+			assert_eq(seen[1], "radio0", "first radio name passed through")
+			assert_eq(seen[2], "radio1", "second radio name passed through")
+		end
+	},
+	{
+		name = "inform packet: build_json passes no hwassign when the modelmap has none",
+		fn = function()
+			local seen, called = "sentinel", false
+			inform._ucihelper = {
+				get_vap_table   = function() return {} end,
+				get_radio_table = function(hwassign) called = true; seen = hwassign; return {} end,
+			}
+			inform.build_json(sample_state(), {net = {lan_cpueth = "eth0"}})
+			inform._ucihelper = nil
+			assert_true(called, "get_radio_table still called")
+			assert_nil(seen, "no hwassign -> nil, i.e. report every radio")
+		end
+	},
+	{
 		name = "inform packet: handle_response cmd block-sta adds the MAC, persists, reconciles, and deauths",
 		fn = function()
 			local st = sample_state()

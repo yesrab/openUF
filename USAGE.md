@@ -119,7 +119,13 @@ The modelmap sets:
   know the board's LED — LED control is a silent no-op until you set it. Find yours with
   `ls /sys/class/leds`
 - `dev.openuf.uap.ufmodel`  — Which ufmodel file to load (e.g. `"u6iw"`)
-- `dev.openuf.uap.hwassign` — Radio names (e.g. `{"radio0", "radio1"}`)
+- `dev.openuf.uap.hwassign` — UCI radio names to report to the controller
+  (e.g. `{"radio0", "radio1"}`). Every other `wifi-device` on the board is left out of
+  `radio_table`, so a radio the emulated model doesn't have (a third phy, a mesh- or
+  monitor-only one) is neither shown nor configurable in the UI. Omit it — or leave it
+  empty — to report every radio UCI knows about, which is what a modelmap without the
+  field means. openUF never touches an unreported radio: a config push naming one is
+  refused rather than applied
 
 ### Device identity (`openuf/ufmodel/u6iw.lua`)
 

@@ -1804,6 +1804,22 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: get_radio_table reports only the modelmap's hwassign radios",
+		fn = function()
+			with_ucihelper(function()
+				seed_radios({"radio0", "radio1", "radio2"})
+				local all = ucihelper.get_radio_table()
+				assert_eq(#all, 3, "no hwassign -> every wifi-device is reported")
+				local some = ucihelper.get_radio_table({"radio0", "radio1"})
+				assert_eq(#some, 2, "hwassign filters the report")
+				assert_eq(some[1].name, "radio0", "kept radio0")
+				assert_eq(some[2].name, "radio1", "kept radio1")
+				assert_eq(#ucihelper.get_radio_table({}), 3,
+					"empty hwassign means unset, not 'report nothing'")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: rf_config refuses to create a radio this device does not have",
 		fn = function()
 			with_ucihelper(function(db)
