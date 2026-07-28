@@ -548,6 +548,41 @@ return {
 		end
 	},
 	{
+		name = "inform packet: the site's regdomain reaches the radio as an alpha-2 country",
+		fn = function()
+			-- Exact shape from a real controller (UniFi Network 10.4.57, site
+			-- set to Czechia): the code is ISO 3166-1 NUMERIC and is sent both
+			-- unindexed and per radio, while UCI's `country` wants alpha-2.
+			local radio_table = inform._parse_wifi_system_cfg(
+				"radio.status=enabled\nradio.countrycode=203\n"
+				.. "radio.1.phyname=radio0\nradio.1.countrycode=203\n"
+				.. "radio.2.phyname=radio1\nradio.2.countrycode=203\n")
+			assert_eq(radio_table[1].country, "CZ", "203 -> CZ on radio0")
+			assert_eq(radio_table[2].country, "CZ", "203 -> CZ on radio1")
+		end
+	},
+	{
+		name = "inform packet: the unindexed countrycode is used when radios carry none",
+		fn = function()
+			local radio_table = inform._parse_wifi_system_cfg(
+				"radio.countrycode=840\nradio.1.phyname=radio0\n")
+			assert_eq(radio_table[1].country, "US", "global regdomain applied")
+		end
+	},
+	{
+		name = "inform packet: an unmapped country code leaves the regdomain alone",
+		fn = function()
+			-- Better an unchanged regdomain than a guessed one: writing the
+			-- wrong domain changes which channels and power levels the radio
+			-- will legally use.
+			local radio_table = inform._parse_wifi_system_cfg(
+				"radio.1.phyname=radio0\nradio.1.countrycode=999\n")
+			assert_nil(radio_table[1].country, "unknown numeric -> no country written")
+			local none = inform._parse_wifi_system_cfg("radio.1.phyname=radio0\n")
+			assert_nil(none[1].country, "no countrycode at all -> nil")
+		end
+	},
+	{
 		name = "inform packet: radio/VAP disable is nil when the wire omits status",
 		fn = function()
 			-- Tri-state on purpose: a blob that never carries the key must not

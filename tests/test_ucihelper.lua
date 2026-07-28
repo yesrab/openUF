@@ -1926,6 +1926,46 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: rf_config writes the controller's regdomain to UCI",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				ucihelper.rf_config("radio0", nil, 36, nil, nil, nil, nil, nil, "CZ")
+				assert_eq(db.wireless.radio0.country, "CZ", "regdomain written")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a regdomain change invalidates the cached driver capabilities",
+		fn = function()
+			with_ucihelper(function()
+				-- Per-channel dBm limits are regdomain-derived, so max_txpower
+				-- read under the old domain is stale the moment it changes.
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio0"})
+				ucihelper.phy_caps()
+				assert_true(ucihelper._phy_caps_cache ~= nil, "capabilities cached")
+				ucihelper.rf_config("radio0", nil, nil, nil, nil, nil, nil, nil, "CZ")
+				assert_nil(ucihelper._phy_caps_cache, "cache dropped on a regdomain change")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an unchanged regdomain does not churn the capability cache",
+		fn = function()
+			with_ucihelper(function()
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio0"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "country", "CZ")
+				ucihelper.phy_caps()
+				ucihelper.rf_config("radio0", nil, 36, nil, nil, nil, nil, nil, "CZ")
+				assert_true(ucihelper._phy_caps_cache ~= nil,
+					"same country -> cache kept, no re-probe every push")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: rf_config skips beacon_rate on a driver that cannot set it",
 		fn = function()
 			with_ucihelper(function(db)

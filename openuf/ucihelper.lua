@@ -541,7 +541,11 @@ end
 -- radio.<n>.status (Radios -> Transmit Power -> Disabled). nil leaves UCI
 -- alone -- a blob that never carries the key must not re-enable a radio the
 -- user disabled by hand; only an explicit enabled/disabled writes.
-function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates, disabled)
+-- country: ISO 3166-1 alpha-2 regulatory domain from the controller's site
+-- setting (system_cfg's radio.<n>.countrycode, numeric on the wire and mapped
+-- to alpha-2 by inform.lua). nil leaves UCI alone.
+function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates,
+		disabled, country)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	-- Every write below is cursor:set on a named section, which in UCI CREATES
@@ -563,6 +567,14 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 	end
 	if disabled ~= nil then
 		cursor:set("wireless", radio, "disabled", disabled and "1" or "0")
+	end
+	if country and country ~= cursor:get("wireless", radio, "country") then
+		-- The regdomain decides which channels are legal and how much power
+		-- each may use, so it has to be written BEFORE the channel and txpower
+		-- below -- and it invalidates the cached driver capabilities, whose
+		-- per-channel dBm limits are regdomain-derived.
+		cursor:set("wireless", radio, "country", country)
+		M._phy_caps_cache = nil
 	end
 	if chan then
 		cursor:set("wireless", radio, "channel", tostring(chan))
@@ -745,7 +757,8 @@ function M.apply_config(resp, cfg, opts)
 				if rates then rates.beacon_rate = agg.beacon_rate end
 			end
 			M.rf_config(radio.name, radio.htmode, radio.channel, radio.tx_power,
-				radio.min_rssi_enabled, radio.min_rssi, rates, radio.disabled)
+				radio.min_rssi_enabled, radio.min_rssi, rates, radio.disabled,
+				radio.country)
 		end
 	end
 

@@ -342,6 +342,13 @@ local ISO3166_NUMERIC = {
 	VN = 704, IL = 376, AE = 784, SA = 682, AR = 32, CL = 152, CO = 170,
 }
 
+-- The same map inverted, for the inbound direction: the controller pushes its
+-- site's regulatory domain as a NUMERIC code (system_cfg's
+-- radio.<n>.countrycode), while UCI's `country` option wants the alpha-2 one.
+-- Built from the table above so the two directions can never disagree.
+local ISO3166_ALPHA = {}
+for alpha, numeric in pairs(ISO3166_NUMERIC) do ISO3166_ALPHA[numeric] = alpha end
+
 -- cjson encodes an empty Lua table as a JSON OBJECT ({}), but the payload's
 -- list fields (vap_table, scan_radio_table, mac_table, ...) must serialize
 -- as ARRAYS ([]) -- the controller's DTOs type them as lists, and {} for an
@@ -1177,6 +1184,7 @@ end
 
 function M._parse_wifi_system_cfg(sys_raw)
 	local aaa, wireless, radio, stamgr, macacl = {}, {}, {}, {}, {}
+	local global_countrycode = nil
 	local qos_vap = {}
 	for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
 		-- qos.vap.<m>: "WiFi Speed Limit". Needs its own pattern rather than
@@ -1221,6 +1229,16 @@ function M._parse_wifi_system_cfg(sys_raw)
 			tbl[idx] = tbl[idx] or {}
 			tbl[idx][key] = v
 		end
+		-- The site's regulatory domain, as an ISO 3166-1 NUMERIC code. Sent
+		-- both unindexed and per radio ("radio.countrycode=203",
+		-- "radio.1.countrycode=203" for a Czechia site -- confirmed live on a
+		-- real controller). The per-radio copy is captured by the indexed
+		-- pattern above; this catches the unindexed one as a fallback, so a
+		-- controller sending only the global still sets the regdomain.
+		if not section then
+			local cc = line:match("^radio%.countrycode=(%d+)$")
+			if cc then global_countrycode = tonumber(cc) end
+		end
 	end
 
 	local function sorted_indices(t)
@@ -1236,6 +1254,16 @@ function M._parse_wifi_system_cfg(sys_raw)
 		if r.phyname then
 			local entry = {
 				name     = r.phyname,
+				-- Regulatory domain, numeric on the wire -> UCI's alpha-2
+				-- `country`. Nothing wrote this before, so a device kept
+				-- whatever regdomain OpenWrt booted with (typically the
+				-- unconfigured world domain) while REPORTING 840/US back --
+				-- get_radio_table reads UCI `country` to derive country_code
+				-- and falls back to US when it is unset. A site in Czechia
+				-- therefore ran radios on US channel and power limits and saw
+				-- "US" in the UI. An unmapped numeric leaves UCI alone rather
+				-- than guessing a regdomain.
+				country  = ISO3166_ALPHA[tonumber(r.countrycode) or global_countrycode or -1],
 				-- "auto" passes through verbatim: UCI channel=auto is OpenWrt's
 				-- ACS request (hostapd surveys the band at bring-up and picks
 				-- the least-busy channel). Dropping it to nil instead would
