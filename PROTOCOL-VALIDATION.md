@@ -18,13 +18,21 @@ hypotheses and the investigation trails that produced these facts have been remo
 git history has them if needed. Decompiled evidence is retained inline wherever a claim
 would otherwise be hard to re-verify.
 
-**Environment:** `lscr.io/linuxserver/unifi-network-application:10.4.57` (Docker, pinned),
-with openUF running as the AP in a disposable Alpine container on the same Docker network
-(`tools/validation/`).
+**Environments:**
+
+- `lscr.io/linuxserver/unifi-network-application:10.4.57` (Docker, pinned), with openUF as
+  the AP in a disposable Alpine container on the same Docker network (`tools/validation/`).
+  Mocked `uci`/`ubus`, no radios.
+- **Real hardware, 2026-07-28:** a TP-Link Archer C5 v1 (OpenWrt 25.12.5, ath79/mips_24kc,
+  ath9k 2.4GHz + ath10k 5GHz) adopted by a **UniFi Cloud Gateway Ultra running Network
+  10.4.57** — the same version as the Docker baseline, so the two are directly comparable.
+  See [the first real-hardware run](#the-first-real-hardware-run) for what only appears
+  once genuine `netifd`/`hostapd`/radios are in the loop.
 
 **Status:** adoption, provisioning, and every UI-surfaced feature listed in the
 [feature matrix](#feature-matrix) are confirmed working end-to-end against a real
-controller, except where a row says otherwise.
+controller, except where a row says otherwise. Adoption, the WiFi config push, live
+clients and the radios themselves are additionally confirmed on real hardware.
 
 ---
 
@@ -97,6 +105,105 @@ back. Consequences:
   it). `docker start` the stopped — not removed — container to recover logs.
 - Background `127.0.0.1:9080/api/ucore/manifest` and `get-ulp-manifest` connection-refused
   errors appear in `server.log` regardless of device activity. Pre-existing and harmless.
+
+---
+
+## The first real-hardware run
+
+2026-07-28, Archer C5 v1 + UniFi Cloud Gateway Ultra (Network 10.4.57). Everything below
+is what the Docker environment structurally *cannot* show: it mocks `uci`/`ubus` and has no
+radios, so a config that `apply_config` writes "successfully" is never handed to `netifd`,
+`hostapd`, or a regulatory domain. Three of the four findings are of the same shape — UCI
+that reads perfectly and not one SSID on the air.
+
+### The discovery path decides the adoption method, not the subnet
+
+A controller that has heard a device's L2 broadcasts adopts it **by SSH**, even when it sits
+on the controller's own subnet and its informs are landing perfectly. On the Adopt click the
+gateway opened three SSH connections to the AP within 20 seconds:
+
+```
+dropbear[3746]: Child connection from 192.168.200.1:33114
+dropbear[3746]: Login attempt for nonexistent user from 192.168.200.1:33114
+```
+
+and, failing them, parked the device at **Connection Interrupted** while the inform loop kept
+running normally. The device record remembers this: removing it, stopping the broadcaster
+(`config.l2_announce = false`), and letting the device re-appear from L3 informs alone made
+the very next Adopt click complete over the inform channel with no SSH attempted at all.
+
+So a device that cannot accept the controller's SSH login (no password auth, no bootstrap
+account) **must** have `l2_announce` off, regardless of topology. "L3 adoption" names how the
+controller discovered the device, not where it is.
+
+### `macfilter="disable"` takes both radios off the air
+
+OpenWrt's own schema (`/usr/share/schema/wireless.wifi-iface.json`) declares the option as
+`enum: ["allow","deny"]`. 25.12's ucode validator does not ignore an out-of-enum value — it
+aborts the radio setup:
+
+```
+wifi-scripts: macfilter: disable has to be one of [ "allow", "deny" ]
+netifd: radio0 (4179): Died   (validate.uc:47 → die())
+```
+
+openUF wrote `macfilter="disable"` whenever the MAC filter was off, i.e. by default, so
+**every** config push killed both radios. "Off" is the absence of the option: `ap.uc`'s
+`iface_macfilter()` emits `accept_mac_file`/`deny_mac_file` for the two enum values and
+returns for anything else. Fixed by deleting the option instead.
+
+### `beacon_rate` is fatal on a driver that cannot program it
+
+hostapd does not treat an unsupported beacon rate as a hint:
+
+```
+nl80211: Driver does not support setting Beacon frame rate (legacy)
+Failed to set beacon parameters
+Interface initialization failed
+```
+
+The 2.4GHz ath9k radio never came up, while the ath10k 5GHz radio — which the controller sent
+no `beacon_rate` for — was fine. The capability is `NL80211_EXT_FEATURE_BEACON_RATE_LEGACY`,
+reported **per phy** in `iw phy`'s "Supported extended features" list; neither phy on this
+board has it. openUF now gates the option on that flag and still applies the rate floor
+itself (`basic_rate`/`supported_rates`), which needs no driver support.
+
+### The regulatory domain arrives as a numeric code, and nothing was applying it
+
+`get_radio_table` has always *read* UCI `country` to derive the payload's `country_code`, but
+nothing ever wrote it — so the radios kept whatever regdomain OpenWrt booted with while
+reporting `840`/US back (the fallback when the option is unset). On the wire it is an
+**ISO 3166-1 numeric** code, sent both unindexed and per radio:
+
+```
+radio.countrycode=203
+radio.1.countrycode=203      # radio.1.phyname=radio0
+radio.2.countrycode=203      # radio.2.phyname=radio1
+```
+
+UCI wants alpha-2, so 203 → `CZ`. Applying it moved the device from `country US: DFS-FCC` to
+`country CZ: DFS-ETSI` and the 2.4GHz radio to channel 13 — legal in CZ, not in the US.
+
+Worth knowing for anyone reading channel numbers off a live AP afterwards: with
+`channel=auto` (which is what the controller sends unless a channel is pinned) hostapd ACS
+picks freely within the new domain, and its choice can be a poor one in practice — it landed
+on 5GHz channel 165, which CZ caps at **13 dBm**, and on 2.4GHz channel 13, which plenty of
+client devices refuse outright. The controller's site-level Channel Plan exclusions are not
+on the wire; pinning the channel per radio in the device's Radios settings is the remedy, and
+that push (Auto → 6 / 36) was confirmed reaching UCI and the live radios within one inform
+cycle.
+
+### What the real controller sends that the Docker one did not
+
+`radio.<n>.ieee_mode` came through as **`11naht40`** (5GHz) and **`11nght20`** (2.4GHz) — HT,
+not HE, even though the device presents as an 802.11ax U6-InWall. openUF's downward clamp of
+the PHY generation was therefore never triggered on this site; it remains insurance for a
+site configured with wider/newer channel widths, not a confirmed-exercised path.
+
+WPA2/WPA3 transition with PMF Optional arrives as `aaa.<n>.wpa=2` +
+`wpa.key.1.mgmt=WPA-PSK` + `pmf.status=enabled` + `pmf.mode=1` — no SAE key-mgmt on the wire
+at all, confirming the earlier Docker-era note that this controller signals WPA3-mixed purely
+through PMF for a madwifi-driver model.
 
 ---
 
