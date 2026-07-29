@@ -2229,6 +2229,24 @@ function M.handle_response(json_str, st, cfg)
 					for _, radio in ipairs(radios) do
 						local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
 						if ok_if and ifname then
+							-- Survey counters are cumulative and exist
+							-- independently of the sweep, so sample them BEFORE
+							-- it as well: immediately after a scan the radio has
+							-- just come back from off-channel and the OPERATING
+							-- channel's noise reads as 0 -- confirmed on real
+							-- hardware, where the same channel reports 0 right
+							-- after the sweep and -106 dBm moments later. 0 dBm
+							-- is not a plausible noise floor, and this value is
+							-- reported to the controller as `interference`.
+							local pre_noise = {}
+							local ok_pre, pre_stats = pcall(M._sysinfo.radio_stats, ifname)
+							if ok_pre then
+								for _, s in ipairs(pre_stats) do
+									if s.freq and s.noise and s.noise ~= 0 then
+										pre_noise[s.freq] = s.noise
+									end
+								end
+							end
 							ufuci._popen("iw dev " .. ifname .. " scan")
 							local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 							if ok_rs then
@@ -2242,7 +2260,10 @@ function M.handle_response(json_str, st, cfg)
 										center_freq = s.freq,
 										width       = width,
 										utilization = total > 0 and math.floor(busy * 100 / total) or 0,
-										interference = s.noise or 0,
+										-- Post-sweep 0 falls back to the
+										-- pre-sweep reading for that frequency.
+										interference = (s.noise ~= 0 and s.noise)
+											or pre_noise[s.freq] or 0,
 									}
 								end
 								M._spectrum_cache[radio.name] = {

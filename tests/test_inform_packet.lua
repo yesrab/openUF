@@ -2130,6 +2130,59 @@ return {
 		end
 	},
 	{
+		name = "inform packet: spectrum-scan keeps the pre-sweep noise when the post-sweep read is 0",
+		fn = function()
+			-- On real hardware the OPERATING channel's noise reads back as 0
+			-- immediately after an `iw scan` sweep -- the radio has just
+			-- returned from off-channel -- while the same channel reports
+			-- -106 dBm moments later. 0 dBm is not a plausible noise floor,
+			-- and this value goes to the controller as `interference`.
+			local st = sample_state()
+			local orig_uci, orig_stats = inform._ucihelper, inform._sysinfo.radio_stats
+			local orig_cache = inform._spectrum_cache
+			inform._spectrum_cache = {}
+			local scanned = false
+			inform._ucihelper = {
+				get_radio_table = function()
+					return { { name = "radio0", channel = "36", ht = "HT40" } }
+				end,
+				get_ifname_for_radio = function() return "wlan0" end,
+				_popen = function(cmd)
+					if tostring(cmd):match("scan") then scanned = true end
+					return ""
+				end,
+			}
+			inform._sysinfo.radio_stats = function()
+				if not scanned then
+					-- pre-sweep: the operating channel has a real noise floor
+					return {
+						{ freq = 5180, noise = -106, channel_time = 1000, channel_time_busy = 10 },
+						{ freq = 5200, noise = -105, channel_time = 46, channel_time_busy = 0 },
+					}
+				end
+				-- post-sweep: operating channel's noise has gone to 0
+				return {
+					{ freq = 5180, noise = 0,    channel_time = 5000, channel_time_busy = 500 },
+					{ freq = 5200, noise = -104, channel_time = 46, channel_time_busy = 0 },
+				}
+			end
+
+			local ok, err = pcall(function()
+				inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
+				local t = inform._spectrum_cache.radio0.table
+				assert_eq(t[1].interference, -106,
+					"operating channel keeps its pre-sweep noise floor, not 0")
+				assert_eq(t[1].utilization, 10,
+					"utilization still comes from the fresh post-sweep counters")
+				assert_eq(t[2].interference, -104,
+					"a valid post-sweep reading always wins over the pre-sweep one")
+			end)
+			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
+			inform._spectrum_cache = orig_cache
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform: _populate_net_info does not trigger announce.lua's self-executing entry point outside test mode",
 		fn = function()
 			-- Regression test: _populate_net_info dofile()s announce.lua to
