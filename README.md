@@ -84,13 +84,21 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 
 ## Supported hardware
 
-Any OpenWrt device with at least 8 MB flash and a dual-band wireless chipset.  Known-working:
+A dual-band OpenWrt device with **at least 16 MB flash**, and roughly **5 MB free on
+`/overlay`** after the stock image.  8 MB is not enough: the AES-GCM backend
+(`lua-openssl`) pulls in `libopenssl3` at ~4.35 MB, and adoption cannot complete without
+GCM — a stock 8 MB build leaves only ~1.6 MB of overlay, which no crypto backend fits in
+(`openssl-util` and `luaossl` depend on the same library).  Measured on a TL-WDR3500 v1,
+which is 3.2 MB short and therefore **cannot run openUF from a stock image** — it needs
+USB extroot or a custom build with the crypto baked into squashfs.  Known-working:
 
 - **TP-Link Archer C5 v1** (dual-band 802.11n/ac) — use `modelmap/archer-c5-v1.lua`.
   **The reference device**: install, adoption, the WiFi config push, live clients and the
   radios themselves are confirmed on this board (OpenWrt 25.12.5) against a real UniFi Cloud
   Gateway Ultra — see [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md#the-first-real-hardware-run)
-- **TP-Link WDR3500** (dual-band 802.11n) — use `modelmap/generic-dualband-ap.lua`
+- **TP-Link WDR3500** (dual-band 802.11n) — use `modelmap/generic-dualband-ap.lua`.
+  ⚠️ **8 MB flash: does not fit a stock image** (see the space requirement above). Its
+  radio order is also the reverse of the Archer C5's — `radio0` is 2.4 GHz here
 - **TP-Link WR1043ND v2** (single-band 802.11n) — use `modelmap/tl-wr1043ndv2.lua`
 
 The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end — `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
