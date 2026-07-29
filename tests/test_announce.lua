@@ -225,6 +225,40 @@ return {
 		end
 	},
 	{
+		name = "announce: get_hostname reads /proc, not just the `hostname` command",
+		fn = function()
+			-- OpenWrt builds do not necessarily ship a `hostname` applet --
+			-- confirmed absent on a real Archer C5 running 25.12.5 -- and the
+			-- command-only version then reported every such device to the
+			-- controller as "openUF" rather than its real hostname.
+			local orig_read, orig_popen = announce._read_file, announce._popen
+			local popen_called = false
+			announce._read_file = function(path)
+				if path == "/proc/sys/kernel/hostname" then return "livingroom-ap\n" end
+				return nil
+			end
+			announce._popen = function() popen_called = true; return "" end
+			local got = announce.get_hostname()
+			announce._read_file, announce._popen = orig_read, orig_popen
+			assert_eq(got, "livingroom-ap", "hostname read from /proc and trimmed")
+			assert_false(popen_called, "no process spawned when /proc answers")
+		end
+	},
+	{
+		name = "announce: get_hostname falls back to the command, then to nil",
+		fn = function()
+			local orig_read, orig_popen = announce._read_file, announce._popen
+			announce._read_file = function() return nil end
+			announce._popen = function() return "fallback-name\n" end
+			local via_cmd = announce.get_hostname()
+			announce._popen = function() return "" end
+			local none = announce.get_hostname()
+			announce._read_file, announce._popen = orig_read, orig_popen
+			assert_eq(via_cmd, "fallback-name", "command used when /proc is unreadable")
+			assert_nil(none, "neither source -> nil, caller falls back to openUF")
+		end
+	},
+	{
 		name = "announce: get_ip reads the address off the interface itself",
 		fn = function()
 			local orig, seen = announce._popen, {}

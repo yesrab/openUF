@@ -102,6 +102,35 @@ M._run_cmd = function(cmd)
 	return s or ""
 end
 
+-- Injectable: sysfs reader for the per-netdev link attributes below.
+M._read_file = function(path)
+	local f = io.open(path, "r")
+	if not f then return nil end
+	local s = f:read("*a")
+	f:close()
+	return s
+end
+
+-- Negotiated link speed in Mbit/s for a netdev, or nil when the kernel can't
+-- report one (interface down, or a virtual device with no PHY -- reading
+-- /sys/class/net/<if>/speed on a down interface returns an error, which
+-- io.read surfaces as nil or an unparseable string, both handled here).
+function M._link_speed(ifname)
+	if not ifname then return nil end
+	local n = tonumber((tostring(M._read_file(
+		"/sys/class/net/" .. ifname .. "/speed") or ""):match("(-?%d+)") or ""))
+	-- The kernel reports -1 for "unknown"; treat that as no reading.
+	if n and n > 0 then return n end
+	return nil
+end
+
+-- "full"/"half"/nil, from the same sysfs directory.
+function M._link_duplex(ifname)
+	if not ifname then return nil end
+	local s = M._read_file("/sys/class/net/" .. ifname .. "/duplex")
+	return s and s:match("^%s*(%a+)") or nil
+end
+
 -- Returns the mtime (seconds since epoch, as a number) of path, or nil if
 -- it can't be stat'd (missing, permission denied, stat unavailable, ...).
 function M._state_mtime(path)
@@ -940,8 +969,20 @@ function M.build_json(st, cfg, ufhw)
 			media       = "GE",
 			up          = iface ~= nil,
 			enable      = true,
-			speed       = 1000,
-			full_duplex = true,
+			-- Negotiated link speed/duplex, read from the netdev rather than
+			-- asserted: these were hardcoded 1000/full, so the controller's
+			-- Ports view showed "GbE" for every device on every board no
+			-- matter what the link had actually negotiated -- a reported
+			-- metric that was never measured at all.
+			--
+			-- NB on swconfig boards the named netdev is the CPU port, whose
+			-- link is the internal SoC<->switch one (always 1000 here); the
+			-- external socket the cable is in belongs to the switch and its
+			-- speed is only visible via swconfig. So this reports the truth
+			-- about the interface it names, which is the best any generic
+			-- reading can do -- see PROTOCOL-VALIDATION.md.
+			speed       = M._link_speed(p.ifname) or 1000,
+			full_duplex = M._link_duplex(p.ifname) ~= "half",
 			is_uplink   = p.uplink or false,
 			speed_caps  = 0,
 			port_poe    = false,

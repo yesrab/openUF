@@ -211,17 +211,36 @@ M._popen = function(cmd)
 	return s or ""
 end
 
+-- Injectable: file reader, same seam convention as ucihelper._read_file.
+M._read_file = function(path)
+	local f = io.open(path, "r")
+	if not f then return nil end
+	local s = f:read("*a")
+	f:close()
+	return s
+end
+
 -- The device's real system hostname, or nil when unavailable/empty.
 -- Used by the L2-discovery entry point below and by inform.lua's
 -- _populate_net_info (the inform payload's top-level "hostname" field --
 -- without it every openUF device shows up in the controller as "openUF").
+--
+-- /proc/sys/kernel/hostname is read FIRST, and the `hostname` command is only
+-- a fallback: OpenWrt builds do not necessarily ship a `hostname` applet at
+-- all (confirmed on a real Archer C5 running 25.12.5 -- busybox there has no
+-- such applet), so the command-only version silently reported every such
+-- device to the controller as "openUF" instead of its actual hostname. The
+-- proc file is always present on Linux and needs no process spawn.
 function M.get_hostname()
-	local out = M._popen("hostname")
-	if type(out) ~= "string" then return nil end
-	local line = out:match("([^\r\n]+)")          -- first line
-	line = line and line:match("^%s*(.-)%s*$")    -- trimmed
-	if not line or line == "" then return nil end
-	return line
+	local function clean(s)
+		if type(s) ~= "string" then return nil end
+		local line = s:match("([^\r\n]+)")           -- first line
+		line = line and line:match("^%s*(.-)%s*$")   -- trimmed
+		if not line or line == "" then return nil end
+		return line
+	end
+	return clean(M._read_file("/proc/sys/kernel/hostname"))
+		or clean(M._popen("hostname"))
 end
 
 -- Start the main announce loop (blocks forever).

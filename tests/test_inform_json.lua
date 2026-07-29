@@ -1012,6 +1012,52 @@ return {
 		end
 	},
 	{
+		name = "inform json: port_table reports the link speed the kernel negotiated",
+		fn = function()
+			-- speed/full_duplex used to be hardcoded 1000/full, so the Ports
+			-- view claimed "GbE" on every device and every board regardless of
+			-- what the link actually came up at -- a reported metric that was
+			-- never measured.
+			local orig = inform._read_file
+			inform._read_file = function(path)
+				if path == "/sys/class/net/eth0/speed"  then return "100\n"  end
+				if path == "/sys/class/net/eth0/duplex" then return "half\n" end
+				if path == "/sys/class/net/eth1/speed"  then return "1000\n" end
+				if path == "/sys/class/net/eth1/duplex" then return "full\n" end
+				return nil
+			end
+			local ok, err = pcall(function()
+				local d = build()
+				assert_eq(d.port_table[1].speed, 100, "uplink reports its real 100Mbit link")
+				assert_false(d.port_table[1].full_duplex, "and its real half duplex")
+				assert_eq(d.port_table[2].speed, 1000, "the gigabit port reports 1000")
+				assert_true(d.port_table[2].full_duplex, "and full duplex")
+			end)
+			inform._read_file = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform json: port_table falls back when the kernel reports no speed",
+		fn = function()
+			-- A down interface, or a virtual device with no PHY, makes the
+			-- kernel return an error or -1 for speed; neither may be sent as a
+			-- link rate.
+			local orig = inform._read_file
+			inform._read_file = function(path)
+				if path:find("/speed") then return "-1\n" end
+				return nil
+			end
+			local ok, err = pcall(function()
+				local d = build()
+				assert_eq(d.port_table[1].speed, 1000, "-1 is 'unknown', not a speed")
+				assert_true(d.port_table[1].full_duplex, "duplex defaults to full when unknown")
+			end)
+			inform._read_file = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform json: port_table marks exactly the uplink port is_uplink",
 		fn = function()
 			local d = build()
