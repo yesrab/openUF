@@ -426,6 +426,47 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: radio_caps() derives nss from the HT MCS range on an HT-only radio",
+		fn = function()
+			-- Real ath9k output: no "HT TX Max spatial streams" summary line,
+			-- and no VHT/HE MCS-set tables to count "N streams: MCS" lines in
+			-- -- an HT-only radio has neither of the two sources radio_caps
+			-- used, so every 2.4GHz-only radio fell through to the 1x1
+			-- default. A real controller showed this board's 3-stream ath9k
+			-- radio as "1x1 WiFi 4".
+			local ht_only = table.concat({
+				"Wiphy phy1",
+				"\tBand 1:",
+				"\t\tCapabilities: 0x11ef",
+				"\t\t\tHT20/HT40",
+				"\t\tHT TX/RX MCS rate indexes supported: 0-23",
+				"\t\tFrequencies:",
+				"\t\t\t* 2412.0 MHz [1] (20.0 dBm)",
+			}, "\n")
+			with_fixtures({}, {
+				["dev wlan0 info"] = "Interface wlan0\n\twiphy 1\n\tchannel 6 (2437 MHz)\n",
+				["phy phy1 info"]  = ht_only,
+			}, function()
+				local caps = sysinfo.radio_caps("wlan0")
+				assert_eq(caps.nss, 3, "MCS 0-23 is three spatial streams, not one")
+				assert_false(caps.is_11ac, "and it is still correctly HT-only")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: radio_caps() prefers the explicit spatial-streams line over the MCS range",
+		fn = function()
+			-- Where both exist they must agree; the summary line stays
+			-- authoritative. ("0-15, 32" -> floor(15/8)+1 = 2, same answer.)
+			with_fixtures({}, {
+				["dev wlan0 info"] = fixture("iw_dev_info.txt"),
+				["phy phy0 info"]  = fixture("iw_phy_info_2g.txt"),
+			}, function()
+				assert_eq(sysinfo.radio_caps("wlan0").nss, 2, "explicit line wins, and agrees")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: sta_table() signal is the client's RSSI, not the ack signal",
 		fn = function()
 			-- `iw` prints "avg ack signal:\t-95 dBm" further down the same

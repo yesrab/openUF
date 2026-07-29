@@ -423,6 +423,26 @@ function M.radio_caps(ifname)
 		end
 		if max_streams > 0 then nss = max_streams end
 	end
+	if not nss then
+		-- Last resort, and the only one an HT-only radio has: the supported HT
+		-- MCS index range ("HT TX/RX MCS rate indexes supported: 0-23"). The
+		-- HT MCS layout is 8 indexes per spatial stream (0-7 = 1 stream,
+		-- 8-15 = 2, 16-23 = 3), the same mapping _bitrate_generation_nss
+		-- already applies to per-station HT rates.
+		--
+		-- Neither of the two sources above exists on a plain 802.11n phy:
+		-- there is no "HT TX Max spatial streams" summary line, and the
+		-- "N streams: MCS" lines belong to the VHT/HE MCS-set tables, which
+		-- an HT-only radio has none of. So every 2.4GHz-only radio fell
+		-- through to the default and was reported as 1x1 -- confirmed against
+		-- a real controller, which showed this board's 3-stream ath9k radio
+		-- as "1x1 WiFi 4".
+		local hi = phy_info:match("HT TX/RX MCS rate indexes supported:%s*%d+%-(%d+)")
+		if hi then
+			local n = math.floor(tonumber(hi) / 8) + 1
+			if n > 0 then nss = n end
+		end
+	end
 	caps.nss = nss and tonumber(nss) or 1
 
 	return caps
