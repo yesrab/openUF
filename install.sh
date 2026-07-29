@@ -29,9 +29,15 @@ case "$1" in
 		# while the feature does nothing -- so they are installed rather than merely
 		# reported, same as usteer/wpad below. A failed install is a warning, not a
 		# hard stop: openUF starts and reports honestly without the optional ones.
+		# ip-bridge supplies the `bridge` command. Busybox's `ip` has no
+		# `bridge` subcommand at all, and without it sysinfo.mac_table()'s
+		# `bridge fdb show` finds nothing, so no wired client behind the AP is
+		# ever reported and the controller's Ports view stays empty -- another
+		# silent degradation, confirmed on a real Archer C5 where the command
+		# was simply absent.
 		MISSING=""
 		for pkg in lua lua-cjson luasocket lua-openssl luabitop iw lldpd \
-			openssl-util hostapd-utils nftables; do
+			openssl-util hostapd-utils nftables ip-bridge; do
 			if ! apk info -e "$pkg" >/dev/null 2>&1; then
 				MISSING="$MISSING $pkg"
 			fi

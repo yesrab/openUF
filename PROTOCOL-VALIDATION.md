@@ -1095,9 +1095,42 @@ them for measured values.
 | `sta_table[].linkscore`, `.multicast` | `0` placeholders — **no local source and no public reference found for either.** Neither `paultyng/go-unifi`'s `User` model nor `unpoller/unifi`'s `clients.go` has them at all. Still needs live-capture verification. |
 | `sta_table[].satisfaction` | `estimate_satisfaction()`: worse of a signal score (−85 dBm → 0, −50 dBm → 100) and a retry score (`100 − retries%`), matching community descriptions of the real behavior. A proxy for Ubiquiti's undocumented on-device formula. |
 | `spectrum_table[].width` | The radio's configured `htmode` (e.g. `HT40` → 40) as a uniform approximation — no live-scan source gives per-channel width |
-| `spectrum_table[].interference` | Raw noise-floor dBm passed through; `iw survey dump` has no equivalent metric |
+| `spectrum_table[].interference` | Noise-floor dBm passed through; `iw survey dump` has no interference metric of its own. Falls back to the pre-sweep reading for any frequency whose post-scan noise comes back `0` (see [the first real-hardware run](#the-first-real-hardware-run)) |
+| `radio_table[].builtin_antenna` = `true`, `.builtin_ant_gain` = `3` (dBi) | **Constants — no software source exists for either.** Not inert: the controller adds the gain to TX power to display EIRP, so a board with different antennas reports a wrong EIRP. Change them in `ucihelper.RADIO_DEFAULTS` if your hardware differs. |
+| `radio_caps().has_fccdfs` | Mirrors `has_dfs`; `iw` exposes no separate FCC-DFS indication |
+| `radio_caps().has_eht240` / `.has_eht320` | Hardcoded `false` — openUF has no 802.11be target hardware to derive them from |
+| `port_table[].media` = `"GE"`, `.enable` = `true`, `.speed_caps` = `0`, `.port_poe` = `false`, `.poe_caps` = `0` | Constants. The PoE ones are honest for every target board (none source PoE); `media`/`speed_caps` are unmodelled. `speed`/`full_duplex` **are** measured (sysfs) as of the real-hardware run |
+| `serial` | Derived from the device MAC with the colons stripped — a real AP's serial is a separate factory value openUF has no equivalent of |
+| `spectrum_scanning` = `false` | Always false: scans are run synchronously inside the cmd handler, so the device is never "currently scanning" when a payload is built |
+| `lldp_table[].is_wired` = `true` | LLDP is inherently a wired-link protocol |
+| `model` / `platform` / `version` / `required_version` / `bootrom_version` | The emulated UniFi identity from `ufmodel/*.lua` — deliberately not the host hardware. This is the point of the project, not an accidental approximation |
+| `fw_caps` = `0x110`, `wifi_caps2` = `0x40` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
 | `ucihelper` `wps_device_name` / `ap_setup_locked` | Standards-based rather than Ubiquiti-derived — see the beacon row in the [feature matrix](#feature-matrix) |
 | `usteer.lua`'s `USTEER_DEFAULTS` | Guessed `/etc/config/usteer` option names; verify against the package's own shipped defaults if usteer is ever installed in the validation container |
+
+Everything not listed above is measured from the running system. Several fields
+*used* to belong in this table and no longer do — `max_txpower`, `tx_power`,
+`nss`, per-client `signal`, `hostname`, and `port_table[].speed`/`full_duplex`
+were all constants or misparsed values until the first real-hardware run
+surfaced them; they are now read from `iw`, sysfs and `/proc`.
+
+### Fixtures must be verbatim command output
+
+Three of the bugs found on real hardware were invisible to a green test suite
+because the fixtures under `tests/fixtures/` were *tidier than reality*:
+
+- `iw_station_dump.txt` had no `avg ack signal:` lines, so nothing caught an
+  unanchored `signal:` pattern matching them and reporting every client at the
+  ack value instead of its RSSI.
+- `iw_phy_info_*.txt` carried an `HT TX Max spatial streams:` line that real
+  ath9k/ath10k never emit, hiding that an HT-only radio has no source for `nss`
+  at all and always fell back to 1x1.
+- `iw_dev_info.txt` omitted the `ssid` and `multicast TXQ` blocks real output
+  carries.
+
+A fixture is a *recording*, not an illustration: paste real output from a real
+device, including the lines that look irrelevant. The ones that look irrelevant
+are exactly where unanchored patterns go wrong.
 
 ---
 
@@ -1114,8 +1147,8 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 4 | VLAN-tagged network + SSID assignment | `aaa.<n>.br.devname = br0.<vlan>` | ✅ Confirmed |
 | 5 | Fast Roaming (802.11r) | `aaa.<n>.ft.status` only | ✅ Confirmed by byte-for-byte `system_cfg` diff, both directions |
 | 6 | TX power / channel per radio | `radio.<n>.channel`/`.txpower`/`.txpower_mode` | ✅ Confirmed |
-| 7 | Locate | `cmd:"set-locate"` | ✅ Confirmed. LED *hardware* effect untestable here (`dev.conf.led` is nil); covered by `tests/test_led.lua` |
-| 8 | RF/spectrum scan trigger | `cmd:"spectrum-scan"` | ⚠️ Handler implemented and unit-tested; **no manual trigger control exists anywhere in 10.4.57's UI** (AirView is entirely passive), so never fired live. Nothing contradicts the handler's correctness. |
+| 7 | Locate | `cmd:"set-locate"` | ✅ Confirmed, including the **LED hardware effect on a real board** (Archer C5, `dev.conf.led = "green:system"`): `locate_start` writes `trigger=timer` + 250/250 ms, `locate_stop` restores `trigger=none`, and the Manage → LED toggle drives `brightness` 1/0 |
+| 8 | RF/spectrum scan trigger | `cmd:"spectrum-scan"` | ✅ Handler exercised **against real radios** — 27 channels on 5 GHz, 13 on 2.4 GHz, with genuine per-channel utilization and noise. Still **no manual trigger control exists anywhere in 10.4.57's UI** (AirView is passive), so it has never been fired *by the controller*; the handler was invoked directly on the device. |
 | 9 | Firmware upgrade | `_type:"upgrade"` | ✅ Confirmed. openUF stores `upgrade_requested_version`/`_url` and logs — it never downloads, verifies, flashes, or reboots. Verified live: no side effects, device stayed Connected. The pushed `md5sum`/filename match Ubiquiti's real CDN artifact byte-for-byte. |
 | 10 | Forget device / factory reset | `_type:"setdefault"` | ⚠️ UI action and server-side deletion work, but **no `setdefault` was ever dispatched on the wire**; handler unverified. See [open questions](#open-questions). |
 | 11 | `fw.ver` acceptance | — | ✅ Accepted verbatim, no validation beyond storage |

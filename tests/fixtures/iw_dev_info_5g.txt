@@ -1,8 +1,12 @@
 Interface wlan0
 	ifindex 3
-	wdev 0x1
+	wdev 0x100000004
 	addr de:ad:be:ef:00:01
+	ssid openuf-test
 	type AP
 	wiphy 0
 	channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz
-	txpower 20.00 dBm
+	txpower 23.00 dBm
+	multicast TXQ:
+		qsz-byt	qsz-pkt	flows	drops	marks	overlmt	hashcol	tx-bytes	tx-packets
+		0	0	22	0	0	0	0	4300		22
