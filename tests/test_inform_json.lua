@@ -768,6 +768,10 @@ return {
 			-- the literal string "auto" here, and used to go out as-is.
 			assert_eq(d.vap_table[1].channel, 6, "vap channel overridden with the live value")
 			assert_eq(d.vap_table[1].radio, "ng", "vap band matches the corrected radio band")
+			-- tx_power has the same UCI-echo problem: the option is absent
+			-- while Transmit Power is Auto, so both copies stayed nil.
+			assert_eq(d.radio_table[1].tx_power, 20, "radio reports the live driver TX power")
+			assert_eq(d.vap_table[1].tx_power, 20, "and the vap inherits the same correction")
 		end
 	},
 	{

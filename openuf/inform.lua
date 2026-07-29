@@ -740,6 +740,11 @@ function M.build_json(st, cfg, ufhw)
 			if live then
 				if live.channel then vap.channel = live.channel end
 				if live.radio then vap.radio = live.radio end
+				-- Same UCI-echo problem as channel: get_vap_table reads the
+				-- `txpower` option, which does not exist while Transmit Power
+				-- is Auto, so the vap's copy stayed nil even after the radio
+				-- entry picked up the driver's real value.
+				if live.tx_power then vap.tx_power = live.tx_power end
 			end
 			-- get_ifname_for_radio() resolves a UCI radio device name
 			-- ("radio0"/"radio1"), not the band vap.radio now reports
