@@ -1209,9 +1209,18 @@ end
 -- just aaa.<n>.wpa, which is only the WPA protocol version and stays "2"
 -- even for a WPA2/WPA3 transition WLAN): SAE present -> sae/sae-mixed,
 -- else WPA2-PSK. Confirmed live for the WPA2-PSK case (wpa=2 +
--- wpa.key.1.mgmt=WPA-PSK -> "wpa2"); the SAE branches are correct-by-
--- construction but not yet live-captured -- this environment's controller
--- signals WPA3-mixed via PMF for this madwifi model, never SAE key-mgmt.
+-- wpa.key.1.mgmt=WPA-PSK -> "wpa2").
+--
+-- The SAE branches are UNREACHABLE as things stand, and not merely
+-- un-captured: SAE never arrives as a wpa.key.<n>.mgmt value at all. The
+-- controller emits WPA3 as its own `wpa3.support` / `wpa3.transition` keys,
+-- and only for a radio that claims the SAE capability bit (0x1) -- which
+-- openUF does not, so every WPA3 WLAN is silently downgraded to WPA2 for
+-- this device before the config is even generated. Decompiled and confirmed
+-- against a live 10.4.57 gateway; see PROTOCOL-VALIDATION.md's "WPA3 is
+-- silently downgraded to WPA2". (An earlier version of this comment read the
+-- PMF keys as the WPA3-mixed signal for a madwifi-driver model. They are
+-- not: PMF is just PMF.)
 local function _wire_bool(v)
 	if v == nil then return nil end
 	return v == "1" or v == "true" or v == "enabled"

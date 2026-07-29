@@ -1114,6 +1114,62 @@ Everything not listed above is measured from the running system. Several fields
 were all constants or misparsed values until the first real-hardware run
 surfaced them; they are now read from `iw`, sysfs and `/proc`.
 
+### WPA3 is silently downgraded to WPA2 — the radio must claim the SAE bit
+
+A WLAN set to **WPA2/WPA3** in the UI reaches openUF as plain WPA2, and nothing
+anywhere says so. The captured `system_cfg` contains no `sae`, no `wpa3`, just:
+
+```
+aaa.1.wpa=2
+aaa.1.wpa.key.1.mgmt=WPA-PSK
+aaa.1.pmf.status=enabled     aaa.1.pmf.mode=1
+```
+
+openUF applies that faithfully, so hostapd runs
+`wpa_key_mgmt=WPA-PSK FT-PSK WPA-PSK-SHA256` and every client — WPA3-capable
+ones included — associates with AKM `00-0f-ac-2`/`-4`/`-6`. Never `00-0f-ac-8`
+(SAE).
+
+This is **not** the controller's WLAN being misconfigured. Its REST API confirms
+the wlanconf really does carry `wpa3_support: true`, `wpa3_transition: true`.
+The downgrade is per device, in `com.ubnt.service.config.ubntconf.QSAkfnbfInKJ`:
+
+```java
+if (wlanconf.isWpa3()) {                      // wlanconf field wpa3_support
+    if (!radio.CVir()) {                      // radio lacks the SAE capability
+        if (wlanconf.isWpa3LegacyEnabled())   // wlanconf field wpa3_transition
+            return downgrade(wlanconf, radio);          // ← silent WPA2
+        log.warn("SAE cannot provision {} to {}", name, mac);
+        return null;                                     // WLAN dropped entirely
+    }
+```
+
+So a **transition-mode** WLAN degrades quietly, while a **WPA3-only** WLAN would
+be dropped from the device altogether with that one server-side log line.
+
+`CVir()` tests **bit `0x1`** of the radio's capability integer (the class reads
+both `radio_caps` and `radio_caps2`). openUF sends `radio_caps` for the MIMO
+column only — `0x8`/`0x10`/`0x20`/`0x4000000` for 1x1…4x4 — and no `radio_caps2`
+at all, so bit `0x1` is clear either way and every WPA3 WLAN is downgraded on
+every openUF device.
+
+The emission side is gated separately, on the WLAN alone
+(`com.ubnt.service.config.j.rYtJfMBbtgWvku`: `isWpa3() || band == 6E`), and
+produces `wpa3.support=enabled` + `wpa3.transition=enabled|disabled` — the keys
+openUF's `_parse_wifi_system_cfg` would need to read, since **SAE never arrives
+as a `wpa.key.<n>.mgmt` value**. `SECURITY_MAP`'s `wpa3` → `sae` and
+`wpa2/wpa3` → `sae-mixed` entries are therefore unreachable today: no producer
+emits the strings that select them. (An earlier note in this document read the
+PMF keys as the controller's way of signalling WPA3-mixed for a madwifi-driver
+model. That was wrong — PMF is just PMF, and the real signal is these two keys.)
+
+Fixing it needs the capability claimed *and* honoured: which of `radio_caps` /
+`radio_caps2` carries the bit is best settled by setting it and watching the
+wire, and the SAE apply path must then be verified end-to-end. Note
+`wpad-mbedtls`, OpenWrt 25.12's ath79 default, does support SAE
+(`sae_password`, `sae_groups`, and `psk-sae` in `ap.uc`), so on that hardware
+the claim would be honest.
+
 ### Fixtures must be verbatim command output
 
 Three of the bugs found on real hardware were invisible to a green test suite
