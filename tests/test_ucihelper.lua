@@ -1385,6 +1385,50 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: get_vap_table omits foreign SSIDs that are switched off",
+		fn = function()
+			-- OpenWrt's stock default_radioN sections, which
+			-- use_only_unifi_wlan disables during provisioning. They have no
+			-- BSS on the air, and reporting them cost more than a wasted
+			-- entry: the nested sta_table is built per RADIO, so every real
+			-- station on that radio was attributed to the phantom VAP too,
+			-- duplicating its traffic and retry counters. Confirmed on real
+			-- hardware -- one live SSID was reported as four VAPs.
+			with_ucihelper(function()
+				seed_radios({"radio0", "radio1"})
+				local cursor = ucihelper._uci.cursor()
+				for _, r in ipairs({"radio0", "radio1"}) do
+					local name = "default_" .. r
+					cursor:set("wireless", name, "wifi-iface")
+					cursor:set("wireless", name, "device", r)
+					cursor:set("wireless", name, "ssid", "OpenWrt")
+					cursor:set("wireless", name, "disabled", "1")
+				end
+				ucihelper.wlan_add("radio0", "corp", "wpa2", "hunter22", nil, nil, "wlan-1")
+				local vaps = ucihelper.get_vap_table()
+				assert_eq(#vaps, 1, "only the live, openUF-managed vap is reported")
+				assert_eq(vaps[1].essid, "corp", "and it is the right one")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: get_vap_table still reports an openUF vap the controller disabled",
+		fn = function()
+			-- The other side of the same rule: a WLAN the controller itself
+			-- switched off must keep appearing (as disabled), or the UI would
+			-- show it vanishing off the device entirely.
+			with_ucihelper(function()
+				seed_radios({"radio0"})
+				ucihelper.wlan_add("radio0", "corp", "wpa2", "hunter22", nil, nil, "wlan-1")
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "openuf_radio0_corp", "disabled", "1")
+				local vaps = ucihelper.get_vap_table()
+				assert_eq(#vaps, 1, "still reported")
+				assert_eq(vaps[1].disabled, true, "and reported as disabled")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: get_vap_table echoes the wlanconf id as both id and wlanconf_id",
 		fn = function()
 			-- Regression test: the controller's vapInformProcessor silently

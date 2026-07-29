@@ -1191,6 +1191,22 @@ function M.get_vap_table()
 
 	local vaps = {}
 	cursor:foreach("wireless", "wifi-iface", function(s)
+		-- Skip foreign SSIDs that are switched off: a disabled section with no
+		-- wlanconf id is not openUF's and is not on the air (typically
+		-- OpenWrt's stock "OpenWrt" default_radioN sections, which
+		-- use_only_unifi_wlan disables during provisioning). Reporting them
+		-- claimed a VAP per radio that has no BSS, and -- because the nested
+		-- sta_table is built per radio, not per BSS -- attributed every one of
+		-- that radio's real stations to the phantom VAP as well, duplicating
+		-- their traffic and retry counters across two vap_table entries.
+		-- Confirmed on real hardware: a device with one live SSID reported
+		-- four VAPs, the two "OpenWrt" ones carrying identical station counts
+		-- and counters to the live ones.
+		--
+		-- A disabled vap that IS openUF-managed stays in the report: that is
+		-- how a WLAN the controller itself disabled keeps showing up as
+		-- disabled rather than vanishing.
+		if s.disabled == "1" and not s.openuf_wlanconf_id then return end
 		local radio = radio_by_name[s.device]
 		local bssid = ""
 		local ok_if, ifname = pcall(M.get_ifname_for_radio, s.device)
