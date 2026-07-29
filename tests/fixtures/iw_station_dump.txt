@@ -7,10 +7,17 @@ Station aa:bb:cc:dd:ee:ff (on wlan0)
 	tx packets:	287
 	tx retries:	4
 	tx failed:	0
-	signal:  	-62 dBm
-	signal avg:	-63 dBm
+	rx drop misc:	5
+	signal:  	-62 [-76, -62, -66] dBm
+	signal avg:	-63 [-75, -63, -66] dBm
 	tx bitrate:	144.4 MBit/s MCS 15 short GI
+	tx duration:	9835724 us
 	rx bitrate:	72.2 MBit/s MCS 7 short GI
+	rx duration:	14756520 us
+	last ack signal:-95 dBm
+	avg ack signal:	-95 dBm
+	airtime weight: 256
+	expected throughput:	93.851Mbps
 	authorized:	yes
 	authenticated:	yes
 	associated:	yes
@@ -25,10 +32,12 @@ Station 11:22:33:44:55:66 (on wlan0)
 	tx packets:	12
 	tx retries:	0
 	tx failed:	0
-	signal:  	-75 dBm
-	signal avg:	-74 dBm
+	signal:  	-75 [-88, -75, -80] dBm
+	signal avg:	-74 [-87, -74, -79] dBm
 	tx bitrate:	65.0 MBit/s MCS 6 short GI
 	rx bitrate:	54.0 MBit/s MCS 5
+	last ack signal:-95 dBm
+	avg ack signal:	-95 dBm
 	authorized:	yes
 	authenticated:	yes
 	associated:	yes

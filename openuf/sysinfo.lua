@@ -233,7 +233,18 @@ function M.sta_table(ifname)
 			if cur then clients[#clients + 1] = cur end
 			cur = {mac = mac}
 		elseif cur then
-			local signal     = line:match("signal:%s+(-?%d+)")
+			-- ANCHORED, and this matters: `iw` emits "avg ack signal:\t-95 dBm"
+			-- further down the same station block, which an unanchored
+			-- "signal:%s+" also matches -- and being later, it overwrote the
+			-- real reading. Every client was reported at the ack-signal value
+			-- (-95 dBm on this driver) no matter its actual RSSI. That feeds
+			-- the Clients list, the vap's avg_client_signal, the satisfaction
+			-- estimate AND Minimum RSSI enforcement, which would have deauthed
+			-- every client on the radio the moment the feature was switched
+			-- on. ("last ack signal:-95" escaped only by luck: no space after
+			-- the colon.) The per-chain suffix ("-53 [-76, -53, -66] dBm") is
+			-- ignored -- the first number is the combined RSSI.
+			local signal     = line:match("^%s*signal:%s+(-?%d+)")
 			local tx_rate    = line:match("tx bitrate:%s+(%S+)")
 			local rx_rate    = line:match("rx bitrate:%s+(%S+)")
 			-- tx_mcs/rx_mcs: only present on their respective bitrate line,
@@ -321,7 +332,9 @@ function M.scan_table(ifname)
 			seen_rsn, seen_wpa, seen_privacy = false, false, false
 		elseif cur then
 			local freq     = line:match("freq:%s+(%d+)")
-			local signal   = line:match("signal:%s+(-?%d+)")
+			-- Anchored for the same reason as the station-dump copy above,
+			-- defensively: scan output carries no ack-signal lines today.
+			local signal   = line:match("^%s*signal:%s+(-?%d+)")
 			local ssid     = line:match("^\tSSID:%s?(.*)$")
 			local last_ms  = line:match("last seen:%s+(%d+) ms ago")
 			local bw       = line:match("BSS operating channel width:%s+(%d+) MHz")

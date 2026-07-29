@@ -426,6 +426,27 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: sta_table() signal is the client's RSSI, not the ack signal",
+		fn = function()
+			-- `iw` prints "avg ack signal:\t-95 dBm" further down the same
+			-- station block, and an unanchored "signal:%s+" pattern matches it
+			-- too -- being later in the block, it overwrote the real reading,
+			-- so every client on every radio was reported at the ack value
+			-- regardless of its actual RSSI. That value feeds the Clients
+			-- list, avg_client_signal, the satisfaction estimate, and Minimum
+			-- RSSI enforcement, which would have deauthed every client on the
+			-- radio the moment the feature was enabled.
+			with_fixtures({}, {["station dump"] = fixture("iw_station_dump.txt")}, function()
+				local stas = sysinfo.sta_table("wlan0")
+				assert_eq(stas[1].signal, -62, "combined RSSI, not the -95 ack signal")
+				assert_eq(stas[2].signal, -75, "and for the second client too")
+				for _, s in ipairs(stas) do
+					assert_neq(s.signal, -95, "no client picks up the ack-signal value")
+				end
+			end)
+		end
+	},
+	{
 		name = "sysinfo: radio_caps() reports the live TX power as whole dBm",
 		fn = function()
 			-- Same rationale as the live channel: with the controller's
