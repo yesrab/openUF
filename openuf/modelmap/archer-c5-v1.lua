@@ -40,6 +40,15 @@ dev.conf.net = {
 	-- offers the real uplink up for per-port VLAN reassignment. Uplink ports
 	-- never get a `swport`, so no controller-pushed port VLAN can strand this
 	-- device.
+	--
+	-- Consequence worth knowing: wired clients are only ever reported on
+	-- non-uplink ports (the controller skips client creation on the uplink,
+	-- which faces its own network), so this board reports none. That is the
+	-- honest answer here -- every host the bridge learns is reached through
+	-- this one netdev, and which physical socket each sits on is knowable
+	-- only from the switch's own ARL table, which openUF does not read. The
+	-- alternative, declaring eth1 a downstream port, would report the whole
+	-- LAN segment -- gateway included -- as clients plugged into the AP.
 	ports = {
 		{idx = 1, ifname = "eth1", uplink = true},
 	},
