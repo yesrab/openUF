@@ -426,6 +426,38 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: radio_caps() reports the live TX power as whole dBm",
+		fn = function()
+			-- Same rationale as the live channel: with the controller's
+			-- Transmit Power set to Auto, UCI carries no `txpower` option at
+			-- all, so the payload's tx_power was nil and the Radios view
+			-- reported every radio as transmitting at 0 dBm while the
+			-- hardware was really at 23 dBm (5GHz) / 17 dBm (2.4GHz).
+			with_fixtures({}, {
+				["dev wlan0 info"] = fixture("iw_dev_info.txt"),
+				["phy phy0 info"]  = fixture("iw_phy_info_2g.txt"),
+			}, function()
+				local caps = sysinfo.radio_caps("wlan0")
+				assert_eq(caps.tx_power, 20, "live txpower from 'txpower 20.00 dBm'")
+				assert_eq(tostring(caps.tx_power), "20", "whole dBm, not the 20.0 iw prints")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: radio_caps() omits tx_power when iw reports none",
+		fn = function()
+			-- nil (not 0) so build_json's merge leaves whatever UCI had:
+			-- pairs() skips absent keys, so a configured fixed power survives
+			-- when the driver can't be asked.
+			with_fixtures({}, {
+				["dev wlan0 info"] = "Interface wlan0\n\twiphy 0\n\tchannel 6 (2437 MHz)\n",
+				["phy phy0 info"]  = fixture("iw_phy_info_2g.txt"),
+			}, function()
+				assert_nil(sysinfo.radio_caps("wlan0").tx_power, "no txpower line -> nil")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: radio_caps() parses a 5GHz (VHT+HE, DFS, 160MHz) phy correctly",
 		fn = function()
 			with_fixtures({}, {

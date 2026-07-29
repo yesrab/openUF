@@ -371,8 +371,17 @@ function M.radio_caps(ifname)
 	-- "auto" (a config *intent*, not a number) -- the controller has no use
 	-- for the literal string "auto" here and was left showing channel 0.
 	local channel = dev_info:match("channel%s+(%d+)")
+	-- The live TX power ("txpower 23.00 dBm"), for exactly the same reason as
+	-- the channel above: UCI carries no `txpower` option at all while the
+	-- controller's Transmit Power is set to Auto (absent = driver default),
+	-- so the payload's tx_power was nil and the Radios view reported every
+	-- radio as transmitting at 0 dBm -- confirmed against a real controller,
+	-- with the hardware actually at 23 dBm (5GHz) and 17 dBm (2.4GHz).
+	-- Floored to whole dBm, which is the unit the field is in.
+	local txpower = tonumber(dev_info:match("txpower%s+([%d%.]+)"))
 	local caps = {
 		channel    = channel and tonumber(channel) or nil,
+		tx_power   = txpower and math.floor(txpower) or nil,
 		is_11ac    = phy_info:find("VHT Capabilities") ~= nil,
 		is_11ax    = (phy_info:find("HE PHY Capabilities") ~= nil) or (phy_info:find("HE MAC Capabilities") ~= nil),
 		is_11be    = phy_info:find("EHT PHY Capabilities") ~= nil,
