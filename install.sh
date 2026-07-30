@@ -19,72 +19,53 @@ case "$1" in
 	install)
 		echo "Installing openUF to $INSTALL_DIR ..."
 
-		# Install the required apk packages (OpenWrt 25.12+ uses apk, not opkg).
-		# lua-openssl provides AES-128-CBC/GCM (luacrypto was dropped from the feeds);
-		# there is no Lua zlib binding in 25.12, so inform-response decompression is
-		# handled in-tree by openuf/inflate.lua and no zlib package is required.
-		# hostapd-utils supplies hostapd_cli (Minimum RSSI enforcement, client kick
-		# and block); nftables backs firewall.lua's client blocking. Every one of
-		# these is a silent degradation when absent -- provisioning still "succeeds"
-		# while the feature does nothing -- so they are installed rather than merely
-		# reported, same as usteer/wpad below. A failed install is a warning, not a
-		# hard stop: openUF starts and reports honestly without the optional ones.
-		# ip-bridge supplies the `bridge` command. Busybox's `ip` has no
-		# `bridge` subcommand at all, and without it sysinfo.mac_table()'s
-		# `bridge fdb show` finds nothing, so no wired client behind the AP is
-		# ever reported and the controller's Ports view stays empty -- another
-		# silent degradation, confirmed on a real Archer C5 where the command
-		# was simply absent.
-		MISSING=""
-		for pkg in lua lua-cjson luasocket lua-openssl luabitop iw lldpd \
-			openssl-util hostapd-utils nftables ip-bridge; do
-			if ! apk info -e "$pkg" >/dev/null 2>&1; then
-				MISSING="$MISSING $pkg"
-			fi
-		done
-		if [ -n "$MISSING" ]; then
-			echo "Installing missing apk packages:$MISSING"
-			apk add $MISSING || {
-				echo "WARNING: failed to install:$MISSING"
-				echo "  Install them by hand with: apk update && apk add$MISSING"
-				echo "  Without lua-openssl in particular, adoption cannot complete"
-				echo "  (the controller requires a genuine AES-128-GCM inform)."
-			}
-		fi
+		# Free space on the filesystem holding $INSTALL_DIR, in KB. Used to
+		# decide whether an OPTIONAL package can be afforded -- see below.
+		overlay_free_kb() {
+			df -k "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+		}
 
-		# usteer (Band Steering) + a full wpad build. BSS Transition and Band
-		# Steering both need real 802.11k/v support: wpad-basic-* lacks
-		# bss_transition entirely and errors with "unknown configuration item
-		# 'bss_transition'". Any of the full builds provides it -- checking only
-		# for wolfssl/openssl would miss a device that already ships
-		# wpad-mbedtls (the OpenWrt 25.12 ath79 default) and needlessly swap out
-		# a working hostapd, bouncing every SSID on the device for no gain.
-		if ! apk info -e usteer >/dev/null 2>&1; then
-			echo "Installing usteer (Band Steering support) ..."
-			apk add usteer \
-				|| echo "WARNING: failed to install usteer -- Band Steering will not function."
-		fi
-
-		HAVE_WPAD=0
-		for pkg in wpad wpad-wolfssl wpad-openssl wpad-mbedtls; do
-			if apk info -e "$pkg" >/dev/null 2>&1; then
-				HAVE_WPAD=1
-				break
+		# Feature packages are only installed when there is room to spare
+		# AFTERWARDS. On a small-flash board they are collectively bigger than
+		# openUF itself (nftables alone drags in ~210 KB of kernel modules), and
+		# filling the overlay to 100% is far worse than losing one feature: it
+		# breaks state.json writes, apk's own database, and any later upgrade.
+		# Threshold is deliberately generous -- jffs2 needs slack to garbage
+		# collect at all.
+		OPTIONAL_MIN_FREE_KB=400
+		try_optional() {
+			pkg=$1; feature=$2
+			if apk info -e "$pkg" >/dev/null 2>&1; then return 0; fi
+			free=$(overlay_free_kb "$INSTALL_DIR")
+			if [ -n "$free" ] && [ "$free" -lt "$OPTIONAL_MIN_FREE_KB" ]; then
+				echo "SKIP $pkg (${free}KB free, need ${OPTIONAL_MIN_FREE_KB}KB): $feature"
+				echo "     Bake it into your firmware image instead, or free space."
+				return 0
 			fi
-		done
-		if [ "$HAVE_WPAD" = "0" ]; then
-			echo "Installing a full wpad build (required for BSS Transition / Band Steering) ..."
-			apk add wpad-wolfssl \
-				|| apk add wpad-openssl \
-				|| apk add wpad-mbedtls \
-				|| echo "WARNING: failed to install a full wpad build -- BSS Transition and Band Steering will not function (wpad-basic-* lacks 802.11v support)."
-		fi
+			echo "Installing $pkg ($feature) ..."
+			apk add "$pkg" >/dev/null 2>&1 \
+				|| echo "WARNING: failed to install $pkg -- $feature will not function."
+		}
+
+		# ── openUF's own files go in FIRST ───────────────────────────────
+		# Deliberately before any package install. The feature packages below
+		# are collectively larger than openUF, and on a small-flash board
+		# installing them first fills the overlay and leaves the product
+		# itself unable to be copied at all -- observed on a 512 KB overlay,
+		# where nftables' kernel modules alone (~210 KB) starved out the 126 KB
+		# of Lua and the install "succeeded" with no /opt/openuf on disk.
+		# Product first means a space shortage costs a feature, never openUF.
 
 		# Copy Lua source. etc/ is excluded deliberately: the init script
 		# belongs in /etc/init.d (installed further down) and a second copy
 		# under $INSTALL_DIR would never be executed.
 		mkdir -p "$INSTALL_DIR"
-		cp -r openuf/* "$INSTALL_DIR/"
+		cp -r openuf/* "$INSTALL_DIR/" || {
+			echo "ERROR: failed to copy openUF into $INSTALL_DIR"
+			echo "  Free space: $(overlay_free_kb "$INSTALL_DIR")KB. openUF needs ~130KB"
+			echo "  (comment-stripped) plus room for state and logs."
+			exit 1
+		}
 		rm -rf "$INSTALL_DIR/etc"
 
 		# Release tarballs arrive already comment-stripped (tools/dist.sh).
@@ -111,6 +92,63 @@ case "$1" in
 		# Install init.d service
 		cp openuf/etc/init.d/openuf "$INIT_SCRIPT"
 		chmod +x "$INIT_SCRIPT"
+
+		# ── Dependencies, now that openUF itself is safely installed ──────
+		# REQUIRED: openUF cannot function without these. They may already be
+		# baked into the firmware image (the only way to fit them on a small
+		# board), so a present package is silently fine.
+		#
+		# lua-openssl provides AES-128-CBC/GCM (luacrypto was dropped from the
+		# feeds) and is effectively mandatory: the controller will not finish
+		# provisioning a device that has never sent a genuine GCM inform. There
+		# is no Lua zlib binding in 25.12, so inform-response decompression is
+		# handled in-tree by openuf/inflate.lua and needs no package.
+		MISSING=""
+		for pkg in lua lua-cjson luasocket lua-openssl luabitop iw; do
+			if ! apk info -e "$pkg" >/dev/null 2>&1; then
+				MISSING="$MISSING $pkg"
+			fi
+		done
+		if [ -n "$MISSING" ]; then
+			echo "Installing required apk packages:$MISSING"
+			apk add $MISSING || {
+				echo "WARNING: failed to install:$MISSING"
+				echo "  Install them by hand with: apk update && apk add$MISSING"
+				echo "  Without lua-openssl in particular, adoption cannot complete"
+				echo "  (the controller requires a genuine AES-128-GCM inform)."
+			}
+		fi
+
+		# OPTIONAL: each one silently disables exactly one feature when absent
+		# -- provisioning still reports success while the feature does nothing
+		# -- so they are installed when affordable rather than merely mentioned.
+		try_optional lldpd         "LLDP topology / neighbour discovery"
+		try_optional hostapd-utils "Minimum RSSI, client kick, block-deauth"
+		try_optional usteer        "Band Steering"
+		try_optional ip-bridge     "wired clients behind the AP (bridge fdb)"
+		try_optional nftables      "client Block/Unblock enforcement"
+
+		# A full wpad build. BSS Transition and Band Steering need real
+		# 802.11k/v support: wpad-basic-* lacks bss_transition entirely and
+		# errors with "unknown configuration item 'bss_transition'". Any full
+		# build provides it -- checking only for wolfssl/openssl would miss a
+		# device already shipping wpad-mbedtls (the OpenWrt 25.12 ath79
+		# default) and needlessly swap out a working hostapd, bouncing every
+		# SSID on the device for no gain.
+		HAVE_WPAD=0
+		for pkg in wpad wpad-wolfssl wpad-openssl wpad-mbedtls; do
+			if apk info -e "$pkg" >/dev/null 2>&1; then
+				HAVE_WPAD=1
+				break
+			fi
+		done
+		if [ "$HAVE_WPAD" = "0" ]; then
+			echo "Installing a full wpad build (BSS Transition / Band Steering) ..."
+			apk add wpad-wolfssl \
+				|| apk add wpad-openssl \
+				|| apk add wpad-mbedtls \
+				|| echo "WARNING: failed to install a full wpad build -- BSS Transition and Band Steering will not function (wpad-basic-* lacks 802.11v support)."
+		fi
 
 		# Enable and start services
 		"$INIT_SCRIPT" enable 2>/dev/null

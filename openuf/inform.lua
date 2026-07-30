@@ -131,6 +131,25 @@ function M._link_duplex(ifname)
 	return s and s:match("^%s*(%a+)") or nil
 end
 
+-- Does the port have a link partner? Reads sysfs `carrier` (1/0), falling back
+-- to `operstate` ("up"/"down"), and returns nil when neither is readable.
+--
+-- A port's mere existence in /proc/net/dev is NOT link state: an unused socket
+-- is present, counted, and utterly idle. Reporting it as up was visible on a
+-- real TL-WDR3500, whose eth1 (the unused WAN socket) went out as
+-- "up, 1000 Mbps" while carrier was 0 and the kernel reported speed -1.
+function M._link_up(ifname)
+	if not ifname then return nil end
+	local carrier = M._read_file("/sys/class/net/" .. ifname .. "/carrier")
+	if carrier then
+		local n = tonumber((carrier:match("(%d+)") or ""))
+		if n then return n == 1 end
+	end
+	local state = M._read_file("/sys/class/net/" .. ifname .. "/operstate")
+	if state then return state:match("^%s*(%a+)") == "up" end
+	return nil
+end
+
 -- Returns the mtime (seconds since epoch, as a number) of path, or nil if
 -- it can't be stat'd (missing, permission denied, stat unavailable, ...).
 function M._state_mtime(path)
@@ -968,11 +987,17 @@ function M.build_json(st, cfg, ufhw)
 	local port_table = {}
 	for _, p in ipairs(ports) do
 		local iface = iface_by_name[p.ifname]
+		-- Link state from the kernel, not from the netdev merely existing:
+		-- an unused socket exists in /proc/net/dev and is idle, and reporting
+		-- it as a live port misleads the Ports view. Falls back to existence
+		-- only when sysfs cannot answer.
+		local link_up = M._link_up(p.ifname)
+		if link_up == nil then link_up = (iface ~= nil) end
 		local entry = {
 			port_idx    = p.idx,
 			name        = "Port " .. tostring(p.idx),
 			media       = "GE",
-			up          = iface ~= nil,
+			up          = link_up,
 			enable      = true,
 			-- Negotiated link speed/duplex, read from the netdev rather than
 			-- asserted: these were hardcoded 1000/full, so the controller's
@@ -986,8 +1011,12 @@ function M.build_json(st, cfg, ufhw)
 			-- speed is only visible via swconfig. So this reports the truth
 			-- about the interface it names, which is the best any generic
 			-- reading can do -- see PROTOCOL-VALIDATION.md.
-			speed       = M._link_speed(p.ifname) or 1000,
-			full_duplex = M._link_duplex(p.ifname) ~= "half",
+			-- A port with no link has no negotiated speed: 0, not the fallback.
+			-- The kernel reports -1 for a down interface, which _link_speed
+			-- already discards, so without this the fallback claimed a gigabit
+			-- link on a socket with nothing plugged into it.
+			speed       = (not link_up) and 0 or (M._link_speed(p.ifname) or 1000),
+			full_duplex = link_up and (M._link_duplex(p.ifname) ~= "half") or false,
 			is_uplink   = p.uplink or false,
 			speed_caps  = 0,
 			port_poe    = false,

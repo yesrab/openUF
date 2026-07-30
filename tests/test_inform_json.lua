@@ -1042,6 +1042,61 @@ return {
 		end
 	},
 	{
+		name = "inform json: a port with no carrier is reported down, at speed 0",
+		fn = function()
+			-- Existence in /proc/net/dev is not link state: an unused socket is
+			-- present and idle. Seen on a real TL-WDR3500 whose unused WAN
+			-- socket (eth1, carrier 0, kernel speed -1) went out as
+			-- "up, 1000 Mbps".
+			local orig = inform._read_file
+			inform._read_file = function(path)
+				if path == "/sys/class/net/eth0/carrier" then return "1\n" end
+				if path == "/sys/class/net/eth0/speed"   then return "100\n" end
+				if path == "/sys/class/net/eth1/carrier" then return "0\n" end
+				if path == "/sys/class/net/eth1/speed"   then return "-1\n" end
+				return nil
+			end
+			local ok, err = pcall(function()
+				local d = build()
+				assert_true(d.port_table[1].up, "eth0 has carrier -> up")
+				assert_eq(d.port_table[1].speed, 100, "and its real negotiated speed")
+				assert_false(d.port_table[2].up, "eth1 has no carrier -> down")
+				assert_eq(d.port_table[2].speed, 0, "a down port has no speed, not the fallback")
+				assert_false(d.port_table[2].full_duplex, "nor a duplex")
+			end)
+			inform._read_file = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform json: link state falls back to operstate, then to existence",
+		fn = function()
+			local orig = inform._read_file
+			-- No carrier file, but operstate present.
+			inform._read_file = function(path)
+				if path:find("/operstate") then
+					return path:find("eth1") and "down\n" or "up\n"
+				end
+				return nil
+			end
+			local ok, err = pcall(function()
+				local d = build()
+				assert_true(d.port_table[1].up, "operstate up")
+				assert_false(d.port_table[2].up, "operstate down")
+			end)
+			-- Neither file readable: fall back to the netdev existing at all,
+			-- which is the pre-existing behaviour.
+			inform._read_file = function() return nil end
+			local ok2, err2 = pcall(function()
+				local d = build()
+				assert_true(d.port_table[1].up, "unknown link state -> existence")
+			end)
+			inform._read_file = orig
+			if not ok then error(err, 0) end
+			if not ok2 then error(err2, 0) end
+		end
+	},
+	{
 		name = "inform json: port_table falls back when the kernel reports no speed",
 		fn = function()
 			-- A down interface, or a virtual device with no PHY, makes the
