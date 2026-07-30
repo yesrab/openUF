@@ -96,9 +96,14 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   **The reference device**: install, adoption, the WiFi config push, live clients and the
   radios themselves are confirmed on this board (OpenWrt 25.12.5) against a real UniFi Cloud
   Gateway Ultra — see [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md#the-first-real-hardware-run)
-- **TP-Link WDR3500** (dual-band 802.11n) — use `modelmap/generic-dualband-ap.lua`.
-  ⚠️ **8 MB flash: does not fit a stock image** (see the space requirement above). Its
-  radio order is also the reverse of the Archer C5's — `radio0` is 2.4 GHz here
+- **TP-Link TL-WDR3500 v1** (dual-band 802.11n, 2x2) — use `modelmap/tl-wdr3500-v1.lua`.
+  Adoption, SSID provisioning, 802.11r/k/v, Band Steering, Minimum RSSI and WiFi Speed
+  Limit all confirmed on real hardware against a UCG Ultra.
+  ⚠️ **8 MB flash: does not fit a stock image** (see the space requirement above) — it needs
+  a custom build with the crypto in squashfs. Even then **`nftables` typically does not fit**
+  (~490 KB with its kernel modules), which leaves two features unavailable on this board:
+  **client Block/Unblock** and the **Multicast and Broadcast Blocker**. Its radio order is
+  also the reverse of the Archer C5's — `radio0` is 2.4 GHz here
 - **TP-Link WR1043ND v2** (single-band 802.11n) — use `modelmap/tl-wr1043ndv2.lua`
 
 The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end — `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.

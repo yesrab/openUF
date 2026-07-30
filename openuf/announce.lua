@@ -186,17 +186,45 @@ end
 -- silent and wrong -- announce.run() broadcasts 192.168.1.1 and inform.lua's
 -- build_json reports ip "0.0.0.0", which a controller cannot adopt.
 -- So: try the port, then the bridge it is a member of, before giving up.
+-- The bridge a netdev is enslaved to, or nil. /sys/class/net/<if>/master
+-- symlinks to the enslaving device (e.g. "../../../../../virtual/net/br-lan").
+local function master_of(iface)
+	local m = M._popen("readlink /sys/class/net/" .. iface .. "/master")
+	m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
+	if m and m ~= iface and m ~= "" then return m end
+	return nil
+end
+
 function M.get_ip(iface)
 	iface = iface or "eth0"
 	local ip = ipv4_of(iface)
 	if ip then return ip end
 
-	-- /sys/class/net/<if>/master symlinks to the enslaving device (e.g.
-	-- "../../../../../virtual/net/br-lan"); the basename is the bridge name.
-	local master = M._popen("readlink /sys/class/net/" .. iface .. "/master")
-	master = type(master) == "string" and master:match("([^/%s]+)%s*$") or nil
-	if master and master ~= iface then
-		return ipv4_of(master)
+	-- One hop: the port is a bridge member and the address is on the bridge.
+	local master = master_of(iface)
+	if master then
+		ip = ipv4_of(master)
+		if ip then return ip end
+	end
+
+	-- Two hops: the port is a VLAN TRUNK, and it is the tagged sub-interface
+	-- -- not the trunk itself -- that is enslaved to the bridge. That is the
+	-- normal swconfig layout (eth0 -> eth0.1 -> br-lan), and lan_cpueth must
+	-- name the trunk there so a pushed VLAN 20 becomes eth0.20 rather than
+	-- eth0.1.20. Confirmed on a real TL-WDR3500, where naming the trunk made
+	-- every inform report ip 0.0.0.0 until this hop existed.
+	local children = M._popen("ls -d /sys/class/net/" .. iface .. ".* 2>/dev/null")
+	for line in tostring(children or ""):gmatch("[^\r\n]+") do
+		local child = line:match("([^/%s]+)%s*$")
+		if child and child ~= iface then
+			ip = ipv4_of(child)
+			if ip then return ip end
+			local cm = master_of(child)
+			if cm then
+				ip = ipv4_of(cm)
+				if ip then return ip end
+			end
+		end
 	end
 	return nil
 end

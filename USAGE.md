@@ -21,7 +21,7 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables hostapd-u
 | `iw` | Radio and station statistics |
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
-| `nftables` | Client block/unblock enforcement (`openuf/firewall.lua`) |
+| `nftables` | Client block/unblock (`openuf/firewall.lua`) **and** the Multicast/Broadcast Blocker (`openuf/bcfilter.lua`). ~490 KB with its kernel modules — the first thing that won't fit on a small-flash board, which leaves both features unavailable (openUF logs that rather than pretending) |
 | `hostapd-utils` | `hostapd_cli` — immediate deauth of a just-blocked wireless client, client kick (Roaming Assistance) and Minimum RSSI enforcement |
 | `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced |
 | `coreutils-stat` | `stat` — only if your build has no `stat` applet (some do not). `inform.lua` uses `stat -c %Y` to notice an out-of-process `state.json` write, i.e. an SSH `set-adopt` or a manual `reset-inform`; without it those are ignored until restart. Enabling busybox's own `stat` applet is smaller |
@@ -108,7 +108,10 @@ Select the modelmap that matches your hardware:
 -- For TP-Link Archer C5 v1 (dual-band, board-specific):
 dev = dofile("modelmap/archer-c5-v1.lua")
 
--- For TP-Link WDR3500 or any other dual-band OpenWrt AP:
+-- For TP-Link TL-WDR3500 v1 (dual-band, board-specific):
+dev = dofile("modelmap/tl-wdr3500-v1.lua")
+
+-- For any other dual-band OpenWrt AP:
 dev = dofile("modelmap/generic-dualband-ap.lua")
 
 -- For TP-Link WR1043ND v2 (single-band):

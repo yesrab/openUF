@@ -300,6 +300,37 @@ return {
 		end
 	},
 	{
+		name = "announce: get_ip follows a VLAN trunk through its tagged child to the bridge",
+		fn = function()
+			-- The normal swconfig layout: eth0 (trunk) -> eth0.1 (tagged) ->
+			-- br-lan (address). lan_cpueth has to name the TRUNK so a pushed
+			-- VLAN 20 becomes eth0.20 and not eth0.1.20 -- so the trunk itself
+			-- is neither addressed nor bridged. Confirmed on a real
+			-- TL-WDR3500, where this reported ip 0.0.0.0 on every inform.
+			local orig = announce._popen
+			announce._popen = function(cmd)
+				if cmd:match("addr show dev eth0%.1") or cmd:match("addr show dev eth0 ") then
+					return ""   -- neither the trunk nor the tagged child is addressed
+				end
+				if cmd:match("readlink /sys/class/net/eth0/master") then return "" end
+				if cmd:match("ls %-d /sys/class/net/eth0%.") then
+					return "/sys/class/net/eth0.1\n"
+				end
+				if cmd:match("readlink /sys/class/net/eth0%.1/master") then
+					return "../../../../../virtual/net/br-lan\n"
+				end
+				if cmd:match("addr show dev br%-lan") then
+					return "    inet 192.168.200.2/24 brd 192.168.200.255 scope global br-lan\n"
+				end
+				return ""
+			end
+			local ip = announce.get_ip("eth0")
+			announce._popen = orig
+			assert_not_nil(ip, "address found two hops away")
+			assert_eq(table.concat(ip, "."), "192.168.200.2", "trunk -> tagged child -> bridge")
+		end
+	},
+	{
 		name = "announce: get_ip returns nil when neither port nor bridge has an address",
 		fn = function()
 			local orig = announce._popen
