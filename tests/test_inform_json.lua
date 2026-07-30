@@ -339,6 +339,70 @@ return {
 		end
 	},
 	{
+		name = "inform json: radio_table_stats carries per-radio TX counters and retry pct",
+		fn = function()
+			-- Without these the controller's own entry ended up
+			-- tx_packets=243, tx_retries=0, tx_retries_pct=100 -- rendering a
+			-- permanent "TX Retries: High (100%)" on an AP whose real rate is
+			-- a few percent. It does not derive them from the vap_table copies
+			-- it already holds.
+			local d = build({with_uci = true, with_clients = true})
+			local rs = d.radio_table_stats[1]
+			local vap = d.vap_table[1]
+			assert_eq(rs.tx_packets, vap.tx_packets, "radio sums its VAPs' packets")
+			assert_eq(rs.tx_retries, vap.tx_retries, "and their retries")
+			local attempts = rs.tx_packets + rs.tx_retries
+			assert_eq(rs.tx_retries_pct, math.floor(rs.tx_retries * 100 / attempts + 0.5),
+				"pct is retries over total attempts, matching sta_table's definition")
+			assert_true(rs.tx_retries_pct >= 0 and rs.tx_retries_pct <= 100,
+				"and is a percentage")
+		end
+	},
+	{
+		name = "inform json: wifi_tx_attempts/dropped are reported per VAP and per radio",
+		fn = function()
+			-- The controller aggregates this pair upward into stat.ap
+			-- ("<band>-wifi_tx_attempts", "radio0-wifi_tx_attempts", ...) and
+			-- divides them to get a rate. openUF sent them per STATION only,
+			-- so every aggregate sat at 0 and the division degenerated into
+			-- the permanent "TX Retries: High (100%)" on the Devices view.
+			local d = build({with_uci = true, with_clients = true})
+			local vap, rs = d.vap_table[1], d.radio_table_stats[1]
+			assert_eq(vap.wifi_tx_attempts, vap.tx_packets + vap.tx_retries,
+				"attempts are successful + retried, as sta_table defines them")
+			assert_eq(vap.wifi_tx_dropped, vap.tx_dropped, "dropped is the driver's tx_failed")
+			assert_eq(rs.wifi_tx_attempts, vap.wifi_tx_attempts,
+				"radio sums its VAPs' attempts")
+			assert_eq(rs.wifi_tx_dropped, vap.wifi_tx_dropped, "and their drops")
+			-- The per-station field this aggregates must still be there.
+			assert_not_nil(vap.sta_table[1].wifi_tx_attempts, "per-station copy kept")
+		end
+	},
+	{
+		name = "inform json: no retry percentage is reported when nothing was transmitted",
+		fn = function()
+			-- A client associated but idle: 0% and 100% are both lies about a
+			-- radio that has transmitted nothing, so the field is absent.
+			-- (Built with clients so radio_table_stats entries exist at all --
+			-- with none, this would assert on nothing.)
+			local orig = inform._sysinfo.sta_table
+			inform._sysinfo.sta_table = function()
+				return {{mac = "aa:bb:cc:dd:ee:01", signal = -50,
+					tx_packets = 0, tx_retries = 0, rx_packets = 0,
+					tx_bytes = 0, rx_bytes = 0}}
+			end
+			local ok, err = pcall(function()
+				local d = build({with_uci = true, with_clients = true})
+				local rs = d.radio_table_stats[1]
+				assert_not_nil(rs, "fixture sanity: a radio entry exists to check")
+				assert_eq(rs.tx_packets, 0, "and it really did transmit nothing")
+				assert_true(rs.tx_retries_pct == nil, "no attempts -> no percentage")
+			end)
+			inform._sysinfo.sta_table = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform json: satisfaction is aggregated to the vap and the device",
 		fn = function()
 			-- The controller does not derive these from the per-client scores

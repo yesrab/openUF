@@ -539,6 +539,9 @@ function M.build_json(st, cfg, ufhw)
 		-- populating every cycle while cu_interf/cu_total never appeared at
 		-- all despite being sent correctly.
 		local radio_cu_stats = {}
+		-- radio_table_stats entries, keyed by UCI radio name, so the VAP loop
+		-- can attach per-radio TX counters after summing them per station.
+		local radio_stats_by_name = {}
 		-- Minimum RSSI enforcement data, keyed by radio name (e.g. "radio0"),
 		-- consumed by the per-station loop below -- kept as absolute dBm
 		-- thresholds (already converted using this same loop's live noise
@@ -689,6 +692,10 @@ function M.build_json(st, cfg, ufhw)
 						entry.spectrum_table_time = sscan.table_time
 					end
 					radio_table_stats[#radio_table_stats + 1] = entry
+					-- Keep the entry addressable so the VAP/station loop below
+					-- can attach this radio's TX counters once it has summed
+					-- them -- see radio_tx_stats.
+					radio_stats_by_name[radio.name] = entry
 				end
 				-- Neighboring wireless networks visible to this radio --
 				-- confirmed real field names via the decompiled controller's
@@ -968,6 +975,51 @@ function M.build_json(st, cfg, ufhw)
 			vap.tx_packets = vap_tx_packets
 			vap.tx_retries = vap_tx_retries
 			vap.tx_dropped = vap_tx_dropped
+			-- Per-RADIO TX counters, accumulated across every VAP on it.
+			--
+			-- radio_table_stats carried only name/channel/cu_* -- no TX
+			-- counters at all -- and the controller does not fill them from
+			-- the vap_table copies it already has. Instead its stored entry
+			-- ended up with tx_packets=243, tx_retries=0 and, from those,
+			-- tx_retries_pct=100, which the Devices view renders as a
+			-- permanent "TX Retries: High (100%)" on an AP whose real retry
+			-- rate is a few percent. Confirmed against a live 10.4.57
+			-- controller, on both APs.
+			-- wifi_tx_attempts / wifi_tx_dropped: the pair the controller
+			-- aggregates upward into stat.ap ("<band>-wifi_tx_attempts",
+			-- "radio0-wifi_tx_attempts", "user-...-wifi_tx_attempts") and
+			-- divides to get a retry/failure rate. openUF sent them per
+			-- STATION only, so every aggregate sat at 0 and the division
+			-- degenerated -- which is what pinned "TX Retries: High (100%)"
+			-- on the Devices view even though the signal-bucketed attempt
+			-- counters, derived from the same per-station data, were populated
+			-- correctly. Attempts are successful + retried transmissions, the
+			-- same definition sta_table uses; dropped is the driver's own
+			-- tx_failed.
+			vap.wifi_tx_attempts = vap_tx_packets + vap_tx_retries
+			vap.wifi_tx_dropped  = vap_tx_dropped
+			local rstat = radio_stats_by_name[vap.radio_name]
+			if rstat then
+				rstat.wifi_tx_attempts =
+					(rstat.wifi_tx_attempts or 0) + vap.wifi_tx_attempts
+				rstat.wifi_tx_dropped =
+					(rstat.wifi_tx_dropped or 0) + vap.wifi_tx_dropped
+				rstat.tx_packets = (rstat.tx_packets or 0) + vap_tx_packets
+				rstat.tx_retries = (rstat.tx_retries or 0) + vap_tx_retries
+				rstat.tx_dropped = (rstat.tx_dropped or 0) + vap_tx_dropped
+				rstat.rx_packets = (rstat.rx_packets or 0) + vap_rx_packets
+				rstat.tx_bytes   = (rstat.tx_bytes   or 0) + vap_tx_bytes
+				rstat.rx_bytes   = (rstat.rx_bytes   or 0) + vap_rx_bytes
+				-- Retries as a share of total attempts (successful + retried),
+				-- the same definition sta_table's wifi_tx_retries_percentage
+				-- uses. Left absent while nothing has been transmitted, rather
+				-- than reported as 0% or 100% of nothing.
+				local attempts = rstat.tx_packets + rstat.tx_retries
+				if attempts > 0 then
+					rstat.tx_retries_pct =
+						math.floor(rstat.tx_retries * 100 / attempts + 0.5)
+				end
+			end
 			-- avg_client_signal: mean RSSI (dBm, negative) of currently
 			-- associated clients on this VAP. The stat archiver (decompiled
 			-- com.ubnt.service.system.QDcGUYAmLvJwylXw) reads this exact
