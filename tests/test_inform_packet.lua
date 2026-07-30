@@ -2309,11 +2309,52 @@ return {
 	{
 		name = "inform: _state_mtime returns nil when stat yields no output",
 		fn = function()
-			local orig = inform._run_cmd
+			local orig, orig_read = inform._run_cmd, inform._read_file
 			inform._run_cmd = function(cmd) return "" end
+			inform._read_file = function() return nil end
 			local mtime = inform._state_mtime("/nonexistent")
-			inform._run_cmd = orig
+			inform._run_cmd, inform._read_file = orig, orig_read
 			assert_true(mtime == nil, "nil when file missing")
+		end
+	},
+	{
+		name = "inform: _state_mtime falls back to file contents without stat",
+		fn = function()
+			-- BusyBox gates `stat -c` behind FEATURE_STAT_FORMAT and some
+			-- builds ship no stat applet at all -- confirmed on a real
+			-- TL-WDR3500 -- which silently disabled detection of an SSH
+			-- set-adopt or a manual reset-inform until openUF restarted.
+			local orig, orig_read = inform._run_cmd, inform._read_file
+			inform._run_cmd = function() return "" end        -- no stat anywhere
+			inform._read_file = function() return '{"adopted":false}' end
+			local a = inform._state_mtime("/etc/openuf/state.json")
+			inform._read_file = function() return '{"adopted":true}' end
+			local b = inform._state_mtime("/etc/openuf/state.json")
+			inform._run_cmd, inform._read_file = orig, orig_read
+			assert_not_nil(a, "a token is produced without stat")
+			assert_true(a ~= b, "and it changes when the file changes")
+		end
+	},
+	{
+		name = "inform: _reload_if_changed reloads on a contents-only change",
+		fn = function()
+			-- The whole point of the fallback: with no stat, a changed file
+			-- must still trigger the reload path.
+			local orig, orig_read = inform._run_cmd, inform._read_file
+			local orig_state = inform._state
+			inform._run_cmd = function() return "" end
+			inform._read_file = function() return '{"adopted":true}' end
+			inform._state = {
+				_state_file = "/etc/openuf/state.json",
+				load = function() return {adopted = true, authkey = "new"} end,
+			}
+			local st = {adopted = false, authkey = "old"}
+			local token = inform._reload_if_changed(st, nil, "an-older-token")
+			inform._run_cmd, inform._read_file = orig, orig_read
+			inform._state = orig_state
+			assert_eq(st.adopted, true, "state reloaded from disk")
+			assert_eq(st.authkey, "new", "including the rotated key")
+			assert_eq(token, '{"adopted":true}', "token advanced to the new contents")
 		end
 	},
 	{

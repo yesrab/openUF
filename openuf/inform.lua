@@ -152,10 +152,25 @@ end
 
 -- Returns the mtime (seconds since epoch, as a number) of path, or nil if
 -- it can't be stat'd (missing, permission denied, stat unavailable, ...).
+-- A token that changes whenever the state file changes. Compared for equality
+-- only -- callers never interpret it -- so its type is free to vary.
+--
+-- `stat -c %Y` first, since it costs no file read. But it cannot be relied on:
+-- BusyBox gates `-c` behind FEATURE_STAT_FORMAT and some builds omit the stat
+-- applet entirely (confirmed on a real TL-WDR3500 with no stat at all), and
+-- coreutils-stat is 40 KB on boards that are already out of flash. When it is
+-- unavailable, fall back to the file's own CONTENTS as the token: state.json
+-- is a few hundred bytes, so re-reading it once per poll costs nothing, and it
+-- needs no package, no applet and no busybox config.
+--
+-- The fallback is in fact the stronger test: mtime has one-second granularity,
+-- so two writes inside the same second are indistinguishable by it, while the
+-- contents are not.
 function M._state_mtime(path)
 	local out = M._run_cmd("stat -c %Y '" .. path .. "'")
 	local n = tonumber((out:gsub("%s+$", "")))
-	return n
+	if n then return n end
+	return M._read_file(path)
 end
 
 -- Locks or unlocks the temporary SSH bootstrap account (see conf.lua's
