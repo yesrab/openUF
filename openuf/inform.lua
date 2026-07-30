@@ -2567,11 +2567,39 @@ function M._reload_if_changed(st, cfg, last_mtime)
 	return mtime
 end
 
+-- dev.conf.net.lan_cpueth decides the device's IDENTITY, not just which port
+-- carries VLANs: its MAC is what the controller keys the adopted device on.
+-- Change it on an already-adopted device -- switching modelmaps, say -- and
+-- every inform afterwards arrives under a MAC the controller has no adoption
+-- for, so it rejects them (HTTP 400) while the old record sits there going
+-- Offline. That is invisible from the device: the daemon is healthy, the
+-- config is right, the radios are up, and the log just fills with anonymous
+-- 400s. Observed for real when a board-specific modelmap moved lan_cpueth
+-- from the (unused) WAN socket to the LAN trunk, which have different MACs.
+-- Returns true when it warned, so this is testable without running the loop.
+function M._warn_identity_change(prev_mac, st, cfg)
+	if not (st and st.adopted and prev_mac and st.mac) then return false end
+	if prev_mac == st.mac then return false end
+	io.stderr:write(string.format(
+		"openuf: IDENTITY MAC CHANGED %s -> %s (dev.conf.net.lan_cpueth = %s).\n" ..
+		"openuf: this device was adopted as %s, so the controller will reject\n" ..
+		"openuf: informs from %s with HTTP 400 and show the old record Offline.\n" ..
+		"openuf: Forget the device in the controller and re-adopt it, or point\n" ..
+		"openuf: lan_cpueth back at the interface whose MAC is %s.\n",
+		prev_mac, st.mac, tostring(cfg and cfg.net and cfg.net.lan_cpueth),
+		prev_mac, st.mac, prev_mac))
+	return true
+end
+
 -- Start the inform heartbeat loop (blocks forever).
 -- cfg, ufhw: passed through to build_json()
 function M.run(cfg, ufhw)
 	local st = state.load()
+	-- The MAC persisted by the previous run, before _populate_net_info
+	-- overwrites it with the live one read off dev.conf.net.lan_cpueth.
+	local prev_mac = st.mac
 	M._populate_net_info(st, cfg)
+	M._warn_identity_change(prev_mac, st, cfg)
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 	-- Blocked-client nft rules are live kernel state, not persisted UCI --
 	-- reapply from state.json on every fresh start (mirrors the bootstrap

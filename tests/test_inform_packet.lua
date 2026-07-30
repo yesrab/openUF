@@ -2318,6 +2318,45 @@ return {
 		end
 	},
 	{
+		name = "inform: a changed identity MAC on an adopted device is reported loudly",
+		fn = function()
+			-- lan_cpueth's MAC is the device's identity. Moving it on an
+			-- adopted device (a modelmap switch) makes the controller reject
+			-- every inform with HTTP 400 while the old record goes Offline --
+			-- with nothing on the device to explain it. Observed for real.
+			local out = with_stderr(function()
+				local warned = inform._warn_identity_change(
+					"e8:de:27:5f:62:7a",
+					{adopted = true, mac = "e8:de:27:5f:62:77"},
+					{net = {lan_cpueth = "eth0"}})
+				assert_true(warned, "warns")
+			end)
+			assert_contains(out, "IDENTITY MAC CHANGED", "names the problem")
+			assert_contains(out, "e8:de:27:5f:62:7a", "the MAC it was adopted as")
+			assert_contains(out, "e8:de:27:5f:62:77", "the MAC it now reports")
+			assert_contains(out, "eth0", "and which setting decides it")
+			assert_contains(out, "re-adopt", "says how to fix it")
+		end
+	},
+	{
+		name = "inform: no identity warning when unadopted, unchanged, or first run",
+		fn = function()
+			-- Not adopted yet: a MAC change is harmless, the controller has no
+			-- record. Unchanged: nothing to say. First run: nothing persisted
+			-- to compare against, which must not read as a change.
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			local out = with_stderr(function()
+				assert_false(inform._warn_identity_change("aa:bb:cc:dd:ee:01",
+					{adopted = false, mac = "aa:bb:cc:dd:ee:02"}, cfg), "unadopted")
+				assert_false(inform._warn_identity_change("aa:bb:cc:dd:ee:01",
+					{adopted = true, mac = "aa:bb:cc:dd:ee:01"}, cfg), "unchanged")
+				assert_false(inform._warn_identity_change(nil,
+					{adopted = true, mac = "aa:bb:cc:dd:ee:01"}, cfg), "first run")
+			end)
+			assert_eq(out, "", "and stays silent in all three")
+		end
+	},
+	{
 		name = "inform: _state_mtime falls back to file contents without stat",
 		fn = function()
 			-- BusyBox gates `stat -c` behind FEATURE_STAT_FORMAT and some
