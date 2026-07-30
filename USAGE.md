@@ -49,6 +49,8 @@ package is required.
 Only required if your inform URL uses `https://` (uncommon — the UniFi default
 is `http://…:8080/inform`): `apk add luasec` for the TLS client. Without it, an
 `https://` URL fails with a clear error instead of connecting in cleartext.
+`install.sh` installs it for you when — and only when — the URL it finds (the
+adopted `state.json`, else `conf.lua`'s default) actually is `https://`.
 
 ---
 

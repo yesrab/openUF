@@ -139,6 +139,23 @@ case "$1" in
 			try_optional coreutils-stat "state-file change detection (stat)"
 		fi
 
+		# luasec, but only when it is actually needed: inform.lua TLS-wraps the
+		# socket for an https:// inform URL and fails with a clear error
+		# without it. The UniFi default is plain http on 8080, so installing it
+		# unconditionally would spend flash on a feature almost nobody uses --
+		# hence the check against the URL openUF will really use: the adopted
+		# state file if there is one, otherwise conf.lua's default. (state.json
+		# escapes its slashes, which does not affect the scheme match.)
+		INFORM_URL=$(sed -n 's/.*"inform_url":"\([^"]*\)".*/\1/p' \
+			"$STATE_DIR/state.json" 2>/dev/null | head -1)
+		if [ -z "$INFORM_URL" ]; then
+			INFORM_URL=$(sed -n 's/.*inform_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+				"$INSTALL_DIR/conf.lua" 2>/dev/null | head -1)
+		fi
+		case "$INFORM_URL" in
+			https*) try_optional luasec "TLS for the https:// inform URL" ;;
+		esac
+
 		# A full wpad build. BSS Transition and Band Steering need real
 		# 802.11k/v support: wpad-basic-* lacks bss_transition entirely and
 		# errors with "unknown configuration item 'bss_transition'". Any full
