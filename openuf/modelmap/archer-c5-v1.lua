@@ -54,6 +54,13 @@ dev.conf.net = {
 	},
 }
 
+-- NB for topology: lan_cpueth is eth1 here, so openUF's identity MAC is
+-- eth1's -- but lldpd defaults its chassis ID to eth0's MAC, which on this
+-- board is the unused WAN socket. The gateway then learns this AP as a
+-- neighbour it cannot match to any adopted device, and the controller shows
+-- the wrong Parent Device. Fix on the device (see USAGE § 7):
+--   uci set lldpd.config.cid_interface='lan'; uci commit lldpd
+
 -- Status LED for the controller's Locate action and its Manage > LED toggle.
 -- The board also has green:wlan2g / green:wlan5g if you would rather flash a
 -- radio LED; `ls /sys/class/leds` on the device for the full set.

@@ -65,7 +65,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | WiFi Experience / satisfaction score | ✅ Working — device-computed, confirmed rendering live |
 | Wired client statistics (`port_table[].mac_table`) | ✅ Working — bridge-learned hosts on downstream switch ports report as `is_wired` clients |
 | Environment / rogue-AP scanning (`scan_radio_table`) | ✅ Working — confirmed rendering live in the Environment tab |
-| LLDP topology announcement | ✅ Working (via `lldpd`) |
+| LLDP topology announcement | ✅ Working (via `lldpd`) — **set `lldpd.config.cid_interface` to your LAN network**, or the controller shows the wrong Parent Device: lldpd's default chassis ID is some other interface's MAC, which the controller can't match to the MAC openUF is adopted under. See [USAGE](USAGE.md#7-lldp-topology) |
 | RF/spectrum scan | ⚠️ Best-effort trigger only — the result-reporting wire format is unconfirmed |
 
 ### Device management

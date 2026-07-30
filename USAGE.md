@@ -504,6 +504,41 @@ lldpctl -f json  # JSON output (what openUF reads)
 
 If `lldpd` is absent or returns no neighbors, `lldp.lua` returns an empty table — non-fatal.
 
+### Point lldpd's chassis ID at the same interface as `lan_cpueth`
+
+```sh
+uci set lldpd.config.cid_interface='lan'
+uci commit lldpd && /etc/init.d/lldpd restart
+```
+
+**Without this the controller cannot place the AP on its topology map**, and shows
+some unrelated device (here the ISP's uplink) as the AP's Parent Device.
+
+The reason is that two different MACs are involved. openUF identifies the device
+by the MAC of `dev.conf.net.lan_cpueth`, and that is the MAC the controller
+adopts it under. `lldpd`, left to itself, picks its chassis ID from whichever
+interface it likes — in practice the lowest-numbered one, i.e. `eth0`. The
+upstream gateway therefore learns the AP as a neighbour under a chassis ID that
+does not match any adopted device, and silently declines to join the two.
+
+Whether that bites is pure luck of the board's port naming:
+
+| Board | `eth0` | `lan_cpueth` | Default chassis ID | Topology |
+|---|---|---|---|---|
+| TL-WDR3500 v1 | LAN trunk | `eth0` | matches identity | resolves by accident |
+| Archer C5 v1 | unused WAN socket | `eth1` | **`eth0`, wrong** | Parent Device wrong |
+
+Setting `cid_interface` to the LAN network makes the chassis ID the same MAC
+openUF reports, and the controller resolves the uplink immediately — confirmed
+live: an Archer C5 went from no `uplink_mac` at all to
+`Cloud Gateway Ultra, port 4` on the next LLDP advertisement.
+
+Verify the two agree:
+```sh
+lldpcli show chassis | grep ChassisID          # lldpd's identity
+grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
+```
+
 ---
 
 ## 8. Troubleshooting
