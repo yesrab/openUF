@@ -492,6 +492,9 @@ function M.build_json(st, cfg, ufhw)
 	-- wireless client bridged into br-lan (and thus also visible in the
 	-- bridge FDB) is never double-reported as a wired client too.
 	local station_macs = {}
+	-- Device-level satisfaction accumulator, filled by the per-VAP station
+	-- loop further down and consumed at payload assembly.
+	local sat_sum_all, sat_count_all = 0, 0
 	-- The device's own MACs (its netdevs) -- excluded from port_table's
 	-- mac_table for the same reason: without this, the AP would report
 	-- itself as a wired client of its own switch.
@@ -808,6 +811,9 @@ function M.build_json(st, cfg, ufhw)
 			local vap_rx_packets, vap_tx_packets = 0, 0
 			local vap_tx_retries, vap_tx_dropped = 0, 0
 			local signal_sum, signal_count = 0, 0
+			-- Per-VAP satisfaction accumulator; the device-level one lives
+			-- outside this loop (sat_sum_all/sat_count_all) -- see below.
+			local sat_sum, sat_count = 0, 0
 			local sta_table = {}
 			for _, sta in ipairs(stas) do
 				station_macs[sta.mac] = true
@@ -864,6 +870,10 @@ function M.build_json(st, cfg, ufhw)
 					wifi_tx_retries_pct = (sta.tx_retries or 0) * 100 / wifi_tx_attempts
 				end
 				local satisfaction_now = estimate_satisfaction(sta.signal, wifi_tx_retries_pct)
+				if satisfaction_now then
+					sat_sum, sat_count = sat_sum + satisfaction_now, sat_count + 1
+					sat_sum_all, sat_count_all = sat_sum_all + satisfaction_now, sat_count_all + 1
+				end
 
 				sta_table[#sta_table + 1] = {
 					active     = true,
@@ -969,6 +979,20 @@ function M.build_json(st, cfg, ufhw)
 			-- already being sent correctly.
 			if signal_count > 0 then
 				vap.avg_client_signal = math.floor(signal_sum / signal_count)
+			end
+			-- satisfaction: the mean of this VAP's clients' own scores. The
+			-- controller does NOT derive it from the per-client values it
+			-- already has -- with this absent, the Devices list showed
+			-- "No Clients" in the Experience column on an AP with eight
+			-- connected clients, all of them individually scored (96, 82,
+			-- 93 ...) in the Clients view.
+			--
+			-- Omitted entirely, rather than sent as 0, when the VAP has no
+			-- clients: 0 would read as "terrible experience" where "nothing
+			-- to measure" is the truth, and "No Clients" is then the correct
+			-- thing for the UI to say.
+			if sat_count > 0 then
+				vap.satisfaction = math.floor(sat_sum / sat_count + 0.5)
 			end
 			-- cu_total/cu_self_rx/cu_self_tx/cu_interf: same per-radio channel-
 			-- utilization figures as radio_table_stats, duplicated onto each
@@ -1165,6 +1189,14 @@ function M.build_json(st, cfg, ufhw)
 		-- not claim.
 		wifi_caps2       = 0x40,
 		-- Device-level (not per-radio -- see radio_table_stats above)
+		-- Device-level Experience: the mean of every connected client's own
+		-- satisfaction, across all VAPs. Same reasoning as the per-VAP copy
+		-- above -- the controller does not aggregate the per-client scores it
+		-- already holds, so without this the Devices list reads "No Clients"
+		-- however many are connected. nil (not 0) with no clients, so the
+		-- column says "No Clients" only when that is actually true.
+		satisfaction     = sat_count_all > 0
+			and math.floor(sat_sum_all / sat_count_all + 0.5) or nil,
 		spectrum_scanning       = false,
 		spectrum_scan_timestamp = spectrum_scan_timestamp,
 		-- Real devices report this under the hyphenated key "system-stats"

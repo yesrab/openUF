@@ -339,6 +339,39 @@ return {
 		end
 	},
 	{
+		name = "inform json: satisfaction is aggregated to the vap and the device",
+		fn = function()
+			-- The controller does not derive these from the per-client scores
+			-- it already holds: without them the Devices list showed
+			-- "No Clients" in the Experience column on an AP with eight
+			-- connected clients, each individually scored in the Clients view.
+			local d = build({with_uci = true, with_clients = true})
+			local vap = d.vap_table[1]
+			assert_not_nil(vap.satisfaction, "vap carries a satisfaction score")
+			assert_true(vap.satisfaction >= 0 and vap.satisfaction <= 100,
+				"and it is a percentage")
+			assert_not_nil(d.satisfaction, "device carries one too")
+			-- Both are means of the same per-client scores, and this fixture
+			-- has a single vap, so they must agree.
+			assert_eq(d.satisfaction, vap.satisfaction,
+				"device mean matches the only vap's mean")
+			local sum, n = 0, 0
+			for _, s in ipairs(vap.sta_table) do sum, n = sum + s.satisfaction, n + 1 end
+			assert_eq(vap.satisfaction, math.floor(sum / n + 0.5),
+				"and equals the mean of the clients actually reported")
+		end
+	},
+	{
+		name = "inform json: satisfaction is omitted, not zero, when nothing is connected",
+		fn = function()
+			-- 0 would read as "terrible experience"; absent lets the UI say
+			-- "No Clients", which is what is actually true.
+			local d = build({with_uci = true, with_clients = false})
+			assert_true(d.vap_table[1].satisfaction == nil, "no vap score without clients")
+			assert_true(d.satisfaction == nil, "no device score either")
+		end
+	},
+	{
 		name = "inform json: vap_table carries cu_total/cu_self_rx/cu_self_tx/cu_interf from its radio",
 		fn = function()
 			local d = build({with_uci = true, with_clients = true})
