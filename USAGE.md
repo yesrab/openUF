@@ -8,7 +8,7 @@ OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
 
 ```sh
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftables hostapd-utils usteer wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
 ```
 
 | Package | Purpose |
@@ -23,6 +23,8 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd openssl-util nftab
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
 | `nftables` | Client block/unblock enforcement (`openuf/firewall.lua`) |
 | `hostapd-utils` | `hostapd_cli` — immediate deauth of a just-blocked wireless client, client kick (Roaming Assistance) and Minimum RSSI enforcement |
+| `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced |
+| `coreutils-stat` | `stat` — only if your build has no `stat` applet (some do not). `inform.lua` uses `stat -c %Y` to notice an out-of-process `state.json` write, i.e. an SSH `set-adopt` or a manual `reset-inform`; without it those are ignored until restart. Enabling busybox's own `stat` applet is smaller |
 | `usteer` | Band Steering (Behavior Controls) — ubus-based client-steering daemon, driven by `openuf/usteer.lua` |
 | `wpad-wolfssl` (or `wpad-openssl`, `wpad-mbedtls`, `wpad`) | Full hostapd build with 802.11k/v support — required for BSS Transition and Band Steering. Any of the full builds will do; `wpad-basic-*` lacks `bss_transition` entirely and errors with "unknown configuration item 'bss_transition'" |
 

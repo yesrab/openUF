@@ -126,7 +126,18 @@ case "$1" in
 		try_optional hostapd-utils "Minimum RSSI, client kick, block-deauth"
 		try_optional usteer        "Band Steering"
 		try_optional ip-bridge     "wired clients behind the AP (bridge fdb)"
-		try_optional nftables      "client Block/Unblock enforcement"
+		try_optional nftables      "client Block/Unblock + Multicast/Broadcast Blocker"
+		# shaper.lua shells out to `tc` for the WiFi Speed Limit, and nothing
+		# installed it -- busybox has no tc. tc-tiny is enough (htb + fq_codel).
+		try_optional tc-tiny       "WiFi Speed Limit (tc)"
+		# inform.lua detects an out-of-process state.json write (syswrapper's
+		# SSH set-adopt, a manual reset-inform) with `stat -c %Y`. Some builds
+		# ship no stat applet at all -- confirmed on a real WDR3500 -- and
+		# without it those changes go unnoticed until openUF is restarted.
+		# Cheaper than this package: enable busybox's own stat applet.
+		if ! command -v stat >/dev/null 2>&1; then
+			try_optional coreutils-stat "state-file change detection (stat)"
+		fi
 
 		# A full wpad build. BSS Transition and Band Steering need real
 		# 802.11k/v support: wpad-basic-* lacks bss_transition entirely and
