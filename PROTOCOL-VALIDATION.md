@@ -1163,12 +1163,55 @@ emits the strings that select them. (An earlier note in this document read the
 PMF keys as the controller's way of signalling WPA3-mixed for a madwifi-driver
 model. That was wrong — PMF is just PMF, and the real signal is these two keys.)
 
-Fixing it needs the capability claimed *and* honoured: which of `radio_caps` /
-`radio_caps2` carries the bit is best settled by setting it and watching the
-wire, and the SAE apply path must then be verified end-to-end. Note
+### What that capability is, and why openUF cannot assert it
+
+`CVir()` tests bit `0x1` of a capability integer built by
+`com.ubnt.g.f.e.VVyiC`'s factory, which reads `radio_caps` / `radio_caps2` off
+the radio object. **Both were set live, on real hardware, and neither changed
+the outcome** — the next push still carried `wpa.key.1.mgmt=WPA-PSK`.
+
+The radio capabilities the generator consults come from the controller's own
+model registry, not from the inform:
+
+```java
+getModel().<radiosByBand>().getOrDefault(band, EMPTY_DEVICE_MODEL_RADIO)
+```
+
+`wpa3_supported` is not an ingestion path either. The only class carrying that
+literal (`com.ubnt.net.k.aI.jRsSex`, a record of `wpa3Supported` /
+`band6GHzSupported` / `oweSupported`) is **constructed, never parsed**: its
+single caller builds it from an injected `com.ubnt.service.wifi.AcrQJeJCScLn`
+service and ignores the device object it is handed. It describes what the site
+supports, outbound.
+
+> An earlier revision of this document claimed that setting `wpa3_supported`
+> flipped a push from `WPA-PSK` to `SAE`. That observation was real but the
+> attribution was wrong — it was a coincidental config regeneration, and has
+> never reproduced, including across a clean re-adoption with the field present
+> from the very first inform.
+
+So on 10.4.57 there is **no known payload field by which an emulated device can
+unlock WPA3**; the decision rests on controller-side data about the model.
+
+### The device side works — verified end-to-end
+
+Independently of whether the controller will send it, feeding a real captured
+transition-mode `system_cfg` through openUF produces correct mixed mode on real
+hardware:
+
+```
+UCI:     encryption='sae-mixed'
+hostapd: wpa_key_mgmt = SAE FT-SAE WPA-PSK WPA-PSK-SHA256 FT-PSK
+         sae_require_mfp=1  sae_pwe=2  sae_groups=19 20 21
+```
+
+Live clients then split exactly as transition mode intends — a Pixel 9
+negotiated `00-0f-ac-9` (FT-SAE) while older devices stayed on `00-0f-ac-2`
+(WPA2-PSK) on the same SSID.
+
 `wpad-mbedtls`, OpenWrt 25.12's ath79 default, does support SAE
-(`sae_password`, `sae_groups`, and `psk-sae` in `ap.uc`), so on that hardware
-the claim would be honest.
+(`sae_password`, `sae_groups`, `psk-sae` in `ap.uc`), so claiming it is honest
+on that hardware.
 
 ### Fixtures must be verbatim command output
 

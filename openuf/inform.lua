@@ -615,21 +615,33 @@ function M.build_json(st, cfg, ufhw)
 					-- Reported only when hostapd can really do SAE, so the
 					-- controller is never told to push a config the radio
 					-- cannot run.
-					-- Sent as a SET, not just the one field that matters. The
-					-- controller's radio-capability DTO carries wpa3_supported,
-					-- owe_supported and band_6ghz_supported together, and
-					-- wpa3_supported ALONE does not take effect -- confirmed
-					-- live: the identical payload plus owe_supported produced
-					-- SAE, and without it the push fell back to WPA-PSK.
-					-- The two openUF does not implement are reported false,
-					-- which is the truth for every target board.
+					-- Truthful, but the controller does NOT read it.
+					--
+					-- Decompiling the only class that mentions wpa3_supported
+					-- (com.ubnt.net.k.aI.jRsSex, a record of wpa3Supported/
+					-- band6GHzSupported/oweSupported) shows it is CONSTRUCTED,
+					-- never parsed: its single caller builds it from an
+					-- injected com.ubnt.service.wifi.AcrQJeJCScLn service and
+					-- takes the device object as a parameter it then ignores.
+					-- It is an outbound/API description of what the site
+					-- supports, not an inform ingestion path.
+					--
+					-- An earlier commit here claimed setting this field flipped
+					-- a push from WPA-PSK to SAE. That was a coincidental
+					-- config regeneration: it has never reproduced, including
+					-- across a clean re-adoption with the field present from
+					-- the first inform.
+					--
+					-- Kept because it is accurate (these radios really do have
+					-- SAE) and harmless, and another controller version may yet
+					-- read it -- but nothing here unlocks WPA3 on 10.4.57. See
+					-- PROTOCOL-VALIDATION.md's WPA3 section.
 					if M._sysinfo.sae_supported and M._sysinfo.sae_supported() then
 						radio.wpa3_supported = true
 					else
 						radio.wpa3_supported = false
 					end
 					radio.owe_supported       = false
-					radio.band_6ghz_supported = false
 				end
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 				-- min_rssi (outbound field, confirmed via decompile alongside
