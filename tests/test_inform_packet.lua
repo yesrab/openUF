@@ -1722,6 +1722,35 @@ return {
 		end
 	},
 	{
+		name = "inform packet: wpa3.transition makes a SAE-only akm mixed, not WPA3-only",
+		fn = function()
+			-- The exact bytes a real 10.4.57 gateway sends for a WPA2/WPA3
+			-- transition WLAN: SAE is the ONLY akm -- no WPA-PSK beside it --
+			-- and the transition is marked by its own key. Read the akm alone
+			-- and this provisions as pure WPA3, dropping every WPA2-only
+			-- client on the network.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "aaa.1.wpa.key.1.mgmt=SAE\naaa.1.wpa.psk=hunter22\n"
+				.. "aaa.1.wpa3.support=enabled\naaa.1.wpa3.transition=enabled\n"
+				.. "aaa.1.sae.anti_clogging=5\naaa.1.sae.sync=5\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].security, "wpa2/wpa3",
+				"transition -> mixed, so WPA2 clients keep working")
+		end
+	},
+	{
+		name = "inform packet: wpa3.support without transition is WPA3-only",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "aaa.1.wpa.key.1.mgmt=SAE\n"
+				.. "aaa.1.wpa3.support=enabled\naaa.1.wpa3.transition=disabled\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vap_table[1].security, "wpa3", "support without transition -> WPA3 only")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg wpa=2 without any key.mgmt stays wpa2",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"

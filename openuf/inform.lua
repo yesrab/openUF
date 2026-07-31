@@ -606,6 +606,30 @@ function M.build_json(st, cfg, ufhw)
 						[4] = 0x4000000,
 					}
 					radio.radio_caps = RADIO_CAPS_MIMO_BIT[caps.nss or 1] or RADIO_CAPS_MIMO_BIT[1]
+					-- wpa3_supported: the field that decides whether this
+					-- device gets WPA3 at all. Without it the controller
+					-- silently downgrades a WPA2/WPA3 WLAN to plain WPA2 for
+					-- this AP -- confirmed live: setting it flipped the very
+					-- next push from `wpa.key.1.mgmt=WPA-PSK` to `SAE` plus
+					-- the whole wpa3.*/sae.* block, with no other change.
+					-- Reported only when hostapd can really do SAE, so the
+					-- controller is never told to push a config the radio
+					-- cannot run.
+					-- Sent as a SET, not just the one field that matters. The
+					-- controller's radio-capability DTO carries wpa3_supported,
+					-- owe_supported and band_6ghz_supported together, and
+					-- wpa3_supported ALONE does not take effect -- confirmed
+					-- live: the identical payload plus owe_supported produced
+					-- SAE, and without it the push fell back to WPA-PSK.
+					-- The two openUF does not implement are reported false,
+					-- which is the truth for every target board.
+					if M._sysinfo.sae_supported and M._sysinfo.sae_supported() then
+						radio.wpa3_supported = true
+					else
+						radio.wpa3_supported = false
+					end
+					radio.owe_supported       = false
+					radio.band_6ghz_supported = false
 				end
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 				-- min_rssi (outbound field, confirmed via decompile alongside
@@ -1339,16 +1363,23 @@ end
 -- else WPA2-PSK. Confirmed live for the WPA2-PSK case (wpa=2 +
 -- wpa.key.1.mgmt=WPA-PSK -> "wpa2").
 --
--- The SAE branches are UNREACHABLE as things stand, and not merely
--- un-captured: SAE never arrives as a wpa.key.<n>.mgmt value at all. The
--- controller emits WPA3 as its own `wpa3.support` / `wpa3.transition` keys,
--- and only for a radio that claims the SAE capability bit (0x1) -- which
--- openUF does not, so every WPA3 WLAN is silently downgraded to WPA2 for
--- this device before the config is even generated. Decompiled and confirmed
--- against a live 10.4.57 gateway; see PROTOCOL-VALIDATION.md's "WPA3 is
--- silently downgraded to WPA2". (An earlier version of this comment read the
--- PMF keys as the WPA3-mixed signal for a madwifi-driver model. They are
--- not: PMF is just PMF.)
+-- WPA3 is gated on the DEVICE claiming it: a radio_table entry must report
+-- `wpa3_supported = true` (see build_json) or the controller silently
+-- downgrades a WPA2/WPA3 WLAN to plain WPA2 for that device, before the
+-- config is even generated. Confirmed live against a 10.4.57 gateway --
+-- setting that one field flipped the very next push from
+-- `wpa.key.1.mgmt=WPA-PSK` to `SAE`, and brought the whole
+-- wpa3.support/wpa3.transition/wpa3.ft.status/sae.* block with it.
+--
+-- Once it does arrive, `SAE` comes as the ONLY akm -- there is no WPA-PSK
+-- alongside it even in transition mode -- so the akm set alone cannot tell
+-- transition from WPA3-only. wpa3.transition is what distinguishes them, and
+-- is read below.
+--
+-- Two earlier readings recorded here were wrong: that the PMF keys carry the
+-- WPA3-mixed signal (they do not -- PMF is just PMF), and that a radio_caps
+-- capability bit gates it (neither radio_caps nor radio_caps2 bit 0x1 has any
+-- effect; both were tested live).
 local function _wire_bool(v)
 	if v == nil then return nil end
 	return v == "1" or v == "true" or v == "enabled"
@@ -1610,7 +1641,19 @@ function M._parse_wifi_system_cfg(sys_raw)
 			if a.wpa == "2" or a.wpa == "3" then
 				local has_sae = akm:find("SAE", 1, true) ~= nil
 				local has_psk = akm:find("PSK", 1, true) ~= nil
-				if has_sae and has_psk then security = "wpa2/wpa3"
+				-- WPA3 rides on its OWN keys, and the akm set alone cannot
+				-- tell transition from WPA3-only: a WPA2/WPA3 transition WLAN
+				-- sends `wpa.key.1.mgmt=SAE` *by itself* -- no WPA-PSK
+				-- alongside it -- and marks the transition separately with
+				-- `wpa3.transition=enabled`. Reading only the akm would
+				-- therefore provision a transition WLAN as pure WPA3 and drop
+				-- every WPA2-only client on the network (IoT devices above
+				-- all). These two keys are authoritative where present.
+				local wpa3_support    = _wire_bool(a["wpa3.support"])
+				local wpa3_transition = _wire_bool(a["wpa3.transition"])
+				if wpa3_support and wpa3_transition then security = "wpa2/wpa3"
+				elseif wpa3_support then security = "wpa3"
+				elseif has_sae and has_psk then security = "wpa2/wpa3"
 				elseif has_sae then security = "wpa3"
 				elseif a.wpa == "3" then security = "wpa3"
 				else security = "wpa2" end

@@ -370,6 +370,35 @@ end
 -- be far weaker or stronger than the U6-InWall it impersonates. Also
 -- returns `channel`, the live negotiated channel number (more authoritative
 -- than UCI's own config value, which is often the string "auto").
+-- Cached: whether this device's hostapd build can actually do WPA3-SAE.
+-- nil = not probed yet.
+M._sae_supported_cache = nil
+
+-- Does this system support WPA3/SAE?
+--
+-- Reported to the controller as radio_table[].wpa3_supported, which is what
+-- gates WPA3 for the device: without it a WPA2/WPA3 WLAN is silently
+-- downgraded to plain WPA2 for this AP (see PROTOCOL-VALIDATION.md). So it
+-- must be answered honestly -- claiming it on a build whose hostapd has no
+-- SAE would make the controller push a config the radio cannot run.
+--
+-- Probed from the wifi config generator rather than by parsing a binary:
+-- OpenWrt 24+ ships ucode wifi scripts that name the auth types they can
+-- emit ('sae', 'psk-sae'), and older releases express the same in
+-- hostapd.sh. Both are plain file reads, no process spawn.
+function M.sae_supported()
+	if M._sae_supported_cache ~= nil then return M._sae_supported_cache end
+	local found = false
+	local ucode = M._read_file("/usr/share/ucode/wifi/ap.uc")
+	if ucode and ucode:find("psk-sae", 1, true) then found = true end
+	if not found then
+		local legacy = M._read_file("/lib/netifd/hostapd.sh")
+		if legacy and legacy:find("sae", 1, true) then found = true end
+	end
+	M._sae_supported_cache = found
+	return found
+end
+
 function M.radio_caps(ifname)
 	if not ifname then return {} end
 	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")

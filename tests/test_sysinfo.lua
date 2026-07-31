@@ -488,6 +488,54 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: sae_supported() detects SAE from the wifi config generator",
+		fn = function()
+			-- This decides whether openUF claims WPA3 to the controller, and
+			-- the controller pushes SAE on the strength of it -- so a build
+			-- whose hostapd cannot do SAE must answer false, or the radio gets
+			-- a config it cannot run.
+			local orig = sysinfo._read_file
+			sysinfo._sae_supported_cache = nil
+			sysinfo._read_file = function(path)
+				if path == "/usr/share/ucode/wifi/ap.uc" then
+					return "if (config.auth_type in [ 'psk-sae', 'eap-eap2' ])\n"
+				end
+				return nil
+			end
+			assert_true(sysinfo.sae_supported(), "ucode generator naming psk-sae -> supported")
+
+			sysinfo._sae_supported_cache = nil
+			sysinfo._read_file = function(path)
+				if path == "/lib/netifd/hostapd.sh" then return "sae_password\n" end
+				return nil
+			end
+			assert_true(sysinfo.sae_supported(), "legacy hostapd.sh mentioning sae -> supported")
+
+			sysinfo._sae_supported_cache = nil
+			sysinfo._read_file = function() return nil end
+			assert_false(sysinfo.sae_supported(), "neither readable -> not claimed")
+
+			sysinfo._read_file = orig
+			sysinfo._sae_supported_cache = nil
+		end
+	},
+	{
+		name = "sysinfo: sae_supported() caches its answer",
+		fn = function()
+			local orig, reads = sysinfo._read_file, 0
+			sysinfo._sae_supported_cache = nil
+			sysinfo._read_file = function(path)
+				reads = reads + 1
+				if path == "/usr/share/ucode/wifi/ap.uc" then return "psk-sae" end
+				return nil
+			end
+			sysinfo.sae_supported(); sysinfo.sae_supported(); sysinfo.sae_supported()
+			sysinfo._read_file = orig
+			sysinfo._sae_supported_cache = nil
+			assert_eq(reads, 1, "probed once, not on every inform")
+		end
+	},
+	{
 		name = "sysinfo: radio_caps() reports the live TX power as whole dBm",
 		fn = function()
 			-- Same rationale as the live channel: with the controller's
