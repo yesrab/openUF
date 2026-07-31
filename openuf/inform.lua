@@ -606,16 +606,16 @@ function M.build_json(st, cfg, ufhw)
 						[4] = 0x4000000,
 					}
 					radio.radio_caps = RADIO_CAPS_MIMO_BIT[caps.nss or 1] or RADIO_CAPS_MIMO_BIT[1]
-					-- wpa3_supported: the field that decides whether this
-					-- device gets WPA3 at all. Without it the controller
-					-- silently downgrades a WPA2/WPA3 WLAN to plain WPA2 for
-					-- this AP -- confirmed live: setting it flipped the very
-					-- next push from `wpa.key.1.mgmt=WPA-PSK` to `SAE` plus
-					-- the whole wpa3.*/sae.* block, with no other change.
-					-- Reported only when hostapd can really do SAE, so the
-					-- controller is never told to push a config the radio
-					-- cannot run.
-					-- Truthful, but the controller does NOT read it.
+					-- wpa3_supported: reported only when hostapd can really
+					-- do SAE, so we never claim what the radio cannot run.
+					-- Truthful -- but the controller does NOT read it, and it
+					-- does NOT unlock WPA3.
+					--
+					-- Confirmed live on 10.4.57 by reading back the persisted
+					-- device: radio_caps survives the round trip verbatim
+					-- (nss=3 -> 0x20 comes back as radio_caps=32), while
+					-- wpa3_supported and owe_supported come back UNDEFINED --
+					-- the controller drops them on ingestion entirely.
 					--
 					-- Decompiling the only class that mentions wpa3_supported
 					-- (com.ubnt.net.k.aI.jRsSex, a record of wpa3Supported/

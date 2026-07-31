@@ -1177,7 +1177,21 @@ model registry, not from the inform:
 getModel().<radiosByBand>().getOrDefault(band, EMPTY_DEVICE_MODEL_RADIO)
 ```
 
-`wpa3_supported` is not an ingestion path either. The only class carrying that
+Reading the persisted device back from `/api/s/default/stat/device` settles it
+from the other end. openUF sends `radio_caps`, `wpa3_supported` and
+`owe_supported` on every radio; only the first survives:
+
+```
+192.168.200.3  radio0/na: radio_caps=32 radio_caps2=0 wpa3_supported=undefined owe=undefined nss=3
+192.168.200.2  radio0/ng: radio_caps=16 radio_caps2=0 wpa3_supported=undefined owe=undefined nss=2
+```
+
+`radio_caps` round-trips verbatim (nss 3 → `0x20` = 32, nss 2 → `0x10` = 16 —
+exactly what `RADIO_CAPS_MIMO_BIT` emits), so the ingestion of that DTO is
+working. `wpa3_supported` and `owe_supported` are simply **dropped**: the
+controller never stores them.
+
+That is consistent with the bytecode. The only class carrying that
 literal (`com.ubnt.net.k.aI.jRsSex`, a record of `wpa3Supported` /
 `band6GHzSupported` / `oweSupported`) is **constructed, never parsed**: its
 single caller builds it from an injected `com.ubnt.service.wifi.AcrQJeJCScLn`
