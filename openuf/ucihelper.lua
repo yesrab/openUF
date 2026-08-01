@@ -560,6 +560,39 @@ function M.ensure_vlan_network(cpueth, vlan_id)
 	return section_name
 end
 
+-- Delete the interface and bridge sections of every VLAN not in `wanted`
+-- (a set keyed by VLAN id). Only openUF's own sections are ever touched --
+-- same discipline as wlan_clear()'s openuf_ prefix rule.
+--
+-- Called on every push, including one that carries no VLAN at all: deleting
+-- the last tagged WLAN has to tear its L2 down too, and an empty `wanted` is
+-- exactly how that arrives.
+function M.prune_vlan_networks(wanted)
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	wanted = wanted or {}
+
+	local doomed = {}
+	local function sweep(stype, pattern)
+		cursor:foreach("network", stype, function(s)
+			local id = s[".name"] and s[".name"]:match(pattern)
+			if id and not wanted[tonumber(id)] then
+				doomed[#doomed + 1] = s[".name"]
+			end
+		end)
+	end
+	sweep("interface", "^" .. OPENUF_PREFIX .. "vlan(%d+)$")
+	sweep("device",    "^" .. OPENUF_PREFIX .. "brdev(%d+)$")
+
+	if #doomed == 0 then return false end
+	for _, name in ipairs(doomed) do
+		cursor:delete("network", name)
+	end
+	cursor:commit("network")
+	M._network_dirty = true
+	return true
+end
+
 -- ─── Radio configuration ─────────────────────────────────────────────────────
 
 -- Configure a radio's channel, mode, and TX power.
@@ -823,6 +856,9 @@ function M.apply_config(resp, cfg, opts)
 
 	-- Clear existing openuf_ VAPs and re-add from vap_table
 	M.wlan_clear()
+	-- Every VLAN this push still wants an L2 for; anything else gets pruned
+	-- after the loop.
+	local wanted_vlans = {}
 	for _, vap in ipairs(vap_table) do
 		if vap.ssid and vap.radio then
 			local extra = {}
@@ -1050,12 +1086,23 @@ function M.apply_config(resp, cfg, opts)
 			local network = "lan"
 			if vlan_enabled and vlan_id and cpueth then
 				network = M.ensure_vlan_network(cpueth, vlan_id)
+				wanted_vlans[tonumber(vlan_id) or vlan_id] = true
 			end
 
 			M.wlan_add(vap.radio, vap.ssid, vap.security, vap.x_passphrase, extra,
 				network, vap.wlanconf_id)
 		end
 	end
+
+	-- Drop the L2 of any VLAN no longer carried by a WLAN. Changing a
+	-- network's VLAN id in the controller (20 -> 10) or deleting the WLAN
+	-- outright leaves the old bridge and its tagged sub-device behind
+	-- otherwise -- confirmed live on both APs, which kept a br-openuf20 with
+	-- eth1.20 in it long after the WLAN had moved to VLAN 10. Harmless-looking
+	-- but it accumulates, keeps a sub-device on the trunk forever, and makes
+	-- the running config stop matching what the controller asked for.
+	-- switchvlan.lua already reconciles its own switch_vlan sections this way.
+	M.prune_vlan_networks(wanted_vlans)
 
 	-- Hand-configured (non-openuf_) SSIDs: disable or restore them per
 	-- conf.lua's use_only_unifi_wlan. Runs after the vap loop so it sees the

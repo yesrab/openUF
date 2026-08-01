@@ -2320,4 +2320,70 @@ return {
 			end)
 		end
 	},
+	{
+		name = "ucihelper: changing a WLAN's VLAN tears the old L2 down",
+		fn = function()
+			-- Confirmed live: moving the IoT network from VLAN 20 to 10 in
+			-- the controller left br-openuf20 and its eth1.20 member behind
+			-- on both APs -- a bridge with a tagged sub-device sitting on the
+			-- trunk forever, and a running config that no longer matches what
+			-- the controller asked for.
+			with_ucihelper(function(db, cmds)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				local cfg = {net = {lan_cpueth = "eth1"}}
+				local function push(vlan)
+					return {radio_table = {}, vap_table = {
+						{ssid = "iot", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", vlan_enabled = true, vlan = vlan}}}
+				end
+
+				ucihelper.apply_config(push(20), cfg)
+				assert_not_nil(db.network.openuf_vlan20, "VLAN 20 L2 created")
+				assert_not_nil(db.network.openuf_brdev20, "with its bridge")
+
+				ucihelper.apply_config(push(10), cfg)
+				assert_not_nil(db.network.openuf_vlan10, "VLAN 10 L2 created")
+				assert_not_nil(db.network.openuf_brdev10, "with its bridge")
+				assert_nil(db.network.openuf_vlan20, "VLAN 20 interface removed")
+				assert_nil(db.network.openuf_brdev20, "VLAN 20 bridge removed")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: removing the last tagged WLAN removes its VLAN L2",
+		fn = function()
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				local cfg = {net = {lan_cpueth = "eth1"}}
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "iot", radio = "radio0", security = "wpa2",
+					 x_passphrase = "hunter22", vlan_enabled = true, vlan = 20}}}, cfg)
+				assert_not_nil(db.network.openuf_vlan20, "created")
+
+				-- The WLAN is gone; an untagged one remains.
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "home", radio = "radio0", security = "wpa2",
+					 x_passphrase = "hunter22"}}}, cfg)
+				assert_nil(db.network.openuf_vlan20, "interface torn down")
+				assert_nil(db.network.openuf_brdev20, "bridge torn down")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the prune never touches a hand-made VLAN interface",
+		fn = function()
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "iot_vlan99", "interface")
+				c:set("network", "iot_vlan99", "device", "br-iot99")
+				ucihelper.prune_vlan_networks({})
+				assert_not_nil(db.network.iot_vlan99,
+					"only openuf_-prefixed sections are ever deleted")
+			end)
+		end
+	},
 }
