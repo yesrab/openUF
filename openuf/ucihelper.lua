@@ -476,27 +476,86 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	cursor:commit("wireless")
 end
 
--- Idempotently create (or reuse) a UCI network interface for a VLAN-tagged
--- sub-device, e.g. "eth1.20" for VLAN 20 on cpueth "eth1". Mirrors how
--- dev.conf.net.wan_vlanid is already handled for the WAN/LAN split in the
--- modelmap. Returns the UCI network/interface section name.
+-- True when this OpenWrt is 21.02+, i.e. netifd expects `config device`
+-- sections and `option device` on an interface. Probed from the running
+-- config rather than assumed: any interface carrying `device`, or the
+-- presence of a `device` section, settles it. Pre-21.02 builds have neither
+-- and want `option ifname` (which 25.12 still accepts as a legacy alias --
+-- confirmed live -- so the probe is about which BRIDGE syntax to use, not
+-- about the sub-device name).
+local function netifd_uses_device_sections(cursor)
+	local modern = false
+	cursor:foreach("network", "device", function() modern = true end)
+	if modern then return true end
+	cursor:foreach("network", "interface", function(s)
+		if s.device then modern = true end
+	end)
+	return modern
+end
+
+-- Idempotently create (or reuse) the L2 a VLAN-tagged SSID lives on: a bridge
+-- holding the tagged uplink sub-device (e.g. "eth1.20" for VLAN 20 on cpueth
+-- "eth1"). The VAP joins by naming the returned interface section, and netifd
+-- enslaves it to the same bridge.
+--
+-- The bridge is the whole point. An interface whose device is the bare
+-- sub-device does come up (confirmed live on 25.12: `eth1.20@eth1` UP,
+-- netifd logging "Interface 'openuf_vlan20' is now up") -- but the VAP is
+-- then a second, SEPARATE netdev with no master, so nothing joins the two.
+-- A client associates and gets no DHCP, no gateway, nothing, while every
+-- layer looks healthy. The controller's own push says as much: alongside the
+-- WLAN it sends a bridge block naming exactly this topology --
+--   bridge.2.devname=br0.20
+--   bridge.2.port.1.devname=ath2      (the vap)
+--   bridge.2.port.2.devname=eth0.20   (the tagged uplink)
+-- which is a specification, not decoration.
+--
+-- Returns the UCI network/interface section name.
 function M.ensure_vlan_network(cpueth, vlan_id)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	local section_name = OPENUF_PREFIX .. "vlan" .. tostring(vlan_id)
 	local ifname = cpueth .. "." .. tostring(vlan_id)
+	local br_section = OPENUF_PREFIX .. "brdev" .. tostring(vlan_id)
+	local br_name = "br-" .. OPENUF_PREFIX:gsub("_$", "") .. tostring(vlan_id)
 
-	local exists = false
-	cursor:foreach("network", "interface", function(s)
-		if s[".name"] == section_name then exists = true end
-	end)
-
-	if not exists then
-		cursor:set("network", section_name, "interface")
-		cursor:set("network", section_name, "ifname", ifname)
-		cursor:set("network", section_name, "proto", "none")
-		cursor:commit("network")
+	local changed = false
+	if netifd_uses_device_sections(cursor) then
+		-- 21.02+: a named `config device` bridge, and the interface points at
+		-- it by name.
+		if cursor:get("network", br_section, "name") ~= br_name then
+			cursor:set("network", br_section, "device")
+			cursor:set("network", br_section, "type", "bridge")
+			cursor:set("network", br_section, "name", br_name)
+			cursor:set("network", br_section, "ports", {ifname})
+			changed = true
+		end
+		if cursor:get("network", section_name, "device") ~= br_name then
+			cursor:set("network", section_name, "interface")
+			cursor:set("network", section_name, "device", br_name)
+			cursor:set("network", section_name, "proto", "none")
+			-- Leaving a stale ifname behind would have netifd bridge the raw
+			-- sub-device instead of the bridge on some builds.
+			cursor:delete("network", section_name, "ifname")
+			changed = true
+		end
+	else
+		-- Pre-21.02: the interface IS the bridge, with the sub-device as its
+		-- only member port.
+		if cursor:get("network", section_name, "ifname") ~= ifname
+			or cursor:get("network", section_name, "type") ~= "bridge" then
+			cursor:set("network", section_name, "interface")
+			cursor:set("network", section_name, "type", "bridge")
+			cursor:set("network", section_name, "ifname", ifname)
+			cursor:set("network", section_name, "proto", "none")
+			changed = true
+		end
 	end
+
+	if changed then cursor:commit("network") end
+	-- Reported to the caller so one network reload covers every VLAN in a
+	-- push, and a steady-state push that changed nothing issues none.
+	M._network_dirty = M._network_dirty or changed
 
 	return section_name
 end
@@ -1002,6 +1061,21 @@ function M.apply_config(resp, cfg, opts)
 	-- conf.lua's use_only_unifi_wlan. Runs after the vap loop so it sees the
 	-- final section set, and before the reload so both land in one restart.
 	M.set_wlan_exclusive(cfg and cfg.config and cfg.config.use_only_unifi_wlan == true)
+
+	-- A VLAN bridge that only exists in UCI carries no traffic: netifd has to
+	-- be told, and `wifi reload` alone does not create a bridge device. Runs
+	-- BEFORE the wireless reload so the bridge exists by the time hostapd's
+	-- interfaces come up and netifd looks for something to enslave them to.
+	--
+	-- Gated on an actual change (ensure_vlan_network sets the flag) for the
+	-- same reason switchvlan guards its own reload: every steady-state
+	-- setparam re-carries the whole config, and reloading the network on each
+	-- one would bounce the uplink -- and with it the inform connection --
+	-- every few seconds.
+	if M._network_dirty then
+		M._run_cmd("/etc/init.d/network reload 2>/dev/null")
+		M._network_dirty = false
+	end
 
 	-- Reload wireless
 	M._run_cmd("wifi reload")

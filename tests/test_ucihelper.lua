@@ -58,7 +58,14 @@ local function new_mock_uci()
 
 	function cursor:get(config, section, option)
 		local s = db[config] and db[config][section]
-		return s and s[option]
+		local v = s and s[option]
+		-- Real libuci returns (nil, "Entry not found") for a miss, and that
+		-- second value is a live hazard: tonumber(cursor:get(...)) without
+		-- parens takes it as the base argument and throws on the first run,
+		-- when the section does not exist yet. A single-value mock hides it
+		-- until real hardware finds it.
+		if v == nil then return nil, "Entry not found" end
+		return v
 	end
 
 	-- Commits are recorded, not applied (the mock db is always-live): the
@@ -214,13 +221,90 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: ensure_vlan_network creates a tagged interface",
+		name = "ucihelper: ensure_vlan_network bridges the tagged uplink (21.02+)",
 		fn = function()
+			-- The bridge is the entire point. Confirmed live on OpenWrt
+			-- 25.12: with only `config interface` + the bare sub-device, both
+			-- eth1.20 and the VAP come up as separate masterless netdevs --
+			-- netifd even logs "Interface 'openuf_vlan20' is now up" -- and a
+			-- client associates to a WLAN with no path to anything. Every
+			-- layer looks healthy; only `ip link` shows the missing master.
 			with_ucihelper(function(db)
+				-- A `config device` section is what marks a 21.02+ netifd.
+				-- Seeded through the cursor so the mock's own iteration order
+				-- sees it, exactly as libuci's foreach would.
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "type", "bridge")
 				local name = ucihelper.ensure_vlan_network("eth1", 20)
 				assert_eq(name, "openuf_vlan20", "section name")
-				assert_eq(db.network.openuf_vlan20.ifname, "eth1.20", "tagged ifname")
-				assert_eq(db.network.openuf_vlan20.proto, "none", "proto none")
+
+				local br = db.network.openuf_brdev20
+				assert_true(br ~= nil, "a bridge device section is created")
+				assert_eq(br[".type"], "device", "as a `config device` section")
+				assert_eq(br.type, "bridge", "of type bridge")
+				assert_eq(br.name, "br-openuf20", "named br-openuf<vid>")
+				assert_eq(br.ports[1], "eth1.20", "with the tagged uplink as its port")
+
+				local iface = db.network.openuf_vlan20
+				assert_eq(iface.device, "br-openuf20", "the interface points at the bridge")
+				assert_eq(iface.proto, "none", "proto none -- the AP needs no address here")
+				assert_eq(iface.ifname, nil,
+					"no stale ifname: netifd would bridge the raw sub-device instead")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: ensure_vlan_network uses pre-21.02 bridge syntax when that is what the box speaks",
+		fn = function()
+			-- No `config device` section and no interface carrying `device`
+			-- means old netifd, where the interface IS the bridge.
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "lan", "interface")
+				c:set("network", "lan", "ifname", "eth0")
+				c:set("network", "lan", "proto", "static")
+				ucihelper.ensure_vlan_network("eth1", 20)
+				local iface = db.network.openuf_vlan20
+				assert_eq(iface.type, "bridge", "the interface itself is the bridge")
+				assert_eq(iface.ifname, "eth1.20", "with the tagged uplink as its member")
+				assert_eq(iface.proto, "none", "proto none")
+				assert_eq(db.network.openuf_brdev20, nil,
+					"and no `config device` section, which old netifd cannot read")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config reloads the network only when a VLAN changed",
+		fn = function()
+			with_ucihelper(function(db, cmds)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				local resp = {
+					radio_table = {},
+					vap_table = {{ssid = "iot", radio = "radio0", security = "wpa2",
+						x_passphrase = "hunter22", vlan_enabled = true, vlan = 20}},
+				}
+				local cfg = {net = {lan_cpueth = "eth1"}}
+				ucihelper.apply_config(resp, cfg)
+				local reloads = 0
+				for _, c in ipairs(cmds) do
+					if c:find("network reload", 1, true) then reloads = reloads + 1 end
+				end
+				assert_eq(reloads, 1, "the new bridge is pushed to netifd")
+
+				-- Steady state: the controller re-sends the same config every
+				-- inform. Reloading the network each time bounces the uplink
+				-- and with it the inform connection.
+				local before = #cmds
+				ucihelper.apply_config(resp, cfg)
+				local again = 0
+				for i = before + 1, #cmds do
+					if cmds[i]:find("network reload", 1, true) then again = again + 1 end
+				end
+				assert_eq(again, 0, "an unchanged push issues no network reload")
 			end)
 		end
 	},
