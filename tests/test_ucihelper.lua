@@ -317,6 +317,72 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: wpa3.ft.status alone still enables 802.11r",
+		fn = function()
+			with_ucihelper(function(db)
+				-- The controller asked for FT on the SAE akm while the
+				-- WLAN-level toggle is off. OpenWrt has one switch, so the
+				-- request is honoured rather than dropped -- ignoring it
+				-- would silently deny roaming the controller enabled.
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2/wpa3",
+						 x_passphrase = "hunter22",
+						 fast_roaming_enabled = false,
+						 wpa3_fast_roaming_enabled = true},
+					},
+				}, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.ieee80211r, "1",
+					"FT enabled from the SAE toggle alone")
+				assert_eq(db.wireless.openuf_radio0_corp.mobility_domain,
+					ucihelper.derive_mobility_domain("corp"),
+					"and the mobility domain comes with it")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: wpa3.ft.status=disabled does not drop FT the WLAN asked for",
+		fn = function()
+			with_ucihelper(function(db)
+				-- The inexpressible case: FT-PSK wanted, FT-SAE not. OpenWrt
+				-- cannot split them, so FT stays on -- dropping it would
+				-- break roaming for every WPA2 client on the WLAN.
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2/wpa3",
+						 x_passphrase = "hunter22",
+						 fast_roaming_enabled = true,
+						 wpa3_fast_roaming_enabled = false},
+					},
+				}, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.ieee80211r, "1",
+					"FT kept for the akm that did ask for it")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: both FT toggles off leaves 802.11r off",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2/wpa3",
+						 x_passphrase = "hunter22",
+						 fast_roaming_enabled = false,
+						 wpa3_fast_roaming_enabled = false},
+					},
+				}, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.ieee80211r, nil,
+					"neither toggle set -- no ieee80211r written")
+				assert_eq(db.wireless.openuf_radio0_corp.mobility_domain, nil,
+					"and no mobility domain")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: derive_mobility_domain is stable across independent APs",
 		fn = function()
 			with_ucihelper(function(db)

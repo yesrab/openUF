@@ -487,7 +487,8 @@ an **absent block means disabled** — there is generally no explicit `status=fa
 | `wpa.key.<k>.mgmt` | AKM set (`WPA-PSK`, `SAE`, …). **This**, not `wpa`, is what distinguishes SAE. |
 | `pmf.status` / `pmf.mode` | 802.11w. `mode` is `0`\|`1`\|`2` (disabled/optional/required), mapping 1:1 onto hostapd's `ieee80211w`. On this madwifi model, **WPA2/WPA3 transition intent is carried entirely by these fields** — dropping them silently collapses mixed mode to plain WPA2. |
 | `pmf.cipher` | `AES-128-CMAC`. Not translated — hostapd's default BIP group-mgmt cipher already is this. |
-| `ft.status` | Fast Roaming (802.11r). **The only FT field on the wire** — no `mobility_domain`/`r0kh`/`r1kh`, which the controller computes and syncs internally across the site. `ucihelper.derive_mobility_domain()` fills that gap locally. |
+| `ft.status` | Fast Roaming (802.11r) for the WLAN. No `mobility_domain`/`r0kh`/`r1kh` on the wire — the controller computes and syncs those internally across the site; `ucihelper.derive_mobility_domain()` fills the gap locally. |
+| `wpa3.ft.status` | FT for the **SAE akm alone**, a separate toggle from `ft.status`, from the wlanconf's `isWpa3SaeFastRoamingEnabled()`. Emitted unconditionally on any SAE push (the first key `OXMua` writes) and absent otherwise. OpenWrt has one `ieee80211r` switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK **and** FT-SAE together, so openUF enables FT if *either* toggle asks and logs the disagreement. |
 | `bss_transition` | 802.11v. Present on every band's block, flips independently of Fast Roaming. |
 | `br.devname` | `br0` untagged, **`br0.<vlan>`** when the WLAN is assigned to a VLAN network. This suffix is the *only* VLAN signal — there is no `network_table`/`networkconf_id` join anywhere in the wire format. |
 | `sae.anti_clogging` / `sae.sync` | Plain integers, emitted only when > 0 **and** the WLAN is genuinely WPA3 (see below). |
@@ -504,10 +505,13 @@ n = wlan.getInt("sae_anti_clogging", -1); if (n > 0) emit "aaa.<idx>.sae.anti_cl
 s = wlan.getInt("sae_sync", -1);          if (s > 0) emit "aaa.<idx>.sae.sync" = s
 ```
 
-but is only *called* when `wlan.isWpa3() || wlan.isOn6GHzBand()`. `isWpa3()` reads a distinct
-admin-facing DB flag `wpa3_support` (default false) — **not** the "WPA2/WPA3" mixed dropdown
-choice. So a mixed-mode WLAN never emits either key, even with non-default values saved
-server-side. openUF maps these to hostapd's `sae_anti_clogging_threshold` / `sae_sync`
+but is only *called* when `wlan.isWpa3() || wlan.isOn6GHzBand()`. `isWpa3()` reads the DB flag
+`wpa3_support`, which the **"WPA2/WPA3" dropdown does set** — read live from this site's
+wlanconf: `wpa3_support: true`, `wpa3_transition: true`, `pmf_mode: optional`. (An earlier
+revision of this document claimed the mixed choice left `wpa3_support` false and that a mixed
+WLAN therefore never emits these keys. Wrong: the WLAN-side gate passes; what suppresses the
+whole SAE block is the *per-device radio* capability check described in the WPA3 section.)
+openUF maps these to hostapd's `sae_anti_clogging_threshold` / `sae_sync`
 (the older name, still the broadly-supported one across the OpenWrt/wpad versions targeted).
 
 ### `wireless.<n>.*` — per-SSID radio binding and behavior
@@ -1206,6 +1210,49 @@ supports, outbound.
 
 So on 10.4.57 there is **no known payload field by which an emulated device can
 unlock WPA3**; the decision rests on controller-side data about the model.
+
+### What a transition-mode push looks like
+
+Reconstructed from the emitters rather than captured, since no openUF device can
+provoke one. Two classes produce it — `com.ubnt.service.config.eWivisHeQsnaqDtx`
+for the WLAN block (prefix recipe `aaa.`, so keys are `aaa.<idx>.…`) and
+`com.ubnt.service.config.ubntconf.OXMua` for the SAE sub-block — both behind the
+same gate, `com.ubnt.service.config.j.rYtJfMBbtgWvku`:
+**`isWpa3() || radioBand == 6E`** (that second clause is why 6 GHz always gets
+WPA3). The key-mgmt method in full:
+
+```java
+String mgmt = "WPA-PSK";
+if (gate(wlan)) {
+    mgmt = "SAE";                       // replaces — never appended
+    OXMua.emit(sb, wlan, "aaa." + i);   // the sae.* / wpa3.ft.status block
+}
+emit("aaa." + i, "wpa.key.1.mgmt", mgmt, "wpa.psk", wlan.getWpaPreSharedKey());
+```
+
+For a WPA2/WPA3 WLAN with PMF Optional and 802.11r on, that yields:
+
+```
+aaa.1.wpa=2                       # stays 2 — WPA3 never makes this 3
+aaa.1.wpa.1.pairwise=CCMP         # the legacy flag is inverted under WPA3, so never "TKIP CCMP"
+aaa.1.wpa.key.1.mgmt=SAE          # replaces WPA-PSK; both never appear together
+aaa.1.wpa.psk=<psk>
+aaa.1.wpa3.support=enabled
+aaa.1.wpa3.transition=enabled     # "disabled" here means WPA3-only
+aaa.1.wpa3.ft.status=enabled
+aaa.1.pmf.status=enabled  aaa.1.pmf.mode=1  aaa.1.pmf.cipher=<cipher>
+aaa.1.ft.status=enabled
+```
+
+plus, only when the site actually sets them: `sae.anti_clogging` / `sae.sync`
+(each when > 0), `sae.groups.<n>.group` with `sae.has_groups=enabled` (from
+`sae_groups`), `sae.psk.<n>.psk`/`.mac`/`.id`/`.vlan` (SAE private PSKs), and
+`wpa3.enhanced_192=enabled` for EAP with Enhanced 192-bit.
+
+**The structural trap:** `SAE` *replaces* `WPA-PSK` — the wire never carries
+both, so the AKM set alone cannot distinguish transition mode from WPA3-only.
+Only `wpa3.transition` does. Reading the AKM by itself provisions a mixed WLAN
+as pure WPA3 and locks out every WPA2 client.
 
 ### The device side works — verified end-to-end
 

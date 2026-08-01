@@ -367,7 +367,7 @@ Settings carried through from the controller:
 | WPA2 / WPA3 / WPA2-WPA3 mixed | derived from the pushed AKM set, not a single flag |
 | WPA-Enterprise (802.1X) | **not supported** — the WLAN is skipped and logged. The wire protocol carries no RADIUS server/port/secret to write, so there is nothing openUF could provision |
 | PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
-| Fast Roaming (802.11r) | `ieee80211r` |
+| Fast Roaming (802.11r) | `ieee80211r`. The controller carries **two** toggles — `ft.status` for the WLAN and `wpa3.ft.status` for the SAE akm alone (SAE pushes only). OpenWrt has one switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK *and* FT-SAE together, so FT is enabled if **either** asks for it and a disagreement is logged |
 | BSS Transition (802.11v) | `bss_transition` — **needs a full `wpad` build** |
 | Band Steering | `usteer` config, not a hostapd option |
 | Auto/Custom DTIM Period | `dtim_period` |

@@ -1740,6 +1740,35 @@ return {
 		end
 	},
 	{
+		name = "inform packet: aaa.<n>.wpa3.ft.status is parsed as its own tri-state",
+		fn = function()
+			-- A separate toggle from ft.status: the SAE emitter
+			-- (com.ubnt.service.config.ubntconf.OXMua) writes it on every
+			-- SAE push from isWpa3SaeFastRoamingEnabled(). "disabled" must
+			-- survive as false, not collapse to nil -- nil means "the
+			-- controller said nothing", which is a different instruction.
+			local base = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "aaa.1.wpa.key.1.mgmt=SAE\naaa.1.wpa3.support=enabled\n"
+				.. "aaa.1.wpa3.transition=enabled\naaa.1.ft.status=enabled\n"
+			local tail = "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+
+			local _, vt = inform._parse_wifi_system_cfg(
+				base .. "aaa.1.wpa3.ft.status=enabled\n" .. tail)
+			assert_eq(vt[1].wpa3_fast_roaming_enabled, true, "enabled -> true")
+
+			local _, vt2 = inform._parse_wifi_system_cfg(
+				base .. "aaa.1.wpa3.ft.status=disabled\n" .. tail)
+			assert_eq(vt2[1].wpa3_fast_roaming_enabled, false,
+				"disabled -> false, NOT nil (an and/or idiom would lose this)")
+
+			local _, vt3 = inform._parse_wifi_system_cfg(base .. tail)
+			assert_eq(vt3[1].wpa3_fast_roaming_enabled, nil,
+				"absent -> nil, so non-SAE pushes are untouched")
+			assert_eq(vt3[1].fast_roaming_enabled, true,
+				"the WLAN-level ft.status is read independently")
+		end
+	},
+	{
 		name = "inform packet: wpa3.support without transition is WPA3-only",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"

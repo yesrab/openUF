@@ -776,7 +776,27 @@ function M.apply_config(resp, cfg, opts)
 			if vap.disabled ~= nil then
 				extra.disabled = vap.disabled and "1" or "0"
 			end
-			if vap.fast_roaming_enabled then
+			-- The controller carries two independent FT toggles: ft.status
+			-- for the WLAN and wpa3.ft.status for the SAE akm alone (the
+			-- latter only on SAE pushes, so nil elsewhere). OpenWrt cannot
+			-- express the split -- one ieee80211r switch feeds hostapd's
+			-- key_mgmt, and on sae-mixed it yields FT-PSK *and* FT-SAE
+			-- together. So enable FT if either toggle asks for it: that
+			-- honours every explicit "enabled" and never silently drops a
+			-- capability the controller requested. Warn when they disagree,
+			-- because the extra akm is ours, not the controller's.
+			local ft_enabled = vap.fast_roaming_enabled
+			if vap.wpa3_fast_roaming_enabled ~= nil
+				and vap.wpa3_fast_roaming_enabled ~= (vap.fast_roaming_enabled or false) then
+				ft_enabled = true
+				io.stderr:write(string.format(
+					"openuf: %s: ft.status=%s but wpa3.ft.status=%s -- OpenWrt cannot "
+						.. "enable 802.11r for one akm only, enabling it for both\n",
+					tostring(vap.ssid),
+					vap.fast_roaming_enabled and "enabled" or "disabled",
+					vap.wpa3_fast_roaming_enabled and "enabled" or "disabled"))
+			end
+			if ft_enabled then
 				extra.ieee80211r = "1"
 				extra.mobility_domain = M.derive_mobility_domain(vap.ssid)
 				extra.ft_psk_generate_local = "1"

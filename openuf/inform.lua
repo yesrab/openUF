@@ -1699,6 +1699,13 @@ function M._parse_wifi_system_cfg(sys_raw)
 			-- bcfilt.status is emitted whenever the control is on, including
 			-- with an empty allow-list; the per-entry keys only appear once
 			-- the list is non-empty.
+			-- Tri-state on purpose: absent (nil) is not the same as
+			-- "disabled" here -- see wpa3_fast_roaming_enabled below.
+			local wpa3_ft
+			if a["wpa3.ft.status"] ~= nil then
+				wpa3_ft = (a["wpa3.ft.status"] == "enabled")
+			end
+
 			local bcfilt_macs
 			for k, val in pairs(w) do
 				local idx = k:match("^bcfilt%.(%d+)%.mac$")
@@ -1721,6 +1728,16 @@ function M._parse_wifi_system_cfg(sys_raw)
 				wlanconf_id           = a.id,
 				x_passphrase          = a["wpa.psk"],
 				fast_roaming_enabled  = (a["ft.status"] == "enabled"),
+				-- aaa.<n>.wpa3.ft.status: FT for the SAE akm specifically,
+				-- a SEPARATE toggle from ft.status. Confirmed from the
+				-- emitter (com.ubnt.service.config.ubntconf.OXMua, first
+				-- key it writes): emitted unconditionally -- "enabled" or
+				-- "disabled" -- whenever the WLAN goes out as SAE, from
+				-- the wlanconf's isWpa3SaeFastRoamingEnabled(). nil when
+				-- absent, which is every non-SAE push, so a plain WPA2
+				-- WLAN is unaffected. See apply_wifi_config for why the
+				-- two toggles are merged rather than honoured separately.
+				wpa3_fast_roaming_enabled = wpa3_ft,
 				vlan_enabled          = vlan_id ~= nil,
 				vlan                  = vlan_id,
 				-- aaa.<n>.bss_transition: CONFIRMED live 2026-07-15 (toggled
