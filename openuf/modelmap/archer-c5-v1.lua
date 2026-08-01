@@ -67,17 +67,33 @@ dev.conf.net = {
 dev.conf.led = "green:system"
 
 -- Switch layout (AR8327, swconfig-era ath79).
--- Physical port 5 is the uplink socket on this unit; ports 1-4 are the LAN
--- sockets. Only ports named here can ever be VLAN-assigned.
+--
+-- Read off the board's own stock config rather than assumed: VLAN 2 (WAN) is
+-- `ports '1 6'` and physical port 1 is the one socket that never shows link
+-- on a unit cabled as an AP, so **physical 1 is the WAN socket and the four
+-- LAN sockets are 2-5**. CPU port 0 serves the LAN side (eth1), CPU port 6
+-- the WAN side (eth0).
+--
+-- An earlier revision here had lan1..lan4 = 1..4, which put "lan1" on the WAN
+-- port and left the fourth LAN socket unaddressable. Latent while no port
+-- carried a swport, but it surfaced the moment a tagged SSID needed a trunk:
+-- the generated port string tagged the WAN socket and skipped a LAN one.
+--
+-- NOT verified: which *labelled* socket (LAN1..LAN4 on the case) maps to
+-- which physical number -- TP-Link boards commonly reverse them. Only the
+-- SET is confirmed. To settle it, watch `swconfig dev switch0 show | grep -A1
+-- "^Port"` while moving one cable between sockets. Nothing openUF does today
+-- depends on the ordering (the trunk tags every LAN port); a per-port VLAN
+-- assignment would, so confirm before adding `swport` to dev.conf.net.ports.
 dev.conf.vlan = {
 	cpu_lan	= 0,
 	cpu_wan	= 6,
 	ports	= {
-		lan1	= 1,
-		lan2	= 2,
-		lan3	= 3,
-		lan4	= 4,
-		wan		= 5,
+		lan1	= 2,
+		lan2	= 3,
+		lan3	= 4,
+		lan4	= 5,
+		wan		= 1,
 	}
 }
 

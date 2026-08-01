@@ -134,6 +134,51 @@ return {
 			assert_eq(dev.conf.net.ports[1].ifname, "eth1", "the uplink is eth1, not eth0")
 			assert_true(dev.conf.net.ports[1].uplink, "flagged as the uplink")
 			assert_eq(dev.conf.led, "green:system", "LED name set so Locate works")
+
+			-- Switch port map, read off this board's own stock config: VLAN 2
+			-- (WAN) is `ports '1 6'`, so physical 1 is the WAN socket and the
+			-- LAN sockets are 2-5. The map said lan1..lan4 = 1..4 until a
+			-- tagged SSID needed a trunk and the generated port string tagged
+			-- the WAN socket while skipping a LAN one. No generic invariant
+			-- can catch that -- which physical port faces which socket is
+			-- board truth, not derivable from the table -- so it is pinned
+			-- here, by the board.
+			assert_eq(dev.conf.vlan.ports.wan, 1, "physical 1 is the WAN socket")
+			local lan = {}
+			for i = 1, 4 do lan[#lan + 1] = dev.conf.vlan.ports["lan" .. i] end
+			table.sort(lan)
+			assert_eq(table.concat(lan, ","), "2,3,4,5", "the LAN sockets are 2-5")
+			assert_eq(dev.conf.vlan.cpu_lan, 0, "eth1 hangs off CPU port 0")
+		end
+	},
+	{
+		name = "modelmap: a board's LAN ports never collide with its WAN port",
+		fn = function()
+			-- The trunk a tagged SSID needs is built from dev.conf.vlan.ports,
+			-- tagging every LAN entry. Getting the map wrong therefore tags a
+			-- socket facing a different network and skips one that matters --
+			-- which is exactly what the Archer map did (lan1..lan4 = 1..4
+			-- while physical 1 is the WAN socket), latent right up until the
+			-- first VLAN SSID.
+			each_modelmap(function(name, dev)
+				local vlan = dev.conf.vlan
+				if vlan == nil or vlan.ports == nil then return end
+				local wan = vlan.ports.wan
+				local seen = {}
+				for label, phys in pairs(vlan.ports) do
+					assert_true(type(phys) == "number",
+						name .. ": vlan.ports." .. label .. " is a physical port number")
+					assert_nil(seen[phys],
+						name .. ": physical port " .. tostring(phys) .. " is mapped twice")
+					seen[phys] = label
+					if label ~= "wan" and wan ~= nil then
+						assert_true(phys ~= wan,
+							name .. ": " .. label .. " must not be the WAN port")
+					end
+					assert_true(phys ~= vlan.cpu_lan and phys ~= vlan.cpu_wan,
+						name .. ": " .. label .. " must not be a CPU port")
+				end
+			end)
 		end
 	},
 }
