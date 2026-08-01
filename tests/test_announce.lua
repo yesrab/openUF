@@ -204,22 +204,41 @@ return {
 	{
 		name = "announce: get_hostname returns the trimmed first line of `hostname`",
 		fn = function()
-			local orig = announce._popen
+			-- Both sources must be stubbed. get_hostname reads
+			-- /proc/sys/kernel/hostname first (OpenWrt has no `hostname`
+			-- applet), and on any Linux host -- notably CI -- that file
+			-- really exists, so stubbing only _popen tests nothing and the
+			-- assertion fails against the runner's own hostname.
+			local orig_popen, orig_read = announce._popen, announce._read_file
+			announce._read_file = function() return nil end
 			announce._popen = function() return "myap\n" end
 			local got = announce.get_hostname()
-			announce._popen = orig
-			assert_eq(got, "myap", "hostname read and trimmed")
+
+			-- /proc wins when present, and is trimmed the same way.
+			announce._read_file = function() return "procap\n" end
+			local from_proc = announce.get_hostname()
+
+			announce._popen, announce._read_file = orig_popen, orig_read
+			assert_eq(got, "myap", "falls back to `hostname` when /proc has none")
+			assert_eq(from_proc, "procap", "/proc/sys/kernel/hostname preferred")
 		end
 	},
 	{
 		name = "announce: get_hostname returns nil for empty or failed output",
 		fn = function()
-			local orig = announce._popen
+			-- Same reason as above: /proc must be stubbed away too, or a
+			-- Linux host answers before the empty _popen is ever reached.
+			local orig_popen, orig_read = announce._popen, announce._read_file
+			announce._read_file = function() return nil end
 			announce._popen = function() return "" end
 			local empty = announce.get_hostname()
 			announce._popen = function() return "   \n" end
 			local blank = announce.get_hostname()
-			announce._popen = orig
+			announce._read_file = function() return "  \n" end
+			announce._popen = function() return "" end
+			local blank_proc = announce.get_hostname()
+			announce._popen, announce._read_file = orig_popen, orig_read
+			assert_nil(blank_proc, "whitespace-only /proc -> nil, not a blank hostname")
 			assert_nil(empty, "empty output -> nil (caller falls back to openUF)")
 			assert_nil(blank, "whitespace-only output -> nil")
 		end
