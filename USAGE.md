@@ -376,7 +376,7 @@ Settings carried through from the controller:
 | Multicast and Broadcast Blocker | nftables rules, not a hostapd option (plus `openuf_bcfilt`/`openuf_bcfilt_macs` on the section for visibility) |
 | Proxy ARP | `proxy_arp` — **needs a full `wpad` build** |
 | Client Isolation | `isolate` (hostapd `ap_isolate`) |
-| Network / VLAN assignment | a `br0.<vlan>` bridge + tagged sub-interface |
+| Network / VLAN assignment | a per-VLAN bridge (`br-openuf<id>`) holding the tagged uplink sub-device (`eth1.<id>`), which the VAP joins — plus a `switch_vlan` trunk on swconfig boards. See below |
 | Channel, TX power | `wifi-device` channel/txpower; the controller's **Auto** channel is written as the literal `channel=auto`, engaging hostapd ACS (the AP surveys the band at radio bring-up and picks the least-busy channel). **Auto** TX power *deletes* the `txpower` option (UCI has no auto value; absent = driver default/max), so reverting from a fixed dBm actually takes effect |
 | Radio enable/disable (TX Power → Disabled) | `wifi-device` `disabled`; the radio's WLANs get `wifi-iface` `disabled` too, keeping their config for a later re-enable |
 | Channel width | `wifi-device` htmode, from the radio's `ieee_mode` token, **clamped to what the radio can actually do** — see below |
@@ -404,6 +404,36 @@ If `iw` is unavailable or its output can't be parsed, the controller's value is
 written through unchanged rather than clamped to a guess. The same probe supplies
 each radio's real `max_txpower` (the ceiling the controller's TX Power slider
 uses) instead of a static default.
+
+**VLAN-tagged SSIDs** (assigning a WiFi network to a non-native network) need three
+things on the AP, and openUF builds all three:
+
+1. a tagged sub-device on the uplink — `eth1.<vlan>`;
+2. a **bridge** holding it, `br-openuf<vlan>`, which the VAP joins. This is the part
+   that is easy to miss: point the VAP's network at the bare sub-device instead and
+   netifd brings the interface up, `ip link` shows both netdevs, hostapd starts, and a
+   client associates and gets *nothing* — because the VAP and the uplink are two
+   separate masterless interfaces. Everything looks healthy except `ip link`'s missing
+   `master`;
+3. on swconfig boards, a `switch_vlan` **trunk** so the switch passes the VID at all.
+   Without it an ASIC that filters unknown VIDs drops every frame (confirmed: 100%
+   packet loss on an AR8327 until the entry existed). openUF tags the CPU port and every
+   LAN port, deliberately not just the uplink — which socket is the uplink is not
+   knowable from config, and it changes when someone moves a cable. `pvid` is untouched,
+   so untagged wired clients are unaffected.
+
+> **Keep VLAN ids below the switch's VLAN table size.** netifd has no `vid` option
+> (`strings /sbin/netifd` lists only `vlan` and `ports`), so a `switch_vlan` section's
+> `vlan` value is *both* the table slot and the VLAN id. Small switches have small
+> tables — the TL-WDR3500's AR8229 reports `vlans: 16` in `swconfig dev switch0 help` —
+> and a section naming a slot the hardware lacks is skipped by netifd **silently**.
+> openUF reads that size and logs the mismatch instead of writing config that will be
+> ignored. Whether it actually breaks traffic depends on the ASIC: the AR8327 filters
+> unknown VIDs and needs the entry, the AR8229 forwards them and the SSID works without
+> one. Choosing a VLAN id under 16 keeps both boards properly configured.
+
+Changing a network's VLAN id, or deleting the WLAN, tears the old bridge and interface
+down again — only `openuf_`-prefixed sections are ever removed.
 
 **Per-port VLAN assignment** must be switched on twice: once on the device
 (Devices → *AP* → Settings → IP Settings → **Port VLAN**, which is what flips the wire's

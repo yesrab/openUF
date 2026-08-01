@@ -490,13 +490,39 @@ an **absent block means disabled** — there is generally no explicit `status=fa
 | `ft.status` | Fast Roaming (802.11r) for the WLAN. No `mobility_domain`/`r0kh`/`r1kh` on the wire — the controller computes and syncs those internally across the site; `ucihelper.derive_mobility_domain()` fills the gap locally. |
 | `wpa3.ft.status` | FT for the **SAE akm alone**, a separate toggle from `ft.status`, from the wlanconf's `isWpa3SaeFastRoamingEnabled()`. Emitted unconditionally on any SAE push (the first key `OXMua` writes) and absent otherwise. OpenWrt has one `ieee80211r` switch feeding hostapd's `key_mgmt`, and on `sae-mixed` it yields FT-PSK **and** FT-SAE together, so openUF enables FT if *either* toggle asks and logs the disagreement. |
 | `bss_transition` | 802.11v. Present on every band's block, flips independently of Fast Roaming. |
-| `br.devname` | `br0` untagged, **`br0.<vlan>`** when the WLAN is assigned to a VLAN network. This suffix is the *only* VLAN signal — there is no `network_table`/`networkconf_id` join anywhere in the wire format. |
+| `br.devname` | `br0` untagged, **`br0.<vlan>`** when the WLAN is assigned to a VLAN network — CONFIRMED live 2026-08-01, the first capture of a tagged WLAN on real hardware. This suffix is the *only* per-WLAN VLAN signal; there is no `network_table`/`networkconf_id` join anywhere in the wire format. |
 | `sae.anti_clogging` / `sae.sync` | Plain integers, emitted only when > 0 **and** the WLAN is genuinely WPA3 (see below). |
 | `driver` | `madwifi` — confirms the controller is talking to this model as madwifi-era firmware, which explains several value encodings below. |
 
-A VLAN assignment also produces companion `vlan.*` (`vlan.1.devname=eth0`, `vlan.1.id=20`),
-`bridge.*`, and `netconf.*` blocks. openUF does not need to reproduce these — real hardware's
-OpenWrt network stack builds them from the UCI config `ucihelper` writes.
+A VLAN assignment also produces companion `vlan.*`, `bridge.*` and `netconf.*` blocks.
+**The `bridge.*` block is a specification, not decoration** — an earlier revision of this
+document said openUF "does not need to reproduce these", which cost a live debugging
+session. Captured 2026-08-01 when a WLAN was put on VLAN 20:
+
+```
+bridge.1.devname=br0            bridge.2.devname=br0.20
+bridge.1.port.1.devname=eth0    bridge.2.port.1.devname=ath2      ← the vap
+bridge.1.port.2.devname=ath0    bridge.2.port.2.devname=eth0.20   ← the tagged uplink
+bridge.1.port.3.devname=ath1    bridge.2.stp.status=disabled
+```
+
+That second bridge is exactly the L2 a tagged SSID needs, and openUF must build the
+equivalent (`br-openuf<vlan>` holding `<cpueth>.<vlan>`, with the VAP joined to it).
+Skipping it yields a VAP and an uplink sub-device that are both up and completely
+unconnected: the client associates and gets no DHCP, no gateway, nothing, while UCI,
+netifd and hostapd all look correct.
+
+`netconf.*` blocks are per-device-interface and stay anchored: the AP's own IP settings
+remained at `netconf.1` (`devname=br0`) with the VLAN's entries taking later indices, so
+inform.lua's `^netconf%.1%.` anchor is safe against a VLAN being added.
+
+**Provisioning is not driven by `cfgversion` alone.** A device reporting a stale or bogus
+version sometimes gets an immediate full push and sometimes only `noop`s, indefinitely,
+even across restarts and fresh random values. An empty string is ignored outright. The
+reliable trigger is a real config change in the controller — and note that a UI form
+failing validation (e.g. switching a 2.4-GHz-only WLAN to Manual, where Band Steering
+demands two bands) saves nothing and pushes nothing, with no error surfaced beyond the
+form itself.
 
 **SAE gating.** `com.ubnt.service.config.ubntconf.OXMua`'s emitter is capability-gate-free:
 
