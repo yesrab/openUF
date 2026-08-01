@@ -1027,6 +1027,46 @@ return {
 		end
 	},
 	{
+		name = "inform json: radio_table carries radio_caps2 bit 0x1 -- the WPA3 gate",
+		fn = function()
+			-- This bit is the ONLY thing that makes the controller provision
+			-- WPA3/SAE to a device. Traced through the 10.4.57 bytecode:
+			-- the config generator (QSAkfnbfInKJ) calls radio.CVir(), which
+			-- is (1 & ZPjpXpgFhJSgqk().orElse(0)) == 1; that accessor returns
+			-- impl field iBjnA, fed from builder field SuUD, whose only
+			-- setter the radio parser calls with getInt("radio_caps2").
+			-- radio_caps goes somewhere else entirely (builder kJeOrfqt ->
+			-- impl DbisCuTqoItCGd -> accessor FJaWnIAautY, the MIMO column).
+			--
+			-- Confirmed live end-to-end 2026-08-01 on real hardware: with
+			-- this field absent every WPA3 WLAN was silently downgraded to
+			-- WPA-PSK; adding it flipped the very next push to
+			-- wpa.key.1.mgmt=SAE + wpa3.support/transition + sae.*, and both
+			-- APs came up with hostapd key_mgmt "SAE FT-SAE WPA-PSK
+			-- WPA-PSK-SHA256 FT-PSK". Losing this bit re-breaks WPA3
+			-- entirely, and nothing else on the wire would say so.
+			-- Gated on real SAE support, so both arms are pinned: claiming
+			-- the bit on a build whose hostapd cannot do SAE would make the
+			-- controller push a config the radio then fails to start.
+			local prev = inform._sysinfo._sae_supported_cache
+			inform._sysinfo._sae_supported_cache = true
+			local d = build({with_uci = true, with_radio_caps = true})
+			assert_eq(#d.radio_table > 0, true, "fixture produced radios")
+			for _, r in ipairs(d.radio_table) do
+				assert_eq(r.radio_caps2, 0x1,
+					"SAE-capable: radio_caps2 bit 0x1 set, so the controller provisions WPA3")
+			end
+
+			inform._sysinfo._sae_supported_cache = false
+			local d2 = build({with_uci = true, with_radio_caps = true})
+			for _, r in ipairs(d2.radio_table) do
+				assert_eq(r.radio_caps2, 0,
+					"no SAE: the bit is NOT claimed, so no unrunnable config is pushed")
+			end
+			inform._sysinfo._sae_supported_cache = prev
+		end
+	},
+	{
 		name = "inform json: scan_radio_table reports neighboring networks per radio",
 		fn = function()
 			-- Confirmed real field names via the decompiled controller's

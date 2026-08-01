@@ -1118,10 +1118,11 @@ Everything not listed above is measured from the running system. Several fields
 were all constants or misparsed values until the first real-hardware run
 surfaced them; they are now read from `iw`, sysfs and `/proc`.
 
-### WPA3 is silently downgraded to WPA2 — the radio must claim the SAE bit
+### WPA3 was silently downgraded to WPA2 — the radio must claim the SAE bit — FIXED
 
-A WLAN set to **WPA2/WPA3** in the UI reaches openUF as plain WPA2, and nothing
-anywhere says so. The captured `system_cfg` contains no `sae`, no `wpa3`, just:
+Before `radio_caps2` was sent (see below), a WLAN set to **WPA2/WPA3** in the UI
+reached openUF as plain WPA2, and nothing anywhere said so. The captured
+`system_cfg` contained no `sae`, no `wpa3`, just:
 
 ```
 aaa.1.wpa=2
@@ -1151,65 +1152,93 @@ if (wlanconf.isWpa3()) {                      // wlanconf field wpa3_support
 So a **transition-mode** WLAN degrades quietly, while a **WPA3-only** WLAN would
 be dropped from the device altogether with that one server-side log line.
 
-`CVir()` tests **bit `0x1`** of the radio's capability integer (the class reads
-both `radio_caps` and `radio_caps2`). openUF sends `radio_caps` for the MIMO
-column only — `0x8`/`0x10`/`0x20`/`0x4000000` for 1x1…4x4 — and no `radio_caps2`
-at all, so bit `0x1` is clear either way and every WPA3 WLAN is downgraded on
-every openUF device.
+`CVir()` tests **bit `0x1` of `radio_caps2`** — see the next section for the
+field-level trace. openUF used to send `radio_caps` (the MIMO column:
+`0x8`/`0x10`/`0x20`/`0x4000000` for 1x1…4x4) and **no `radio_caps2` at all**, so
+the bit was clear and every WPA3 WLAN was downgraded on every openUF device.
+That is fixed: `radio_caps2 = 0x1` now ships on each SAE-capable radio.
 
 The emission side is gated separately, on the WLAN alone
 (`com.ubnt.service.config.j.rYtJfMBbtgWvku`: `isWpa3() || band == 6E`), and
 produces `wpa3.support=enabled` + `wpa3.transition=enabled|disabled` — the keys
 openUF's `_parse_wifi_system_cfg` would need to read, since **SAE never arrives
 as a `wpa.key.<n>.mgmt` value**. `SECURITY_MAP`'s `wpa3` → `sae` and
-`wpa2/wpa3` → `sae-mixed` entries are therefore unreachable today: no producer
-emits the strings that select them. (An earlier note in this document read the
+`wpa2/wpa3` → `sae-mixed` entries were unreachable for exactly as long as the
+capability bit was missing; both are now exercised on real hardware. (An earlier note in this document read the
 PMF keys as the controller's way of signalling WPA3-mixed for a madwifi-driver
 model. That was wrong — PMF is just PMF, and the real signal is these two keys.)
 
-### What that capability is, and why openUF cannot assert it
+### The capability is `radio_caps2` bit `0x1` — RESOLVED
 
-`CVir()` tests bit `0x1` of a capability integer built by
-`com.ubnt.g.f.e.VVyiC`'s factory, which reads `radio_caps` / `radio_caps2` off
-the radio object. **Both were set live, on real hardware, and neither changed
-the outcome** — the next push still carried `wpa.key.1.mgmt=WPA-PSK`.
-
-The radio capabilities the generator consults come from the controller's own
-model registry, not from the inform:
-
-```java
-getModel().<radiosByBand>().getOrDefault(band, EMPTY_DEVICE_MODEL_RADIO)
-```
-
-Reading the persisted device back from `/api/s/default/stat/device` settles it
-from the other end. openUF sends `radio_caps`, `wpa3_supported` and
-`owe_supported` on every radio; only the first survives:
+`CVir()` is a bit test, and tracing which field backs it settles the whole
+question. The chain, all from the 10.4.57 bytecode:
 
 ```
-192.168.200.3  radio0/na: radio_caps=32 radio_caps2=0 wpa3_supported=undefined owe=undefined nss=3
-192.168.200.2  radio0/ng: radio_caps=16 radio_caps2=0 wpa3_supported=undefined owe=undefined nss=2
+config gen (QSAkfnbfInKJ)   calls radio.CVir()
+CVir()                      = (1 & ZPjpXpgFhJSgqk().orElse(0)) == 1
+ZPjpXpgFhJSgqk()            -> impl field iBjnA          (com.ubnt.g.f.e.jRsSex)
+iBjnA                       <- builder field SuUD
+SuUD                        <- setter rMxwXnPhhdotvjERKoA(int)
+that setter is called with  getInt("radio_caps2")        ← the wire field
 ```
 
-`radio_caps` round-trips verbatim (nss 3 → `0x20` = 32, nss 2 → `0x10` = 16 —
-exactly what `RADIO_CAPS_MIMO_BIT` emits), so the ingestion of that DTO is
-working. `wpa3_supported` and `owe_supported` are simply **dropped**: the
-controller never stores them.
+`radio_caps` lands somewhere else entirely — builder `kJeOrfqt` → impl
+`DbisCuTqoItCGd` → accessor `FJaWnIAautY()`, which is the MIMO column and
+nothing more. **The two capability integers are not interchangeable, and the one
+that gates WPA3 is the one openUF never sent.** It arrived as `0` on every
+inform (the parser's `getInt` default), `0` fails the bit test, and so every
+WPA3 WLAN was silently downgraded on every openUF device.
 
-That is consistent with the bytecode. The only class carrying that
-literal (`com.ubnt.net.k.aI.jRsSex`, a record of `wpa3Supported` /
-`band6GHzSupported` / `oweSupported`) is **constructed, never parsed**: its
-single caller builds it from an injected `com.ubnt.service.wifi.AcrQJeJCScLn`
-service and ignores the device object it is handed. It describes what the site
-supports, outbound.
+**Confirmed live end-to-end, 2026-08-01, real hardware.** Sending
+`radio_caps2 = 0x1` (gated on `sysinfo.sae_supported()`) flipped the very next
+config push:
 
-> An earlier revision of this document claimed that setting `wpa3_supported`
-> flipped a push from `WPA-PSK` to `SAE`. That observation was real but the
-> attribution was wrong — it was a coincidental config regeneration, and has
-> never reproduced, including across a clean re-adoption with the field present
-> from the very first inform.
+```
+aaa.1.wpa.key.1.mgmt=SAE          (was WPA-PSK)
+aaa.1.wpa3.support=enabled
+aaa.1.wpa3.transition=enabled
+aaa.1.wpa3.ft.status=disabled
+aaa.1.sae.anti_clogging=5   aaa.1.sae.sync=5
+```
 
-So on 10.4.57 there is **no known payload field by which an emulated device can
-unlock WPA3**; the decision rests on controller-side data about the model.
+and both APs came up controller-driven, no manual step:
+
+```
+UCI:     encryption='sae-mixed'  ieee80211w='1'  ieee80211r='1'
+         sae_sync='5'  sae_anti_clogging_threshold='5'
+hostapd: wpa_key_mgmt = SAE FT-SAE WPA-PSK WPA-PSK-SHA256 FT-PSK
+```
+
+Note the push also carries `wpa3.ft.status=disabled` alongside `ft.status=enabled`
+— the exact disagreement case described in the [`aaa.<n>` table](#aaan--per-ssid-security-and-behavior).
+
+#### What was wrong before, and why
+
+Three earlier claims in this document are now retracted:
+
+1. *"`wpa3_supported` is the gate."* It is not read at all — see below.
+2. *"`radio_caps`/`radio_caps2` bit `0x1` were both set live with no effect."*
+   The conclusion was wrong. Whatever that experiment actually set, sending
+   `radio_caps2 = 0x1` from the radio-table builder works reproducibly on both
+   APs. Suspected cause: the config was never regenerated, so no push followed
+   — a device-state change alone does not trigger one. Clearing the stored
+   `cfgversion` and restarting forces a full push, which is how this was tested.
+3. *"The capability comes from the controller's model registry, so no payload
+   field can unlock WPA3."* The model registry exists —
+   `getModel().radiosByBand().getOrDefault(band, EMPTY_DEVICE_MODEL_RADIO)`,
+   with the U6-InWall's entry mapping `BAND_NA→2400`, `BAND_NG→570` — but it
+   returns `com.ubnt.g.f.VVyiC`, a **different type** from the device radio DTO
+   `com.ubnt.g.f.e.VVyiC` that `CVir()` is invoked on. It is not on this path.
+   Checking the receiver type is what broke the deadlock.
+
+`wpa3_supported` genuinely is inert, and that part stands: the only class
+carrying the literal (`com.ubnt.net.k.aI.jRsSex`, a record of `wpa3Supported` /
+`band6GHzSupported` / `oweSupported`) is **constructed, never parsed** — built
+from an injected `com.ubnt.service.wifi` service, ignoring the device parameter
+— and reading the persisted device back confirms it: `radio_caps` round-trips
+verbatim while `wpa3_supported` and `owe_supported` come back `undefined`.
+openUF still sends it, because it is truthful and another version may read it,
+but it unlocks nothing.
 
 ### What a transition-mode push looks like
 
@@ -1256,9 +1285,8 @@ as pure WPA3 and locks out every WPA2 client.
 
 ### The device side works — verified end-to-end
 
-Independently of whether the controller will send it, feeding a real captured
-transition-mode `system_cfg` through openUF produces correct mixed mode on real
-hardware:
+With the capability bit in place the controller sends transition mode of its own
+accord, and openUF provisions it correctly on real hardware:
 
 ```
 UCI:     encryption='sae-mixed'

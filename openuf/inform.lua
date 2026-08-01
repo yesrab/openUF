@@ -642,6 +642,29 @@ function M.build_json(st, cfg, ufhw)
 						radio.wpa3_supported = false
 					end
 					radio.owe_supported       = false
+					-- radio_caps2 bit 0x1: THE WPA3 GATE. Traced end to
+					-- end through the 10.4.57 bytecode:
+					--
+					--   config gen (QSAkfnbfInKJ) calls radio.CVir()
+					--   CVir()  = (1 & ZPjpXpgFhJSgqk().orElse(0)) == 1
+					--   ZPjpXpgFhJSgqk() -> impl field iBjnA
+					--   iBjnA <- builder field SuUD
+					--   SuUD  <- setter rMxwXnPhhdotvjERKoA(int)
+					--   which the radio parser feeds from "radio_caps2"
+					--
+					-- radio_caps goes to a DIFFERENT field (builder kJeOrfqt
+					-- -> impl DbisCuTqoItCGd -> accessor FJaWnIAautY), which
+					-- is the MIMO column and nothing else. So the capability
+					-- that decides WPA3 lives in the one radio field openUF
+					-- never sent -- it arrived as 0 on every inform, and 0
+					-- fails the bit test, so every WPA3 WLAN was downgraded.
+					-- Gated on real SAE support for the same reason as
+					-- wpa3_supported: never claim what hostapd cannot run.
+					if M._sysinfo.sae_supported and M._sysinfo.sae_supported() then
+						radio.radio_caps2 = 0x1
+					else
+						radio.radio_caps2 = 0
+					end
 				end
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 				-- min_rssi (outbound field, confirmed via decompile alongside
