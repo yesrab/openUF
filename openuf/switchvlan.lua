@@ -43,6 +43,15 @@ local M = {}
 
 -- Injectable, matching netconfig.lua/shaper.lua's convention.
 M._exec = function(cmd) return os.execute(cmd) end
+-- Injectable stdout capture, for read-only switch introspection (the VLAN
+-- table size). Same seam name and shape as ucihelper's.
+M._popen = function(cmd)
+	local h = io.popen(cmd .. " 2>/dev/null")
+	if not h then return "" end
+	local s = h:read("*a")
+	h:close()
+	return s or ""
+end
 M._uci  = nil   -- set by callers/tests; falls back to require("uci")
 
 local OPENUF_VLAN_PREFIX = "openuf_swvlan"
@@ -110,13 +119,69 @@ function M.build_ports(cfg, vlan_id, members)
 	return table.concat(parts, " ")
 end
 
+-- Port string trunking one VLAN up to the SoC and out of every LAN socket:
+-- the CPU port plus every mapped physical port, all tagged.
+--
+-- A VLAN-tagged SSID is useless without this. The bridge can be perfect and
+-- the VAP up, and the switch still drops every VID it has no entry for once
+-- `enable_vlan 1` is set -- which is the stock config on both validated
+-- boards. Confirmed live: with the bridge in place and no VLAN 20 entry,
+-- pinging the IoT gateway over the tagged interface lost 100% of packets;
+-- adding this exact string took it to 0%.
+--
+-- Tagging every port rather than just the uplink is deliberate. Which socket
+-- carries the uplink is not knowable from config -- it moved from physical
+-- port 5 to port 2 on the validation AP between two runs of this very
+-- feature, simply because a cable was replugged. `pvid` is untouched, so
+-- every socket keeps its untagged VLAN and ordinary wired clients see no
+-- change; the only effect is that a tagged frame for this VLAN is now
+-- carried wherever it arrives.
+function M.trunk_ports(cfg, vlan_id)
+	local cpu = cfg and cfg.vlan and cfg.vlan.cpu_lan
+	local ports = cfg and cfg.vlan and cfg.vlan.ports
+	if not (cpu and ports) then return nil end
+	local phys = {}
+	for name, n in pairs(ports) do
+		-- The WAN socket is not part of the LAN trunk: it faces a different
+		-- network entirely, and on the validated boards it sits in its own
+		-- stock VLAN on the other CPU port.
+		if name ~= "wan" and tonumber(n) then phys[#phys + 1] = tonumber(n) end
+	end
+	if #phys == 0 then return nil end
+	table.sort(phys)
+	local parts = {tostring(cpu) .. "t"}
+	for _, n in ipairs(phys) do parts[#parts + 1] = tostring(n) .. "t" end
+	return table.concat(parts, " ")
+end
+
+-- How many VLAN table entries this switch has, or nil when unknown.
+-- `swconfig dev <sw> help` opens with e.g.
+--   switch0: mdio.0:1f(Atheros AR8229), ports: 5 (cpu @ 0), vlans: 16
+-- and that number is a hard limit on the VLAN ID openUF can program, because
+-- netifd on these builds has NO `vid` option -- `strings /sbin/netifd` lists
+-- `vlan` and `ports` and nothing else -- so the section's `vlan` value is
+-- used as BOTH the table slot and the VLAN ID. Asking for VLAN 20 on a
+-- 16-entry table therefore cannot work: netifd skips the section without a
+-- word, which is exactly how it presented on the second validation AP.
+function M.vlan_table_size(cursor, device)
+	local out = M._popen(("swconfig dev %s help"):format(device or "switch0"))
+	local n = tostring(out or ""):match("vlans:%s*(%d+)")
+	return n and tonumber(n) or nil
+end
+
 -- Apply a parsed switch table.
 -- sw:  output of inform.M._parse_switch_system_cfg (may be nil)
 -- cfg: device configuration (dev.conf)
 -- st:  openUF state table, used as the reversibility ledger
+-- wireless_vlans: array of VLAN ids carried by tagged SSIDs on this device.
+--   These need a trunk whether or not the controller's per-port VLAN feature
+--   is in use, so their presence alone is enough to run this function. Kept
+--   here rather than in a module of its own so that ONE place owns every
+--   switch_vlan section -- two writers would race to define the same VID.
 -- Returns true when UCI was changed and a reload was issued.
-function M.apply(sw, cfg, st)
-	if not sw or not sw.enabled then return false end
+function M.apply(sw, cfg, st, wireless_vlans)
+	local has_wireless = wireless_vlans and #wireless_vlans > 0
+	if (not sw or not sw.enabled) and not has_wireless then return false end
 	if not (cfg and cfg.vlan and cfg.vlan.ports and cfg.vlan.cpu_lan) then
 		io.stderr:write("switchvlan: no dev.conf.vlan for this board -- "
 			.. "per-port VLAN not applied (a guessed switch port map strands the device)\n")
@@ -139,7 +204,7 @@ function M.apply(sw, cfg, st)
 
 	-- Invert the per-port matrix into per-VLAN membership.
 	local members_by_vlan = {}
-	for port_idx, p in pairs(sw.ports) do
+	for port_idx, p in pairs((sw and sw.enabled and sw.ports) or {}) do
 		local phys, why = M.physical_port(cfg, port_idx)
 		if not phys then
 			io.stderr:write(("switchvlan: skipping port_idx %d (%s)\n")
@@ -176,6 +241,17 @@ function M.apply(sw, cfg, st)
 		desired[vlan_id] = M.build_ports(cfg, vlan_id, members)
 	end
 
+	-- Tagged SSIDs' VLANs. A per-port assignment for the same VID wins: it
+	-- names specific sockets and may mark one untagged, which a blanket trunk
+	-- would override. The trunk only fills in VIDs nothing else defines, so
+	-- the two features compose instead of fighting over a section.
+	for _, vlan_id in ipairs(wireless_vlans or {}) do
+		local vid = tonumber(vlan_id)
+		if vid and not desired[vid] then
+			desired[vid] = M.trunk_ports(cfg, vid)
+		end
+	end
+
 	-- Stock-section strips: moving a port onto an openuf VLAN means it must
 	-- LEAVE the stock VLAN's port list too -- swconfig allows one untagged
 	-- VLAN per port, and a port left untagged in stock VLAN 1 while also
@@ -197,7 +273,7 @@ function M.apply(sw, cfg, st)
 	--     port (same survival principle as the members_by_vlan guard).
 	local untagged_home = {}  -- phys -> vlan_id it becomes untagged in
 	local excluded      = {}  -- vlan_id -> { [phys] = true }
-	for port_idx, p in pairs(sw.ports) do
+	for port_idx, p in pairs((sw and sw.enabled and sw.ports) or {}) do
 		local phys = M.physical_port(cfg, port_idx)
 		if phys then
 			for vlan_id, mode in pairs(p.vlans) do
@@ -289,10 +365,32 @@ function M.apply(sw, cfg, st)
 
 		for vlan_id, ports in pairs(desired) do
 			local section = OPENUF_VLAN_PREFIX .. tostring(vlan_id)
-			if cursor:get("network", section, "ports") ~= ports then
+			local cap = M.vlan_table_size(cursor, cfg.vlan.device)
+			if cap and vlan_id >= cap then
+				-- Not necessarily fatal: whether it matters depends on the
+				-- ASIC. Confirmed live on both validated boards -- the
+				-- AR8327 drops tagged frames for a VID it has no entry for
+				-- (100% loss until the trunk existed), while the AR8229
+				-- forwards them and the tagged SSID works with no entry at
+				-- all. So this is reported as a fact, not a failure.
+				io.stderr:write(("switchvlan: VLAN %d exceeds this switch's %d-entry "
+					.. "VLAN table -- netifd has no `vid` option, so the id doubles "
+					.. "as the table slot; leaving this VLAN unprogrammed. If a "
+					.. "tagged SSID on it does not pass traffic, this switch filters "
+					.. "unknown VIDs and the VLAN id must be below %d\n")
+					:format(vlan_id, cap, cap))
+			elseif cursor:get("network", section, "ports") ~= ports then
 				cursor:set("network", section, "switch_vlan")
 				cursor:set("network", section, "device",
 					(cfg.vlan.device) or "switch0")
+				-- `vlan` is the switch's VLAN TABLE INDEX, not the VLAN ID --
+				-- the single most confusing thing about swconfig, and openUF
+				-- had it wrong. Small switches have few entries (the WDR3500's
+				-- AR8229 reports "vlans: 16"), so writing vlan='20' names a
+				-- slot that does not exist: netifd skips the section in
+				-- silence, no log line, and the VLAN is simply never
+				-- programmed. It only appeared to work on the Archer because
+				-- its AR8327 has a table big enough for index 20 to be real.
 				cursor:set("network", section, "vlan", tostring(vlan_id))
 				cursor:set("network", section, "ports", ports)
 				changed = true

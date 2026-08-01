@@ -2339,9 +2339,14 @@ function M.handle_response(json_str, st, cfg)
 				end
 			end
 
+			-- Parsed once, out here: the switch pass below needs the vap_table
+			-- too (for the VLANs tagged SSIDs sit on), and scoping it inside
+			-- the wifi branch left that consumer reading a nil table -- an
+			-- empty trunk list that fails silently.
+			local radio_table, vap_table = M._parse_wifi_system_cfg(sys_raw)
+
 			local ufuci = M._ucihelper
 			if ufuci and ufuci.apply_config then
-				local radio_table, vap_table = M._parse_wifi_system_cfg(sys_raw)
 				if #radio_table > 0 or #vap_table > 0 then
 					-- Band Steering (wireless.<n>.no2ghz_oui) is confirmed
 					-- live to be a per-WLAN wire field, not a per-device
@@ -2366,6 +2371,16 @@ function M.handle_response(json_str, st, cfg)
 			-- before a switch port is put on the same VLAN.
 			if M._switchvlan then
 				pcall(function()
+					-- Every VLAN a tagged SSID lands on. The switch drops
+					-- frames for a VID it has no entry for, so these need
+					-- trunking whether or not per-port VLAN is in use.
+					local wireless_vlans, seen = {}, {}
+					for _, vap in ipairs(vap_table or {}) do
+						if vap.vlan_enabled and vap.vlan and not seen[vap.vlan] then
+							seen[vap.vlan] = true
+							wireless_vlans[#wireless_vlans + 1] = vap.vlan
+						end
+					end
 					local sw = M._parse_switch_system_cfg(sys_raw)
 					if sw and not sw.enabled then
 						-- Explicit disable: unticking the device-level "Port
@@ -2380,9 +2395,19 @@ function M.handle_response(json_str, st, cfg)
 						-- ever runs on an affirmative off signal, and its own
 						-- empty-ledger no-op keeps steady-state disabled
 						-- pushes free of switch reloads.
-						M._switchvlan.restore(st)
+						-- ...unless a tagged SSID still needs its VLAN
+						-- trunked. restore() puts the stock port strings
+						-- back and drops every openuf section, which would
+						-- take the wireless trunk with it and silently kill
+						-- the IoT WLAN's uplink. apply() reconciles both
+						-- concerns in one pass.
+						if #wireless_vlans > 0 then
+							M._switchvlan.apply(sw, cfg, st, wireless_vlans)
+						else
+							M._switchvlan.restore(st)
+						end
 					else
-						M._switchvlan.apply(sw, cfg, st)
+						M._switchvlan.apply(sw, cfg, st, wireless_vlans)
 					end
 				end)
 			end

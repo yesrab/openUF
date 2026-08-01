@@ -787,6 +787,56 @@ return {
 		end
 	},
 	{
+		name = "inform packet: a tagged SSID's VLAN reaches switchvlan as a trunk request",
+		fn = function()
+			-- The switch drops frames for a VID it has no entry for, so a
+			-- VLAN-tagged SSID needs a trunk even with the controller's
+			-- per-port VLAN feature switched off entirely. Confirmed live:
+			-- bridge correct, VAP up, 100% packet loss to the VLAN's gateway
+			-- until the trunk existed.
+			--
+			-- This also pins the scope bug it was written for: vap_table used
+			-- to be local to the wifi branch, so the switch pass read nil and
+			-- silently trunked nothing while every test still passed.
+			local st = sample_state()
+			local got
+			local orig = inform._switchvlan
+			inform._switchvlan = {
+				apply   = function(_, _, _, vlans) got = vlans end,
+				restore = function() end,
+			}
+			local sys_cfg = "aaa.1.ssid=Home IoT\naaa.1.wpa=2\n"
+				.. "aaa.1.wpa.key.1.mgmt=WPA-PSK\naaa.1.br.devname=br0.20\n"
+				.. "wireless.1.ssid=Home IoT\nwireless.1.parent=radio1\n"
+			local resp = ('{"_type":"setparam","system_cfg":"%s"}')
+				:format(sys_cfg:gsub("\n", "\\n"))
+			inform.handle_response(resp, st, nil)
+			inform._switchvlan = orig
+			assert_true(got ~= nil, "switchvlan is handed a vlan list")
+			assert_eq(#got, 1, "one tagged SSID -> one VLAN to trunk")
+			assert_eq(got[1], 20, "the VLAN off aaa.<n>.br.devname=br0.20")
+		end
+	},
+	{
+		name = "inform packet: an untagged-only push asks for no trunk",
+		fn = function()
+			local st = sample_state()
+			local got
+			local orig = inform._switchvlan
+			inform._switchvlan = {
+				apply   = function(_, _, _, vlans) got = vlans end,
+				restore = function() end,
+			}
+			local sys_cfg = "aaa.1.ssid=Home LAN\naaa.1.br.devname=br0\n"
+				.. "wireless.1.ssid=Home LAN\nwireless.1.parent=radio1\n"
+			local resp = ('{"_type":"setparam","system_cfg":"%s"}')
+				:format(sys_cfg:gsub("\n", "\\n"))
+			inform.handle_response(resp, st, nil)
+			inform._switchvlan = orig
+			assert_eq(#(got or {}), 0, "br0 with no suffix -> nothing to trunk")
+		end
+	},
+	{
 		name = "inform packet: _report_dropped_keys summarizes unrecognized keys by prefix",
 		fn = function()
 			-- The feedback loop that macacl.*/qos.vap.* needed: no tokenizer

@@ -23,7 +23,14 @@ local function new_mock_uci()
 
 	function cursor:get(config, section, key)
 		local s = db[config] and db[config][section]
-		return s and s[key]
+		local v = s and s[key]
+		-- Real libuci returns (nil, "Entry not found") for a miss. Mirroring
+		-- that matters: a caller writing tonumber(cursor:get(...)) without
+		-- parens passes the message string as tonumber's base and throws on
+		-- the very first run. A single-value mock made that unreachable in
+		-- tests and it only surfaced on real hardware.
+		if v == nil then return nil, "Entry not found" end
+		return v
 	end
 
 	function cursor:foreach(config, stype, fn)
@@ -130,6 +137,9 @@ return {
 				assert_true(switchvlan.apply(override(), CFG, st), "apply reports a change")
 				local sec = u.db.network.openuf_swvlan20
 				assert_not_nil(sec, "openuf_swvlan20 section created")
+				-- netifd on these builds has no `vid` option (confirmed with
+				-- `strings /sbin/netifd`), so this value is both the table
+				-- slot and the VLAN ID -- see vlan_table_size.
 				assert_eq(sec.vlan, "20", "VLAN id written")
 				assert_eq(sec.ports, "0t 1", "port 2 (physical 1) untagged, CPU tagged")
 				assert_eq(sec.device, "switch0", "bound to the switch device")
@@ -402,6 +412,108 @@ return {
 				bare.ports = {}
 				assert_false(switchvlan.apply(bare, CFG, {}), "gate on but no override")
 				assert_eq(#cmds, 0, "no command in any case")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: a tagged SSID's VLAN gets trunked even with per-port VLAN off",
+		fn = function()
+			-- The IoT-network case. Per-port VLAN is untouched in the
+			-- controller (sw is nil), but a WLAN sits on VLAN 20, and the
+			-- switch drops every VID it has no entry for once enable_vlan is
+			-- set -- the stock config on both validated boards. Confirmed
+			-- live: 100% loss to the VLAN's gateway without this section, 0%
+			-- with it.
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				assert_true(switchvlan.apply(nil, CFG, {}, {20}),
+					"a wireless VLAN alone is reason enough to program the switch")
+				local sec = u.db.network.openuf_swvlan20
+				assert_true(sec ~= nil, "a switch_vlan section is written for VLAN 20")
+				assert_eq(sec.vlan, "20", "for the right VID")
+				-- CPU tagged, every LAN socket tagged, WAN left out. Which
+				-- socket is the uplink is not knowable -- it moved between two
+				-- runs on the validation AP when a cable was replugged.
+				assert_eq(sec.ports, "0t 1t 2t 3t 4t",
+					"CPU + every LAN port tagged, WAN socket excluded")
+				assert_eq(#cmds, 1, "one network reload")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: a per-port assignment wins over the blanket trunk for the same VID",
+		fn = function()
+			-- Both features can name VLAN 20. Two sections for one VID is a
+			-- config the switch cannot honour, so the specific one -- which
+			-- may mark a socket untagged -- takes it.
+			with_capture(function()
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				local sw = override()
+				sw.ports = {[2] = {vlans = {[20] = "untagged"}}}
+				switchvlan.apply(sw, CFG, {}, {20})
+				assert_eq(u.db.network.openuf_swvlan20.ports, "0t 1",
+					"the per-port membership, not the trunk")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: no wireless VLAN and no switch push changes nothing",
+		fn = function()
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				assert_false(switchvlan.apply(nil, CFG, {}, {}), "empty vlan list")
+				assert_false(switchvlan.apply(nil, CFG, {}, nil), "no vlan list at all")
+				assert_eq(#cmds, 0, "no reload, no section")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: a VLAN beyond the switch's table is refused, loudly",
+		fn = function()
+			-- The AR8229 on the second validation AP reports "vlans: 16".
+			-- netifd has no `vid` option, so the section's `vlan` is both the
+			-- table slot and the VLAN ID: asking for 20 on a 16-entry table
+			-- writes a section netifd skips in total silence. Better to say
+			-- so than to leave a WLAN that associates and passes nothing.
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				local orig = switchvlan._popen
+				switchvlan._popen = function()
+					return "switch0: mdio.0:1f(Atheros AR8229), ports: 5 (cpu @ 0), vlans: 16\n"
+				end
+				local msg = {}
+				local real = io.stderr
+				io.stderr = {write = function(_, s) msg[#msg + 1] = s end}
+				local ok = pcall(switchvlan.apply, nil, CFG, {}, {20})
+				io.stderr = real
+				switchvlan._popen = orig
+				assert_true(ok, "no error thrown")
+				assert_nil(u.db.network.openuf_swvlan20,
+					"no section written -- netifd would ignore it anyway")
+				assert_eq(#cmds, 0, "and no pointless reload")
+				assert_contains(table.concat(msg), "exceeds this switch",
+					"the reason is logged")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: a VLAN inside the table is programmed normally",
+		fn = function()
+			with_capture(function()
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				local orig = switchvlan._popen
+				switchvlan._popen = function()
+					return "switch0: ports: 5 (cpu @ 0), vlans: 16\n"
+				end
+				switchvlan.apply(nil, CFG, {}, {8})
+				switchvlan._popen = orig
+				assert_not_nil(u.db.network.openuf_swvlan8, "VLAN 8 fits in 16 entries")
+				assert_eq(u.db.network.openuf_swvlan8.vlan, "8", "written as the id")
 			end)
 		end
 	},
