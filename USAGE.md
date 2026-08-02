@@ -433,10 +433,26 @@ things on the AP, and openUF builds all three:
    `master`;
 3. on swconfig boards, a `switch_vlan` **trunk** so the switch passes the VID at all.
    Without it an ASIC that filters unknown VIDs drops every frame (confirmed: 100%
-   packet loss on an AR8327 until the entry existed). openUF tags the CPU port and every
-   LAN port, deliberately not just the uplink — which socket is the uplink is not
-   knowable from config, and it changes when someone moves a cable. `pvid` is untouched,
-   so untagged wired clients are unaffected.
+   packet loss on an AR8327 until the entry existed). openUF tags exactly two ports —
+   the CPU port and the uplink socket, the latter found at runtime by
+   `sysinfo.uplink_phys_port()`. That is the whole path a tagged SSID's frames take
+   (`VAP → br-openuf<id> → eth0.<id> → CPU → uplink → gateway`); no LAN socket is on it.
+   If the uplink cannot be resolved openUF leaves any existing trunk alone rather than
+   guessing.
+
+> **Why not simply tag every socket.** openUF used to, and it broke every untagged
+> wired client behind an AP running a tagged SSID. On the `ar8216`/`ar8226`/`ar8229`/
+> `ar8236` driver family the tag flag is **not** per (port, VLAN): `ar8xxx_sw_set_ports()`
+> folds it into one global per-port bitmask (`priv->vlan_tagged`) from which
+> `__ar8216_setup_port()` picks add-tag vs strip-tag *for every VLAN at once*. Tagging a
+> socket into VLAN 10 therefore made it egress-tagged in VLAN 1 too, and the printer
+> plugged into it went deaf while still transmitting — UCI read `1 2 3 4 0t` while the
+> switch reported `0t 1t 2t 3t 4t`. The AR8327 has a real per-(port, VLAN) tag table and
+> showed none of it, which is how the bug survived. A consequence worth knowing on the
+> global-bitmask chips: a port cannot be untagged in VLAN 1 *and* tagged in VLAN 10, so
+> running a tagged wireless VLAN necessarily leaves the **uplink** socket egress-tagged
+> for VLAN 1 as well. UniFi gateways accept that, and it is confined to the one port
+> facing the gateway.
 
 > **Keep VLAN ids below the switch's VLAN table size.** netifd has no `vid` option
 > (`strings /sbin/netifd` lists only `vlan` and `ports`), so a `switch_vlan` section's

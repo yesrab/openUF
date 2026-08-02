@@ -282,6 +282,71 @@ openUF now does that once at startup when the attribute exists and reads 0
 
 ---
 
+## A tagged SSID's trunk deafened every wired client on the AP — FIXED
+
+2026-08-02, same two APs. The user reported a printer at a static `192.168.200.11`, cabled
+into the Bedroom AP, that nothing could reach and that never appeared in the controller UI.
+It was an openUF bug, and the printer was only the visible half of it — a second host on
+another socket had been dead the same way, unnoticed.
+
+The printer was alive and talking: the AP's switch had learned its MAC in the ARL on
+physical port 2, and that was the MAC the laptop's ARP cache held for `.11`. Frames got
+*from* it and never *to* it.
+
+**UCI and the switch disagreed**, which is the tell:
+
+| | UCI `switch_vlan` for VLAN 1 | live `swconfig dev switch0 show` |
+|---|---|---|
+| WDR3500 — **AR8229**, `vlans: 16` | `1 2 3 4 0t` (sockets untagged) | `0t 1t 2t 3t 4t` — **all tagged** |
+| Archer C5 — **AR8327**, `vlans: 4096` | `0 1 2 3 4 5` | `0 1t 2 3 4 5` — as written |
+
+Both APs carried an identical `openuf_swvlan10` trunk of `0t 1t 2t 3t 4t`, written by
+`switchvlan.trunk_ports()` for the tagged IoT SSID. Only the AR8229 let it bleed into
+VLAN 1.
+
+**On the `ar8216`/`ar8226`/`ar8229`/`ar8236` driver family, tagging is not a property of
+(port, VLAN) — it is one global per-port bitmask.** `ar8xxx_sw_set_ports()` does
+
+```c
+if (p->flags & (1 << SWITCH_PORT_FLAG_TAGGED))
+        priv->vlan_tagged |= (1 << p->id);
+```
+
+and `__ar8216_setup_port()` reads that single bitmask to choose `AR8216_OUT_ADD_VLAN` vs
+`AR8216_OUT_STRIP_VLAN`, for every VLAN at once. So marking socket 2 tagged for VLAN 10
+made it egress-tagged in VLAN 1 too, and the untagged printer dropped every frame. The
+AR8327 escapes this because `ar8327.c` overrides the get/set-ports ops with a real
+per-(port, VLAN) tag table — which is exactly why the bug shipped: **it is invisible on
+the board the feature was developed against.**
+
+The fix trunks only the CPU port and the uplink socket, which is the entire path a tagged
+SSID's frames take. The old code's stated reason for tagging everything — that the uplink
+socket is not knowable from config — had gone stale: `sysinfo.uplink_phys_port()` measures
+it from the switch's own ARL, and `switchvlan.apply()` already had the answer in hand.
+When it cannot be resolved openUF now holds any existing trunk rather than guessing;
+letting a transient nil fall through to the reconcile pass would delete a working trunk
+and reload, then rewrite it on the next inform, bouncing the IoT WLAN in a loop.
+
+Verified live on both boards. WDR3500: VLAN 1 back to `0t 1 2 3 4t`, printer and the
+second host answering ICMP from the AP and from a laptop two hops away. Archer C5: VLAN 1
+untouched, VLAN 10 down from `0t 2t 3t 4t 5t` to `0t 2t`. On both, a one-shot
+`udhcpc -i br-openuf10` still took a lease from the VLAN 20 gateway, so the feature the
+trunk exists for is intact.
+
+**A hardware limit that follows, and cannot be fixed in software.** On a global-bitmask
+chip a port cannot be untagged in VLAN 1 *and* tagged in VLAN 10. Running a tagged
+wireless VLAN therefore leaves the **uplink** socket egress-tagged for VLAN 1 as well —
+visible above as the `4t` in `0t 1 2 3 4t`. The UCG Ultra accepts tagged VLAN 1 on that
+port (it is the live, working state), and the effect is confined to the one socket facing
+the gateway rather than every socket facing a client.
+
+**Generalising:** this is the third finding in the same shape as the first real-hardware
+run — config that reads perfectly and hardware that does something else. A `swconfig`
+port string is a *request*; `swconfig dev <sw> show` is the only account of what the ASIC
+actually holds, and the two must be compared on each chip family, not one.
+
+---
+
 ## Controller behaviors that are not openUF bugs
 
 Each of these cost real investigation time at least once.
@@ -1479,7 +1544,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 1 | Adopt (L2/SSH, L3/mgmt_cfg) | SSH `syswrapper.sh set-adopt`, or `authkey` in `mgmt_cfg` | ✅ Confirmed both paths |
 | 2 | Baseline post-adopt inform | `setparam` + `mgmt_cfg` | ✅ Confirmed |
 | 3 | SSID push (no VLAN) | `system_cfg` `aaa.*`/`wireless.*`/`radio.*` | ✅ Confirmed |
-| 4 | VLAN-tagged network + SSID assignment | `aaa.<n>.br.devname = br0.<vlan>` | ✅ Confirmed |
+| 4 | VLAN-tagged network + SSID assignment | `aaa.<n>.br.devname = br0.<vlan>` | ✅ Confirmed. The switch trunk carries the CPU port and the uplink socket only — tagging the LAN sockets deafens untagged wired clients on `ar8216`-family switches, where the tag flag is one global per-port bitmask |
 | 5 | Fast Roaming (802.11r) | `aaa.<n>.ft.status` only | ✅ Confirmed by byte-for-byte `system_cfg` diff, both directions |
 | 6 | TX power / channel per radio | `radio.<n>.channel`/`.txpower`/`.txpower_mode` | ✅ Confirmed |
 | 7 | Locate | `cmd:"set-locate"` | ✅ Confirmed, including the **LED hardware effect on a real board** (Archer C5, `dev.conf.led = "green:system"`): `locate_start` writes `trigger=timer` + 250/250 ms, `locate_stop` restores `trigger=none`, and the Manage → LED toggle drives `brightness` 1/0 |
