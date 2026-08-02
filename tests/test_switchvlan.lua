@@ -524,17 +524,88 @@ return {
 			with_capture(function(cmds)
 				local u = swconfig_board()
 				switchvlan._uci = u.mock
-				assert_true(switchvlan.apply(nil, CFG, {}, {20}),
+				assert_true(switchvlan.apply(nil, CFG, {}, {20}, 4),
 					"a wireless VLAN alone is reason enough to program the switch")
 				local sec = u.db.network.openuf_swvlan20
 				assert_true(sec ~= nil, "a switch_vlan section is written for VLAN 20")
 				assert_eq(sec.vlan, "20", "for the right VID")
-				-- CPU tagged, every LAN socket tagged, WAN left out. Which
-				-- socket is the uplink is not knowable -- it moved between two
-				-- runs on the validation AP when a cable was replugged.
-				assert_eq(sec.ports, "0t 1t 2t 3t 4t",
-					"CPU + every LAN port tagged, WAN socket excluded")
+				-- CPU + the uplink socket, and nothing else: that is the whole
+				-- path a tagged SSID's frames take. Tagging the other sockets
+				-- is not merely useless -- on an ar8216-family switch the tag
+				-- flag is one global per-port bitmask shared by every VLAN, so
+				-- it makes untagged wired clients on those sockets deaf.
+				assert_eq(sec.ports, "0t 4t", "CPU + uplink tagged, nothing else")
 				assert_eq(#cmds, 1, "one network reload")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: an unknown uplink holds the trunk instead of writing a guess",
+		fn = function()
+			-- Nothing to trunk through, so no section -- and emphatically not
+			-- the old fallback of tagging every socket, which is what broke
+			-- wired clients on the AR8229.
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				silently(function()
+					assert_false(switchvlan.apply(nil, CFG, {}, {20}),
+						"no uplink, no trunk, no reload")
+				end)
+				assert_true(u.db.network.openuf_swvlan20 == nil,
+					"no section is invented")
+				assert_eq(#cmds, 0, "and the network is not reloaded")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: a transient unknown uplink does not tear down a working trunk",
+		fn = function()
+			-- The flap guard. Uplink detection reads the switch ARL and
+			-- /proc/net/arp; an empty ARP cache for one inform is enough to
+			-- return nil. If that fell through to the reconcile pass it would
+			-- delete a good trunk and reload, then rewrite it on the next
+			-- inform and reload again -- bouncing the IoT WLAN forever.
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				assert_true(switchvlan.apply(nil, CFG, {}, {20}, 4), "trunk written")
+				assert_eq(u.db.network.openuf_swvlan20.ports, "0t 4t", "as expected")
+				local before = #cmds
+
+				silently(function()
+					assert_false(switchvlan.apply(nil, CFG, {}, {20}),
+						"the uplink went unknown: nothing changes")
+				end)
+				assert_true(u.db.network.openuf_swvlan20 ~= nil,
+					"the existing trunk survives an unresolvable uplink")
+				assert_eq(u.db.network.openuf_swvlan20.ports, "0t 4t", "unmodified")
+				assert_eq(#cmds, before, "and no second network reload")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: a VLAN that really left the wire is still reconciled away",
+		fn = function()
+			-- The other half of the hold: holding must not become a leak. When
+			-- the uplink IS known, a VID the push no longer names still loses
+			-- its section -- the hold has to be scoped to the unresolvable
+			-- case, not to every absence.
+			--
+			-- Moving the SSID from VLAN 20 to 30 rather than deleting it
+			-- outright, because an empty wireless_vlans with no switch push
+			-- returns before the reconcile by design; inform.lua routes that
+			-- case to restore() instead.
+			with_capture(function()
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				assert_true(switchvlan.apply(nil, CFG, {}, {20}, 4), "trunk written")
+				assert_true(switchvlan.apply(nil, CFG, {}, {30}, 4),
+					"the SSID moved to another VLAN")
+				assert_true(u.db.network.openuf_swvlan20 == nil,
+					"VLAN 20's section goes with it")
+				assert_eq(u.db.network.openuf_swvlan30.ports, "0t 4t",
+					"and VLAN 30 gets the trunk")
 			end)
 		end
 	},
@@ -585,7 +656,7 @@ return {
 				local msg = {}
 				local real = io.stderr
 				io.stderr = {write = function(_, s) msg[#msg + 1] = s end}
-				local ok = pcall(switchvlan.apply, nil, CFG, {}, {20})
+				local ok = pcall(switchvlan.apply, nil, CFG, {}, {20}, 4)
 				io.stderr = real
 				switchvlan._popen = orig
 				assert_true(ok, "no error thrown")
@@ -607,7 +678,7 @@ return {
 				switchvlan._popen = function()
 					return "switch0: ports: 5 (cpu @ 0), vlans: 16\n"
 				end
-				switchvlan.apply(nil, CFG, {}, {8})
+				switchvlan.apply(nil, CFG, {}, {8}, 4)
 				switchvlan._popen = orig
 				assert_not_nil(u.db.network.openuf_swvlan8, "VLAN 8 fits in 16 entries")
 				assert_eq(u.db.network.openuf_swvlan8.vlan, "8", "written as the id")

@@ -152,39 +152,61 @@ function M.build_ports(cfg, vlan_id, members, uplink_phys)
 	return table.concat(parts, " ")
 end
 
--- Port string trunking one VLAN up to the SoC and out of every LAN socket:
--- the CPU port plus every mapped physical port, all tagged.
+-- Port string trunking one VLAN from the SoC out to the gateway: the CPU port
+-- and the uplink socket, both tagged. Nothing else.
 --
 -- A VLAN-tagged SSID is useless without this. The bridge can be perfect and
 -- the VAP up, and the switch still drops every VID it has no entry for once
 -- `enable_vlan 1` is set -- which is the stock config on both validated
 -- boards. Confirmed live: with the bridge in place and no VLAN 20 entry,
 -- pinging the IoT gateway over the tagged interface lost 100% of packets;
--- adding this exact string took it to 0%.
+-- adding a trunk took it to 0%.
 --
--- Tagging every port rather than just the uplink is deliberate. Which socket
--- carries the uplink is not knowable from config -- it moved from physical
--- port 5 to port 2 on the validation AP between two runs of this very
--- feature, simply because a cable was replugged. `pvid` is untouched, so
--- every socket keeps its untagged VLAN and ordinary wired clients see no
--- change; the only effect is that a tagged frame for this VLAN is now
--- carried wherever it arrives.
-function M.trunk_ports(cfg, vlan_id)
+-- Those two ports are the whole path: VAP -> br-openuf<id> -> eth0.<id> ->
+-- CPU port -> uplink socket -> gateway. A LAN socket is never on it.
+--
+-- This used to tag EVERY LAN socket, on the reasoning that which one carries
+-- the uplink is not knowable and `pvid` is untouched so wired clients see no
+-- change. Both halves were wrong, and together they broke every untagged
+-- wired host behind an AP running a tagged SSID:
+--
+--   * The uplink socket IS knowable -- sysinfo.uplink_phys_port() reads it out
+--     of the switch's own ARL table, and apply() already has the answer.
+--   * On the ar8216/ar8226/ar8229/ar8236 driver family, tagging is NOT per
+--     (port, VLAN). ar8xxx_sw_set_ports() folds it into one global per-port
+--     bitmask, `priv->vlan_tagged`, and __ar8216_setup_port() picks
+--     AR8216_OUT_ADD_VLAN vs AR8216_OUT_STRIP_VLAN from that single bitmask
+--     for every VLAN at once. So tagging a socket into VLAN 10 makes it
+--     egress-tagged in VLAN 1 too, and the untagged host plugged into it
+--     stops receiving. Diagnosed live on a TL-WDR3500 (AR8229): UCI held
+--     VLAN 1 as "1 2 3 4 0t" while the switch reported "0t 1t 2t 3t 4t", and
+--     a printer on socket 2 was transmitting but deaf.
+--
+-- The Archer C5's AR8327 has a real per-(port, VLAN) tag table -- ar8327.c
+-- overrides the get/set-ports ops -- so it showed none of this, which is
+-- exactly why the bug shipped: it is invisible on the board it was written
+-- against. Trunking only what the VLAN needs is correct on both, and stops
+-- the AR8327 boards making every wired socket a tagged member of the IoT
+-- VLAN, which it had no business doing either.
+--
+-- A consequence worth knowing on the global-bitmask chips: a port cannot be
+-- untagged in VLAN 1 and tagged in VLAN 10 at the same time, so running a
+-- tagged wireless VLAN necessarily leaves the UPLINK socket egress-tagged for
+-- VLAN 1 as well. UniFi gateways accept that (it is the live, working state
+-- on the WDR3500), and it is confined to the one port facing the gateway.
+--
+-- Returns nil plus a reason when the uplink socket is not known; the caller
+-- must hold rather than guess, since guessing wrong here strands the device.
+function M.trunk_ports(cfg, vlan_id, uplink_phys)
 	local cpu = cfg and cfg.vlan and cfg.vlan.cpu_lan
 	local ports = cfg and cfg.vlan and cfg.vlan.ports
 	if not (cpu and ports) then return nil end
-	local phys = {}
-	for name, n in pairs(ports) do
-		-- The WAN socket is not part of the LAN trunk: it faces a different
-		-- network entirely, and on the validated boards it sits in its own
-		-- stock VLAN on the other CPU port.
-		if name ~= "wan" and tonumber(n) then phys[#phys + 1] = tonumber(n) end
-	end
-	if #phys == 0 then return nil end
-	table.sort(phys)
-	local parts = {tostring(cpu) .. "t"}
-	for _, n in ipairs(phys) do parts[#parts + 1] = tostring(n) .. "t" end
-	return table.concat(parts, " ")
+	if not uplink_phys then return nil, "uplink unknown" end
+	-- A board whose uplink is a netdev off its own PHY (the WDR3500's WAN
+	-- socket, say) has no switch port to trunk through; uplink_phys is nil
+	-- there and we never reach this line.
+	if tonumber(uplink_phys) == tonumber(cpu) then return tostring(cpu) .. "t" end
+	return ("%dt %dt"):format(tonumber(cpu), tonumber(uplink_phys))
 end
 
 -- How many VLAN table entries this switch has, or nil when unknown.
@@ -312,10 +334,27 @@ function M.apply(sw, cfg, st, wireless_vlans, uplink_phys)
 	-- names specific sockets and may mark one untagged, which a blanket trunk
 	-- would override. The trunk only fills in VIDs nothing else defines, so
 	-- the two features compose instead of fighting over a section.
+	--
+	-- `held` are VIDs whose trunk we cannot render right now because the
+	-- uplink socket is unknown -- a transient empty ARP cache is enough. That
+	-- is not the same as "this VLAN is gone": letting it fall through to the
+	-- reconcile below would delete a working trunk and reload the network on
+	-- one inform, then put it back on the next, bouncing the IoT WLAN in a
+	-- loop. Leave whatever is already there alone instead.
+	local held = {}
 	for _, vlan_id in ipairs(wireless_vlans or {}) do
 		local vid = tonumber(vlan_id)
 		if vid and not desired[vid] then
-			desired[vid] = M.trunk_ports(cfg, vid)
+			local ports, why = M.trunk_ports(cfg, vid, uplink_phys)
+			if ports then
+				desired[vid] = ports
+			elseif why == "uplink unknown" then
+				held[vid] = true
+				io.stderr:write(("switchvlan: VLAN %d needs a trunk but the uplink "
+					.. "socket is unknown -- leaving the existing section as it is "
+					.. "(tagging every socket instead would make wired clients on "
+					.. "this board's LAN ports egress-tagged and deaf)\n"):format(vid))
+			end
 		end
 	end
 
@@ -403,7 +442,7 @@ function M.apply(sw, cfg, st, wireless_vlans, uplink_phys)
 	local doomed = {}
 	cursor:foreach("network", "switch_vlan", function(s)
 		local vid = s[".name"] and s[".name"]:match("^" .. OPENUF_VLAN_PREFIX .. "(%d+)$")
-		if vid and desired[tonumber(vid)] == nil then
+		if vid and desired[tonumber(vid)] == nil and not held[tonumber(vid)] then
 			doomed[#doomed + 1] = s[".name"]
 		end
 	end)
