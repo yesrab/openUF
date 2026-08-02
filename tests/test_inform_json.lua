@@ -37,9 +37,15 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 		return ""
 	end
 	inform._sysinfo._run_cmd = function(cmd)
-		if with_clients and cmd:find("station dump") then
+		-- Keyed on the interface, like the real `iw dev <if> station dump`.
+		-- A blanket match would return the same stations for every netdev,
+		-- which is precisely the failure mode this suite needs to be able to
+		-- see: a second WLAN on a radio must come back empty, not with the
+		-- first WLAN's clients.
+		if with_clients and cmd:find("dev wlan0 station dump", 1, true) then
 			return fixture("iw_station_dump.txt")
 		end
+		if cmd:find("station dump") then return "" end
 		if with_clients and cmd:find("survey dump") then
 			return fixture("iw_survey_dump.txt")
 		end
@@ -88,6 +94,18 @@ local function inject_ucihelper()
 		-- that regresses back to passing vap.radio here (sta_table would
 		-- silently stay empty on every real inform).
 		get_ifname_for_radio = function(radio) if radio == "radio0" then return "wlan0" end return nil end,
+		-- Per-VAP resolution, keyed on BOTH radio and ssid, the way the real
+		-- one matches SSIDs inside a radio's interface list. Modelled per-SSID
+		-- so a second WLAN on the same radio gets its own netdev -- a mock
+		-- that ignored the ssid would happily pass a build that hands every
+		-- vap on a radio the first vap's clients, which is the live bug this
+		-- guards.
+		get_ifname_for_vap = function(radio, ssid)
+			if radio ~= "radio0" then return nil end
+			if ssid == "test" then return "wlan0" end
+			if ssid == "guest" then return "wlan0-1" end
+			return nil
+		end,
 	}
 end
 
@@ -305,6 +323,48 @@ return {
 			assert_not_nil(stats.uptime, "uptime field present")
 			-- meminfo fixture: total=131072kB, free=65536kB -> 50% used
 			assert_eq(stats.mem, "50", "mem percent computed from meminfo fixture")
+		end
+	},
+	{
+		name = "inform json: a second WLAN on the same radio does not inherit the first's clients",
+		fn = function()
+			-- The live bug: with "Home LAN" and a brand-new "Home IoT" both on
+			-- radio1, the IoT WLAN reported nine connected clients -- every one
+			-- of them the other WLAN's, showing the other network's IP
+			-- addresses in the controller UI. sta_table was resolved per RADIO
+			-- (get_ifname_for_radio returns whichever interface netifd lists
+			-- first), so every secondary vap on a radio got the first vap's
+			-- station dump, and with it the traffic counters, satisfaction and
+			-- num_sta. The device-level aggregates double-counted too.
+			inject_sysinfo(true)          -- fixture: 2 clients, on wlan0 only
+			inject_ucihelper()
+			local ufuci = inform._ucihelper
+			local orig_vaps = ufuci.get_vap_table
+			ufuci.get_vap_table = function()
+				return {
+					{name = "openuf_test", essid = "test", radio = "ng",
+					 radio_name = "radio0", encryption = "psk2", disabled = false,
+					 bssid = "aa:bb:cc:00:00:01", channel = 6, usage = "user"},
+					-- Same radio, different SSID -- the IoT case.
+					{name = "openuf_guest", essid = "guest", radio = "ng",
+					 radio_name = "radio0", encryption = "psk2", disabled = false,
+					 bssid = "aa:bb:cc:00:00:02", channel = 6, usage = "user"},
+				}
+			end
+			local st = {authkey = state.DEFAULT_KEY, adopted = true, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap"}
+			local d = cjson.decode(inform.build_json(st, nil, ufhw))
+			ufuci.get_vap_table = orig_vaps
+
+			local by_essid = {}
+			for _, v in ipairs(d.vap_table) do by_essid[v.essid] = v end
+			assert_eq(by_essid["test"].num_sta, 2,
+				"the WLAN whose netdev has the stations reports them")
+			assert_eq(by_essid["guest"].num_sta, 0,
+				"the other WLAN on the same radio reports none of them")
+			assert_eq(#by_essid["guest"].sta_table, 0,
+				"and nests no borrowed sta_table entries")
 		end
 	},
 	{

@@ -849,13 +849,30 @@ function M.build_json(st, cfg, ufhw)
 				-- entry picked up the driver's real value.
 				if live.tx_power then vap.tx_power = live.tx_power end
 			end
-			-- get_ifname_for_radio() resolves a UCI radio device name
-			-- ("radio0"/"radio1"), not the band vap.radio now reports
-			-- ("ng"/"na") -- using vap.radio here always missed, silently
-			-- leaving sta_table empty on every inform (no fake/real client
-			-- ever appeared in a vap's sta_table, regardless of the id/
-			-- wlanconf_id fix that lets vap_table itself through at all).
-			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, vap.radio_name)
+			-- Resolve THIS vap's netdev, not the radio's first one.
+			-- get_ifname_for_radio() returns whichever interface netifd
+			-- lists first, which is the same thing only on a single-SSID
+			-- radio. With two WLANs on one radio every secondary vap
+			-- inherited the first vap's station dump: a brand-new IoT SSID
+			-- with nobody on it reported nine connected clients, all of them
+			-- the other WLAN's, complete with the other network's IP
+			-- addresses. Every per-vap figure derived from `stas` below --
+			-- num_sta, the traffic and retry counters, satisfaction -- was
+			-- wrong the same way, and the device-level aggregates
+			-- double-counted those stations once per vap on the radio.
+			--
+			-- get_ifname_for_vap() matches on SSID within the radio's
+			-- interface list and needs no extra data (same ubus call, same
+			-- cjson dependency). When it cannot resolve -- no cjson, an
+			-- older netifd that omits config.ssid, a radio with several
+			-- interfaces and no match -- the vap reports NO clients rather
+			-- than someone else's: an empty sta_table understates, a
+			-- borrowed one invents associations that never happened.
+			-- `essid` is what get_vap_table() calls it -- the vap has no
+			-- `ssid` field, and passing one silently resolves to nil, which
+			-- would empty every sta_table instead of fixing anything.
+			local ok_if, ifname = pcall(ufuci.get_ifname_for_vap,
+				vap.radio_name, vap.essid)
 			local stas = {}
 			if ok_if and ifname then
 				local ok_sta, rv2 = pcall(M._sysinfo.sta_table, ifname)
