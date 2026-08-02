@@ -446,6 +446,30 @@ function M._fix_empty_arrays(json_str)
 	return json_str
 end
 
+-- One port's `mac_table`: the wired hosts a source reports, minus the two sets
+-- that are never wired clients of this AP -- its own netdev MACs, and the
+-- stations currently associated to its radios (a wireless client bridged into
+-- br-lan genuinely shows up in the bridge FDB and the switch ARL too).
+-- `source` is sysinfo.mac_table(ifname) or sysinfo.switch_mac_table(phys, arl);
+-- a failing source yields no hosts rather than aborting the payload.
+local function _filter_hosts(source, a, b, self_macs, station_macs)
+	local hosts = {}
+	local ok, found = pcall(source, a, b)
+	if not ok or type(found) ~= "table" then return hosts end
+	for _, host in ipairs(found) do
+		if not self_macs[host.mac] and not station_macs[host.mac] then
+			hosts[#hosts + 1] = {
+				mac      = host.mac,
+				ip       = host.ip,
+				hostname = host.hostname,
+				age      = host.age,
+				uptime   = host.uptime,
+			}
+		end
+	end
+	return hosts
+end
+
 -- Build the inform JSON payload.
 -- st: current state table
 -- cfg: device configuration (from conf.lua)
@@ -1151,71 +1175,127 @@ function M.build_json(st, cfg, ufhw)
 	}
 	local iface_by_name = {}
 	for _, iface in ipairs(ifaces) do iface_by_name[iface.name] = iface end
+
+	-- On a swconfig board the kernel sees only the CPU port, so every fact a
+	-- netdev can offer about "the port" is really a fact about the internal
+	-- SoC<->switch link. Ask the switch instead when the board has one and the
+	-- uplink socket can be identified; anything short of that stays on the
+	-- netdev path below rather than guessing which socket is which (see
+	-- sysinfo.switch_status / sysinfo.uplink_phys_port).
+	local sw = {ports = {}, arl = {}}
+	if cfg and cfg.vlan and cfg.vlan.ports then
+		local ok_sw, s = pcall(M._sysinfo.switch_status, cfg.vlan.device)
+		if ok_sw and type(s) == "table" then sw = s end
+	end
+	local uplink_phys = nil
+	if next(sw.ports) then
+		local ok_up, phys = pcall(M._sysinfo.uplink_phys_port, sw.arl)
+		if ok_up then uplink_phys = phys end
+	end
+	local mgmt_vlan = (cfg and cfg.net and cfg.net.lan_vlanid) or 1
+	local cpu_iface = iface_by_name[cfg and cfg.net and cfg.net.lan_cpueth]
+
 	local port_table = {}
 	for _, p in ipairs(ports) do
-		local iface = iface_by_name[p.ifname]
-		-- Link state from the kernel, not from the netdev merely existing:
-		-- an unused socket exists in /proc/net/dev and is idle, and reporting
-		-- it as a live port misleads the Ports view. Falls back to existence
-		-- only when sysfs cannot answer.
-		local link_up = M._link_up(p.ifname)
-		if link_up == nil then link_up = (iface ~= nil) end
-		local entry = {
-			port_idx    = p.idx,
-			name        = "Port " .. tostring(p.idx),
-			media       = "GE",
-			up          = link_up,
-			enable      = true,
-			-- Negotiated link speed/duplex, read from the netdev rather than
-			-- asserted: these were hardcoded 1000/full, so the controller's
-			-- Ports view showed "GbE" for every device on every board no
-			-- matter what the link had actually negotiated -- a reported
-			-- metric that was never measured at all.
-			--
-			-- NB on swconfig boards the named netdev is the CPU port, whose
-			-- link is the internal SoC<->switch one (always 1000 here); the
-			-- external socket the cable is in belongs to the switch and its
-			-- speed is only visible via swconfig. So this reports the truth
-			-- about the interface it names, which is the best any generic
-			-- reading can do -- see PROTOCOL-VALIDATION.md.
-			-- A port with no link has no negotiated speed: 0, not the fallback.
-			-- The kernel reports -1 for a down interface, which _link_speed
-			-- already discards, so without this the fallback claimed a gigabit
-			-- link on a socket with nothing plugged into it.
-			speed       = (not link_up) and 0 or (M._link_speed(p.ifname) or 1000),
-			full_duplex = link_up and (M._link_duplex(p.ifname) ~= "half") or false,
-			is_uplink   = p.uplink or false,
-			speed_caps  = 0,
-			port_poe    = false,
-			poe_caps    = 0,
-			rx_bytes    = iface and iface.rx_bytes   or 0,
-			tx_bytes    = iface and iface.tx_bytes   or 0,
-			rx_packets  = iface and iface.rx_packets or 0,
-			tx_packets  = iface and iface.tx_packets or 0,
-			rx_errors   = iface and iface.rx_errors  or 0,
-			tx_errors   = iface and iface.tx_errors  or 0,
-		}
-		-- Wired clients are only reported on downstream (non-uplink) ports --
-		-- the controller itself skips client creation on ports flagged
-		-- is_uplink, since that port faces the controller's own network, not
-		-- an end host.
-		if not entry.is_uplink then
-			local mac_table = {}
-			local ok_mt, hosts = pcall(M._sysinfo.mac_table, p.ifname)
-			if ok_mt then
-				for _, host in ipairs(hosts) do
-					if not self_macs[host.mac] and not station_macs[host.mac] then
-						mac_table[#mac_table + 1] = {
-							mac      = host.mac,
-							ip       = host.ip,
-							hostname = host.hostname,
-							age      = host.age,
-							uptime   = host.uptime,
-						}
-					end
-				end
+		local phys = uplink_phys and M._switchvlan
+			and M._switchvlan.resolve_swport(cfg, p.swport) or nil
+		local link = phys and sw.ports[phys] or nil
+
+		local entry
+		if link then
+			-- Per-socket: the speed, duplex and link state of the physical
+			-- socket a cable is actually in, and the uplink flag on whichever
+			-- socket the default gateway is reached through.
+			local is_uplink = (phys == uplink_phys)
+			-- Per-port MIB counters where the switch driver exposes them (an
+			-- AR9344 does; an AR8327 with mib polling off does not), and only
+			-- bytes -- swconfig has no per-port packet or error count. The
+			-- uplink falls back to the CPU netdev's counters, which for that
+			-- one socket are a fair proxy: everything the CPU sent or received
+			-- crossed it. A downstream socket has no such stand-in, and its
+			-- share of the CPU netdev's total is not knowable, so it reports 0
+			-- rather than a made-up number.
+			local rx_bytes, tx_bytes = link.rx_bytes, link.tx_bytes
+			local counted_iface = nil
+			if not (rx_bytes or tx_bytes) and is_uplink then
+				counted_iface = cpu_iface
+				rx_bytes = counted_iface and counted_iface.rx_bytes
+				tx_bytes = counted_iface and counted_iface.tx_bytes
 			end
-			entry.mac_table = arr(mac_table)
+			entry = {
+				port_idx    = p.idx,
+				name        = "Port " .. tostring(p.idx),
+				media       = "GE",
+				up          = link.up,
+				enable      = true,
+				speed       = link.up and (link.speed or 1000) or 0,
+				full_duplex = link.up and (link.full_duplex ~= false) or false,
+				is_uplink   = is_uplink,
+				speed_caps  = 0,
+				port_poe    = false,
+				poe_caps    = 0,
+				rx_bytes    = rx_bytes or 0,
+				tx_bytes    = tx_bytes or 0,
+				rx_packets  = counted_iface and counted_iface.rx_packets or 0,
+				tx_packets  = counted_iface and counted_iface.tx_packets or 0,
+				rx_errors   = counted_iface and counted_iface.rx_errors  or 0,
+				tx_errors   = counted_iface and counted_iface.tx_errors  or 0,
+			}
+			-- Hosts from the switch's own ARL table -- which socket each MAC
+			-- sits on, the one thing the bridge FDB cannot say. Suppressed on
+			-- the uplink (that socket faces the controller's network: every
+			-- host on the far side would be reported as plugged into this AP)
+			-- and on any socket whose pvid is not the management VLAN -- the
+			-- Archer C5's WAN socket is live but stranded on VLAN 2, and a
+			-- host there is not reachable on the LAN it would be listed in.
+			if not is_uplink and (link.pvid == nil or link.pvid == mgmt_vlan) then
+				entry.mac_table = arr(_filter_hosts(
+					M._sysinfo.switch_mac_table, phys, sw.arl, self_macs, station_macs))
+			end
+		else
+			-- Netdev-only: no switch, no swconfig, or no identifiable uplink.
+			-- Link state from the kernel, not from the netdev merely existing:
+			-- an unused socket exists in /proc/net/dev and is idle, and
+			-- reporting it as a live port misleads the Ports view. Falls back
+			-- to existence only when sysfs cannot answer.
+			local iface = iface_by_name[p.ifname]
+			local link_up = M._link_up(p.ifname)
+			if link_up == nil then link_up = (iface ~= nil) end
+			entry = {
+				port_idx    = p.idx,
+				name        = "Port " .. tostring(p.idx),
+				media       = "GE",
+				up          = link_up,
+				enable      = true,
+				-- Negotiated link speed/duplex, read from the netdev rather
+				-- than asserted: these were hardcoded 1000/full, so the
+				-- controller's Ports view showed "GbE" for every device on
+				-- every board no matter what the link had actually negotiated.
+				-- A port with no link has no negotiated speed: 0, not the
+				-- fallback. The kernel reports -1 for a down interface, which
+				-- _link_speed already discards, so without this the fallback
+				-- claimed a gigabit link on a socket with nothing in it.
+				speed       = (not link_up) and 0 or (M._link_speed(p.ifname) or 1000),
+				full_duplex = link_up and (M._link_duplex(p.ifname) ~= "half") or false,
+				is_uplink   = p.uplink or false,
+				speed_caps  = 0,
+				port_poe    = false,
+				poe_caps    = 0,
+				rx_bytes    = iface and iface.rx_bytes   or 0,
+				tx_bytes    = iface and iface.tx_bytes   or 0,
+				rx_packets  = iface and iface.rx_packets or 0,
+				tx_packets  = iface and iface.tx_packets or 0,
+				rx_errors   = iface and iface.rx_errors  or 0,
+				tx_errors   = iface and iface.tx_errors  or 0,
+			}
+			-- Wired clients are only reported on downstream (non-uplink)
+			-- ports -- the controller itself skips client creation on ports
+			-- flagged is_uplink, since that port faces the controller's own
+			-- network, not an end host.
+			if not entry.is_uplink then
+				entry.mac_table = arr(_filter_hosts(
+					M._sysinfo.mac_table, p.ifname, nil, self_macs, station_macs))
+			end
 		end
 		port_table[#port_table + 1] = entry
 	end
@@ -2398,6 +2478,13 @@ function M.handle_response(json_str, st, cfg)
 							wireless_vlans[#wireless_vlans + 1] = vap.vlan
 						end
 					end
+					-- Which socket the uplink cable is in, so a pushed port
+					-- VLAN can never be applied to it (see physical_port).
+					local uplink_phys = nil
+					if cfg and cfg.vlan and cfg.vlan.ports then
+						local swst = M._sysinfo.switch_status(cfg.vlan.device)
+						uplink_phys = M._sysinfo.uplink_phys_port(swst.arl)
+					end
 					local sw = M._parse_switch_system_cfg(sys_raw)
 					if sw and not sw.enabled then
 						-- Explicit disable: unticking the device-level "Port
@@ -2419,12 +2506,12 @@ function M.handle_response(json_str, st, cfg)
 						-- the IoT WLAN's uplink. apply() reconciles both
 						-- concerns in one pass.
 						if #wireless_vlans > 0 then
-							M._switchvlan.apply(sw, cfg, st, wireless_vlans)
+							M._switchvlan.apply(sw, cfg, st, wireless_vlans, uplink_phys)
 						else
 							M._switchvlan.restore(st)
 						end
 					else
-						M._switchvlan.apply(sw, cfg, st, wireless_vlans)
+						M._switchvlan.apply(sw, cfg, st, wireless_vlans, uplink_phys)
 					end
 				end)
 			end

@@ -399,6 +399,61 @@ return {
 		end
 	},
 	{
+		name = "switchvlan: apply never touches the socket the uplink cable is in",
+		fn = function()
+			-- A socket-shaped modelmap names no uplink: which socket carries
+			-- it is detected at runtime (sysinfo.uplink_phys_port) and passed
+			-- in. Moving that socket's VLAN strands the device just as surely
+			-- as moving a statically declared uplink would.
+			local cfg = {net = {lan_vlanid = 1, ports = {
+				{idx = 1, swport = "lan1"},   -- physical 1
+				{idx = 2, swport = "lan2"},   -- physical 2 -- the cable is here
+			}}, vlan = CFG.vlan}
+			local sw = {
+				enabled = true,
+				vlans   = {[20] = {mode = "tagged", enabled = true}},
+				ports   = {[2] = {pvid = 20, vlans = {[20] = "untagged"}}},
+			}
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				silently(function()
+					assert_false(switchvlan.apply(sw, cfg, {}, nil, 2),
+						"the override lands on the uplink socket and is refused")
+				end)
+				assert_eq(#cmds, 0, "no command issued")
+			end)
+			-- The same push on a board whose cable is elsewhere is applied.
+			with_capture(function(cmds)
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				silently(function()
+					assert_true(switchvlan.apply(sw, cfg, {}, nil, 1),
+						"a downstream socket is assignable")
+				end)
+				assert_true(#cmds > 0, "the switch is reloaded")
+			end)
+		end
+	},
+	{
+		name = "switchvlan: a dynamic-uplink board fails closed when the uplink is unknown",
+		fn = function()
+			-- No static uplink flag and no detected socket: any port could be
+			-- the one carrying the device's own management traffic. Refusing
+			-- every port loses a feature; guessing loses the device.
+			local cfg = {net = {lan_vlanid = 1, ports = {
+				{idx = 1, swport = "lan1"},
+				{idx = 2, swport = "lan2"},
+			}}, vlan = CFG.vlan}
+			assert_nil(switchvlan.physical_port(cfg, 2, nil),
+				"no port resolves without a known uplink")
+			-- A modelmap that DOES name its uplink statically is unaffected --
+			-- it already told openUF which port to protect.
+			assert_eq(switchvlan.physical_port(CFG, 2, nil), 1,
+				"a static-uplink board still resolves its downstream ports")
+		end
+	},
+	{
 		name = "switchvlan: apply is a no-op when gated off or absent",
 		fn = function()
 			with_capture(function(cmds)

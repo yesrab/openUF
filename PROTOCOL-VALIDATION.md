@@ -207,6 +207,60 @@ through PMF for a madwifi-driver model.
 
 ---
 
+## The ports an AP reported were the CPU's, not the board's — FIXED
+
+2026-08-02, two APs on the real UCG Ultra: a TL-WDR3500 (`Bedroom AP`) and an Archer C5 v1
+(`Living room AP`). The Ports view showed **one port per AP**, and the number on it was
+wrong. The investigation started from the user's own reading of the UI — only the uplink is
+listed, and what is listed looks like it came from the gateway.
+
+What the controller held for each AP (`/proxy/network/api/s/default/stat/device`):
+
+```
+port_table: [{port_idx:1, is_uplink:true, speed:1000, full_duplex:true, name:"PoE Out + Data"}]
+ethernet_table: []      lldp_table: []
+uplink: {..., uplink_remote_port:4, uplink_source:"lldp_downlink"}
+```
+
+Three separate things were wrong, all of them on the openUF side:
+
+- **The speed was the CPU port's.** Both modelmaps declared a single port naming the CPU
+  netdev, whose link is the internal SoC↔switch one — always `1000/full`. The Bedroom AP's
+  actual uplink socket had negotiated 100baseT: `swconfig dev switch0 port 4 get link` said
+  `speed:100baseT`, and the gateway's own row for the same cable said **FE** while the AP's
+  row said **GbE**. A metric that contradicts the device on the other end of the wire.
+- **The other sockets did not exist.** Both boards had live links on sockets the controller
+  never heard of (the Archer C5 had three sockets up, of which one was reported).
+- **Wired clients were attributed to the gateway.** Two hosts plugged into the APs' own LAN
+  sockets showed up as `last_uplink_name: "Cloud Gateway Ultra"`, `sw_port` 2 and 4,
+  `sw_depth: 1` — the gateway learned them through its downlink and, since the AP they sit
+  behind reported no downstream port at all, the gateway's account was the only one.
+
+The old code's premise was that MAC↔socket mapping "is knowable only from the switch's own
+ARL table, which openUF does not read". The fix is that it now does. One
+`swconfig dev switch0 show` returns per-port `link`/`pvid`, the ARL table, and (driver
+permitting) per-port MIB counters — see the [`port_table[]` entry](#port_table-entry)
+reference for what each field is sourced from now.
+
+**Which socket is the uplink is measured, not declared.** The default route's gateway IP →
+its MAC in `/proc/net/arp` → that MAC's port in the ARL. On these two boards the same
+gateway MAC was learned on physical port 4 and physical port 2 respectively, matching the
+cabling — a modelmap constant would have been wrong on one of them, and would go wrong on
+either the next time a cable moves. It is also the guard on per-port VLAN: that socket is
+refused an assignment, and a board that cannot determine it refuses every port.
+
+**A side effect worth recording:** per-port VLAN assignment was unreachable on both real
+boards before this. The only reported port was the uplink, and uplink ports deliberately
+carry no `swport` — so the Port Manager had exactly one port and it was the one port that
+must never be reassigned.
+
+Two things looked broken and are not openUF's doing: `lldp_table` is empty because `lldpd`
+on the APs receives nothing (the UCG Ultra does not transmit LLDP to them, though it happily
+parses theirs), and `ethernet_table` is not sent at all — no evidence yet on what the
+controller does with it, so it stays unsent rather than guessed at.
+
+---
+
 ## Controller behaviors that are not openUF bugs
 
 Each of these cost real investigation time at least once.
@@ -745,8 +799,9 @@ one — it is what carries tagging, and `pvid` is derivable from it (the VLAN wh
 
 **`switch.port.<n>` joins directly to `port_table[].port_idx`** — no devname indirection,
 unlike `macacl.*`/`qos.vap.*`. Confirmed by the Port Manager UI listing exactly the two ports
-openUF reports (not the registry's five) and the override landing on wire index 2, openUF's
-port_idx 2.
+openUF reports at the time (not the registry's five) and the override landing on wire index
+2, openUF's port_idx 2. This join is why `port_idx` is pinned to a physical socket in the
+modelmaps and must not be renumbered: the controller stores a port's settings against it.
 
 **C3 — Tagged VLAN Management → Block All.** One key changes:
 
@@ -1047,18 +1102,43 @@ ports** and the switch feature, matching reality (a U6-InWall has a built-in 4-p
 switch). A plain AP like `U6MP` is not a switch. So for the model openUF impersonates, this is
 not optional: an empty `port_table` means zero wired clients can ever appear.
 
-One entry per `cfg.net.ports` (modelmap field `{idx, ifname, uplink}`, defaulting to
-`{wan_cpueth=uplink, lan_cpueth=lan}`):
+One entry per `cfg.net.ports`. Each entry carries `port_idx` (1-based), `name`, `media`,
+`up`, `enable`, `speed`, `full_duplex`, `is_uplink`, `speed_caps`, `port_poe`, `poe_caps`
+and `rx_bytes`/`tx_bytes`/`rx_packets`/`tx_packets`/`rx_errors`/`tx_errors`. Where those
+facts come from depends on what the board can be asked:
 
-`port_idx` (1-based), `name`, `media`, `up`, `enable`, `speed`, `full_duplex`, `is_uplink`,
-`speed_caps`, `port_poe`, `poe_caps`, and `rx_bytes`/`tx_bytes`/`rx_packets`/`tx_packets`/
-`rx_errors`/`tx_errors` from the same `sysinfo.interfaces()` counters `if_table` uses.
+**Per-socket (swconfig board, modelmap field `{idx, swport}`).** One entry per physical
+socket. `up`/`speed`/`full_duplex`/`pvid` and the ARL table come from a single
+`swconfig dev <sw> show` (`sysinfo.switch_status`), and `is_uplink` is set on the socket the
+default gateway's MAC was learned on (`sysinfo.uplink_phys_port`) — detected, never declared,
+because on an AP the cable is in whichever LAN socket the installer used. Counters are the
+switch's own per-port MIB (`RxGoodByte`/`TxByte`; there are no per-port packet or error
+counts, and an AR8327 with `ar8xxx_mib_poll_interval: 0` has no MIB at all), falling back on
+the uplink entry only to the CPU netdev's `sysinfo.interfaces()` counters — everything the
+CPU sent or received crossed that socket. Other sockets report `0` rather than a fabricated
+share of the same total.
+
+**Netdev (no switch, no swconfig, or no identifiable uplink — modelmap field
+`{idx, ifname, uplink}`, defaulting to `{wan_cpueth=uplink, lan_cpueth=lan}`).** `up` from
+sysfs `carrier`/`operstate`, `speed`/`full_duplex` from sysfs, counters from
+`sysinfo.interfaces()`, `is_uplink` from the modelmap. On a swconfig board every one of
+those describes the *CPU port* — the internal SoC↔switch link, always 1000/full — which is
+why this is the fallback and not the default. Confirmed live: a TL-WDR3500 reported GbE on
+an uplink whose socket had negotiated 100baseT, and the gateway's own Ports view said FE for
+the same cable.
 
 **Non-uplink ports additionally carry `mac_table[]`** — `{mac, ip, hostname, age, uptime}`,
-sourced by `sysinfo.mac_table(ifname)` joining `bridge fdb show dev <ifname>` (dynamic
-`master br-lan` entries only; `self`/`permanent` lines and multicast/broadcast MACs filtered
-out) with `/proc/net/arp` for IPs and `/tmp/dhcp.leases` when present for hostnames (optional —
-an AP is usually not the DHCP server; `hostname` stays absent rather than invented).
+joined with `/proc/net/arp` for IPs and `/tmp/dhcp.leases` when present for hostnames
+(optional — an AP is usually not the DHCP server; `hostname` stays absent rather than
+invented). The host list itself is per-socket from the ARL table
+(`sysinfo.switch_mac_table`, multicast/broadcast MACs filtered on the address bit), or
+`sysinfo.mac_table(ifname)` off `bridge fdb show dev <ifname>` on the netdev path (dynamic
+`master br-lan` entries only; `self`/`permanent` and multicast/broadcast filtered).
+`bridge fdb` can only ever say "behind the CPU port", so on a switch board it cannot place a
+host on a socket — that is what the ARL adds. Sockets whose `pvid` is not the management
+VLAN carry no `mac_table` either: the Archer C5's WAN socket is live and has learned a host,
+but it sits on VLAN 2 with its CPU port down, so that host is not on the LAN it would be
+listed in.
 
 Ports flagged `is_uplink: true` are skipped by the controller for client creation, since that
 port faces the controller's own network.
@@ -1129,7 +1209,8 @@ them for measured values.
 | `radio_table[].builtin_antenna` = `true`, `.builtin_ant_gain` = `3` (dBi) | **Constants — no software source exists for either.** Not inert: the controller adds the gain to TX power to display EIRP, so a board with different antennas reports a wrong EIRP. Change them in `ucihelper.RADIO_DEFAULTS` if your hardware differs. |
 | `radio_caps().has_fccdfs` | Mirrors `has_dfs`; `iw` exposes no separate FCC-DFS indication |
 | `radio_caps().has_eht240` / `.has_eht320` | Hardcoded `false` — openUF has no 802.11be target hardware to derive them from |
-| `port_table[].media` = `"GE"`, `.enable` = `true`, `.speed_caps` = `0`, `.port_poe` = `false`, `.poe_caps` = `0` | Constants. The PoE ones are honest for every target board (none source PoE); `media`/`speed_caps` are unmodelled. `speed`/`full_duplex` **are** measured (sysfs) as of the real-hardware run |
+| `port_table[].media` = `"GE"`, `.enable` = `true`, `.speed_caps` = `0`, `.port_poe` = `false`, `.poe_caps` = `0` | Constants. The PoE ones are honest for every target board (none source PoE); `media`/`speed_caps` are unmodelled. `speed`/`full_duplex`/`up` **are** measured — per physical socket via swconfig where the board has a switch, else from sysfs |
+| `port_table[].rx_packets`/`tx_packets`/`rx_errors`/`tx_errors` on a per-socket entry | `0`. swconfig's per-port MIB exposes byte counters only (`RxGoodByte`/`TxByte`), and the CPU netdev's packet/error totals belong to every socket at once. A downstream socket's `rx_bytes`/`tx_bytes` are likewise `0` on a driver with no MIB (AR8327 with polling off) rather than a share of the CPU total |
 | `serial` | Derived from the device MAC with the colons stripped — a real AP's serial is a separate factory value openUF has no equivalent of |
 | `spectrum_scanning` = `false` | Always false: scans are run synchronously inside the cmd handler, so the device is never "currently scanning" when a payload is built |
 | `lldp_table[].is_wired` = `true` | LLDP is inherently a wired-link protocol |
@@ -1371,8 +1452,8 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 14 | IP Settings (DHCP/Static) | `system_cfg` `netconf.*`/`dhcpc.*`/`route.*` | ✅ Confirmed end-to-end: real kernel interface change, real route, informing from the new address, controller Overview reflecting it back |
 | 15 | Power / PoE | `power_source`, `power_source_voltage`, `psu_table`, `power-monitor`, `total_max_power`, `led_state`, `outlet_table` — copied straight off the inform when present | 🔍 Not implemented. The "Power: -" element lives in the **Parent Device** subsection (properties of the upstream LLDP-linked switch), and this environment has no PoE switch. Field names confirmed; values/format not researched, and openUF has no local signal for a real PoE class. |
 | 16 | Set Replacement Device / Load Configuration | **None** — controller-side Mongo document clone (`commonDeviceCloneConfigService`), then an ordinary adopt + `setparam` | ✅ Both confirmed live; zero product code needed. Replacement auto-adopts the target ~50 s after the source goes away. |
-| 17 | Wired clients | `port_table[]` + per-port `mac_table[]` | ✅ Confirmed live: both fake hosts under Connection → Wired, on the correct port; Ports view renders them |
-| 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ⚠️ Wire format fully mapped live 2026-07-19 (gate, per-VLAN table, per-port `pvid` + tagged/untagged/exclude matrix, teardown). The **controller side** is confirmed — it accepts the assignment and pushes an actionable table. Device-side apply is swconfig-only and unverifiable here (the validation AP has no switch) |
+| 17 | Wired clients | `port_table[]` + per-port `mac_table[]` | ✅ Confirmed live: both fake hosts under Connection → Wired, on the correct port; Ports view renders them. Hosts are placed on the physical socket the switch learned them on (ARL table) as of 2026-08-02 — before that, real wired clients behind an AP were reported by nobody and the controller credited them to the gateway's port |
+| 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ⚠️ Wire format fully mapped live 2026-07-19 (gate, per-VLAN table, per-port `pvid` + tagged/untagged/exclude matrix, teardown). The **controller side** is confirmed — it accepts the assignment and pushes an actionable table. Device-side apply is swconfig-only and unverifiable here (the validation AP has no switch). Note it was unreachable on both real boards until 2026-08-02: the only port they reported was the uplink, which is exactly the port that must never be reassigned |
 | 19 | Client block / unblock | `cmd:"block-sta"` / `"unblock-sta"` | ✅ Confirmed live including real nftables enforcement and survival across a simulated reboot. `hostapd_cli` deauth is unit-tested only (no real hostapd here). |
 | 20 | Environment / rogue-AP scan | `scan_radio_table[]` | ✅ openUF's payload and the controller's ingestion both confirmed correct (10/10 direct API polls). The tab's own display bug is [controller-side](#controller-side-ui-quirks). |
 | 21 | Radios tab + client MIMO/generation | `radio_table` capability fields; per-station `nss`/`is_11*` | ✅ Confirmed live on four stations spanning HT/VHT/HE/legacy |

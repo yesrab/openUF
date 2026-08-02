@@ -72,11 +72,40 @@ function M.detect_backend(cursor)
 	return "unknown"
 end
 
+-- Resolve a modelmap `swport` to a physical switch port number. It may name a
+-- key in dev.conf.vlan.ports ("lan1") or be the physical number outright.
+-- Returns nil when the board has no switch map or the name is not in it --
+-- never a guess. Also used by inform.lua, which needs the mapping for every
+-- socket including the uplink one physical_port() below refuses.
+function M.resolve_swport(cfg, swport)
+	local vlan = cfg and cfg.vlan
+	if not (vlan and vlan.ports and swport) then return nil end
+	return vlan.ports[swport] or tonumber(swport)
+end
+
+-- Does this board's modelmap name its uplink port statically? Boards whose
+-- uplink socket is fixed (a dedicated WAN netdev, say) say so with
+-- `uplink = true`; boards where the cable can sit in any LAN socket leave it
+-- out and the uplink is detected at runtime instead.
+local function has_static_uplink(net)
+	for _, p in ipairs((net and net.ports) or {}) do
+		if p.uplink then return true end
+	end
+	return false
+end
+
 -- Map a UniFi port_idx to this board's physical switch port number.
 -- The chain is deliberately explicit and never guessed:
 --   controller port_idx -> dev.conf.net.ports[].swport -> dev.conf.vlan.ports[]
 -- Returns nil when any link is missing, which callers treat as "skip this port".
-function M.physical_port(cfg, port_idx)
+--
+-- uplink_phys: the physical port the uplink cable is currently in
+-- (sysinfo.uplink_phys_port), for modelmaps that do not name one statically.
+-- Reassigning the uplink's VLAN strands the device, so that socket is refused
+-- here -- and when a dynamic-uplink board cannot say which socket that is, so
+-- is every port: fail closed, since the alternative is a coin flip on which
+-- one takes the device off the network.
+function M.physical_port(cfg, port_idx, uplink_phys)
 	local net  = cfg and cfg.net
 	local vlan = cfg and cfg.vlan
 	if not (net and net.ports and vlan and vlan.ports) then return nil end
@@ -84,10 +113,13 @@ function M.physical_port(cfg, port_idx)
 		if p.idx == port_idx then
 			if p.uplink then return nil, "uplink" end
 			if not p.swport then return nil, "no swport in modelmap" end
-			-- swport may name a key in dev.conf.vlan.ports ("lan1") or be the
-			-- physical number outright.
-			local phys = vlan.ports[p.swport] or tonumber(p.swport)
+			local phys = M.resolve_swport(cfg, p.swport)
 			if not phys then return nil, "swport not in dev.conf.vlan.ports" end
+			if uplink_phys then
+				if phys == uplink_phys then return nil, "uplink" end
+			elseif not has_static_uplink(net) then
+				return nil, "uplink port unknown"
+			end
 			return phys
 		end
 	end
@@ -96,9 +128,10 @@ end
 
 -- Build the desired swconfig port string for one VLAN.
 -- members: {[port_idx] = "untagged"|"tagged"|"exclude"}
+-- uplink_phys: as for M.physical_port -- the socket that must never be moved.
 -- Returns nil when the VLAN ends up with no member beyond the CPU port, so the
 -- caller can skip writing an empty section.
-function M.build_ports(cfg, vlan_id, members)
+function M.build_ports(cfg, vlan_id, members, uplink_phys)
 	local cpu = cfg and cfg.vlan and cfg.vlan.cpu_lan
 	if not cpu then return nil end
 	local parts, any = {}, false
@@ -109,7 +142,7 @@ function M.build_ports(cfg, vlan_id, members)
 	table.sort(idxs)   -- stable, comparable output
 	for _, idx in ipairs(idxs) do
 		local mode = members[idx]
-		local phys = M.physical_port(cfg, idx)
+		local phys = M.physical_port(cfg, idx, uplink_phys)
 		if phys and mode ~= "exclude" then
 			parts[#parts + 1] = tostring(phys) .. (mode == "tagged" and "t" or "")
 			any = true
@@ -178,8 +211,10 @@ end
 --   is in use, so their presence alone is enough to run this function. Kept
 --   here rather than in a module of its own so that ONE place owns every
 --   switch_vlan section -- two writers would race to define the same VID.
+-- uplink_phys: the physical port the uplink cable is currently in, from
+--   sysinfo.uplink_phys_port -- see M.physical_port for why it is refused.
 -- Returns true when UCI was changed and a reload was issued.
-function M.apply(sw, cfg, st, wireless_vlans)
+function M.apply(sw, cfg, st, wireless_vlans, uplink_phys)
 	local has_wireless = wireless_vlans and #wireless_vlans > 0
 	if (not sw or not sw.enabled) and not has_wireless then return false end
 	if not (cfg and cfg.vlan and cfg.vlan.ports and cfg.vlan.cpu_lan) then
@@ -205,7 +240,7 @@ function M.apply(sw, cfg, st, wireless_vlans)
 	-- Invert the per-port matrix into per-VLAN membership.
 	local members_by_vlan = {}
 	for port_idx, p in pairs((sw and sw.enabled and sw.ports) or {}) do
-		local phys, why = M.physical_port(cfg, port_idx)
+		local phys, why = M.physical_port(cfg, port_idx, uplink_phys)
 		if not phys then
 			io.stderr:write(("switchvlan: skipping port_idx %d (%s)\n")
 				:format(port_idx, why or "unmappable"))
@@ -238,7 +273,7 @@ function M.apply(sw, cfg, st, wireless_vlans)
 	-- to nil and must lose its section just like a VLAN that left the wire.
 	local desired = {}
 	for vlan_id, members in pairs(members_by_vlan) do
-		desired[vlan_id] = M.build_ports(cfg, vlan_id, members)
+		desired[vlan_id] = M.build_ports(cfg, vlan_id, members, uplink_phys)
 	end
 
 	-- Tagged SSIDs' VLANs. A per-port assignment for the same VID wins: it

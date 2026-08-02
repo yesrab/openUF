@@ -14,16 +14,32 @@ dev.conf.net = {
 	wan_name 	= "wan",
 	wan_cpueth 	= "eth0",
 	wan_vlanid 	= 4090,
-	-- UniFi port_idx -> netdev mapping for the inform payload's port_table
-	-- (separate numbering space from dev.conf.vlan.ports below, which is
-	-- swconfig physical-switch-port numbering, not UniFi's port_idx).
-	-- This board exposes only two netdevs (no per-physical-port netdevs),
-	-- so the single "lan" entry reports every downstream host behind eth1.
-	-- `swport` names a key in dev.conf.vlan.ports below; it is what per-port
-	-- VLAN assignment (switchvlan.lua) joins the controller's port_idx on.
+	-- UniFi port_idx -> physical socket, for the inform payload's port_table
+	-- and for per-port VLAN assignment (switchvlan.lua joins the controller's
+	-- switch.port.<n> onto port_idx). `swport` names a key in
+	-- dev.conf.vlan.ports below -- swconfig's own port numbering, a separate
+	-- space from port_idx.
+	--
+	-- One entry per socket, not per netdev: both netdevs here are CPU ports,
+	-- whose link is the internal SoC<->switch one and behind which every wired
+	-- host looks identical. The switch knows per-socket link and which socket
+	-- each host is on; the netdev knows neither (sysinfo.switch_status).
+	-- Which socket is the uplink is detected at runtime from the switch's ARL
+	-- table, not declared -- see sysinfo.uplink_phys_port.
+	--
+	-- NOT verified against the real board (openUF has never run on one):
+	-- dev.conf.vlan.ports below carries the generic template's numbering, and
+	-- TP-Link boards commonly put the WAN socket on physical 1 with the LAN
+	-- sockets at 2-5, as the Archer C5 turned out to. Check it with
+	-- `swconfig dev switch0 show` and the board's stock `network` config
+	-- before trusting these labels; a wrong map here mislabels ports (the
+	-- uplink is still detected correctly, since that comes from the ARL).
 	ports = {
-		{idx = 1, ifname = "eth0", uplink = true},
-		{idx = 2, ifname = "eth1", swport = "lan1"},
+		{idx = 1, swport = "lan1"},
+		{idx = 2, swport = "lan2"},
+		{idx = 3, swport = "lan3"},
+		{idx = 4, swport = "lan4"},
+		{idx = 5, swport = "wan"},
 	},
 }
 

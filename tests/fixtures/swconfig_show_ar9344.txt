@@ -1,0 +1,65 @@
+Global attributes:
+	enable_vlan: 1
+	ar8xxx_mib_poll_interval: 500
+	ar8xxx_mib_type: 0
+	enable_mirror_rx: 0
+	enable_mirror_tx: 0
+	mirror_monitor_port: 0
+	mirror_source_port: 0
+	arl_table: address resolution table
+Port 0: MAC aa:bb:cc:dd:ee:01
+Port 0: MAC aa:bb:cc:dd:ee:02
+Port 0: MAC aa:bb:cc:dd:ee:03
+Port 0: MAC aa:bb:cc:dd:ee:04
+Port 0: MAC aa:bb:cc:dd:ee:05
+Port 0: MAC aa:bb:cc:dd:ee:06
+Port 0: MAC aa:bb:cc:dd:ee:07
+Port 0: MAC aa:bb:cc:dd:ee:08
+Port 0: MAC aa:bb:cc:dd:ee:09
+Port 0: MAC aa:bb:cc:dd:ee:0a
+Port 0: MAC aa:bb:cc:dd:ee:0b
+Port 3: MAC aa:bb:cc:dd:ee:0c
+Port 4: MAC aa:bb:cc:dd:ee:0d
+Port 4: MAC aa:bb:cc:dd:ee:ff
+Port 4: MAC aa:bb:cc:dd:ee:0e
+Port 4: MAC aa:bb:cc:dd:ee:0f
+Port 4: MAC aa:bb:cc:dd:ee:10
+Port 4: MAC aa:bb:cc:dd:ee:11
+Port 4: MAC aa:bb:cc:dd:ee:12
+Port 4: MAC aa:bb:cc:dd:ee:13
+
+Port 0:
+	mib: MIB counters
+RxGoodByte  : 4411999066 (4.1 GiB)
+TxByte      : 8352905899 (7.7 GiB)
+
+	pvid: 0
+	link: port:0 link:up speed:1000baseT full-duplex txflow rxflow 
+Port 1:
+	mib: No MIB data
+	pvid: 1
+	link: port:1 link:down
+Port 2:
+	mib: No MIB data
+	pvid: 1
+	link: port:2 link:down
+Port 3:
+	mib: MIB counters
+RxGoodByte  : 45338209 (43.2 MiB)
+TxByte      : 1183354521 (1.1 GiB)
+
+	pvid: 1
+	link: port:3 link:up speed:100baseT full-duplex auto
+Port 4:
+	mib: MIB counters
+RxGoodByte  : 8264851368 (7.6 GiB)
+TxByte      : 4439087984 (4.1 GiB)
+
+	pvid: 1
+	link: port:4 link:up speed:100baseT full-duplex auto
+VLAN 1:
+	vid: 1
+	ports: 0t 1t 2t 3t 4t 
+VLAN 10:
+	vid: 10
+	ports: 0t 1t 2t 3t 4t 

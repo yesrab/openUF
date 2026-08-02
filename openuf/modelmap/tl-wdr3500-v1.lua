@@ -48,14 +48,25 @@ dev.conf.net = {
 	wan_name	= "wan",
 	wan_cpueth	= "eth1",
 	wan_vlanid	= 2,
-	-- One port, the uplink. The board has four LAN sockets, but they all sit
-	-- behind this single netdev: which socket a given host is on is knowable
-	-- only from the switch's ARL table, which openUF does not read. Declaring
-	-- a downstream port instead would report the entire LAN segment -- the
-	-- gateway included -- as clients plugged into the AP. Uplink ports get no
-	-- `swport`, so no controller-pushed port VLAN can strand the device.
+	-- The board's four LAN sockets, one port_idx each -- not the CPU netdev
+	-- they share. eth0's link is the internal SoC<->switch one (always
+	-- 1000/full) while the socket the cable is in had negotiated 100baseT, and
+	-- every wired host behind the switch reaches the CPU through it, so
+	-- neither speed nor host placement can be read from the netdev. Both come
+	-- from the switch itself (sysinfo.switch_status); which socket carries the
+	-- uplink is detected from its ARL table (sysinfo.uplink_phys_port) rather
+	-- than declared, because it is simply wherever the cable was put -- port 4
+	-- as cabled today. `idx` stays pinned to a socket so controller-side
+	-- per-port overrides survive a replug.
+	--
+	-- The WAN socket is absent because this board has none: all four sockets
+	-- are LAN (see dev.conf.vlan.ports), and eth1 is a netdev with no socket
+	-- of its own.
 	ports = {
-		{idx = 1, ifname = "eth0", uplink = true},
+		{idx = 1, swport = "lan1"},
+		{idx = 2, swport = "lan2"},
+		{idx = 3, swport = "lan3"},
+		{idx = 4, swport = "lan4"},
 	},
 }
 

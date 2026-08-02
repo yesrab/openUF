@@ -36,6 +36,13 @@ dev.conf.net = {
 	-- what per-port VLAN assignment (switchvlan.lua) joins on. Without it that
 	-- port is skipped rather than guessed at. Uplink ports never get one --
 	-- reassigning the uplink's VLAN would strand the device.
+	--
+	-- This is the netdev-based shape, kept because a generic profile cannot
+	-- know a board's socket layout. A board-specific map should instead list
+	-- one entry per physical socket (`{idx = 1, swport = "lan1"}`, ...) with no
+	-- `uplink` flag: openUF then reports each socket's own link speed and the
+	-- hosts actually behind it, and detects the uplink socket from the
+	-- switch's ARL table. See modelmap/archer-c5-v1.lua.
 	ports = {
 		{idx = 1, ifname = "eth0", uplink = true},
 		{idx = 2, ifname = "eth1", swport = "lan1"},

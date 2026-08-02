@@ -67,8 +67,13 @@ return {
 					assert_true(type(p.idx) == "number", name .. ": port has a numeric idx")
 					assert_nil(seen_idx[p.idx], name .. ": port_idx " .. tostring(p.idx) .. " is unique")
 					seen_idx[p.idx] = true
-					assert_true(type(p.ifname) == "string" and p.ifname ~= "",
-						name .. ": port " .. p.idx .. " names an ifname")
+					-- Two shapes, and a port must be one of them: a socket
+					-- (`swport`, measured through the switch) or a netdev
+					-- (`ifname`, for boards with no switch map). An entry that
+					-- names neither is a port openUF can report nothing about.
+					assert_true((type(p.swport) == "string" or type(p.swport) == "number")
+						or (type(p.ifname) == "string" and p.ifname ~= ""),
+						name .. ": port " .. p.idx .. " names a swport or an ifname")
 					-- The load-bearing invariant: reassigning the uplink's VLAN
 					-- strands the device on the far side of its own switch, so
 					-- an uplink port must never be VLAN-assignable. Enforced by
@@ -122,7 +127,7 @@ return {
 		end
 	},
 	{
-		name = "modelmap: archer-c5-v1 reports its real uplink and a driveable LED",
+		name = "modelmap: archer-c5-v1 reports its real sockets and a driveable LED",
 		fn = function()
 			-- Board-specific regression guard, from the live install on this
 			-- hardware: deployed as an AP it uplinks through eth1 (CPU switch
@@ -130,10 +135,28 @@ return {
 			-- the generic profile gets both wrong.
 			local dev = dofile(MODELMAP_DIR .. "/archer-c5-v1.lua")
 			assert_eq(dev.conf.net.lan_cpueth, "eth1", "LAN CPU port")
-			assert_eq(#dev.conf.net.ports, 1, "one reported port")
-			assert_eq(dev.conf.net.ports[1].ifname, "eth1", "the uplink is eth1, not eth0")
-			assert_true(dev.conf.net.ports[1].uplink, "flagged as the uplink")
 			assert_eq(dev.conf.led, "green:system", "LED name set so Locate works")
+
+			-- One port per physical socket, and no static uplink flag: the
+			-- board reported a single CPU netdev as "the port" until the first
+			-- real-hardware run showed what that costs -- a link speed no
+			-- cable had negotiated, and not one wired host placeable on a
+			-- socket. The uplink is detected from the switch's ARL table
+			-- instead, because on this board it is simply whichever LAN socket
+			-- the installer used.
+			local ports = dev.conf.net.ports
+			assert_eq(#ports, 5, "one port per socket (4 LAN + WAN)")
+			local phys = {}
+			for _, p in ipairs(ports) do
+				assert_nil(p.uplink, "port " .. p.idx .. " is not statically flagged uplink")
+				assert_not_nil(p.swport, "port " .. p.idx .. " names a socket")
+				local n = dev.conf.vlan.ports[p.swport]
+				assert_not_nil(n, "swport " .. tostring(p.swport) .. " is in the switch map")
+				phys[#phys + 1] = n
+			end
+			table.sort(phys)
+			assert_eq(table.concat(phys, ","), "1,2,3,4,5",
+				"the five sockets, none of them a CPU port")
 
 			-- Switch port map, read off this board's own stock config: VLAN 2
 			-- (WAN) is `ports '1 6'`, so physical 1 is the WAN socket and the

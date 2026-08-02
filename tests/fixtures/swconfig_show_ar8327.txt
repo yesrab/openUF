@@ -1,0 +1,90 @@
+Global attributes:
+	enable_vlan: 1
+	ar8xxx_mib_poll_interval: 0
+	ar8xxx_mib_type: 0
+	enable_mirror_rx: 0
+	enable_mirror_tx: 0
+	mirror_monitor_port: 0
+	mirror_source_port: 0
+	arl_age_time: 300
+	arl_table: address resolution table
+Port 0: MAC aa:bb:cc:dd:ee:01
+Port 0: MAC aa:bb:cc:dd:ee:02
+Port 0: MAC aa:bb:cc:dd:ee:03
+Port 0: MAC aa:bb:cc:dd:ee:04
+Port 0: MAC aa:bb:cc:dd:ee:05
+Port 0: MAC aa:bb:cc:dd:ee:06
+Port 0: MAC aa:bb:cc:dd:ee:07
+Port 1: MAC aa:bb:cc:dd:ee:08
+Port 2: MAC aa:bb:cc:dd:ee:09
+Port 2: MAC aa:bb:cc:dd:ee:ff
+Port 2: MAC aa:bb:cc:dd:ee:0a
+Port 2: MAC aa:bb:cc:dd:ee:0b
+Port 2: MAC aa:bb:cc:dd:ee:0c
+Port 2: MAC aa:bb:cc:dd:ee:0d
+Port 2: MAC aa:bb:cc:dd:ee:0e
+Port 2: MAC aa:bb:cc:dd:ee:0f
+Port 2: MAC aa:bb:cc:dd:ee:10
+Port 2: MAC aa:bb:cc:dd:ee:11
+Port 4: MAC aa:bb:cc:dd:ee:12
+
+	igmp_snooping: 0
+	igmp_v3: 0
+Port 0:
+	mib: ???
+	enable_eee: ???
+	igmp_snooping: 0
+	vlan_prio: 0
+	pvid: 1
+	link: port:0 link:up speed:1000baseT full-duplex txflow rxflow 
+Port 1:
+	mib: ???
+	enable_eee: 0
+	igmp_snooping: 0
+	vlan_prio: 0
+	pvid: 2
+	link: port:1 link:up speed:100baseT full-duplex auto
+Port 2:
+	mib: ???
+	enable_eee: 0
+	igmp_snooping: 0
+	vlan_prio: 0
+	pvid: 1
+	link: port:2 link:up speed:1000baseT full-duplex txflow rxflow auto
+Port 3:
+	mib: ???
+	enable_eee: 0
+	igmp_snooping: 0
+	vlan_prio: 0
+	pvid: 1
+	link: port:3 link:down
+Port 4:
+	mib: ???
+	enable_eee: 0
+	igmp_snooping: 0
+	vlan_prio: 0
+	pvid: 1
+	link: port:4 link:up speed:1000baseT full-duplex txflow rxflow auto
+Port 5:
+	mib: ???
+	enable_eee: 0
+	igmp_snooping: 0
+	vlan_prio: 0
+	pvid: 1
+	link: port:5 link:down
+Port 6:
+	mib: ???
+	enable_eee: ???
+	igmp_snooping: 0
+	vlan_prio: 0
+	pvid: 2
+	link: port:6 link:up speed:1000baseT full-duplex txflow rxflow 
+VLAN 1:
+	vid: 1
+	ports: 0 1t 2 3 4 5 
+VLAN 2:
+	vid: 2
+	ports: 1 6 
+VLAN 10:
+	vid: 10
+	ports: 0t 2t 3t 4t 5t 

@@ -477,12 +477,44 @@ function M.radio_caps(ifname)
 	return caps
 end
 
--- First-seen timestamps for wired hosts, keyed by "ifname mac" -- used to
--- derive `uptime` in M.mac_table() the same way sta_table's connected_sec
--- comes from iw (which has no equivalent concept for a bridge-learned MAC).
+-- First-seen timestamps for wired hosts, keyed by "<source> mac" -- used to
+-- derive `uptime` in M.mac_table()/M.switch_mac_table() the same way
+-- sta_table's connected_sec comes from iw (which has no equivalent concept
+-- for a learned MAC).
 -- Injectable/resettable by tests, same pattern as M._prev_cpu above.
 M._mac_first_seen = {}
 M._time = os.time
+
+-- MAC -> IP from /proc/net/arp (the header line has no MAC and is skipped by
+-- the pattern itself). Shared by both wired-host sources below.
+function M._ip_by_mac()
+	local by_mac = {}
+	local arp_out = M._read_file("/proc/net/arp")
+	if arp_out then
+		for line in arp_out:gmatch("[^\n]+") do
+			local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+			if ip and mac then by_mac[mac:lower()] = ip end
+		end
+	end
+	return by_mac
+end
+
+-- MAC -> hostname from dnsmasq's lease file, when this device runs the DHCP
+-- server (format: "<expiry> <mac> <ip> <hostname> <client-id>"). An AP usually
+-- is not, so this is empty far more often than not.
+function M._hostname_by_mac()
+	local by_mac = {}
+	local leases_out = M._read_file("/tmp/dhcp.leases")
+	if leases_out then
+		for line in leases_out:gmatch("[^\n]+") do
+			local mac, hostname = line:match("^%d+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+%S+%s+(%S+)")
+			if mac and hostname and hostname ~= "*" then
+				by_mac[mac:lower()] = hostname
+			end
+		end
+	end
+	return by_mac
+end
 
 -- Returns a table of wired hosts learned on ifname's bridge port, by
 -- combining three sources also present on a real OpenWrt AP:
@@ -516,28 +548,8 @@ function M.mac_table(ifname)
 	end
 	if #macs == 0 then return {} end
 
-	-- MAC -> IP from /proc/net/arp (skip the header line)
-	local ip_by_mac = {}
-	local arp_out = M._read_file("/proc/net/arp")
-	if arp_out then
-		for line in arp_out:gmatch("[^\n]+") do
-			local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-			if ip and mac then ip_by_mac[mac:lower()] = ip end
-		end
-	end
-
-	-- MAC -> hostname from dnsmasq's lease file, when this device runs the
-	-- DHCP server (format: "<expiry> <mac> <ip> <hostname> <client-id>").
-	local hostname_by_mac = {}
-	local leases_out = M._read_file("/tmp/dhcp.leases")
-	if leases_out then
-		for line in leases_out:gmatch("[^\n]+") do
-			local mac, hostname = line:match("^%d+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+%S+%s+(%S+)")
-			if mac and hostname and hostname ~= "*" then
-				hostname_by_mac[mac:lower()] = hostname
-			end
-		end
-	end
+	local ip_by_mac       = M._ip_by_mac()
+	local hostname_by_mac = M._hostname_by_mac()
 
 	local now = M._time()
 	local hosts = {}
@@ -556,6 +568,144 @@ function M.mac_table(ifname)
 			-- call just observed it fresh (matches TtZhv's use of `age` to
 			-- pick the more-recently-seen of two ports reporting the same
 			-- client, favoring whichever port's dump is being processed).
+			age      = 0,
+			uptime   = math.floor(now - first_seen),
+		}
+	end
+	return hosts
+end
+
+-- === swconfig: what the CPU netdev cannot tell you =========================
+--
+-- On the ath79 boards openUF targets, every ethernet socket sits behind a
+-- switch ASIC and the kernel sees only the CPU port. sysfs therefore answers
+-- questions about the internal SoC<->switch link (always 1000/full), not about
+-- the socket a cable is actually in, and the bridge FDB attributes every wired
+-- host to the one CPU netdev. Both were reported as port facts and both were
+-- wrong on real hardware -- a TL-WDR3500 whose uplink socket had negotiated
+-- 100baseT reported GbE, while the gateway's own view of the same link said FE.
+--
+-- The switch knows all of it, and one `swconfig dev <sw> show` returns the lot:
+-- per-port link/speed/duplex, per-port pvid, the ARL table (MAC -> physical
+-- port), and -- where the driver exposes them -- per-port MIB byte counters.
+
+-- Parses one `swconfig dev <device> show` into
+--   {ports = {[phys] = {up, speed, full_duplex, pvid, rx_bytes, tx_bytes}},
+--    arl   = {[mac] = phys}}
+-- Both tables are empty when swconfig is missing or the board has no switch,
+-- which is the signal callers use to stay on the netdev-only path.
+--
+-- Two line shapes both start with "Port <n>:" and must not be confused: an ARL
+-- entry ("Port 4: MAC aa:bb:..", listed under the global attributes, one line
+-- per learned host) and a port section header ("Port 4:" alone, followed by
+-- indented attributes). The MAC is the discriminator.
+--
+-- MIB counters are optional: the AR8327 in an Archer C5 reports "mib: ???"
+-- (its ar8xxx_mib_poll_interval is 0) while the AR9344 in a WDR3500 prints a
+-- RxGoodByte/TxByte block. Only those two counters exist even there -- there
+-- is no per-port packet or error count to be had from this interface.
+function M.switch_status(device)
+	local status = {ports = {}, arl = {}}
+	local out = M._run_cmd("swconfig dev " .. (device or "switch0") .. " show")
+	if not out or out == "" then return status end
+
+	local cur   -- physical port whose section is being parsed
+	for line in out:gmatch("[^\n]+") do
+		local arl_port, arl_mac =
+			line:match("^Port (%d+):%s+MAC%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+		local header = line:match("^Port (%d+):%s*$")
+		if arl_mac then
+			status.arl[arl_mac:lower()] = tonumber(arl_port)
+		elseif header then
+			cur = tonumber(header)
+			status.ports[cur] = {up = false}
+		elseif line:match("^VLAN %d+:") then
+			cur = nil   -- the VLAN table follows the port sections
+		elseif cur and status.ports[cur] then
+			local p = status.ports[cur]
+			local pvid = line:match("^%s*pvid:%s*(%d+)")
+			if pvid then p.pvid = tonumber(pvid) end
+			local state = line:match("^%s*link:%s*port:%d+%s+link:(%a+)")
+			if state then
+				p.up = (state == "up")
+				if p.up then
+					local speed = line:match("speed:(%d+)baseT")
+					p.speed = speed and tonumber(speed) or nil
+					p.full_duplex = line:match("(%a+)%-duplex") ~= "half"
+				end
+			end
+			local rx = line:match("^RxGoodByte%s*:%s*(%d+)")
+			if rx then p.rx_bytes = tonumber(rx) end
+			local tx = line:match("^TxByte%s*:%s*(%d+)")
+			if tx then p.tx_bytes = tonumber(tx) end
+		end
+	end
+	return status
+end
+
+-- Which physical switch port the uplink cable is in, from an ARL table as
+-- returned by M.switch_status().arl -- the port the default gateway's MAC was
+-- learned on. Verified against both real boards: the same gateway MAC appears
+-- on physical port 4 of one AP and port 2 of the other, matching the cabling.
+--
+-- Deliberately measured rather than declared in the modelmap. These boards are
+-- deployed as APs with the cable in whichever LAN socket is convenient, and a
+-- wrong answer is not a cosmetic error: a socket wrongly treated as downstream
+-- makes the AP report the entire LAN segment, gateway included, as hosts
+-- plugged into it. Returns nil whenever any link of the chain is missing, and
+-- callers must then fall back to the netdev-only port rather than guess.
+function M.uplink_phys_port(arl)
+	if type(arl) ~= "table" then return nil end
+	local gw_ip = tostring(M._run_cmd("ip route show default") or "")
+		:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
+	if not gw_ip then return nil end
+	local arp_out = M._read_file("/proc/net/arp")
+	if not arp_out then return nil end
+	for line in arp_out:gmatch("[^\n]+") do
+		local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+		if ip == gw_ip and mac then return arl[mac:lower()] end
+	end
+	return nil
+end
+
+-- The wired hosts learned on one physical switch port, in the same shape
+-- M.mac_table() returns ({mac, ip, hostname, age, uptime}) so port_table's
+-- consumer does not care which source a port's hosts came from.
+--
+-- Multicast/broadcast MACs are filtered on the address's own multicast bit --
+-- the ARL has no "self"/"permanent" markers to lean on the way `bridge fdb`
+-- does. The device's own MACs and its wireless stations are filtered by the
+-- caller, which is where both sets are already known.
+function M.switch_mac_table(phys, arl)
+	if phys == nil or type(arl) ~= "table" then return {} end
+	local macs = {}
+	for mac, port in pairs(arl) do
+		if port == phys then
+			local first_octet = tonumber(mac:sub(1, 2), 16)
+			if first_octet and first_octet % 2 == 0 then
+				macs[#macs + 1] = mac
+			end
+		end
+	end
+	if #macs == 0 then return {} end
+	table.sort(macs)   -- pairs() order is undefined; keep the payload stable
+
+	local ip_by_mac       = M._ip_by_mac()
+	local hostname_by_mac = M._hostname_by_mac()
+
+	local now = M._time()
+	local hosts = {}
+	for _, mac in ipairs(macs) do
+		local key = "swport" .. tostring(phys) .. " " .. mac
+		local first_seen = M._mac_first_seen[key]
+		if not first_seen then
+			first_seen = now
+			M._mac_first_seen[key] = now
+		end
+		hosts[#hosts + 1] = {
+			mac      = mac,
+			ip       = ip_by_mac[mac],
+			hostname = hostname_by_mac[mac],
 			age      = 0,
 			uptime   = math.floor(now - first_seen),
 		}

@@ -31,26 +31,29 @@ dev.conf.net = {
 	wan_name	= "wan",
 	wan_cpueth	= "eth0",
 	wan_vlanid	= 4090,
-	-- UniFi port_idx -> netdev mapping for the inform payload's port_table.
+	-- UniFi port_idx -> physical socket, for the inform payload's port_table
+	-- and for per-port VLAN assignment (switchvlan.lua joins the controller's
+	-- switch.port.<n> straight onto port_idx).
 	--
-	-- One entry, deliberately. The board exposes two netdevs, but eth0/WAN is
-	-- unused in this AP role -- reporting it as the uplink (as the generic
-	-- profile does) tells the controller the uplink carries no traffic while
-	-- the port that actually carries it is reported as a downstream port, and
-	-- offers the real uplink up for per-port VLAN reassignment. Uplink ports
-	-- never get a `swport`, so no controller-pushed port VLAN can strand this
-	-- device.
+	-- The board's five sockets, not its two netdevs. Both netdevs are CPU
+	-- ports: their link is the internal SoC<->switch one, always 1000/full,
+	-- and every wired host behind the switch reaches them through the same
+	-- one. Reporting a netdev as "the port" therefore reported a speed no
+	-- cable had negotiated and could not place a single host on a socket.
+	-- The switch answers both (sysinfo.switch_status).
 	--
-	-- Consequence worth knowing: wired clients are only ever reported on
-	-- non-uplink ports (the controller skips client creation on the uplink,
-	-- which faces its own network), so this board reports none. That is the
-	-- honest answer here -- every host the bridge learns is reached through
-	-- this one netdev, and which physical socket each sits on is knowable
-	-- only from the switch's own ARL table, which openUF does not read. The
-	-- alternative, declaring eth1 a downstream port, would report the whole
-	-- LAN segment -- gateway included -- as clients plugged into the AP.
+	-- `idx` is fixed to a socket, never to a role: the controller keys per-
+	-- port overrides on port_idx, so the numbering must survive a cable being
+	-- moved. Which socket is the UPLINK is detected at runtime instead, from
+	-- the switch's ARL table -- see sysinfo.uplink_phys_port. No `uplink` flag
+	-- here, deliberately: on this board the uplink is whichever LAN socket the
+	-- installer used (port 2 as cabled today).
 	ports = {
-		{idx = 1, ifname = "eth1", uplink = true},
+		{idx = 1, swport = "lan1"},
+		{idx = 2, swport = "lan2"},
+		{idx = 3, swport = "lan3"},
+		{idx = 4, swport = "lan4"},
+		{idx = 5, swport = "wan"},
 	},
 }
 

@@ -138,6 +138,65 @@ local function build(opts)
 	return cjson.decode(json_str), st
 end
 
+-- A socket-shaped modelmap: one port_idx per physical switch socket, and no
+-- static uplink flag -- which socket the cable is in is detected from the
+-- switch's ARL table. `map` is the board's swconfig port numbering.
+local function switch_cfg(map)
+	local ports = {}
+	for i, label in ipairs({"lan1", "lan2", "lan3", "lan4", "wan"}) do
+		if map[label] then ports[#ports + 1] = {idx = i, swport = label} end
+	end
+	return {
+		net  = {lan_cpueth = "eth1", lan_vlanid = 1, ports = ports},
+		vlan = {cpu_lan = 0, ports = map},
+	}
+end
+
+-- WDR3500 as cabled today: four LAN sockets on physical 1-4, uplink in 4.
+local WDR_MAP    = {lan1 = 1, lan2 = 2, lan3 = 3, lan4 = 4}
+-- Archer C5: the WAN socket is physical 1 and the LAN sockets are 2-5, with
+-- the uplink in physical 2 -- a different socket, same detection.
+local ARCHER_MAP = {lan1 = 2, lan2 = 3, lan3 = 4, lan4 = 5, wan = 1}
+
+-- build() for a board with a switch: same payload, plus the swconfig capture,
+-- default route and ARP table that per-socket reporting reads.
+local function build_switch(opts)
+	opts = opts or {}
+	inject_sysinfo(opts.with_clients, false, false, false)
+	local base_read = inform._sysinfo._read_file
+	local base_cmd  = inform._sysinfo._run_cmd
+	inform._sysinfo._read_file = function(path)
+		if path:find("net/arp") then
+			return opts.arp or fixture("proc_net_arp_switch.txt")
+		end
+		return base_read(path)
+	end
+	inform._sysinfo._run_cmd = function(cmd)
+		if cmd:find("swconfig") then return opts.swconfig or "" end
+		if cmd:find("ip route") then
+			return "default via " .. (opts.gateway or "10.0.0.1") .. " dev br-lan \n"
+		end
+		return base_cmd(cmd)
+	end
+	local st = {
+		authkey    = state.DEFAULT_KEY,
+		adopted    = true,
+		cfgversion = "",
+		inform_url = "http://10.0.0.1:8080/inform",
+		mac        = opts.mac or "aa:bb:cc:00:11:22",
+		ip         = "10.0.0.2",
+		hostname   = "testap",
+	}
+	return cjson.decode(inform.build_json(st, opts.cfg, ufhw))
+end
+
+-- Index a payload's port_table by port_idx.
+local function by_idx(port_table)
+	local out = {}
+	for _, p in ipairs(port_table) do out[p.port_idx] = p end
+	return out
+end
+
 return {
 	{
 		name = "inform json: _type is 'state'",
@@ -1236,6 +1295,175 @@ return {
 			end)
 			inform._read_file = orig
 			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform json: port_table reports one entry per socket, at the socket's own speed",
+		fn = function()
+			-- The board has four sockets behind a switch and two CPU netdevs.
+			-- Reporting a netdev as "the port" reported the internal
+			-- SoC<->switch link -- always 1000/full -- so a WDR3500 whose
+			-- uplink socket had negotiated 100baseT told the controller GbE,
+			-- contradicting the gateway's own view of the same cable.
+			local d = build_switch({
+				cfg = switch_cfg(WDR_MAP),
+				swconfig = fixture("swconfig_show_ar9344.txt"),
+			})
+			assert_eq(#d.port_table, 4, "one entry per socket, not one per netdev")
+			local p = by_idx(d.port_table)
+			assert_eq(p[4].speed, 100, "the uplink socket's real 100baseT link")
+			assert_true(p[4].full_duplex, "and its duplex")
+			assert_eq(p[3].speed, 100, "a downstream socket reports its own speed")
+			assert_false(p[1].up, "an empty socket has no link")
+			assert_eq(p[1].speed, 0, "and no speed, rather than the 1000 fallback")
+		end
+	},
+	{
+		name = "inform json: is_uplink follows the cable, not the modelmap",
+		fn = function()
+			-- Same code, same network, two boards with the cable in different
+			-- sockets. Nothing in either modelmap names an uplink: getting it
+			-- wrong would either hide the real uplink's traffic or report the
+			-- whole LAN segment as hosts plugged into the AP.
+			local d = build_switch({
+				cfg = switch_cfg(WDR_MAP),
+				swconfig = fixture("swconfig_show_ar9344.txt"),
+			})
+			local p = by_idx(d.port_table)
+			assert_true(p[4].is_uplink, "physical 4 carries the gateway here")
+			assert_false(p[3].is_uplink, "and no other socket claims to")
+
+			local d2 = build_switch({
+				cfg = switch_cfg(ARCHER_MAP),
+				swconfig = fixture("swconfig_show_ar8327.txt"),
+			})
+			local p2 = by_idx(d2.port_table)
+			assert_eq(#d2.port_table, 5, "four LAN sockets plus the WAN socket")
+			assert_true(p2[1].is_uplink, "lan1 (physical 2) carries the gateway on this board")
+			assert_false(p2[4].is_uplink, "not the socket the other board used")
+		end
+	},
+	{
+		name = "inform json: wired hosts are reported on the socket they are actually on",
+		fn = function()
+			-- The bridge FDB puts every wired host behind the one CPU netdev;
+			-- only the switch's ARL table says which socket each is on. Until
+			-- this, hosts plugged into an AP were reported by nobody and the
+			-- controller attributed them to the gateway's port instead.
+			local d = build_switch({
+				cfg = switch_cfg(WDR_MAP),
+				swconfig = fixture("swconfig_show_ar9344.txt"),
+			})
+			local p = by_idx(d.port_table)
+			assert_eq(#p[3].mac_table, 1, "the host on socket 3")
+			assert_eq(p[3].mac_table[1].mac, "aa:bb:cc:dd:ee:0c", "its mac")
+			assert_eq(p[3].mac_table[1].ip, "10.0.0.50", "its ip, joined from arp")
+			assert_eq(#p[2].mac_table, 0, "a socket with nothing on it reports no hosts")
+			-- The uplink socket has learned the entire LAN, gateway included.
+			assert_true(p[4].mac_table == nil,
+				"the uplink reports no hosts -- everything there is on the far side")
+		end
+	},
+	{
+		name = "inform json: hosts on a socket outside the management VLAN are not reported",
+		fn = function()
+			-- The Archer C5's WAN socket is live and has learned a host, but
+			-- sits on VLAN 2 with its CPU port down: that host is not on the
+			-- LAN it would be listed in.
+			local d = build_switch({
+				cfg = switch_cfg(ARCHER_MAP),
+				swconfig = fixture("swconfig_show_ar8327.txt"),
+			})
+			local p = by_idx(d.port_table)
+			assert_true(p[5].up, "the WAN socket has link and is reported")
+			assert_true(p[5].mac_table == nil, "but its host is not a client of this LAN")
+			assert_eq(p[5].is_uplink, false, "and it is not the uplink")
+		end
+	},
+	{
+		name = "inform json: a socket's own MACs and wireless stations are never wired hosts",
+		fn = function()
+			-- A wireless client bridged into br-lan is learned by the switch
+			-- on the CPU port, but a station that roamed or a device's own MAC
+			-- appearing on a socket must not turn into a wired client of it.
+			local capture = table.concat({
+				"Global attributes:",
+				"\tarl_table: address resolution table",
+				"Port 0: MAC aa:bb:cc:00:00:01",
+				"Port 3: MAC aa:bb:cc:dd:ee:ff",   -- a connected station
+				"Port 3: MAC aa:bb:cc:00:11:22",   -- this device's own mac
+				"Port 3: MAC aa:bb:cc:dd:ee:0c",   -- an actual wired host
+				"Port 4: MAC aa:bb:cc:00:00:01",   -- the gateway
+				"",
+				"Port 3:",
+				"\tpvid: 1",
+				"\tlink: port:3 link:up speed:1000baseT full-duplex auto",
+				"Port 4:",
+				"\tpvid: 1",
+				"\tlink: port:4 link:up speed:1000baseT full-duplex auto",
+				"",
+			}, "\n")
+			local d = build_switch({
+				cfg = switch_cfg(WDR_MAP),
+				swconfig = capture,
+				with_clients = true,
+				with_uci = true,
+				gateway = "10.0.0.1",
+				arp = "IP address       HW type     Flags       HW address            Mask     Device\n"
+					.. "10.0.0.1         0x1         0x2         aa:bb:cc:00:00:01     *        br-lan\n",
+			})
+			local p = by_idx(d.port_table)
+			assert_eq(#p[3].mac_table, 1, "only the real wired host survives")
+			assert_eq(p[3].mac_table[1].mac, "aa:bb:cc:dd:ee:0c", "the wired host")
+		end
+	},
+	{
+		name = "inform json: port counters come from the switch, falling back to the CPU netdev",
+		fn = function()
+			-- Per-port MIB counters where the driver exposes them (AR9344).
+			local d = build_switch({
+				cfg = switch_cfg(WDR_MAP),
+				swconfig = fixture("swconfig_show_ar9344.txt"),
+			})
+			local p = by_idx(d.port_table)
+			assert_eq(p[3].rx_bytes, 45338209, "socket 3's own RxGoodByte")
+			assert_eq(p[3].tx_bytes, 1183354521, "socket 3's own TxByte")
+
+			-- An AR8327 with MIB polling off has none. The uplink falls back
+			-- to the CPU netdev, whose totals all crossed that one socket; a
+			-- downstream socket has no honest stand-in and reports 0.
+			local d2 = build_switch({
+				cfg = switch_cfg(ARCHER_MAP),
+				swconfig = fixture("swconfig_show_ar8327.txt"),
+			})
+			local p2 = by_idx(d2.port_table)
+			assert_eq(p2[1].rx_bytes, 1024, "the uplink borrows eth1's counters")
+			assert_eq(p2[1].tx_packets, 8, "including packets")
+			assert_eq(p2[3].rx_bytes, 0, "a downstream socket reports 0, not the CPU total")
+			assert_eq(p2[3].tx_bytes, 0, "in both directions")
+		end
+	},
+	{
+		name = "inform json: without a readable switch the netdev port shape is unchanged",
+		fn = function()
+			-- No swconfig (a DSA board, a missing binary, a container): the
+			-- modelmap's ifname entries and everything read from sysfs behave
+			-- exactly as before, rather than a socket list built on guesses.
+			local d = build_switch({
+				cfg = {
+					net = {lan_cpueth = "eth1", ports = {
+						{idx = 1, ifname = "eth0", uplink = true},
+						{idx = 2, ifname = "eth1", swport = "lan1"},
+					}},
+					vlan = {cpu_lan = 0, ports = {lan1 = 1}},
+				},
+				swconfig = "",
+			})
+			assert_eq(#d.port_table, 2, "the modelmap's netdev ports")
+			local p = by_idx(d.port_table)
+			assert_true(p[1].is_uplink, "the statically flagged uplink is honoured")
+			assert_eq(p[2].rx_bytes, 1024, "counters from eth1 in /proc/net/dev")
+			assert_not_nil(p[2].mac_table, "downstream ports still carry a mac_table")
 		end
 	},
 	{

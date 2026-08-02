@@ -126,6 +126,15 @@ which uses `eth1` and never touches `eth0`.
 The modelmap sets:
 - `dev.conf.net.lan_cpueth` — LAN CPU ethernet port (e.g. `eth1`); also the trunk port
   used to create VLAN-tagged sub-interfaces (`eth1.<vlanid>`) for controller-pushed VLAN SSIDs
+- `dev.conf.net.ports`      — the ports openUF reports to the controller, one entry per
+  **physical socket** on a board with a switch: `{idx = 1, swport = "lan1"}`, where `idx`
+  is the UniFi `port_idx` and `swport` names a key in `dev.conf.vlan.ports`. Pin each
+  `idx` to a socket and leave it alone — the controller keys per-port settings on it.
+  Do **not** flag one as `uplink`: openUF detects which socket the uplink cable is in
+  from the switch's ARL table, so the flag follows a replug and the other sockets report
+  their own link speed and their own wired clients. A board with no switch map instead
+  uses the netdev shape (`{idx = 1, ifname = "eth0", uplink = true}`), which can report
+  only the CPU port's internal link
 - `dev.conf.net.wan_iface`  — WAN interface (e.g. `eth0`)
 - `dev.conf.switch`         — Switch device name (e.g. `switch0`)
 - `dev.conf.led`            — status LED, driven by the controller's Locate action and its
@@ -455,7 +464,10 @@ Three things must line up or the port is skipped rather than guessed at:
   the device.
 - the port needs a `swport` in `dev.conf.net.ports`, naming its `dev.conf.vlan.ports` key.
 - the port must not be the uplink — reassigning the uplink's VLAN would cut the device off
-  the network, so that is refused outright.
+  the network, so that is refused outright. On a modelmap that declares sockets rather
+  than netdevs, the uplink is whichever socket the default gateway is reached through
+  (found in the switch's ARL table); if that cannot be determined, **every** port is
+  refused rather than risking the wrong one.
 
 Because assigning a port to a VLAN means removing it from the stock VLAN's port list
 (swconfig allows one *untagged* VLAN per port), this is the one place openUF modifies UCI

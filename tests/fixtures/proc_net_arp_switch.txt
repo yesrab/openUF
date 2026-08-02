@@ -1,0 +1,4 @@
+IP address       HW type     Flags       HW address            Mask     Device
+10.0.0.1         0x1         0x2         aa:bb:cc:dd:ee:ff     *        br-lan
+10.0.0.50        0x1         0x2         aa:bb:cc:dd:ee:0c     *        br-lan
+10.0.0.51        0x1         0x2         aa:bb:cc:dd:ee:12     *        br-lan
