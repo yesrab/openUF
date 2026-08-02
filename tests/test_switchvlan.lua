@@ -454,6 +454,48 @@ return {
 		end
 	},
 	{
+		name = "switchvlan: MIB polling is switched on only when the driver has it off",
+		fn = function()
+			-- Per-port byte counters exist only while the ar8xxx driver polls
+			-- the MIB, and an AR8327 ships with the interval at 0 -- so that
+			-- board's Ports view read 0 B on every socket while an AR9344's
+			-- was populated. Never turned off, and never touched on a board
+			-- that has no such knob.
+			local cfg = {vlan = {cpu_lan = 0, ports = {lan1 = 1}}}
+			local orig = switchvlan._popen
+			local ok, err = pcall(function()
+				with_capture(function(cmds)
+					switchvlan._popen = function() return "0\n" end
+					silently(function()
+						assert_true(switchvlan.enable_mib_polling(cfg), "polling off -> enabled")
+					end)
+					assert_eq(#cmds, 1, "one command")
+					assert_true(cmds[1]:find("set ar8xxx_mib_poll_interval 500", 1, true) ~= nil,
+						"sets the poll interval: " .. cmds[1])
+				end)
+				with_capture(function(cmds)
+					switchvlan._popen = function() return "500\n" end
+					assert_false(switchvlan.enable_mib_polling(cfg), "already polling -> untouched")
+					assert_eq(#cmds, 0, "no command")
+				end)
+				with_capture(function(cmds)
+					switchvlan._popen = function() return 'Unknown attribute "x"\n' end
+					assert_false(switchvlan.enable_mib_polling(cfg), "no such knob -> untouched")
+					assert_eq(#cmds, 0, "no command")
+				end)
+				with_capture(function(cmds)
+					switchvlan._popen = function() return "0\n" end
+					assert_false(switchvlan.enable_mib_polling({vlan = {mib_poll_ms = false}}),
+						"explicit opt-out is honoured")
+					assert_false(switchvlan.enable_mib_polling({}), "no switch map -> no switch")
+					assert_eq(#cmds, 0, "no command")
+				end)
+			end)
+			switchvlan._popen = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "switchvlan: apply is a no-op when gated off or absent",
 		fn = function()
 			with_capture(function(cmds)

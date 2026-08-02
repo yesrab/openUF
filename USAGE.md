@@ -126,6 +126,10 @@ which uses `eth1` and never touches `eth0`.
 The modelmap sets:
 - `dev.conf.net.lan_cpueth` — LAN CPU ethernet port (e.g. `eth1`); also the trunk port
   used to create VLAN-tagged sub-interfaces (`eth1.<vlanid>`) for controller-pushed VLAN SSIDs
+- `dev.conf.vlan.mib_poll_ms` — how often the switch driver refreshes its per-port byte
+  counters, which is where the Ports view's Tx/Rx figures come from. openUF turns polling on
+  at startup (500 ms) when the driver ships it off, which an AR8327 does; set `false` to
+  leave the switch alone, at the cost of 0 B on every socket
 - `dev.conf.net.ports`      — the ports openUF reports to the controller, one entry per
   **physical socket** on a board with a switch: `{idx = 1, swport = "lan1"}`, where `idx`
   is the UniFi `port_idx` and `swport` names a key in `dev.conf.vlan.ports`. Pin each

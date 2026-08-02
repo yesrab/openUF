@@ -2913,6 +2913,9 @@ function M.run(cfg, ufhw)
 	-- reapply from state.json on every fresh start (mirrors the bootstrap
 	-- account reconciliation just above).
 	M._firewall.reconcile(st.blocked_stas)
+	-- Per-port byte counters are a switch-driver setting that some boards ship
+	-- switched off; without it every socket reports 0 B in the Ports view.
+	if M._switchvlan then pcall(M._switchvlan.enable_mib_polling, cfg) end
 
 	local socket   = require("socket")
 	local interval = 10

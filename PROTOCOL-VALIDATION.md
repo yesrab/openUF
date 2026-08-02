@@ -259,6 +259,27 @@ on the APs receives nothing (the UCG Ultra does not transmit LLDP to them, thoug
 parses theirs), and `ethernet_table` is not sent at all — no evidence yet on what the
 controller does with it, so it stays unsent rather than guessed at.
 
+### The Ports view's other columns
+
+Empty is the right answer for most of them, and the real gateway is the control group:
+
+| Column | Source | On this site |
+|---|---|---|
+| **Anomaly** | Controller-side, from its own stats history ("24h AI Anomaly Score") | `0` on every AP port; `20` on the UCG's port facing the 100baseT-linked AP — the same conclusion it records on the device as `detailed_states.negotiated_low_uplink_port_speed: true`, which only appeared once openUF stopped claiming 1000 |
+| **STP** | `stp_state`/`stp_pathcost`, a USW port property | `-` for every port, the gateway's own included |
+| **Profile** | Port profile (`portconf_id` in `port_overrides`), controller-side config | `-` for every port, the gateway's own included |
+| **Operation** | `op_mode` (`switch`/`mirror`/`aggregate`) | The controller writes `op_mode: "switch"` and `forward: "all"` onto openUF's ports **although openUF sends neither** — server-side defaults. `switch` is the truthful value for these sockets anyway |
+| **Tx/Rx Sum, Tx/Rx Rate** | `rx_bytes`/`tx_bytes` | Populated from the per-port MIB — see below |
+| **Tx/Rx Multicast, Broadcast, Dropped, Packets** | `rx_multicast`, `tx_broadcast`, `rx_dropped`, … | Sent by the gateway, not by openUF: swconfig's per-port MIB exposes `RxGoodByte`/`TxByte` and nothing else, and the CPU netdev's totals belong to every socket at once |
+
+**Per-port counters are a driver setting, not a capability.** The ar8xxx driver only maintains
+the MIB while `ar8xxx_mib_poll_interval` is non-zero, and boards differ: the AR9344 shipped at
+`500` and reported counters, the AR8327 shipped at `0` and answered "Operation not supported"
+for every port, so one AP's Ports view was populated and the other's read 0 B everywhere. One
+`swconfig dev switch0 set ar8xxx_mib_poll_interval 500` produced counters on the next read, so
+openUF now does that once at startup when the attribute exists and reads 0
+(`switchvlan.enable_mib_polling`, opt out with `dev.conf.vlan.mib_poll_ms = false`).
+
 ---
 
 ## Controller behaviors that are not openUF bugs

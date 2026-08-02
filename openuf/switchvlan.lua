@@ -202,6 +202,38 @@ function M.vlan_table_size(cursor, device)
 	return n and tonumber(n) or nil
 end
 
+-- Switch on the driver's per-port MIB polling, once, at startup.
+--
+-- port_table's per-socket byte counters come from the switch's MIB, and the
+-- ar8xxx driver only maintains them while `ar8xxx_mib_poll_interval` is
+-- non-zero. It ships that way on some boards and not others -- an AR9344
+-- (TL-WDR3500) had it at 500 ms and reported counters, while an AR8327
+-- (Archer C5) had it at 0 and answered "Operation not supported" for every
+-- port, so that AP's Ports view showed 0 B on every socket while the other's
+-- was populated. Confirmed live: one `swconfig set` produced counters on the
+-- next read.
+--
+-- Only ever turns it ON, and only when the attribute exists and reads 0 --
+-- a board that already polls (or a driver with no such knob) is left alone.
+-- `dev.conf.vlan.mib_poll_ms = false` opts out; a number sets the interval.
+-- Returns true when it changed something.
+function M.enable_mib_polling(cfg)
+	local vlan = cfg and cfg.vlan
+	if not vlan then return false end          -- no switch map: no switch
+	if vlan.mib_poll_ms == false then return false end
+	local interval = tonumber(vlan.mib_poll_ms) or 500
+	local device = vlan.device or "switch0"
+	local attr = "ar8xxx_mib_poll_interval"
+	local cur = M._popen(("swconfig dev %s get %s"):format(device, attr))
+	local n = tostring(cur or ""):match("^%s*(%d+)")
+	if not n then return false end             -- unknown attribute / no swconfig
+	if tonumber(n) > 0 then return false end   -- already polling
+	M._exec(("swconfig dev %s set %s %d"):format(device, attr, interval))
+	io.stderr:write(("switchvlan: enabled %s=%d on %s -- per-port counters were off\n")
+		:format(attr, interval, device))
+	return true
+end
+
 -- Apply a parsed switch table.
 -- sw:  output of inform.M._parse_switch_system_cfg (may be nil)
 -- cfg: device configuration (dev.conf)
