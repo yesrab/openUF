@@ -456,9 +456,19 @@ function M.apply(sw, cfg, st, wireless_vlans, uplink_phys)
 		-- mutation, so restore() can put them back. Only taken when we are
 		-- about to write or strip sections -- a reconcile-only pass has no
 		-- new mutation to ledger.
+		-- Stock sections only. An earlier version snapshotted every
+		-- switch_vlan section, so a second push -- by which time openUF's own
+		-- openuf_swvlan<vid> existed -- filed openUF's output in the ledger as
+		-- if it were the board's original. Inert, because restore() deletes
+		-- the openuf sections before replaying the backup and nothing is left
+		-- to restore that key onto, but it is a false record of what the board
+		-- looked like, and the ledger is the only thing standing between a
+		-- forward mutation and an unrecoverable switch config.
 		st.swvlan_backup = st.swvlan_backup or (function()
 			local snap = {}
 			cursor:foreach("network", "switch_vlan", function(s)
+				local name = s[".name"]
+				if name and name:match("^" .. OPENUF_VLAN_PREFIX) then return end
 				if s.vlan and s.ports then snap[tostring(s.vlan)] = s.ports end
 			end)
 			return snap

@@ -610,6 +610,26 @@ return {
 		end
 	},
 	{
+		name = "switchvlan: the reversibility ledger records stock sections only",
+		fn = function()
+			-- A second push happens with openUF's own sections already in UCI.
+			-- Snapshotting those as if they were the board's original state
+			-- makes the ledger lie about what to restore to.
+			with_capture(function()
+				local u = swconfig_board()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(nil, CFG, st, {20}, 4)
+				st.swvlan_backup = nil          -- force a fresh snapshot
+				switchvlan.apply(nil, CFG, st, {20, 30}, 4)
+				assert_eq(st.swvlan_backup["1"], "0t 1 2 3 4",
+					"the stock VLAN 1 section is in the ledger")
+				assert_true(st.swvlan_backup["20"] == nil,
+					"openUF's own openuf_swvlan20 is not")
+			end)
+		end
+	},
+	{
 		name = "switchvlan: a per-port assignment wins over the blanket trunk for the same VID",
 		fn = function()
 			-- Both features can name VLAN 20. Two sections for one VID is a
