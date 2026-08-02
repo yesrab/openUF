@@ -470,6 +470,29 @@ local function _filter_hosts(source, a, b, self_macs, station_macs)
 	return hosts
 end
 
+-- Pick the survey entry describing the channel the radio is actually on.
+--
+-- `iw dev <if> survey dump` emits one entry per channel the phy supports, in
+-- the phy's own frequency order -- so the operating channel is wherever it
+-- happens to fall (entry 11 of 13 for 2.4GHz ch11, entry 3 of 24 for 5GHz
+-- ch44), essentially never first. Every other entry is a scan dwell holding
+-- a few milliseconds of accumulated time, so deriving utilisation from
+-- stats[1] divided a busy figure by a ~3 ms active time: confirmed live on
+-- both APs, a genuinely 24%-busy 2.4GHz channel was reported to the
+-- controller as 100% and a 1.9%-busy 5GHz channel as 75%, which is what made
+-- the APs look like they were drowning in interference. The same wrong entry
+-- also supplied the noise floor used to convert Minimum RSSI back to dBm.
+--
+-- Falls back to the first entry when nothing is marked, which keeps drivers
+-- (and test doubles) that omit the marker behaving exactly as before.
+local function _in_use_survey(stats)
+	if type(stats) ~= "table" then return nil end
+	for _, s in ipairs(stats) do
+		if s.in_use then return s end
+	end
+	return stats[1]
+end
+
 -- Build the inform JSON payload.
 -- st: current state table
 -- cfg: device configuration (from conf.lua)
@@ -699,7 +722,8 @@ function M.build_json(st, cfg, ufhw)
 				-- "-80 dBm" <-> wire "15", UI "-85 dBm" <-> wire "10", both
 				-- consistent with raw = dbm + 95). Falls back to that -95
 				-- assumption only when a live noise reading isn't available.
-				local noise = (ok_rs and stats[1] and stats[1].noise) or -95
+				local in_use = ok_rs and _in_use_survey(stats) or nil
+				local noise = (in_use and in_use.noise) or -95
 				-- min_rssi_raw can legitimately be missing with the flag set
 				-- (inconsistent UCI, e.g. a hand-edit or interrupted write) --
 				-- without the guard this was `nil + noise`, killing the whole
@@ -708,8 +732,8 @@ function M.build_json(st, cfg, ufhw)
 					radio.min_rssi = radio.min_rssi_raw + noise
 					minrssi_threshold_by_radio[radio.name] = radio.min_rssi
 				end
-				if ok_rs and stats[1] then
-					local s     = stats[1]  -- in-use channel's survey entry
+				if in_use then
+					local s     = in_use  -- the channel the radio is actually on
 					local total = s.channel_time or 0
 					local busy  = s.channel_time_busy or 0
 					local cu_total   = total > 0 and math.floor(busy * 100 / total) or 0

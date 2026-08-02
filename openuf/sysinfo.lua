@@ -153,7 +153,12 @@ function M.radio_stats(ifname)
 		local freq = line:match("frequency:%s+(%d+)")
 		if freq then
 			if current then result[#result + 1] = current end
-			current = {freq = tonumber(freq)}
+			-- iw marks the operating channel's entry "[in use]" on this same
+			-- line. It is the ONLY entry whose counters describe the radio's
+			-- actual airtime -- every other one is a scan dwell of a few
+			-- milliseconds -- so callers wanting utilisation must pick it out
+			-- rather than assume a position (see _in_use_survey in inform.lua).
+			current = {freq = tonumber(freq), in_use = line:find("[in use]", 1, true) ~= nil}
 		elseif current then
 			-- Field names matched against the real iw(8) binary's own format
 			-- strings ("channel active/busy/receive/transmit time:", not

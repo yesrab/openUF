@@ -168,7 +168,9 @@ return {
 		fn = function()
 			with_fixtures({}, {["survey dump"] = fixture("iw_survey_dump.txt")}, function()
 				local stats = sysinfo.radio_stats("wlan0")
-				-- Fixture has 2 frequency entries; the first is the in-use channel
+				-- The fixture mirrors real iw output: entries come in the phy's
+				-- frequency order, so the in-use channel is NOT first (here it
+				-- is third of four). Nothing may assume a position.
 				assert_true(#stats >= 1, "at least one entry")
 				local active
 				for _, s in ipairs(stats) do
@@ -180,6 +182,12 @@ return {
 				assert_eq(active.channel_time_busy, 1850, "channel_time_busy ms")
 				assert_eq(active.channel_time_rx,    900, "channel_time_rx ms")
 				assert_eq(active.channel_time_tx,    450, "channel_time_tx ms")
+				-- The "[in use]" marker is the only way to identify the
+				-- operating channel; without it callers fall back to stats[1],
+				-- which here is a 3 ms scan dwell.
+				assert_true(active.in_use, "2437 MHz flagged in_use")
+				assert_true(not stats[1].in_use, "first entry not flagged in_use")
+				assert_eq(stats[1].freq, 2412, "first entry is a non-operating channel")
 			end)
 		end
 	},

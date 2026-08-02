@@ -1018,6 +1018,19 @@ this radio's own tx/rx.
 > `channel busy time:` doesn't also match inside `extension channel busy time:`, which `iw`
 > emits on wider channels.
 
+> **The operating channel's entry is not first — pick it by `[in use]`.** `survey dump`
+> emits one entry per channel the phy supports, in the phy's own frequency order, so the
+> operating channel sits wherever it falls: measured live on 2026-08-02, entry **11 of 13**
+> for a 2.4GHz radio on ch11 and **3 of 24** for a 5GHz radio on ch44. Every other entry is
+> a scan dwell carrying only a few milliseconds of accumulated time (3–146 ms observed).
+> Deriving `cu_*` from `stats[1]` therefore divided a busy figure by a ~3 ms active time and
+> reported a genuinely 24%-busy 2.4GHz channel to the controller as **100%**, and a 1.9%-busy
+> 5GHz channel as **75%** — which is what made both APs look like they were drowning in
+> interference. The same wrong entry also fed the noise floor used to convert Minimum RSSI
+> back to dBm. Fixed by flagging `in_use` in `sysinfo.radio_stats()` and selecting it in
+> `inform.lua`'s `_in_use_survey()`; the test fixture now mirrors the real ordering, and
+> reverting the selection fails 4 tests.
+
 `spectrum_table[]` entries carry `channel`, `center_freq`, `width`, `utilization`,
 `interference` (field names recovered from two independent Lombok DTO constant pools).
 `channel`/`center_freq`/`utilization` come mechanically from survey dump; `width` and
