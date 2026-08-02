@@ -1118,6 +1118,12 @@ the uplink entry only to the CPU netdev's `sysinfo.interfaces()` counters — ev
 CPU sent or received crossed that socket. Other sockets report `0` rather than a fabricated
 share of the same total.
 
+The two shapes mix within one board, per port: an entry with no `swport` falls through to
+the netdev source below even when the switch answered. That is not a fallback but the right
+answer for a socket wired to its own MAC and PHY rather than to the switch — the
+TL-WDR3500's WAN socket is a second `ag71xx` surfacing as `eth1`, so sysfs there describes
+that socket and not the CPU's link.
+
 **Netdev (no switch, no swconfig, or no identifiable uplink — modelmap field
 `{idx, ifname, uplink}`, defaulting to `{wan_cpueth=uplink, lan_cpueth=lan}`).** `up` from
 sysfs `carrier`/`operstate`, `speed`/`full_duplex` from sysfs, counters from

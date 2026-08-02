@@ -59,14 +59,21 @@ dev.conf.net = {
 	-- as cabled today. `idx` stays pinned to a socket so controller-side
 	-- per-port overrides survive a replug.
 	--
-	-- The WAN socket is absent because this board has none: all four sockets
-	-- are LAN (see dev.conf.vlan.ports), and eth1 is a netdev with no socket
-	-- of its own.
+	-- The WAN socket is the fifth entry and is NOT on the switch: the AR8229
+	-- has 5 ports (`swconfig dev switch0 help`: "ports: 5 (cpu @ 0)") and all
+	-- four external ones are LAN sockets, while the WAN socket hangs off its
+	-- own MAC and PHY -- a second `ag71xx` at 19000000.eth, connected to
+	-- mdio.0:1f:04, surfacing as `eth1`. So it is described by a netdev and
+	-- swconfig knows nothing about it; entries with an `ifname` and no
+	-- `swport` are read from sysfs, which for a socket with its own PHY is
+	-- the real link and not the CPU's. eth1 is a br-lan port here, so a host
+	-- plugged into that socket is on the LAN and gets reported like any other.
 	ports = {
 		{idx = 1, swport = "lan1"},
 		{idx = 2, swport = "lan2"},
 		{idx = 3, swport = "lan3"},
 		{idx = 4, swport = "lan4"},
+		{idx = 5, ifname = "eth1"},
 	},
 }
 

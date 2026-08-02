@@ -1444,6 +1444,42 @@ return {
 		end
 	},
 	{
+		name = "inform json: a socket with its own PHY is reported alongside the switch's",
+		fn = function()
+			-- Not every socket is behind the switch. The TL-WDR3500's four LAN
+			-- sockets are, but its WAN socket has its own MAC and PHY and
+			-- shows up only as a netdev (`eth1`) -- so the board's five
+			-- sockets need a mixed modelmap, and reporting four of them made
+			-- the Ports view disagree with the panel.
+			local cfg = switch_cfg(WDR_MAP)
+			cfg.net.ports[#cfg.net.ports + 1] = {idx = 5, ifname = "eth0"}
+			local orig = inform._read_file
+			inform._read_file = function(path)
+				-- Its own PHY, so sysfs is the socket's real link here -- not
+				-- the CPU's, which is what sysfs answers on a switch port.
+				if path == "/sys/class/net/eth0/carrier" then return "1\n" end
+				if path == "/sys/class/net/eth0/speed"   then return "100\n" end
+				if path == "/sys/class/net/eth0/duplex"  then return "full\n" end
+				return nil
+			end
+			local ok, err = pcall(function()
+				local d = build_switch({
+					cfg = cfg,
+					swconfig = fixture("swconfig_show_ar9344.txt"),
+				})
+				assert_eq(#d.port_table, 5, "four switch sockets plus the PHY-direct one")
+				local p = by_idx(d.port_table)
+				assert_eq(p[5].speed, 100, "its own negotiated speed, from sysfs")
+				assert_true(p[5].up, "and its own link state")
+				assert_eq(p[5].rx_bytes, 9876543, "counters from its netdev")
+				assert_false(p[5].is_uplink, "the uplink is still the socket the cable is in")
+				assert_true(p[4].is_uplink, "which the switch found")
+			end)
+			inform._read_file = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform json: without a readable switch the netdev port shape is unchanged",
 		fn = function()
 			-- No swconfig (a DSA board, a missing binary, a container): the

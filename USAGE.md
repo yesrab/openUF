@@ -133,8 +133,11 @@ The modelmap sets:
   Do **not** flag one as `uplink`: openUF detects which socket the uplink cable is in
   from the switch's ARL table, so the flag follows a replug and the other sockets report
   their own link speed and their own wired clients. A board with no switch map instead
-  uses the netdev shape (`{idx = 1, ifname = "eth0", uplink = true}`), which can report
-  only the CPU port's internal link
+  uses the netdev shape (`{idx = 1, ifname = "eth0", uplink = true}`), which on a switch
+  board can report only the CPU port's internal link. The two mix: a socket wired to its
+  own MAC/PHY instead of the switch (the TL-WDR3500's WAN socket, `eth1`) is listed with an
+  `ifname` and no `swport`, and sysfs then describes that socket correctly. Count the RJ45
+  sockets on the case — the list should have one entry each
 - `dev.conf.net.wan_iface`  — WAN interface (e.g. `eth0`)
 - `dev.conf.switch`         — Switch device name (e.g. `switch0`)
 - `dev.conf.led`            — status LED, driven by the controller's Locate action and its
