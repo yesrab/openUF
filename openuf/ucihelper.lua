@@ -123,6 +123,14 @@ end
 -- all, and nothing in UCI to explain why. So probe what the hardware can
 -- really do and clamp DOWNWARD only -- a controller asking for less than the
 -- radio supports is a legitimate request, never something to "correct".
+--
+-- The one exception is opt-in and per board: dev.conf.radio.<band>.htmode_floor
+-- (see M.raise_htmode). A controller that has no idea what the hardware is can
+-- push a mode far below it -- a UCG Ultra sends 11naht40 to this emulated U6IW,
+-- i.e. 802.11n at 40MHz, at a 4x4 WiFi-6 radio -- and on a board where that is
+-- known to be the controller's blind default rather than an intent, a modelmap
+-- may declare a floor to raise it back to. Never above real capability: the
+-- floor is applied first and the hardware clamp still runs after it.
 local PHY_RANK = {HT = 1, VHT = 2, HE = 3, EHT = 4}
 local RANK_PHY = {"HT", "VHT", "HE", "EHT"}
 
@@ -254,6 +262,59 @@ function M.clamp_htmode(band, htmode)
 	-- HT tops out at 40MHz: there is no such thing as HT80.
 	if out_kind == "HT" then out_width = math.min(out_width, 40) end
 	local out = out_kind .. tostring(out_width)
+	if out == htmode then return htmode, nil end
+	return out, htmode
+end
+
+-- Raise an OpenWrt htmode to at least `floor`, per-kind and per-width
+-- independently ("VHT80" with a floor of "HE20" becomes "HE80": the better PHY
+-- generation, the wider of the two widths).
+--
+-- This deliberately overrides the controller, which is why it only ever runs
+-- when a modelmap explicitly asked for it. The hardware clamp is applied by the
+-- caller AFTERWARDS, so a floor can never ask for more than the radio has.
+--
+-- Returns the (possibly raised) htmode and, when it changed, the original --
+-- callers log the pair, because a silently widened channel is exactly the kind
+-- of change that turns into an unexplainable bug report months later.
+function M.raise_htmode(htmode, floor)
+	if type(htmode) ~= "string" or type(floor) ~= "string" then return htmode, nil end
+	local h_kind, h_width = htmode:match("^(%u+)(%d+)$")
+	local f_kind, f_width = floor:match("^(%u+)(%d+)$")
+	-- "NOHT" and friends are not a width request; a malformed floor is ignored
+	-- rather than guessed at.
+	if not (h_kind and f_kind and PHY_RANK[h_kind] and PHY_RANK[f_kind]) then
+		return htmode, nil
+	end
+	local kind  = RANK_PHY[math.max(PHY_RANK[h_kind], PHY_RANK[f_kind])]
+	local width = math.max(tonumber(h_width), tonumber(f_width))
+	-- HT tops out at 40MHz, same rule clamp_htmode applies: there is no HT80.
+	if kind == "HT" then width = math.min(width, 40) end
+	local out = kind .. tostring(width)
+	if out == htmode then return htmode, nil end
+	return out, htmode
+end
+
+-- Lower an OpenWrt htmode to at most `ceiling`, per-kind and per-width
+-- independently -- the mirror of M.raise_htmode.
+--
+-- Distinct from clamp_htmode, which asks the DRIVER what it can do. This is for
+-- a board whose driver says yes and whose radio then does not: a JIDU6101
+-- reports 160MHz support and hostapd accepts HE160, but every 160MHz block on
+-- 5GHz overlaps DFS and this driver cannot start CAC, so the radio comes up
+-- DOWN. `iw phy` cannot express "advertised but unusable"; only the modelmap
+-- can, via dev.conf.radio.<band>.htmode_max.
+function M.cap_htmode(htmode, ceiling)
+	if type(htmode) ~= "string" or type(ceiling) ~= "string" then return htmode, nil end
+	local h_kind, h_width = htmode:match("^(%u+)(%d+)$")
+	local c_kind, c_width = ceiling:match("^(%u+)(%d+)$")
+	if not (h_kind and c_kind and PHY_RANK[h_kind] and PHY_RANK[c_kind]) then
+		return htmode, nil
+	end
+	local kind  = RANK_PHY[math.min(PHY_RANK[h_kind], PHY_RANK[c_kind])]
+	local width = math.min(tonumber(h_width), tonumber(c_width))
+	if kind == "HT" then width = math.min(width, 40) end
+	local out = kind .. tostring(width)
 	if out == htmode then return htmode, nil end
 	return out, htmode
 end
@@ -636,8 +697,43 @@ end
 -- country: ISO 3166-1 alpha-2 regulatory domain from the controller's site
 -- setting (system_cfg's radio.<n>.countrycode, numeric on the wire and mapped
 -- to alpha-2 by inform.lua). nil leaves UCI alone.
+-- radio_policy: the modelmap's dev.conf.radio table, keyed by openUF's band
+-- keys ("ng" = 2.4GHz, "na" = 5/6GHz). Board-level answers to things the
+-- controller states in terms it cannot know are wrong for this hardware:
+--
+--   acs_exclude_dfs  Controller channel "Auto" arrives as the literal
+--                    channel=auto and is handed to hostapd ACS. On some boards
+--                    ACS then picks a DFS channel the driver cannot actually
+--                    start CAC on and the radio is left DOWN -- verified live
+--                    on an MT7986 (JIDU6101): ACS-COMPLETED channel=52 ->
+--                    "DFS start_dfs_cac() failed, -1" -> AP-DISABLED, every
+--                    time. Setting this writes UCI acs_exclude_dfs=1 whenever
+--                    the effective channel is auto, which makes ACS choose
+--                    among non-DFS channels only. On the same board that took
+--                    5GHz from permanently down to ch149 @ 80MHz.
+--   channels         Optional explicit ACS candidate list (UCI `channels` ->
+--                    hostapd chanlist). Narrower than acs_exclude_dfs and only
+--                    for a board that also needs specific channels excluded.
+--   htmode_floor     Raise a pushed htmode to at least this (see
+--                    M.raise_htmode). For a controller whose default for this
+--                    emulated model is far below the real radio -- a UCG Ultra
+--                    sends 11naht40, i.e. 802.11n/40MHz, at a 4x4 WiFi-6 phy.
+--   htmode_max       Lower a pushed htmode to at most this (see M.cap_htmode),
+--                    for a width the driver ADVERTISES and the radio cannot
+--                    actually run. Verified on a JIDU6101: HE160 on any legal
+--                    primary channel puts the 160MHz block over DFS spectrum
+--                    (ch36 -> seg0=50, i.e. 36-64, and 52-64 are DFS), CAC
+--                    start fails, and the radio never comes up. `iw phy` says
+--                    160MHz is supported, so no capability check can catch it.
+--
+-- Every one of them is absent by default: with no radio_policy, or no entry
+-- for this radio's band, behaviour is exactly as before.
+--
+-- opts: optional table. opts.force_wifi4 suppresses htmode_floor for this
+-- radio, because a WLAN on it has the controller's "Force WiFi 4 Mode" on --
+-- see apply_config, where it is collected per radio.
 function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates,
-		disabled, country)
+		disabled, country, radio_policy, opts)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	-- Every write below is cursor:set on a named section, which in UCI CREATES
@@ -671,19 +767,83 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 	if chan then
 		cursor:set("wireless", radio, "channel", tostring(chan))
 	end
+
+	-- The radio's band comes from its own UCI declaration, not from the channel
+	-- being pushed alongside: a radio's band is fixed by hardware, and `chan`
+	-- can be the literal "auto". Hoisted out of the htmode branch below because
+	-- the channel policy needs it too.
+	local band = band_for_device({
+		band    = cursor:get("wireless", radio, "band"),
+		hwmode  = cursor:get("wireless", radio, "hwmode"),
+		channel = cursor:get("wireless", radio, "channel") or chan,
+	})
+	local policy = (type(radio_policy) == "table" and band and radio_policy[band]) or nil
+
+	-- What "Auto" means on this board. Read back from UCI rather than from
+	-- `chan`, so a push that omits the channel entirely still gets the policy
+	-- applied to the auto that is already configured.
+	local eff_chan = cursor:get("wireless", radio, "channel")
+	if tostring(eff_chan) == "auto" or tostring(eff_chan) == "0" then
+		if policy and policy.acs_exclude_dfs then
+			cursor:set("wireless", radio, "acs_exclude_dfs", "1")
+		else
+			cursor:delete("wireless", radio, "acs_exclude_dfs")
+		end
+		if policy and type(policy.channels) == "table" and #policy.channels > 0 then
+			local list = {}
+			for _, c in ipairs(policy.channels) do list[#list + 1] = tostring(c) end
+			cursor:set("wireless", radio, "channels", list)
+		else
+			cursor:delete("wireless", radio, "channels")
+		end
+	else
+		-- A concrete channel was chosen: neither option means anything to
+		-- hostapd then (both are ACS inputs), and leaving them behind would
+		-- resurrect the restriction the next time Auto is selected.
+		cursor:delete("wireless", radio, "acs_exclude_dfs")
+		cursor:delete("wireless", radio, "channels")
+	end
+
 	if htmode then
-		-- The radio's band comes from its own UCI declaration, not from the
-		-- channel being pushed alongside: a radio's band is fixed by hardware,
-		-- and `chan` can be the literal "auto".
-		local band = band_for_device({
-			band    = cursor:get("wireless", radio, "band"),
-			hwmode  = cursor:get("wireless", radio, "hwmode"),
-			channel = cursor:get("wireless", radio, "channel") or chan,
-		})
-		local clamped, requested = M.clamp_htmode(band, htmode)
+		local want = htmode
+		local force_wifi4 = (type(opts) == "table" and opts.force_wifi4) or false
+		if policy and policy.htmode_floor and not force_wifi4 then
+			local raised, from = M.raise_htmode(want, policy.htmode_floor)
+			if from then
+				io.stderr:write(string.format(
+					"openuf: %s: controller asked for htmode %s, board floor is %s -- raised to %s\n",
+					radio, from, policy.htmode_floor, raised))
+			end
+			want = raised
+		elseif policy and policy.htmode_floor and force_wifi4 then
+			-- "Force WiFi 4 Mode" is an explicit instruction to keep this
+			-- network legible to old 802.11n-only clients, and the floor is a
+			-- correction for a controller default. An explicit intent beats a
+			-- default-correction: raising the radio back to HE would put the HE
+			-- IEs back in the beacon that the mode exists to remove. Confirmed
+			-- on real hardware that this is otherwise exactly what happens --
+			-- the controller leaves radio.<n>.ieee_mode alone for this mode, so
+			-- without the suppression the floor still fires and hostapd got
+			-- ieee80211ax=1 on a WLAN explicitly forced to WiFi 4.
+			io.stderr:write(string.format(
+				"openuf: %s: htmode floor %s suppressed -- a WLAN on this radio " ..
+				"has Force WiFi 4 Mode enabled\n", radio, policy.htmode_floor))
+		end
+		if policy and policy.htmode_max then
+			local capped, from = M.cap_htmode(want, policy.htmode_max)
+			if from then
+				io.stderr:write(string.format(
+					"openuf: %s: htmode %s exceeds the board ceiling %s -- lowered to %s\n",
+					radio, from, policy.htmode_max, capped))
+			end
+			want = capped
+		end
+		-- Hardware clamp runs LAST and unconditionally, so neither a floor nor
+		-- a push can ask for more than the radio really has.
+		local clamped, requested = M.clamp_htmode(band, want)
 		if requested then
 			io.stderr:write(string.format(
-				"openuf: %s: controller asked for htmode %s, hardware supports %s -- clamped\n",
+				"openuf: %s: htmode %s exceeds what the hardware supports (%s) -- clamped\n",
 				radio, requested, clamped))
 		end
 		cursor:set("wireless", radio, "htmode", clamped)
@@ -812,6 +972,21 @@ function M.apply_config(resp, cfg, opts)
 	-- and lock out clients the controller fully intended to admit -- a
 	-- silent, on-air-only failure. VAPs with no floor (the key is absent
 	-- whenever that band's control is off) contribute nothing.
+	-- "Force WiFi 4 Mode" is per WLAN but htmode is per RADIO, so a radio
+	-- carrying any such WLAN cannot also be raised to HE by a board
+	-- htmode_floor -- see rf_config. Collected here, before the radio loop,
+	-- for the same reason the rate aggregation below is.
+	local iot_by_radio = {}
+	for _, vap in ipairs(vap_table) do
+		-- `radio` is what the parsed wire shape calls the UCI device name
+		-- (_parse_wifi_system_cfg sets it from wireless.<n>.parent, and the rate
+		-- aggregation below joins on the same field). `radio_name` is what
+		-- get_vap_table()'s OUTBOUND shape calls it -- accepted too so a
+		-- caller/test handing over either shape works.
+		local rn = vap.radio or vap.radio_name
+		if vap.iot and rn then iot_by_radio[rn] = true end
+	end
+
 	local rates_by_radio = {}
 	for _, vap in ipairs(vap_table) do
 		if vap.radio and vap.minrate_data then
@@ -850,7 +1025,8 @@ function M.apply_config(resp, cfg, opts)
 			end
 			M.rf_config(radio.name, radio.htmode, radio.channel, radio.tx_power,
 				radio.min_rssi_enabled, radio.min_rssi, rates, radio.disabled,
-				radio.country)
+				radio.country, cfg and cfg.radio,
+				{force_wifi4 = iot_by_radio[radio.name] or false})
 		end
 	end
 

@@ -111,7 +111,12 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   profile is derived from the board's OpenWrt DTS and `board.d` entry rather than from a
   live run, and its header flags the two facts to check first (the LED name and which
   radio is which band). The first **DSA** board here rather than swconfig, which changes
-  how ports are reported — see below. 140 MB of SPI-NAND, so space is a non-issue
+  how ports are reported — see below. 140 MB of SPI-NAND, so space is a non-issue.
+  Carries a `dev.conf.radio` policy: its 5 GHz radio cannot be handed the controller's
+  channel **Auto** unqualified (hostapd ACS picks a DFS channel, the mt7915 driver fails
+  to start CAC, and the radio is left down), and the controller's default mode for the
+  emulated U6IW is 802.11n at 40 MHz on a 4x4 WiFi-6 phy — see
+  [USAGE](USAGE.md#radio-policy-devconfradio)
 
 Anything else: `modelmap/generic-dualband-ap.lua` or `modelmap/generic-singleband-ap.lua`,
 or let `setup.sh` generate a profile from the running device (DSA boards only, where every

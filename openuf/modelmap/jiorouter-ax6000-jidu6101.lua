@@ -119,6 +119,60 @@ dev.conf.net = {
 -- board-specific `label` in a future DTS revision would change it.
 dev.conf.led = "green:status"
 
+-- Radio policy: what the controller's "Auto" -- and its blind defaults -- mean
+-- on THIS board. Keyed by openUF's band keys: ng = 2.4GHz, na = 5/6GHz.
+-- Everything here is measured on the real device, not assumed.
+dev.conf.radio = {
+	na = {
+		-- 5 GHz "Auto" channel is the one setting that must not be handed
+		-- straight to hostapd ACS on this board. Verified live, repeatedly:
+		--     phy1-ap0: ACS-COMPLETED freq=5260 channel=52
+		--     phy1-ap0: DFS-CAC-START freq=5260 chan=52 cac_time=60s
+		--     hostapd: DFS start_dfs_cac() failed, -1
+		--     phy1-ap0: interface state DFS->DISABLED / AP-DISABLED
+		-- ACS keeps choosing a DFS channel and the mt7915/MT7986 driver cannot
+		-- start CAC on it, so the radio ends up DOWN with the controller
+		-- reporting the WLAN as provisioned. `iw phy phy1 info` in the IN
+		-- regdomain marks 52-64 and 100-144 "(radar detection)"; only 36-48
+		-- and 149-173 are clear.
+		--
+		-- acs_exclude_dfs is a stock OpenWrt wifi-device option (it reaches
+		-- hostapd as acs_exclude_dfs=1 and applies only when the channel is
+		-- auto). With it set, the same radio came up first try:
+		--     ACS-COMPLETED freq=5765 channel=153 -> HT_SCAN -> AP-ENABLED
+		--     live: channel 149, width 80 MHz, ieee80211ax=1
+		acs_exclude_dfs = true,
+
+		-- Optional and NOT set: an explicit ACS candidate list, if you want to
+		-- narrow it further than "anything non-DFS" (it becomes hostapd's
+		-- chanlist). The full non-DFS set this board reports under IN is:
+		--   channels = {36, 40, 44, 48, 149, 153, 157, 161, 165, 169, 173},
+		-- Note there is no useful "maximum channel" for this board: capping at
+		-- 128 would still leave every DFS channel from 52 up in range, which is
+		-- exactly what fails, while excluding 149-165 -- the channels that
+		-- actually work here.
+
+		-- The UCG Ultra pushes radio.2.ieee_mode=11naht40 to this AP -- 802.11n
+		-- at 40 MHz -- which is what openUF then writes, throwing away most of
+		-- a 4x4 WiFi-6 radio (a client associated at MCS 15, 144 Mbit/s). It is
+		-- a controller-side default for the emulated model rather than an
+		-- intent, so this board raises it. Kind and width are raised
+		-- independently, so a controller that genuinely asks for MORE than this
+		-- keeps its value, and openUF's hardware clamp still runs afterwards.
+		htmode_floor = "HE80",
+	},
+	ng = {
+		-- No DFS on 2.4 GHz, so ACS needs no help here.
+		--
+		-- HE20 as a floor means "at least 802.11ax, at least 20 MHz": the
+		-- controller's 11nght40 keeps its 40 MHz (the floor only raises what is
+		-- below it) and gains the HE generation. Set HE40 here if you want to
+		-- force 40 MHz, but on 2.4 GHz with three non-overlapping channels that
+		-- is usually the wrong trade.
+		htmode_floor = "HE20",
+	},
+}
+
 -- dev.conf.vlan is deliberately ABSENT.
 --
 -- It is the swconfig physical-port map, and this board has no swconfig: the

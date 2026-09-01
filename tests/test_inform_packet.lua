@@ -1172,6 +1172,38 @@ return {
 		end
 	},
 	{
+		name = "inform packet: an 'ht' token wider than 40MHz is promoted, not taken literally",
+		fn = function()
+			-- CONFIRMED live on a UCG Ultra: setting the 5GHz channel width to
+			-- 80 MHz produces radio.2.ieee_mode=11naht80 -- the PHY marker
+			-- stays "ht" and only the width moves. 802.11n has no 80MHz, so
+			-- taken literally that became htmode "HT80", which does not exist,
+			-- and clamp_htmode knocked it straight back to HT40. The operator's
+			-- 80 MHz setting vanished silently, and the radio ran 802.11n at 40
+			-- MHz on a 4x4 WiFi-6 phy. The width is the authoritative half of
+			-- the token; promote to the narrowest PHY that can express it.
+			local cases = {
+				["11nght20"]  = "HT20",   -- 20/40 ARE expressible by HT: unchanged
+				["11nght40"]  = "HT40",
+				["11naht40"]  = "HT40",
+				["11naht80"]  = "VHT80",  -- the live case
+				["11naht160"] = "VHT160",
+			}
+			for token, expected in pairs(cases) do
+				local t = inform._parse_wifi_system_cfg(
+					"radio.1.phyname=radio0\nradio.1.ieee_mode=" .. token .. "\n")
+				assert_eq(t[1].htmode, expected, token .. " -> " .. expected)
+			end
+			-- An explicit vht/he/eht token is never second-guessed.
+			for token, expected in pairs({["11acvht80"] = "VHT80",
+					["11axhe80"] = "HE80", ["11beeht160"] = "EHT160"}) do
+				local t = inform._parse_wifi_system_cfg(
+					"radio.1.phyname=radio0\nradio.1.ieee_mode=" .. token .. "\n")
+				assert_eq(t[1].htmode, expected, token .. " stays " .. expected)
+			end
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg leaves htmode nil for absent/garbage ieee_mode",
 		fn = function()
 			-- nil means "leave the radio's current width alone", the same

@@ -1515,7 +1515,22 @@ local function _htmode_from_ieee_mode(ieee_mode)
 	if not (head and _IEEE_MODE_WIDTHS[width]) then return nil end
 	for _, phy in ipairs(_IEEE_MODE_PHY) do
 		local kind, prefix = phy[1], phy[2]
-		if head:sub(-#kind) == kind then return prefix .. width end
+		if head:sub(-#kind) == kind then
+			-- The WIDTH is the authoritative half of this token; the PHY marker
+			-- is vestigial madwifi naming and the controller does not always
+			-- update it. Confirmed live on a UCG Ultra: setting a 5GHz channel
+			-- width of 80 MHz produces ieee_mode=11naht80 -- still "ht", even
+			-- though 802.11n has no 80MHz. Taken literally that became htmode
+			-- HT80, which does not exist, so clamp_htmode knocked it straight
+			-- back down to HT40 and the operator's 80MHz setting vanished with
+			-- no way to tell from either end. 802.11n tops out at 40MHz, so a
+			-- wider width means the token can only be VHT or better: promote to
+			-- VHT, the narrowest PHY that can express it, and leave the rest to
+			-- clamp_htmode (down to real capability) and any board htmode_floor
+			-- (up, where a modelmap asked for it).
+			if prefix == "HT" and tonumber(width) > 40 then prefix = "VHT" end
+			return prefix .. width
+		end
 	end
 	return nil
 end

@@ -154,6 +154,11 @@ Then set:
   never renumber. **Do not set `uplink`** on a board deployed as an AP: the cable goes in
   whichever socket was convenient, and it is detected at runtime instead.
 - **`dev.conf.net.uplink_detect = "fdb"`** — DSA only.
+- **`dev.conf.radio`** — optional per-band policy (`ng`/`na`): `acs_exclude_dfs`,
+  `channels`, `htmode_floor`. This is where "what does Auto mean on this board" lives.
+  Measure it on the hardware (`iw phy phyN info` for DFS flags, `logread` for what ACS
+  actually picked) and cite the evidence in the comment — every field here overrides the
+  controller, so the justification has to be in the file.
 - **`dev.conf.vlan`** — swconfig only: `cpu_lan`, `cpu_wan`, and `ports` mapping label →
   physical port number. **This is board truth, not derivable.** TP-Link boards commonly
   put the WAN socket on physical 1 with LAN at 2–5 — the Archer C5 map had `lan1..lan4 =
@@ -350,8 +355,19 @@ factory reset.
   `_warn_missing_uci` now shouts at startup and `tools/check.sh` tests for it; keep both.
 - **Controller channel "Auto" means hostapd ACS picks**, and on mt7915/mt7986 it readily
   picks a DFS channel whose CAC then fails (`start_dfs_cac() failed` → `AP-DISABLED`), so
-  a 5 GHz SSID silently never comes up. Not an openUF bug — it writes `channel=auto`
-  through as designed — but it is the first thing to check on filogic.
+  a 5 GHz SSID silently never comes up while the controller reports it provisioned. The
+  fix is `dev.conf.radio.<band>.acs_exclude_dfs = true` in the modelmap. A *maximum
+  channel* is not a fix: DFS runs 52–144, so any cap below 149 keeps every failing channel
+  and drops the working ones.
+- **UniFi's `ieee_mode` token lies about the PHY, not the width.** 80 MHz on 5 GHz arrives
+  as `11naht80` — still `ht`, which has no 80 MHz. Taken literally that became `HT80`, and
+  `clamp_htmode` knocked it back to `HT40`, silently discarding the operator's setting.
+  The width is the authoritative half; a width above 40 promotes to `VHT`. Confirmed live
+  on a UCG Ultra.
+- **`htmode_floor` is the ONE exception to "clamp downward only"** (`ucihelper.lua:124`).
+  A controller that does not know the hardware pushes its default for the emulated model —
+  802.11n/40 at a 4x4 WiFi-6 radio. A modelmap may declare a floor; the hardware clamp
+  still runs after it, so a floor can never invent capability. Keep it opt-in per board.
 - **A fresh OpenWrt ships every radio `disabled='1'`.** openUF writes that option only
   when the controller explicitly pushes a radio status, so a push that omits it leaves the
   radio off — provisioning "succeeds" and not one SSID is on the air. `setup.sh` clears it.

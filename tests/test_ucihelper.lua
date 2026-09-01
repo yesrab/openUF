@@ -122,6 +122,46 @@ end
 -- driving radio config has to start from radios that exist -- which is also
 -- the only state apply_config ever sees on hardware: the controller's radio
 -- names are echoes of the phynames openUF itself reported from UCI.
+-- Real `iw phy` output from a JIDU6101 (MT7986A / filogic, OpenWrt 25.12.5) --
+-- the first HE-capable board this project supports, and the one whose radio
+-- policy the tests below exercise. phy1 is the 5GHz radio (HT40 + VHT160 + HE),
+-- phy0 the 2.4GHz one (HT40 + HE, no VHT, as 2.4GHz HE always is). Trimmed to
+-- the lines parse_phy_caps reads, indentation preserved -- the parser uses the
+-- single-leading-tab rule to find the end of a Band block.
+local JIDU6101_IW_PHY = [[
+Wiphy phy1
+	Band 2:
+		Capabilities: 0x19ff
+			HT20/HT40
+		VHT Capabilities (0x339b79f6):
+			Supported Channel Width: 160 MHz
+		HE Iftypes: AP
+			HE PHY Capabilities: (0x0c204e926f1bafd0000c00):
+		Frequencies:
+			* 5180.0 MHz [36] (30.0 dBm)
+			* 5260.0 MHz [52] (24.0 dBm) (radar detection)
+			* 5745.0 MHz [149] (30.0 dBm)
+	Supported extended features:
+		* [ BEACON_RATE_LEGACY ]: legacy beacon rate setting
+Wiphy phy0
+	Band 1:
+		Capabilities: 0x19ff
+			HT20/HT40
+		HE Iftypes: AP
+			HE PHY Capabilities: (0x02204e926f1bafd0000c00):
+		Frequencies:
+			* 2412.0 MHz [1] (30.0 dBm)
+			* 2437.0 MHz [6] (30.0 dBm)
+	Supported extended features:
+		* [ BEACON_RATE_LEGACY ]: legacy beacon rate setting
+]]
+
+-- The JIDU6101 modelmap's dev.conf.radio, which is what these tests are about.
+local JIDU_POLICY = {
+	na = {acs_exclude_dfs = true, htmode_floor = "HE80"},
+	ng = {htmode_floor = "HE20"},
+}
+
 local function seed_radios(names)
 	local cursor = ucihelper._uci.cursor()
 	for _, r in ipairs(names or {"radio0", "radio1"}) do
@@ -2209,6 +2249,213 @@ return {
 					{basic_rate = {"12000"}, beacon_rate = 12000})
 				assert_eq(db.wireless.radio1.beacon_rate, "120",
 					"unknown capability -> unchanged behavior")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: raise_htmode lifts kind and width independently",
+		fn = function()
+			-- A UCG Ultra pushes 11naht40 -- 802.11n at 40MHz -- to this
+			-- emulated U6IW regardless of the 4x4 WiFi-6 radio underneath. The
+			-- floor is how a board says "that is your default, not your
+			-- intent". Kind and width move independently so a controller that
+			-- genuinely asks for MORE keeps it.
+			assert_eq(ucihelper.raise_htmode("HT40", "HE80"), "HE80",
+				"the real case: n/40 raised to ax/80")
+			assert_eq(ucihelper.raise_htmode("HT40", "HE20"), "HE40",
+				"a 20MHz floor keeps the controller's 40MHz and lifts the PHY")
+			assert_eq(ucihelper.raise_htmode("VHT80", "HE20"), "HE80",
+				"kind up, width kept")
+			local same, from = ucihelper.raise_htmode("HE160", "HE80")
+			assert_eq(same, "HE160", "a request above the floor is untouched")
+			assert_nil(from, "and reports no change")
+			assert_eq(ucihelper.raise_htmode("HT20", "HT80"), "HT40",
+				"HT still tops out at 40MHz -- there is no HT80")
+		end
+	},
+	{
+		name = "ucihelper: raise_htmode ignores anything it cannot parse",
+		fn = function()
+			assert_eq(ucihelper.raise_htmode("NOHT", "HE80"), "NOHT",
+				"NOHT is not a width request")
+			assert_eq(ucihelper.raise_htmode("HE80", "nonsense"), "HE80",
+				"a malformed floor is ignored, not guessed at")
+			assert_eq(ucihelper.raise_htmode("HE80", nil), "HE80", "no floor, no change")
+		end
+	},
+	{
+		name = "ucihelper: the board floor is applied but the hardware clamp still wins",
+		fn = function()
+			with_ucihelper(function(db)
+				-- On real HE hardware the floor takes effect...
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio0", "radio1"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio1", "band", "5g")
+				cursor:set("wireless", "radio0", "band", "2g")
+				ucihelper.rf_config("radio1", "HT40", 36, nil, nil, nil, nil, nil,
+					nil, JIDU_POLICY)
+				assert_eq(db.wireless.radio1.htmode, "HE80",
+					"11naht40 -> HE80 on the 5GHz radio")
+				ucihelper.rf_config("radio0", "HT40", 6, nil, nil, nil, nil, nil,
+					nil, JIDU_POLICY)
+				assert_eq(db.wireless.radio0.htmode, "HE40",
+					"2.4GHz keeps the pushed 40MHz and gains HE")
+			end)
+			with_ucihelper(function(db)
+				-- ...and on hardware that cannot do it, the clamp still runs
+				-- AFTER the floor, so a floor can never invent capability.
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio0"})
+				ucihelper._uci.cursor():set("wireless", "radio0", "band", "5g")
+				ucihelper.rf_config("radio0", "HT20", 36, nil, nil, nil, nil, nil,
+					nil, {na = {htmode_floor = "HE160"}})
+				assert_eq(db.wireless.radio0.htmode, "VHT80",
+					"floor HE160 clamped to the radio's real VHT80 ceiling")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: cap_htmode lowers kind and width independently",
+		fn = function()
+			-- For a width the driver ADVERTISES and the radio cannot run. On a
+			-- JIDU6101 `iw phy` reports 160MHz, hostapd accepts HE160, and the
+			-- radio then never comes up -- so no capability check can catch it
+			-- and only the modelmap can say so.
+			assert_eq(ucihelper.cap_htmode("HE160", "HE80"), "HE80", "the real case")
+			assert_eq(ucihelper.cap_htmode("EHT320", "HE80"), "HE80", "kind and width both")
+			local same, from = ucihelper.cap_htmode("HE40", "HE80")
+			assert_eq(same, "HE40", "below the ceiling is untouched")
+			assert_nil(from, "and reports no change")
+			assert_eq(ucihelper.cap_htmode("NOHT", "HE80"), "NOHT", "non-<PHY><width> passes")
+			assert_eq(ucihelper.cap_htmode("HE80", nil), "HE80", "no ceiling, no change")
+		end
+	},
+	{
+		name = "ucihelper: a board htmode ceiling stops a push that would kill the radio",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio1"})
+				ucihelper._uci.cursor():set("wireless", "radio1", "band", "5g")
+				-- The hardware really does advertise 160MHz, so clamp_htmode
+				-- lets HE160 straight through -- which is exactly how the radio
+				-- ends up DOWN. Only the ceiling catches it.
+				assert_eq(ucihelper.clamp_htmode("na", "HE160"), "HE160",
+					"the driver claims 160MHz, so the capability clamp allows it")
+				ucihelper.rf_config("radio1", "HE160", 36, nil, nil, nil, nil, nil,
+					nil, {na = {htmode_max = "HE80"}})
+				assert_eq(db.wireless.radio1.htmode, "HE80", "ceiling lowered it")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: Force WiFi 4 on a WLAN suppresses that radio's htmode floor",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio0"})
+				ucihelper._uci.cursor():set("wireless", "radio0", "band", "2g")
+				-- The mode exists to keep a network legible to 802.11n-only
+				-- clients. The controller leaves radio.<n>.ieee_mode alone for
+				-- it, so without this the floor still fires and hostapd gets
+				-- ieee80211ax=1 on a WLAN explicitly forced to WiFi 4 --
+				-- confirmed on real hardware.
+				ucihelper.rf_config("radio0", "HT40", 6, nil, nil, nil, nil, nil,
+					nil, JIDU_POLICY, {force_wifi4 = true})
+				assert_eq(db.wireless.radio0.htmode, "HT40",
+					"the controller's 802.11n width is left exactly as pushed")
+				-- Same radio, no Force WiFi 4: the floor applies as normal.
+				ucihelper.rf_config("radio0", "HT40", 6, nil, nil, nil, nil, nil,
+					nil, JIDU_POLICY, {force_wifi4 = false})
+				assert_eq(db.wireless.radio0.htmode, "HE40", "and fires without it")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config finds Force WiFi 4 on the parsed wire shape",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio0"})
+				ucihelper._uci.cursor():set("wireless", "radio0", "band", "2g")
+				-- _parse_wifi_system_cfg calls the UCI device name `radio`
+				-- (from wireless.<n>.parent); get_vap_table's outbound shape
+				-- calls the same thing `radio_name`. A join on the wrong one
+				-- silently never matches, so both are accepted -- and this
+				-- pins the wire shape, which is the one that matters.
+				ucihelper.apply_config({
+					radio_table = {{name = "radio0", htmode = "HT40", channel = 6}},
+					vap_table   = {{ssid = "iot-net", radio = "radio0", iot = true,
+						security = "wpa2", x_passphrase = "01234567"}},
+				}, {radio = JIDU_POLICY.ng and JIDU_POLICY or nil})
+				assert_eq(db.wireless.radio0.htmode, "HT40",
+					"the floor stayed suppressed through apply_config")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an auto channel gets the board's ACS policy, a fixed one does not",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio1"})
+				ucihelper._uci.cursor():set("wireless", "radio1", "band", "5g")
+
+				-- Controller "Auto". Without acs_exclude_dfs, hostapd ACS on
+				-- this board picks a DFS channel the driver cannot start CAC
+				-- on and the radio is left DOWN while the controller reports
+				-- the WLAN provisioned. Verified live on the hardware.
+				ucihelper.rf_config("radio1", nil, "auto", nil, nil, nil, nil,
+					nil, nil, JIDU_POLICY)
+				assert_eq(db.wireless.radio1.channel, "auto", "auto written through")
+				assert_eq(db.wireless.radio1.acs_exclude_dfs, "1",
+					"and the board's DFS exclusion goes with it")
+
+				-- A concrete channel: both options are ACS inputs and mean
+				-- nothing now, and leaving them would silently resurrect the
+				-- restriction the next time Auto is picked.
+				ucihelper.rf_config("radio1", nil, 149, nil, nil, nil, nil,
+					nil, nil, JIDU_POLICY)
+				assert_eq(db.wireless.radio1.channel, "149", "fixed channel written")
+				assert_nil(db.wireless.radio1.acs_exclude_dfs,
+					"and the ACS-only option is torn down again")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an explicit channels list becomes a UCI list, and is reversible",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio1"})
+				ucihelper._uci.cursor():set("wireless", "radio1", "band", "5g")
+				local pol = {na = {channels = {36, 40, 149}}}
+				ucihelper.rf_config("radio1", nil, "auto", nil, nil, nil, nil,
+					nil, nil, pol)
+				local got = db.wireless.radio1.channels
+				assert_true(type(got) == "table", "written as a UCI list")
+				assert_eq(table.concat(got, ","), "36,40,149", "as strings, in order")
+				-- Policy withdrawn: the list must go, or a board keeps an ACS
+				-- restriction nothing asks for any more.
+				ucihelper.rf_config("radio1", nil, "auto", nil, nil, nil, nil,
+					nil, nil, {na = {}})
+				assert_nil(db.wireless.radio1.channels, "and removed when withdrawn")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: no radio policy means exactly the old behaviour",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio1"})
+				ucihelper._uci.cursor():set("wireless", "radio1", "band", "5g")
+				ucihelper.rf_config("radio1", "HT40", "auto", nil, nil, nil, nil, nil, nil)
+				assert_eq(db.wireless.radio1.htmode, "HT40",
+					"the controller's mode is written through untouched")
+				assert_nil(db.wireless.radio1.acs_exclude_dfs, "no ACS option invented")
+				assert_nil(db.wireless.radio1.channels, "no chanlist invented")
 			end)
 		end
 	},

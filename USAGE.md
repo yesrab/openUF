@@ -246,6 +246,58 @@ board's LED name (so Locate and the LED toggle do nothing) or which of its ports
 is the uplink — and it gets the uplink wrong on an Archer C5 deployed as an AP,
 which uses `eth1` and never touches `eth0`.
 
+#### Radio policy (`dev.conf.radio`)
+
+```lua
+dev.conf.radio = {
+	na = { acs_exclude_dfs = true, htmode_floor = "HE80" },
+	ng = { htmode_floor = "HE20" },
+}
+```
+
+| Field | What it does |
+|---|---|
+| `acs_exclude_dfs` | Writes UCI `acs_exclude_dfs=1` whenever the effective channel is `auto`, so hostapd's ACS chooses among **non-DFS** channels only |
+| `channels` | Optional explicit ACS candidate list (UCI `channels` → hostapd `chanlist`). Narrower than `acs_exclude_dfs`, for a board that also needs specific channels excluded |
+| `htmode_floor` | Raise a pushed `htmode` to at least this, kind and width independently. The hardware clamp still runs **after** it, so a floor can never invent capability |
+
+Both ACS options are torn down again the moment a concrete channel is pushed — they are
+ACS-only inputs, and leaving them behind would silently resurrect the restriction the next
+time **Auto** is selected.
+
+**Why `acs_exclude_dfs` exists.** Controller channel **Auto** arrives as the literal
+`channel=auto` and is handed to hostapd's ACS. On an MT7986 (JIDU6101) ACS reliably picks
+a DFS channel the driver cannot start CAC on, and the radio is left **down** while the
+controller happily reports the WLAN as provisioned:
+
+```
+phy1-ap0: ACS-COMPLETED freq=5260 channel=52
+phy1-ap0: DFS-CAC-START freq=5260 chan=52 cac_time=60s
+hostapd: DFS start_dfs_cac() failed, -1
+phy1-ap0: interface state DFS->DISABLED / AP-DISABLED
+```
+
+With the flag set, the same radio came up first try — `ACS-COMPLETED channel=153` →
+`AP-ENABLED`, live on channel 149 at 80 MHz. Note that a *maximum* channel is not a fix:
+under `IN`, `iw phy` marks 52–64 and 100–144 "(radar detection)", so capping at 128 would
+leave every failing channel in range while excluding 149–165, which are the ones that work.
+
+**Why `htmode_floor` exists.** A UCG Ultra pushes `radio.2.ieee_mode=11naht40` to this
+emulated U6IW — 802.11n at 40 MHz — at a 4x4 WiFi-6 radio, and a client duly associated at
+MCS 15 / 144 Mbit/s. That is a controller-side default for the model it thinks it is
+talking to rather than an intent, so a board may declare a floor to raise it back. This is
+the **one exception** to openUF's otherwise absolute "clamp downward only" rule, which is
+why it is opt-in per board and logged when it fires:
+
+```
+openuf: radio1: controller asked for htmode VHT80, board floor is HE80 -- raised to HE80
+```
+
+`HE20` as the 2.4 GHz floor means "at least 802.11ax, at least 20 MHz": a pushed
+`11nght40` keeps its 40 MHz and gains the HE generation. (2.4 GHz may still transmit at 20
+MHz on air — hostapd applies 802.11 40 MHz coexistence when it sees neighbouring BSSes.
+That is standard behaviour, not a misconfiguration.)
+
 #### swconfig boards vs DSA boards
 
 Which of these your board is decides the whole shape of `dev.conf.net.ports`, and
@@ -290,6 +342,10 @@ The modelmap sets:
 - `dev.conf.net.uplink_detect` — `"fdb"` on a DSA board, to find the uplink socket in the
   bridge FDB instead of a swconfig ARL table. Omit it on a swconfig board, where the
   ARL lookup already covers it; the two are mutually exclusive
+- `dev.conf.radio`         — per-band answers to things the controller states in terms it
+  cannot know are wrong for this board. Keyed by openUF's band keys (`ng` = 2.4 GHz,
+  `na` = 5/6 GHz), all three fields optional, and with no entry the behaviour is exactly
+  as before. See **Radio policy** below
 - `dev.conf.vlan.mib_poll_ms` — how often the switch driver refreshes its per-port byte
   counters, which is where the Ports view's Tx/Rx figures come from. openUF turns polling on
   at startup (500 ms) when the driver ships it off, which an AR8327 does; set `false` to
@@ -793,7 +849,8 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
 | **Adopted and healthy, but no pushed SSID is ever created** | **`libuci-lua` is missing** — the most likely cause by far, and it looks like nothing is wrong. Check with `lua -e 'print(pcall(require,"uci"))'`; fix with `apk add libuci-lua` and restart. Every wireless read/write is `pcall`-wrapped, so without it the device adopts, reports ports and statistics, and sends an **empty `radio_table`** — the controller has no radio to put a WLAN on, accepts the push, and creates nothing. openUF warns about this at startup (`logread \| grep openuf`) and `tools/check.sh` tests for it |
 | SSID not appearing after adoption | Confirm the controller actually pushed it: set `debug_dump_file` in `conf.lua`, restart, and look for `wireless.*`/`aaa.*` keys in the `setparam` `system_cfg`. If the controller only ever sends `noop`, it believes the device is already configured — clear `cfgversion` in `state.json` and restart to force a full re-push. Then check `uci show wireless \| grep openuf` |
-| Radios provisioned but a **5 GHz** SSID never comes up | hostapd's ACS picked a **DFS** channel and the driver's CAC failed — `logread \| grep DFS` shows `start_dfs_cac() failed` then `AP-DISABLED`. Common on mt7915/mt7986 (filogic). openUF faithfully writes the controller's channel **Auto** through as `channel=auto` and lets ACS choose, so the fix is controller-side: set the 5 GHz radio to a non-DFS channel (36–48 or 149–165, depending on your regulatory domain) instead of Auto |
+| Controller channel width is ignored; radio runs 802.11n | UniFi's `ieee_mode` token keeps the vestigial `ht` PHY marker and moves only the width, so 80 MHz arrives as `11naht80`. openUF used to take that literally as `HT80` — which does not exist — and `clamp_htmode` knocked it back to `HT40`, silently discarding the setting. Fixed: a width above 40 MHz promotes the token to `VHT`, the narrowest PHY that can express it. If the radio still runs below its capability, set a `dev.conf.radio.<band>.htmode_floor` |
+| Radios provisioned but a **5 GHz** SSID never comes up | hostapd's ACS picked a **DFS** channel and the driver's CAC failed — `logread \| grep DFS` shows `start_dfs_cac() failed` then `AP-DISABLED`. Common on mt7915/mt7986 (filogic). Fix it in the modelmap with `dev.conf.radio.na.acs_exclude_dfs = true`, which restricts ACS to non-DFS channels (see **Radio policy**); pinning a non-DFS channel in the controller also works |
 | `lldp_table` empty | `lldpd` not running — run `/etc/init.d/lldpd start` |
 | Bootstrap account (`ubnt`) doesn't lock after adoption, or doesn't re-enable after a factory reset | `inform.lua` must be running for this — it's what detects the state change and runs `passwd -l`/`-u` (see § SSH prerequisite). Check `/var/log/openuf.log`. |
 
