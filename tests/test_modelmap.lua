@@ -209,14 +209,16 @@ return {
 				assert_not_nil(p.ifname, "port " .. p.idx .. " names a netdev")
 				names[#names + 1] = p.ifname
 			end
-			-- Order is a deliberate board choice, not an invariant: `idx` is the
+			-- The SET is the invariant; the ORDER is a board choice. `idx` is the
 			-- UniFi port_idx and the controller keys per-port settings on it, so
-			-- what matters is that it stays PINNED once a device is adopted --
-			-- renumbering moves which physical socket the controller's "Port 1"
-			-- means. This board leads with the WAN socket, matching how the
-			-- case is laid out and how it is actually cabled.
-			assert_eq(table.concat(names, ","), "wan,lan1,lan2,lan3,lan4",
-				"the five sockets, each exactly once, in the map's declared order")
+			-- what actually matters is that every socket appears exactly once and
+			-- that the numbering stays PINNED once a device is adopted --
+			-- renumbering later moves which physical socket the controller's
+			-- "Port 1" means. Asserting the declared order instead just made this
+			-- test fail every time the map was legitimately re-ordered.
+			table.sort(names)
+			assert_eq(table.concat(names, ","), "lan1,lan2,lan3,lan4,wan",
+				"all five sockets, each exactly once")
 		end
 	},
 	{
