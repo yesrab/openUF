@@ -259,7 +259,8 @@ dev.conf.radio = {
 |---|---|
 | `acs_exclude_dfs` | Writes UCI `acs_exclude_dfs=1` whenever the effective channel is `auto`, so hostapd's ACS chooses among **non-DFS** channels only |
 | `channels` | Optional explicit ACS candidate list (UCI `channels` → hostapd `chanlist`). Narrower than `acs_exclude_dfs`, for a board that also needs specific channels excluded |
-| `htmode_floor` | Raise a pushed `htmode` to at least this, kind and width independently. The hardware clamp still runs **after** it, so a floor can never invent capability |
+| `htmode_floor` | Raise a pushed `htmode` to at least this, kind and width independently. The hardware clamp still runs **after** it, so a floor can never invent capability. **Suppressed for a radio while any WLAN on it has "Force WiFi 4 Mode" on** — that mode is an explicit instruction, the floor is a correction for a controller default, and explicit intent wins |
+| `htmode_max` | Lower a pushed `htmode` to at most this — for a width the driver *advertises* and the radio cannot actually run |
 
 Both ACS options are torn down again the moment a concrete channel is pushed — they are
 ACS-only inputs, and leaving them behind would silently resurrect the restriction the next
@@ -297,6 +298,24 @@ openuf: radio1: controller asked for htmode VHT80, board floor is HE80 -- raised
 `11nght40` keeps its 40 MHz and gains the HE generation. (2.4 GHz may still transmit at 20
 MHz on air — hostapd applies 802.11 40 MHz coexistence when it sees neighbouring BSSes.
 That is standard behaviour, not a misconfiguration.)
+
+**Why `htmode_max` exists.** A JIDU6101's `iw phy` reports `Supported Channel Width: 160
+MHz`, so `clamp_htmode` passes `HE160` straight through — and the radio comes up **down**.
+A 160 MHz block is 8 contiguous 20 MHz channels, and under `IN` every one that fits
+overlaps DFS:
+
+```
+DFS-CAC-START freq=5180 chan=36 sec_chan=1, width=2, seg0=50, seg1=0, cac_time=60s
+hostapd: DFS start_dfs_cac() failed, -1
+hostapd: Interface initialization failed          -> AP-DISABLED
+```
+
+Channel 36 centres the block on `seg0=50` (channels 36–64, of which 52–64 are DFS);
+channel 100 centres on 114 (100–128, all DFS). The only clear range, 149–173, is seven
+channels — 140 MHz — and 177 is disabled, so no 160 MHz block fits there at all. With CAC
+broken in this driver, 160 MHz is unreachable on any channel, and `acs_exclude_dfs` cannot
+help because a **fixed** channel skips ACS entirely. No capability check can catch this —
+only the board can say "advertised but unusable".
 
 #### swconfig boards vs DSA boards
 

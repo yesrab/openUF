@@ -155,7 +155,8 @@ Then set:
   whichever socket was convenient, and it is detected at runtime instead.
 - **`dev.conf.net.uplink_detect = "fdb"`** — DSA only.
 - **`dev.conf.radio`** — optional per-band policy (`ng`/`na`): `acs_exclude_dfs`,
-  `channels`, `htmode_floor`. This is where "what does Auto mean on this board" lives.
+  `channels`, `htmode_floor`, `htmode_max`. This is where "what does Auto mean on this
+  board" lives, and where "the driver advertises a width it cannot run" goes.
   Measure it on the hardware (`iw phy phyN info` for DFS flags, `logread` for what ACS
   actually picked) and cite the evidence in the comment — every field here overrides the
   controller, so the justification has to be in the file.
@@ -364,6 +365,16 @@ factory reset.
   `clamp_htmode` knocked it back to `HT40`, silently discarding the operator's setting.
   The width is the authoritative half; a width above 40 promotes to `VHT`. Confirmed live
   on a UCG Ultra.
+- **160 MHz on 5 GHz needs working DFS**, whatever `iw phy` claims. Every 160 MHz block is
+  8 contiguous channels and every one that fits overlaps DFS (ch36 → seg0=50 spans 36–64;
+  ch100 → 114 spans 100–128); the clear 149–173 range is only 140 MHz wide. So on a board
+  with broken CAC, 160 MHz is unreachable on *any* channel and `acs_exclude_dfs` cannot
+  help (a fixed channel skips ACS). That is what `htmode_max` is for.
+- **"Force WiFi 4 Mode" does not touch `radio.<n>.ieee_mode`.** It works by making the WLAN
+  2.4-only + WPA2 + no 802.11k/v + `bss_load_update_period=0`. So it collides with
+  `htmode_floor`, which would put the HE IEs back in the beacon that the mode exists to
+  remove — hence the per-radio suppression in `rf_config`. The mode is per WLAN, htmode is
+  per radio; that mismatch is the whole difficulty.
 - **`htmode_floor` is the ONE exception to "clamp downward only"** (`ucihelper.lua:124`).
   A controller that does not know the hardware pushes its default for the emulated model —
   802.11n/40 at a 4x4 WiFi-6 radio. A modelmap may declare a floor; the hardware clamp

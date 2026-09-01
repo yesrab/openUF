@@ -160,6 +160,26 @@ dev.conf.radio = {
 		-- independently, so a controller that genuinely asks for MORE than this
 		-- keeps its value, and openUF's hardware clamp still runs afterwards.
 		htmode_floor = "HE80",
+
+		-- ...and a ceiling, because this radio ADVERTISES 160 MHz and cannot
+		-- run it. Verified live, on every legal primary channel:
+		--     DFS-CAC-START freq=5180 chan=36 sec_chan=1 width=2 seg0=50
+		--     hostapd: DFS start_dfs_cac() failed, -1
+		--     hostapd: Interface initialization failed  -> AP-DISABLED
+		-- A 160 MHz block is 8 contiguous 20 MHz channels, and under IN every
+		-- one that fits overlaps DFS: ch36 centres on seg0=50 (36-64, and 52-64
+		-- are DFS), ch100 centres on 114 (100-128, all DFS). The only clear
+		-- range, 149-173, is 7 channels -- 140 MHz -- and 177 is disabled, so no
+		-- 160 MHz block fits there at all. With CAC broken in this driver, 160
+		-- MHz is therefore unreachable no matter which channel is chosen, and
+		-- acs_exclude_dfs cannot help because a FIXED channel skips ACS
+		-- entirely.
+		--
+		-- `iw phy` reports "Supported Channel Width: 160 MHz", so clamp_htmode
+		-- passes HE160 straight through and the radio simply comes up down.
+		-- Only the board can know the difference; remove this if a future
+		-- driver/firmware fixes DFS.
+		htmode_max = "HE80",
 	},
 	ng = {
 		-- No DFS on 2.4 GHz, so ACS needs no help here.
