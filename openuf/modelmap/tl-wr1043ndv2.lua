@@ -1,10 +1,22 @@
 --[[
+	TP-Link WR1043ND v2 hardware profile.
 
+	Single-band 802.11n (2.4 GHz only), so the UniFi identity is uapg1-lr --
+	UAP-LR Gen1, a genuinely one-radio model. Presenting the dual-band U6IW on
+	one radio leaves the controller showing a second radio that never comes up.
 
+	⚠️  NOT verified against real hardware -- openUF has never run on this
+	board. The switch port numbering below is the generic template's; see the
+	note on dev.conf.net.ports.
 ]]--
 
 local dev = {}
 dev.conf = {}
+
+-- OpenWrt board names this profile is for. Read by tools/openuf-setup.sh to
+-- preselect the right map from `ubus call system board`; openUF itself never
+-- looks at it, so a map without this field is still perfectly valid.
+dev.openwrt_boards = {"tplink,tl-wr1043nd-v2"}
 
 -- openwrt hw config
 dev.conf.net = {

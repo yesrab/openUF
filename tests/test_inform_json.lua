@@ -190,6 +190,85 @@ local function build_switch(opts)
 	return cjson.decode(inform.build_json(st, opts.cfg, ufhw))
 end
 
+-- A DSA board (modelmap/jiorouter-ax6000-jidu6101.lua): every socket is its
+-- own netdev, so the netdev path applies and the uplink socket is measured from
+-- the bridge FDB rather than declared -- dev.conf.net.uplink_detect = "fdb".
+local DSA_CFG = {
+	net = {
+		lan_cpueth = "br-lan", lan_vlanid = 1, uplink_detect = "fdb",
+		ports = {
+			{idx = 1, ifname = "lan1"}, {idx = 2, ifname = "lan2"},
+			{idx = 3, ifname = "lan3"}, {idx = 4, ifname = "lan4"},
+			{idx = 5, ifname = "wan"},
+		},
+	},
+}
+
+-- build() for a DSA board: the netdev shape, plus the per-socket bridge FDB,
+-- sysfs link state and default route that uplink detection reads. lan1 and
+-- lan3 are cabled (1000/full); the rest are empty sockets.
+-- opts.no_route / opts.no_fdb break one link of the detection chain.
+local function build_dsa(opts)
+	opts = opts or {}
+	inject_sysinfo(false, false, false, false)
+	local fdb_dump = fixture("bridge_fdb_dsa.txt")
+	local base_read = inform._sysinfo._read_file
+	inform._sysinfo._read_file = function(path)
+		if path:find("net/dev") then return fixture("proc_net_dev_dsa.txt") end
+		if path:find("net/arp") then return fixture("proc_net_arp_switch.txt") end
+		return base_read(path)
+	end
+	inform._sysinfo._run_cmd = function(cmd)
+		-- `bridge fdb show dev <if>` (mac_table, one socket) and the bare
+		-- `bridge fdb show` (uplink_netdev, the whole bridge) are different
+		-- questions and the mock must not answer them identically -- a dump
+		-- that ignored `dev` would put every host on every socket.
+		local dev = cmd:match("bridge fdb show dev (%S+)")
+		if dev then
+			local out = {}
+			for line in fdb_dump:gmatch("[^\n]+") do
+				if line:find("dev " .. dev .. " ", 1, true) then out[#out + 1] = line end
+			end
+			return table.concat(out, "\n") .. "\n"
+		end
+		if cmd:find("bridge fdb show") then
+			return opts.no_fdb and "" or fdb_dump
+		end
+		if cmd:find("ip route") then
+			return opts.no_route and ""
+				or ("default via " .. (opts.gateway or "10.0.0.1") .. " dev br-lan \n")
+		end
+		return ""
+	end
+	local orig_read = inform._read_file
+	inform._read_file = function(path)
+		local iface = path:match("^/sys/class/net/([^/]+)/")
+		if iface then
+			local up = (iface == "lan1" or iface == "lan3")
+			if path:find("carrier") then return up and "1\n" or "0\n" end
+			if path:find("/speed")  then return up and "1000\n" or "-1\n" end
+			if path:find("duplex")  then return up and "full\n" or nil end
+			return nil
+		end
+		return orig_read(path)
+	end
+	local st = {
+		authkey    = state.DEFAULT_KEY,
+		adopted    = true,
+		cfgversion = "",
+		inform_url = "http://10.0.0.1:8080/inform",
+		mac        = "de:ad:be:ef:00:01",
+		ip         = "10.0.0.2",
+		hostname   = "testap",
+	}
+	local ok, res = pcall(function()
+		return cjson.decode(inform.build_json(st, DSA_CFG, ufhw))
+	end)
+	inform._read_file = orig_read
+	if not ok then error(res, 0) end
+	return res
+end
+
 -- Index a payload's port_table by port_idx.
 local function by_idx(port_table)
 	local out = {}
@@ -1362,6 +1441,63 @@ return {
 			-- The uplink socket has learned the entire LAN, gateway included.
 			assert_true(p[4].mac_table == nil,
 				"the uplink reports no hosts -- everything there is on the far side")
+		end
+	},
+	{
+		name = "inform json: a DSA board's uplink comes from the bridge FDB, not the modelmap",
+		fn = function()
+			-- The swconfig boards find the uplink socket in the switch ASIC's
+			-- ARL table. A DSA board has no swconfig at all, and its sockets
+			-- are real netdevs -- so the same fact lives in the bridge FDB.
+			-- Without this, no socket is flagged and the uplink -- which has
+			-- learned the whole LAN including the gateway -- reports the entire
+			-- segment as hosts plugged into this AP.
+			local d = build_dsa()
+			assert_eq(#d.port_table, 5, "one entry per socket")
+			local p = by_idx(d.port_table)
+			assert_true(p[1].is_uplink, "lan1 carries the gateway")
+			assert_false(p[3].is_uplink, "and no other cabled socket claims to")
+			assert_false(p[5].is_uplink, "nor an empty one")
+			-- Per-socket link facts, which is the whole reason DSA needs no
+			-- switch detour: the kernel already knows them.
+			assert_eq(p[3].speed, 1000, "a cabled socket's negotiated speed")
+			assert_true(p[3].full_duplex, "and its duplex")
+			assert_false(p[2].up, "an empty socket has no link")
+			assert_eq(p[2].speed, 0, "and no speed, rather than the 1000 fallback")
+			assert_eq(p[3].rx_bytes, 1870000, "its own counters, not the bridge's")
+		end
+	},
+	{
+		name = "inform json: a DSA socket's wired hosts are its own FDB slice",
+		fn = function()
+			local d = build_dsa()
+			local p = by_idx(d.port_table)
+			assert_eq(#p[3].mac_table, 2, "both hosts learned on lan3")
+			assert_eq(p[3].mac_table[1].mac, "aa:bb:cc:dd:ee:0c", "the first host")
+			assert_eq(p[3].mac_table[1].ip, "10.0.0.50", "its ip, joined from arp")
+			assert_eq(#p[2].mac_table, 0, "a socket with nothing on it reports no hosts")
+			assert_true(p[1].mac_table == nil,
+				"the uplink reports no hosts -- everything there is on the far side")
+		end
+	},
+	{
+		name = "inform json: an undetectable DSA uplink reports ports but no wired clients",
+		fn = function()
+			-- Refuse rather than guess. A map that asked for detection and got
+			-- no answer must not attribute the LAN to a socket: every host
+			-- behind the uplink would become a wired client of this AP, and on
+			-- a per-socket FDB that is the entire segment, gateway included.
+			for _, broken in ipairs({{no_route = true}, {no_fdb = true},
+				{gateway = "10.0.0.254"}}) do
+				local d = build_dsa(broken)
+				assert_eq(#d.port_table, 5, "the ports themselves are still reported")
+				for _, port in ipairs(d.port_table) do
+					assert_false(port.is_uplink,
+						"port " .. port.port_idx .. " claims no uplink")
+					assert_true(port.mac_table == nil,
+						"port " .. port.port_idx .. " reports no hosts")
+				end
+			end
 		end
 	},
 	{

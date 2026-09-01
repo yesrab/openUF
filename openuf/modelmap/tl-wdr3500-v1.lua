@@ -28,6 +28,11 @@
 local dev = {}
 dev.conf = {}
 
+-- OpenWrt board names this profile is for. Read by tools/openuf-setup.sh to
+-- preselect the right map from `ubus call system board`; openUF itself never
+-- looks at it, so a map without this field is still perfectly valid.
+dev.openwrt_boards = {"tplink,tl-wdr3500-v1"}
+
 -- OpenWrt network layout.
 --
 -- Deployed as an AP, this board's uplink is a LAN socket on the switch, which

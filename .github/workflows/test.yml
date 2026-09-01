@@ -68,8 +68,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check install.sh and check.sh
+      - name: Check the shell scripts
         run: |
           bash -n install.sh
+          bash -n setup.sh
           bash -n tools/check.sh
+          bash -n tools/dist.sh
+          bash -n tools/simulate.sh
+          bash -n openuf/hook/syswrapper.sh
+          bash -n openuf/hook/adopt-shell.sh
           bash -n openuf/etc/init.d/openuf || true  # uses /etc/rc.common sourcing, not plain bash
+          # The device runs busybox ash, not bash. dash is the strictest POSIX
+          # shell available on a runner and catches bashisms bash -n accepts --
+          # setup.sh is the one that has to survive being piped into `sh` on an
+          # OpenWrt box, so it is checked twice.
+          dash -n setup.sh
+          dash -n install.sh

@@ -475,6 +475,71 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: uplink_netdev() finds the socket the gateway is behind on DSA",
+		fn = function()
+			with_fixtures(
+				{["/proc/net/arp"] = fixture("proc_net_arp_switch.txt")},
+				{
+					["bridge fdb show"] = fixture("bridge_fdb_dsa.txt"),
+					["ip route"]        = "default via 10.0.0.1 dev br-lan \n",
+				},
+				function()
+					assert_eq(sysinfo.uplink_netdev(), "lan1", "gateway learned on lan1")
+				end
+			)
+			-- The AP's own MAC is filed permanent on a port AND on the bridge.
+			-- A gateway lookup that only tested for `master` would return
+			-- whichever of those came first for that MAC, so the exclusion is
+			-- checked with the device MAC standing in as the "gateway".
+			with_fixtures(
+				{["/proc/net/arp"] =
+					"IP address  HW type  Flags  HW address         Mask  Device\n" ..
+					"10.0.0.1    0x1      0x2    de:ad:be:ef:00:01  *     br-lan\n"},
+				{
+					["bridge fdb show"] = fixture("bridge_fdb_dsa.txt"),
+					["ip route"]        = "default via 10.0.0.1 dev br-lan \n",
+				},
+				function()
+					assert_true(sysinfo.uplink_netdev() == nil,
+						"a permanent/self entry is not a learned host")
+				end
+			)
+		end
+	},
+	{
+		name = "sysinfo: uplink_netdev() gives up rather than guessing",
+		fn = function()
+			-- No default route.
+			with_fixtures(
+				{["/proc/net/arp"] = fixture("proc_net_arp_switch.txt")},
+				{["bridge fdb show"] = fixture("bridge_fdb_dsa.txt")},
+				function()
+					assert_true(sysinfo.uplink_netdev() == nil, "no default route -> nil")
+				end
+			)
+			-- Default route whose gateway has not been ARP-resolved.
+			with_fixtures(
+				{["/proc/net/arp"] = fixture("proc_net_arp_switch.txt")},
+				{
+					["bridge fdb show"] = fixture("bridge_fdb_dsa.txt"),
+					["ip route"]        = "default via 10.0.0.254 dev br-lan \n",
+				},
+				function()
+					assert_true(sysinfo.uplink_netdev() == nil, "gateway not in arp -> nil")
+				end
+			)
+			-- Gateway resolved but the bridge has not learned it (or there is
+			-- no `bridge` binary at all -- both come back as an empty dump).
+			with_fixtures(
+				{["/proc/net/arp"] = fixture("proc_net_arp_switch.txt")},
+				{["ip route"] = "default via 10.0.0.1 dev br-lan \n"},
+				function()
+					assert_true(sysinfo.uplink_netdev() == nil, "gateway not in fdb -> nil")
+				end
+			)
+		end
+	},
+	{
 		name = "sysinfo: switch_mac_table() returns one socket's hosts, joined with arp",
 		fn = function()
 			sysinfo._mac_first_seen = {}

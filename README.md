@@ -106,10 +106,86 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   **client Block/Unblock** and the **Multicast and Broadcast Blocker**. Its radio order is
   also the reverse of the Archer C5's — `radio0` is 2.4 GHz here
 - **TP-Link WR1043ND v2** (single-band 802.11n) — use `modelmap/tl-wr1043ndv2.lua`
+- **JioRouter AX6000 JIDU6101** (MT7986A / mediatek-filogic, dual-band 802.11ax) — use
+  `modelmap/jiorouter-ax6000-jidu6101.lua`. ⚠️ **Not yet confirmed on the hardware**: the
+  profile is derived from the board's OpenWrt DTS and `board.d` entry rather than from a
+  live run, and its header flags the two facts to check first (the LED name and which
+  radio is which band). The first **DSA** board here rather than swconfig, which changes
+  how ports are reported — see below. 140 MB of SPI-NAND, so space is a non-issue
+
+Anything else: `modelmap/generic-dualband-ap.lua` or `modelmap/generic-singleband-ap.lua`,
+or let `setup.sh` generate a profile from the running device (DSA boards only, where every
+socket is a netdev and a correct profile really is derivable — on a swconfig board the
+physical port numbering is board truth that cannot be probed, and it refuses rather than
+guessing).
+
+**swconfig vs DSA.** These change which of two port-reporting shapes a profile uses, and
+getting it wrong is not cosmetic — a socket wrongly treated as downstream makes the AP
+report the whole LAN, gateway included, as hosts plugged into it:
+
+| | swconfig (ath79) | DSA (filogic and later) |
+|---|---|---|
+| Sockets in the kernel | one CPU netdev for all of them | one netdev per socket |
+| Port link speed / duplex | `swconfig dev switch0 show` | the netdev's own sysfs |
+| Which socket a host is on | the switch's ARL table | that socket's bridge-FDB slice |
+| Uplink socket | `dev.conf.vlan` + ARL lookup | `dev.conf.net.uplink_detect = "fdb"` |
+| Per-port VLAN assignment | supported | not available (detected and refused) |
+| `dev.conf.vlan` | required | must be **absent** |
 
 The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end — `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
 
 ## Quick start
+
+One command on the device, over SSH:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/yesrab/openUF/main/setup.sh | sh
+```
+
+`setup.sh` is the whole conversion, guided: it identifies the board, asks what it
+cannot know, and does everything in an order chosen so a failure never leaves the
+device unreachable.
+
+1. **Interview** — every question first, before anything is changed.
+2. **Access-point conversion** — a device still acting as a router fights the real
+   gateway for DHCP and NAT, so the router role goes: no WAN interface, the WAN
+   socket folded into the LAN bridge, DHCP server off, `firewall`/`dnsmasq`/`odhcpd`
+   stopped and out of the boot sequence, and the resolver pointed back at the real
+   nameservers `dnsmasq` was fronting. The packages are left installed, only
+   disabled, so it is one command to undo.
+3. **Hardware profile** — the board-specific profiles are listed with the detected
+   one marked, the generics below them, and generating one from the running device
+   at the bottom. Enter takes the detected board's profile, or a generic chosen by
+   radio count when there is none.
+4. **Controller** — an address, or nothing at all to be found by L2 discovery.
+5. **Adoption account** — the locked-down `ubnt`/`ubnt` bootstrap login, so first
+   adoption works without presetting a root password. Whether it exists also decides
+   the adoption path: with no bootstrap account and no root password, L2 discovery is
+   switched **off**, because a controller that discovered a device over L2 insists on
+   adopting it over SSH and fails outright when it cannot log in.
+6. **Dependencies** — installed, including swapping a `wpad-basic-*` build for the
+   matching full one (`wpad-basic-mbedtls` → `wpad-mbedtls`, same crypto library, so
+   no extra flash). A basic build has no `bss_transition` option at all and errors
+   the radio down; `install.sh` alone cannot fix that, because the two packages
+   conflict and `add` without `del` fails.
+7. **Install and reboot.**
+
+Package installation deliberately runs *before* the network teardown: the teardown
+can take this device's internet with it, so nothing is left to download by then.
+
+Everything it asks can also be passed as an option, so the same script drives an
+unattended install:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/yesrab/openUF/main/setup.sh | sh -s -- \
+    --yes --controller 10.0.0.5 --modelmap jiorouter-ax6000-jidu6101 --no-reboot
+```
+
+`sh setup.sh --help` lists them all. `OPENUF_REPO`, `OPENUF_REF` and `OPENUF_SRC`
+point it at a different fork, branch, or a checkout already on the device.
+
+<details>
+<summary>Doing it by hand instead</summary>
 
 ```sh
 # 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk)
@@ -132,20 +208,30 @@ ssh root@<device> syswrapper.sh set-inform http://<controller-ip>:8080/inform
 #     — Click Adopt.
 ```
 
+`install.sh` does not touch the network configuration, so a device installed this way
+is still a router unless you convert it yourself.
+</details>
+
 Both adoption paths complete to **Connected**.  L2 requires the controller to
 SSH in (set a root password first, or use `--bootstrap-adopt`); L3 skips SSH
 entirely and delivers the adoption key over the inform channel.
 
-Step 1 is optional: `install.sh install` installs every dependency that is
-missing, including `usteer` and a full `wpad` build — both required for BSS
+The `apk add` step is optional: `install.sh install` installs every dependency that
+is missing, including `usteer` and a full `wpad` build — both required for BSS
 Transition (802.11v) and Band Steering to work at all. Any full build counts
 (`wpad`, `wpad-wolfssl`, `wpad-openssl`, `wpad-mbedtls`), and an existing one is
 left in place. `wpad-basic-*` builds lack 802.11v support entirely and will error
-with "unknown configuration item 'bss_transition'"; if you've manually installed
-a basic build, replace it with `apk add wpad-wolfssl` first.
+with "unknown configuration item 'bss_transition'" — `install.sh` cannot swap one
+out (the packages conflict, so `add` without `del` fails), which is why `setup.sh`
+does it. By hand: `apk del wpad-basic-mbedtls && apk add wpad-mbedtls`, matching the
+crypto library already on the device.
+
+`install.sh` works on both package managers: `apk` on OpenWrt 25.12+ and `opkg` on
+24.10 and earlier.
 
 Installing from a git checkout instead (for contributors/dev builds) still works — `scp -r
-openuf/ install.sh root@<device>:/tmp/openuf/` and run `install.sh` from there.
+openuf/ install.sh setup.sh root@<device>:/tmp/openuf/` and run `setup.sh` (or just
+`install.sh`) from there.
 
 See [USAGE.md](USAGE.md) for full dependency details, configuration reference, and troubleshooting.
 

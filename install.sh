@@ -13,6 +13,33 @@ STATE_DIR=/etc/openuf
 BIN_LINK=/usr/bin/syswrapper.sh
 INIT_SCRIPT=/etc/init.d/openuf
 
+# ── Package manager ─────────────────────────────────────────────────────────
+# OpenWrt 25.12 replaced opkg with apk. Both are supported: every package
+# openUF needs is named identically in either feed, only the CLI differs.
+# Hardcoding `apk` made every dependency check fail on a 24.10 device -- not
+# loudly, but by reporting the whole list as missing and then failing to
+# install it, which reads as "openUF needs nothing" right up until the daemon
+# dies on a missing lua-cjson.
+#
+# Neither present (a stripped image, or a `sh install.sh` on something that is
+# not OpenWrt at all) degrades to "nothing is installed and nothing can be":
+# openUF's own files still land, and the warnings say exactly what to add by
+# hand. pkg_add deliberately does NOT redirect output -- callers decide, and
+# the REQUIRED install below wants apk's own error text on screen.
+if command -v apk >/dev/null 2>&1; then
+	PKG_CMD="apk add"
+	pkg_installed() { apk info -e "$1" >/dev/null 2>&1; }
+	pkg_add()       { apk add "$@"; }
+elif command -v opkg >/dev/null 2>&1; then
+	PKG_CMD="opkg install"
+	pkg_installed() { opkg list-installed "$1" 2>/dev/null | grep -q "^$1 "; }
+	pkg_add()       { opkg install "$@"; }
+else
+	PKG_CMD="<no package manager found>"
+	pkg_installed() { return 1; }
+	pkg_add()       { return 1; }
+fi
+
 case "$1" in
 
 	# ────────────────────────────────────────────────────────────────────────
@@ -35,7 +62,7 @@ case "$1" in
 		OPTIONAL_MIN_FREE_KB=400
 		try_optional() {
 			pkg=$1; feature=$2
-			if apk info -e "$pkg" >/dev/null 2>&1; then return 0; fi
+			if pkg_installed "$pkg"; then return 0; fi
 			free=$(overlay_free_kb "$INSTALL_DIR")
 			if [ -n "$free" ] && [ "$free" -lt "$OPTIONAL_MIN_FREE_KB" ]; then
 				echo "SKIP $pkg (${free}KB free, need ${OPTIONAL_MIN_FREE_KB}KB): $feature"
@@ -43,7 +70,7 @@ case "$1" in
 				return 0
 			fi
 			echo "Installing $pkg ($feature) ..."
-			apk add "$pkg" >/dev/null 2>&1 \
+			pkg_add "$pkg" >/dev/null 2>&1 \
 				|| echo "WARNING: failed to install $pkg -- $feature will not function."
 		}
 
@@ -105,15 +132,15 @@ case "$1" in
 		# handled in-tree by openuf/inflate.lua and needs no package.
 		MISSING=""
 		for pkg in lua lua-cjson luasocket lua-openssl luabitop iw; do
-			if ! apk info -e "$pkg" >/dev/null 2>&1; then
+			if ! pkg_installed "$pkg"; then
 				MISSING="$MISSING $pkg"
 			fi
 		done
 		if [ -n "$MISSING" ]; then
-			echo "Installing required apk packages:$MISSING"
-			apk add $MISSING || {
+			echo "Installing required packages:$MISSING"
+			pkg_add $MISSING || {
 				echo "WARNING: failed to install:$MISSING"
-				echo "  Install them by hand with: apk update && apk add$MISSING"
+				echo "  Install them by hand with: $PKG_CMD$MISSING"
 				echo "  Without lua-openssl in particular, adoption cannot complete"
 				echo "  (the controller requires a genuine AES-128-GCM inform)."
 			}
@@ -165,16 +192,16 @@ case "$1" in
 		# SSID on the device for no gain.
 		HAVE_WPAD=0
 		for pkg in wpad wpad-wolfssl wpad-openssl wpad-mbedtls; do
-			if apk info -e "$pkg" >/dev/null 2>&1; then
+			if pkg_installed "$pkg"; then
 				HAVE_WPAD=1
 				break
 			fi
 		done
 		if [ "$HAVE_WPAD" = "0" ]; then
 			echo "Installing a full wpad build (BSS Transition / Band Steering) ..."
-			apk add wpad-wolfssl \
-				|| apk add wpad-openssl \
-				|| apk add wpad-mbedtls \
+			pkg_add wpad-wolfssl \
+				|| pkg_add wpad-openssl \
+				|| pkg_add wpad-mbedtls \
 				|| echo "WARNING: failed to install a full wpad build -- BSS Transition and Band Steering will not function (wpad-basic-* lacks 802.11v support)."
 		fi
 

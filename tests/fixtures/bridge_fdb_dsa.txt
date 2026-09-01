@@ -1,0 +1,9 @@
+33:33:00:00:00:01 dev lan1 self permanent
+01:00:5e:00:00:01 dev lan1 self permanent
+de:ad:be:ef:00:01 dev lan1 vlan 1 master br-lan permanent
+aa:bb:cc:dd:ee:ff dev lan1 master br-lan
+aa:bb:cc:dd:ee:0c dev lan3 master br-lan
+aa:bb:cc:dd:ee:12 dev lan3 master br-lan
+de:ad:be:ef:00:01 dev br-lan vlan 1 self permanent
+33:33:00:00:00:01 dev br-lan self permanent
+01:00:5e:00:00:01 dev br-lan self permanent

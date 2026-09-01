@@ -60,7 +60,10 @@ done
 chmod +x "$STAGE/etc/init.d/openuf" "$STAGE/hook/syswrapper.sh" \
 	"$STAGE/hook/adopt-shell.sh"
 
-cp install.sh LICENSE "$BUILD/"
+# setup.sh ships alongside install.sh: it is the entry point the README
+# documents, and a release tarball that lacked it left a user who
+# downloaded the tarball with no way to run the guided install.
+cp install.sh setup.sh LICENSE "$BUILD/"
 
 # ── Verify ──────────────────────────────────────────────────────────────────
 # README.md/USAGE.md are deliberately not shipped: ~21 KB transferred to and
@@ -117,7 +120,7 @@ fi
 
 # ── Package ─────────────────────────────────────────────────────────────────
 rm -f "$TARBALL"
-tar czf "$TARBALL" -C "$BUILD" openuf install.sh LICENSE
+tar czf "$TARBALL" -C "$BUILD" openuf install.sh setup.sh LICENSE
 
 before=$(find openuf -type f -exec cat {} + | wc -c | tr -d ' ')
 after=$(find "$STAGE" -type f -exec cat {} + | wc -c | tr -d ' ')

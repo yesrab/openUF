@@ -175,6 +175,105 @@ return {
 		end
 	},
 	{
+		name = "modelmap: jiorouter-ax6000-jidu6101 uses the DSA netdev shape",
+		fn = function()
+			-- Board-specific regression guard. This is the first DSA board in
+			-- the tree and it needs the OTHER of openUF's two port shapes: the
+			-- MT7531 is kernel-driven, so each socket is a netdev with its own
+			-- link state and FDB slice, and there is no swconfig to ask.
+			local dev = dofile(MODELMAP_DIR .. "/jiorouter-ax6000-jidu6101.lua")
+
+			-- lan_cpueth is the BRIDGE, not a port: it decides the identity
+			-- MAC, and on a board where the cable can move between four
+			-- equally-valid socket netdevs, naming one of them would make the
+			-- device's identity depend on which hole the installer used. It is
+			-- also what a tagged SSID's sub-device hangs off (br-lan.20), and
+			-- a sub-device on a bridge PORT would never see a frame.
+			assert_eq(dev.conf.net.lan_cpueth, "br-lan", "identity/trunk is the bridge")
+			assert_eq(dev.conf.led, "green:status", "LED name set so Locate works")
+
+			-- No swconfig map: setting one would send inform.lua down the
+			-- switch path, shelling out to a swconfig that isn't installed,
+			-- and switchvlan.lua would have to detect DSA and refuse on every
+			-- push. Its absence is what keeps both on the netdev path.
+			assert_nil(dev.conf.vlan, "no swconfig port map on a DSA board")
+
+			assert_eq(dev.conf.net.uplink_detect, "fdb",
+				"the uplink socket is measured, not declared")
+			local ports = dev.conf.net.ports
+			assert_eq(#ports, 5, "one port per socket (4 LAN + WAN)")
+			local names = {}
+			for _, p in ipairs(ports) do
+				assert_nil(p.uplink, "port " .. p.idx .. " is not statically flagged uplink")
+				assert_nil(p.swport, "port " .. p.idx .. " names no swconfig socket")
+				assert_not_nil(p.ifname, "port " .. p.idx .. " names a netdev")
+				names[#names + 1] = p.ifname
+			end
+			assert_eq(table.concat(names, ","), "lan1,lan2,lan3,lan4,wan",
+				"the sockets, in case-label order")
+		end
+	},
+	{
+		name = "modelmap: uplink_detect is only ever asked for on the netdev shape",
+		fn = function()
+			-- The two uplink-detection paths read different sources (bridge FDB
+			-- vs swconfig ARL) and inform.lua picks between them on the shape
+			-- of the port entry, not on this flag. A map that set both would
+			-- have its `fdb` request silently ignored on any port with a
+			-- swport, which is a control that does nothing.
+			each_modelmap(function(name, dev)
+				local detect = dev.conf.net.uplink_detect
+				if detect == nil then return end
+				assert_eq(detect, "fdb", name .. ": the only detection mode is fdb")
+				assert_nil(dev.conf.vlan,
+					name .. ": fdb detection is for boards with no swconfig map")
+				for _, p in ipairs(dev.conf.net.ports or {}) do
+					assert_nil(p.swport,
+						name .. ": port " .. p.idx .. " must not also name a swport")
+					assert_nil(p.uplink,
+						name .. ": port " .. p.idx .. " must not also declare the uplink")
+				end
+			end)
+		end
+	},
+	{
+		name = "modelmap: openwrt_boards names real board strings, and no two maps claim one",
+		fn = function()
+			-- tools/openuf-setup.sh reads this to preselect a profile from
+			-- `ubus call system board`. Two maps claiming the same board makes
+			-- that choice arbitrary; a malformed entry makes it silently never
+			-- match, and the installer falls back to a generic profile on
+			-- hardware it actually has a map for.
+			local claimed = {}
+			each_modelmap(function(name, dev)
+				local boards = dev.openwrt_boards
+				-- Optional: the generic profiles are for no board in
+				-- particular, which is the whole point of them.
+				-- "autodetected.lua" is what setup.sh writes when it profiles an
+				-- unknown DSA board on the device. It is never committed, but the
+				-- suite runs against a working tree that may have one lying
+				-- around, and it legitimately claims no board -- it describes
+				-- exactly one machine.
+				if boards == nil then
+					assert_true(name:match("^generic%-") ~= nil or name == "autodetected.lua",
+						name .. ": only a generic or generated profile may omit openwrt_boards")
+					return
+				end
+				assert_true(type(boards) == "table", name .. ": openwrt_boards is a table")
+				assert_true(#boards > 0, name .. ": openwrt_boards is non-empty")
+				for _, b in ipairs(boards) do
+					-- OpenWrt board names are the DTS compatible string:
+					-- "vendor,model". Anything else never matches ubus.
+					assert_true(type(b) == "string" and b:match("^[%w_%-]+,[%w_%-%.]+$") ~= nil,
+						name .. ": '" .. tostring(b) .. "' is a vendor,model board name")
+					assert_nil(claimed[b], "board " .. b .. " is claimed by "
+						.. tostring(claimed[b]) .. " as well as " .. name)
+					claimed[b] = name
+				end
+			end)
+		end
+	},
+	{
 		name = "modelmap: a board's LAN ports never collide with its WAN port",
 		fn = function()
 			-- The trunk a tagged SSID needs is built from dev.conf.vlan.ports,

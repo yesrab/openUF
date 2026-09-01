@@ -56,6 +56,71 @@ adopted `state.json`, else `conf.lua`'s default) actually is `https://`.
 
 ## 2. Installation
 
+### The guided installer (`setup.sh`)
+
+```sh
+wget -qO- https://raw.githubusercontent.com/yesrab/openUF/main/setup.sh | sh
+```
+
+This is the path to use unless you have a reason not to. It does everything in this
+guide's sections 1–3 plus the access-point conversion, in an order chosen so a failure
+never leaves the device unreachable — see the README's Quick start for the phase list
+and the reasoning.
+
+Piping into `sh` and still being able to answer questions works because the script
+re-execs itself from a file with stdin reattached to `/dev/tty`: on a pipe, stdin *is*
+the script, so a `read` would otherwise eat the script's own remaining bytes. With no
+controlling terminal at all (cron, a provisioning system) it says so and takes the
+default answer for everything.
+
+| Option | Question it answers | Default |
+|---|---|---|
+| `--ap-mode` / `--no-ap-mode` | convert to a pure AP? | yes |
+| `--absorb-wan` / `--no-absorb-wan` | WAN socket into the LAN bridge? | yes |
+| `--lan-address ADDR` | `dhcp`, `192.168.1.20/24`, or `192.168.1.20,255.255.255.0` | `dhcp` |
+| `--lan-gateway IP`, `--lan-dns "IP [IP]"` | for a static address | — |
+| `--modelmap NAME` | hardware profile, or `auto` to generate one | detected board, else a generic by radio count |
+| `--controller HOST` | IP, hostname, or a full inform URL | none (L2 discovery) |
+| `--bootstrap` / `--no-bootstrap` | create the `ubnt`/`ubnt` adoption account? | yes |
+| `--exclusive-wlan` / `--shared-wlan` | `use_only_unifi_wlan` | exclusive |
+| `--l2-announce` / `--no-l2-announce` | L2 discovery broadcasts | derived (see below) |
+| `--reboot` / `--no-reboot` | reboot at the end? | yes |
+| `-y`, `--yes` | take every default, ask nothing | — |
+| `--keep-work` | leave the downloaded tree in `/tmp` | — |
+
+`OPENUF_REPO=owner/repo`, `OPENUF_REF=branch-or-tag` and `OPENUF_SRC=/path/to/checkout`
+point it at a different source.
+
+**The derived L2 setting.** `l2_announce` ships `true` and that is what makes the AP
+appear in the controller by itself — but a controller that discovered a device over L2
+insists on adopting it over SSH, and fails with "Connection Interrupted" if it cannot log
+in, no matter how healthy the inform loop is. So when there is neither a bootstrap account
+nor a root password, `setup.sh` turns broadcasts **off**: the controller then treats the
+device as L3-discovered and delivers the adoption key over the inform channel, needing no
+login. Override either way with `--l2-announce` / `--no-l2-announce`.
+
+**What the AP conversion changes.** All reversible, and all of it committed but not applied
+until the reboot:
+
+| | Change |
+|---|---|
+| `network` | `wan` and `wan6` interfaces deleted; the WAN netdev added to the LAN bridge; `lan` set to DHCP or the given static address; `ip6assign` dropped |
+| `dhcp` | `dhcp.lan.ignore=1`, `dhcp.wan` deleted |
+| services | `firewall`, `dnsmasq`, `odhcpd` stopped and `disable`d — packages kept, so re-enabling is one command each |
+| resolver | `/tmp/resolv.conf` relinked to `resolv.conf.auto`, since nothing listens on 127.0.0.1 once `dnsmasq` is off and a hostname inform URL would stop resolving |
+| `wireless` | `disabled='1'` removed from each radio — a fresh OpenWrt ships them off, and openUF only writes that option when the controller explicitly pushes a radio status |
+| `lldpd` | `cid_interface` set to the profile's `lan_name` (section 7 explains why) |
+
+An interface with proto `pppoe`/`wwan`/`dhcpv6`/etc. is **named and left alone** rather
+than deleted — it may be a management link, and deleting a section the script did not put
+there is worse than leaving it.
+
+openUF's own nftables tables live in `bridge openuf` and `bridge openuf_bcfilt`,
+deliberately outside `fw4`'s `inet fw4`, so client Block/Unblock and the Multicast and
+Broadcast Blocker keep working with the firewall service off.
+
+### By hand
+
 Download the latest release directly on the device over SSH — no git client or scp required:
 
 ```sh
@@ -79,9 +144,15 @@ transfer-then-install flow still works:
 
 ```sh
 # From your development machine
-scp -r openuf/ install.sh root@<device-ip>:/tmp/openuf/
+scp -r openuf/ install.sh setup.sh tools/ root@<device-ip>:/tmp/openuf/
 ssh root@<device-ip> "cd /tmp/openuf && sh install.sh install"
+# or, for the guided install from that same checkout:
+ssh -t root@<device-ip> "cd /tmp/openuf && sh setup.sh"
 ```
+
+`install.sh` does **not** touch the network configuration: a device installed this way is
+still a router unless you convert it yourself. It works on both package managers — `apk`
+on OpenWrt 25.12+ and `opkg` on 24.10 and earlier.
 
 What `install.sh install` does:
 - Copies `openuf/` to `/opt/openuf/`
@@ -111,21 +182,75 @@ dev = dofile("modelmap/archer-c5-v1.lua")
 -- For TP-Link TL-WDR3500 v1 (dual-band, board-specific):
 dev = dofile("modelmap/tl-wdr3500-v1.lua")
 
+-- For TP-Link WR1043ND v2 (single-band):
+dev = dofile("modelmap/tl-wr1043ndv2.lua")
+
+-- For JioRouter AX6000 JIDU6101 (MT7986A / filogic — a DSA board):
+dev = dofile("modelmap/jiorouter-ax6000-jidu6101.lua")
+
 -- For any other dual-band OpenWrt AP:
 dev = dofile("modelmap/generic-dualband-ap.lua")
 
--- For TP-Link WR1043ND v2 (single-band):
-dev = dofile("modelmap/tl-wr1043ndv2.lua")
+-- For any other single-band OpenWrt AP:
+dev = dofile("modelmap/generic-singleband-ap.lua")
 ```
+
+`setup.sh` picks this line for you: each board-specific profile declares the OpenWrt
+board names it is for in `dev.openwrt_boards` (the DTS compatible string, e.g.
+`{"jiorouter,ax6000-jidu6101"}`), and the installer matches that against
+`/tmp/sysinfo/board_name`. openUF itself never reads the field, so a profile without one
+is still perfectly valid — but adding it is what makes a new profile get preselected on
+every device like yours.
 
 Prefer a board-specific map where one exists. A generic profile cannot know your
 board's LED name (so Locate and the LED toggle do nothing) or which of its ports
 is the uplink — and it gets the uplink wrong on an Archer C5 deployed as an AP,
 which uses `eth1` and never touches `eth0`.
 
+#### swconfig boards vs DSA boards
+
+Which of these your board is decides the whole shape of `dev.conf.net.ports`, and
+getting it wrong is not cosmetic: a socket wrongly treated as downstream makes the AP
+report the entire LAN, gateway included, as hosts plugged into it.
+
+On the **swconfig** boards (ath79 and other pre-DSA targets) the kernel sees only the CPU
+port. sysfs therefore answers questions about the internal SoC↔switch link — always
+1000/full — rather than about the socket a cable is in, and the bridge FDB attributes every
+wired host to that one netdev. The switch knows all of it, so a profile there sets
+`dev.conf.vlan` and lists sockets by `swport`.
+
+On a **DSA** board (mediatek/filogic and later) every socket is its own netdev with its own
+carrier, negotiated speed and slice of the bridge FDB. The switch detour is unnecessary and
+`dev.conf.vlan` must be **absent** — setting it sends openUF down the swconfig path,
+shelling out to a `swconfig` that is not installed. Ports are listed by `ifname`, and the
+uplink socket is found in the bridge FDB by setting:
+
+```lua
+dev.conf.net.uplink_detect = "fdb"
+```
+
+That looks up the default gateway's MAC and reports whichever socket learned it as
+`is_uplink`. When it cannot answer — no default route yet, no `bridge` binary, gateway not
+learned — openUF reports the ports but **no wired clients at all**, rather than attributing
+the LAN to a guessed socket. Two more DSA differences:
+
+- `lan_cpueth` names the LAN **bridge** (`br-lan`), not a socket. It decides the device's
+  identity MAC, which must not depend on which of four equally-valid sockets the installer
+  used; it is where the management address lives; and a tagged SSID's sub-device has to
+  hang off the bridge (`br-lan.20`) — one on a bridge *port* never sees a frame.
+- Per-port VLAN assignment is unavailable. `switchvlan.lua` detects DSA and refuses rather
+  than guessing at a swconfig port map.
+
 The modelmap sets:
-- `dev.conf.net.lan_cpueth` — LAN CPU ethernet port (e.g. `eth1`); also the trunk port
-  used to create VLAN-tagged sub-interfaces (`eth1.<vlanid>`) for controller-pushed VLAN SSIDs
+- `dev.openwrt_boards`      — the OpenWrt board names this profile is for, e.g.
+  `{"tplink,archer-c5-v1"}`. Read only by `setup.sh`, to preselect the profile; openUF
+  ignores it. Omit it on a generic profile
+- `dev.conf.net.lan_cpueth` — LAN CPU ethernet port (e.g. `eth1`), or the LAN **bridge**
+  (`br-lan`) on a DSA board; also the trunk the VLAN-tagged sub-interfaces
+  (`<lan_cpueth>.<vlanid>`) for controller-pushed VLAN SSIDs hang off
+- `dev.conf.net.uplink_detect` — `"fdb"` on a DSA board, to find the uplink socket in the
+  bridge FDB instead of a swconfig ARL table. Omit it on a swconfig board, where the
+  ARL lookup already covers it; the two are mutually exclusive
 - `dev.conf.vlan.mib_poll_ms` — how often the switch driver refreshes its per-port byte
   counters, which is where the Ports view's Tx/Rx figures come from. openUF turns polling on
   at startup (500 ms) when the driver ships it off, which an AR8327 does; set `false` to
@@ -369,6 +494,14 @@ syswrapper.sh reset-inform
 ## 6. WiFi provisioning
 
 When the controller pushes a config, `ucihelper.lua` applies it via OpenWrt UCI.  Only sections prefixed with `openuf_` are created or deleted.
+
+> **The `openuf_` prefix is a UCI *section name*, not an SSID filter.**  Every WLAN the
+> controller pushes is provisioned, whatever it is called: the section is named
+> `openuf_<radio>_<sanitized ssid>` while the broadcast SSID is exactly what the controller
+> sent.  The prefix exists so openUF can tell its own sections from yours and never rewrite
+> or delete a hand-made one — it does not mean openUF only picks up controller WLANs whose
+> name starts with `openuf_`, and there is no way to ask it to.  What *is* configurable is
+> whether your hand-made SSIDs keep broadcasting, which is `use_only_unifi_wlan` below.
 
 `use_only_unifi_wlan` (default `true`) additionally sets `disabled=1` on every *other* `wifi-iface`, so the radios carry only what the controller provisioned.  openUF stamps each SSID it turns off with `openuf_autodisabled=1`; setting the option back to `false` re-enables exactly those and leaves everything else as-is, so an SSID you had disabled yourself is never switched back on.  Set it to `false` from the start to keep hand-configured SSIDs broadcasting alongside the controller's.
 

@@ -1216,6 +1216,25 @@ function M.build_json(st, cfg, ufhw)
 		local ok_up, phys = pcall(M._sysinfo.uplink_phys_port, sw.arl)
 		if ok_up then uplink_phys = phys end
 	end
+
+	-- The netdev-path equivalent, for a DSA board (dev.conf.net.uplink_detect
+	-- = "fdb"): every socket is a real netdev there, so the uplink is found in
+	-- the bridge FDB rather than in a swconfig ARL table. Opt-in per modelmap
+	-- because the existing netdev maps declare a static `uplink` instead and
+	-- must keep behaving exactly as they do.
+	--
+	-- uplink_unknown is the refuse-rather-than-guess case: a map that asked
+	-- for detection and got no answer must not report wired clients at all.
+	-- On DSA each socket's FDB slice is genuinely its own, so the uplink
+	-- socket has learned the entire LAN including the gateway -- attributing
+	-- that to "hosts plugged into this AP" is a far worse payload than an
+	-- empty mac_table.
+	local uplink_dev, uplink_unknown = nil, false
+	if cfg and cfg.net and cfg.net.uplink_detect == "fdb" then
+		local ok_ud, dev = pcall(M._sysinfo.uplink_netdev)
+		if ok_ud then uplink_dev = dev end
+		uplink_unknown = (uplink_dev == nil)
+	end
 	local mgmt_vlan = (cfg and cfg.net and cfg.net.lan_vlanid) or 1
 	local cpu_iface = iface_by_name[cfg and cfg.net and cfg.net.lan_cpueth]
 
@@ -1301,7 +1320,8 @@ function M.build_json(st, cfg, ufhw)
 				-- claimed a gigabit link on a socket with nothing in it.
 				speed       = (not link_up) and 0 or (M._link_speed(p.ifname) or 1000),
 				full_duplex = link_up and (M._link_duplex(p.ifname) ~= "half") or false,
-				is_uplink   = p.uplink or false,
+				is_uplink   = p.uplink or (uplink_dev ~= nil and p.ifname == uplink_dev)
+					or false,
 				speed_caps  = 0,
 				port_poe    = false,
 				poe_caps    = 0,
@@ -1315,8 +1335,9 @@ function M.build_json(st, cfg, ufhw)
 			-- Wired clients are only reported on downstream (non-uplink)
 			-- ports -- the controller itself skips client creation on ports
 			-- flagged is_uplink, since that port faces the controller's own
-			-- network, not an end host.
-			if not entry.is_uplink then
+			-- network, not an end host. And on nothing at all when the map
+			-- asked which socket that is and detection could not say.
+			if not entry.is_uplink and not uplink_unknown then
 				entry.mac_table = arr(_filter_hosts(
 					M._sysinfo.mac_table, p.ifname, nil, self_macs, station_macs))
 			end

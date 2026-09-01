@@ -580,6 +580,47 @@ function M.mac_table(ifname)
 	return hosts
 end
 
+-- Which netdev the uplink cable is in, on a board whose sockets ARE netdevs --
+-- i.e. DSA, where the switch is driven by the kernel and `lan1`..`lan4`/`wan`
+-- each carry their own carrier, link speed and slice of the bridge FDB. The
+-- netdev counterpart of M.uplink_phys_port() below, which has to go through a
+-- swconfig ARL table to learn the same fact on the ath79 boards.
+--
+-- Same measurement, same reasoning: the port the default gateway's MAC was
+-- learned on. Deployed as an AP the cable goes in whichever socket was
+-- convenient, and declaring it in the modelmap would make a moved cable turn
+-- the whole LAN -- gateway included -- into wired clients of this AP.
+--
+-- Returns nil whenever any link of the chain is missing (no default route, no
+-- ARP entry for the gateway, no `bridge` binary, gateway not yet learned);
+-- callers must then refuse to attribute hosts to any socket rather than guess.
+function M.uplink_netdev()
+	local gw_ip = tostring(M._run_cmd("ip route show default") or "")
+		:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
+	if not gw_ip then return nil end
+	local arp_out = M._read_file("/proc/net/arp")
+	if not arp_out then return nil end
+	local gw_mac
+	for line in arp_out:gmatch("[^\n]+") do
+		local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+		if ip == gw_ip and mac then gw_mac = mac:lower(); break end
+	end
+	if not gw_mac then return nil end
+	-- Same discriminator M.mac_table() uses: a LEARNED host is `master`-ed and
+	-- neither `self` nor `permanent`. The excluded shapes are the device's own
+	-- addresses -- present on both the bridge and each of its ports, and on a
+	-- DSA board there is one per socket, so a bare `master` test would happily
+	-- answer with whichever port the AP's own MAC is filed under.
+	local fdb = tostring(M._run_cmd("bridge fdb show") or "")
+	for line in fdb:gmatch("[^\n]+") do
+		if not line:find("self") and not line:find("permanent") and line:find("master") then
+			local mac, dev = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+dev%s+(%S+)")
+			if mac and mac:lower() == gw_mac then return dev end
+		end
+	end
+	return nil
+end
+
 -- === swconfig: what the CPU netdev cannot tell you =========================
 --
 -- On the ath79 boards openUF targets, every ethernet socket sits behind a
