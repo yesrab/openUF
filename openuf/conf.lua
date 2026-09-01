@@ -2,15 +2,21 @@
 	openUF main configuration.
 
 	Select the modelmap that matches your hardware (see openuf/modelmap/).
-	Known-working modelmap files:
-	  archer-c5-v1.lua        — TP-Link Archer C5 v1 (dual-band, board-specific)
-	  tl-wdr3500-v1.lua       — TP-Link TL-WDR3500 v1 (dual-band, board-specific)
-	  generic-dualband-ap.lua — any other dual-band board
-	  tl-wr1043ndv2.lua       — TP-Link WR1043ND v2 (single-band)
+	setup.sh picks this for you from the board name; edit it by hand only if
+	you are installing without the guided installer.
+
+	  archer-c5-v1.lua                   TP-Link Archer C5 v1   (swconfig, 2-band)
+	  tl-wdr3500-v1.lua                  TP-Link TL-WDR3500 v1  (swconfig, 2-band)
+	  tl-wr1043ndv2.lua                  TP-Link WR1043ND v2    (swconfig, 1-band)
+	  jiorouter-ax6000-jidu6101.lua      JioRouter AX6000       (DSA, 2-band)
+	  generic-dualband-ap.lua            any other dual-band swconfig board
+	  generic-singleband-ap.lua          any other single-band swconfig board
 
 	Prefer a board-specific map where one exists: the generic profile cannot
 	know the board's LED name or which of its ports is the uplink, and gets
-	both wrong on an Archer C5.
+	both wrong on an Archer C5. The generics also assume a swconfig board with
+	eth0/eth1 CPU netdevs -- on a DSA board neither exists and every socket is
+	its own netdev, so use a board-specific map or let setup.sh generate one.
 
 	The modelmap drives:
 	  • dev.conf.net.*          network interface assignments

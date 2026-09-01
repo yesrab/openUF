@@ -2465,6 +2465,47 @@ return {
 		end
 	},
 	{
+		name = "inform: a missing Lua UCI binding is reported loudly at startup",
+		fn = function()
+			-- The one dependency failure that leaves no trace: every ucihelper
+			-- call is pcall-wrapped, so the daemon adopts, reports its ports
+			-- and statistics and looks healthy while radio_table goes out
+			-- EMPTY and the controller has no radio to provision a WLAN onto.
+			-- Confirmed on a real JIDU6101 -- four pushed WLANs, zero UCI
+			-- sections, nothing logged anywhere. Cost a full debugging session,
+			-- hence this warning and this test.
+			local had = package.loaded["uci"]
+			package.loaded["uci"] = nil
+			-- Force require("uci") to fail regardless of the host having it.
+			local orig_path, orig_cpath = package.path, package.cpath
+			package.path, package.cpath = "/nonexistent/?.lua", "/nonexistent/?.so"
+			local out = with_stderr(function()
+				assert_true(inform._warn_missing_uci(), "warns")
+			end)
+			package.path, package.cpath = orig_path, orig_cpath
+			package.loaded["uci"] = had
+
+			assert_contains(out, "UCI binding is MISSING", "names the problem")
+			assert_contains(out, "ZERO", "says radio_table goes out empty")
+			assert_contains(out, "libuci-lua", "names the package")
+			assert_contains(out, "opkg", "and the pre-25.12 command")
+		end
+	},
+	{
+		name = "inform: no UCI warning when the binding is present",
+		fn = function()
+			-- Already-loaded is the common case on a healthy device and must
+			-- not re-require or warn.
+			local had = package.loaded["uci"]
+			package.loaded["uci"] = {cursor = function() return {} end}
+			local out = with_stderr(function()
+				assert_false(inform._warn_missing_uci(), "silent")
+			end)
+			package.loaded["uci"] = had
+			assert_eq(out, "", "and writes nothing")
+		end
+	},
+	{
 		name = "inform: _state_mtime falls back to file contents without stat",
 		fn = function()
 			-- BusyBox gates `stat -c` behind FEATURE_STAT_FORMAT and some

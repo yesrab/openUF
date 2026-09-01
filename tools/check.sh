@@ -55,6 +55,21 @@ else
 	fail "lua require('socket') — install: apk add luasocket"
 fi
 
+# The binding every wireless read and write goes through (ucihelper.lua,
+# switchvlan.lua, usteer.lua). Checked here because its absence is otherwise
+# invisible: openUF still adopts and still reports ports and statistics, but
+# radio_table goes out empty, the controller has no radio to provision a WLAN
+# onto, and not one pushed SSID is ever created. This check did not exist and
+# a real device passed the whole preflight while being unable to provision
+# anything at all.
+if lua -e "require('uci')" 2>/dev/null; then
+	ok "lua require('uci')"
+else
+	fail "lua require('uci') — install: apk add libuci-lua"
+	info "     WITHOUT THIS NO SSID CAN EVER BE CREATED. The device will still"
+	info "     adopt and report statistics, so nothing else will look wrong."
+fi
+
 if lua -e "require('bit')" 2>/dev/null; then
 	ok "lua require('bit')"
 else

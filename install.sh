@@ -130,8 +130,20 @@ case "$1" in
 		# provisioning a device that has never sent a genuine GCM inform. There
 		# is no Lua zlib binding in 25.12, so inform-response decompression is
 		# handled in-tree by openuf/inflate.lua and needs no package.
+		#
+		# libuci-lua provides require("uci") and is what every wireless read
+		# and write goes through (ucihelper.lua, switchvlan.lua, usteer.lua).
+		# It is NOT pulled in by `lua`, and its absence is the single most
+		# invisible failure openUF has: every ucihelper call is pcall-wrapped
+		# (correctly -- a UCI error must not take the inform loop down), so the
+		# device adopts, reports its ports and statistics, and looks perfectly
+		# healthy while radio_table goes out EMPTY and the controller has no
+		# radio to provision a WLAN onto. Confirmed on a real JIDU6101: adopted,
+		# port table correct, and not one pushed SSID ever appeared -- until
+		# this package was installed, at which point the very next config push
+		# created every VAP.
 		MISSING=""
-		for pkg in lua lua-cjson luasocket lua-openssl luabitop iw; do
+		for pkg in lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw; do
 			if ! pkg_installed "$pkg"; then
 				MISSING="$MISSING $pkg"
 			fi

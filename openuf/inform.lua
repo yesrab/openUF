@@ -2920,6 +2920,37 @@ function M._reload_if_changed(st, cfg, last_mtime)
 	return mtime
 end
 
+-- A missing Lua UCI binding (libuci-lua, providing require("uci")) is the one
+-- dependency failure that leaves no trace anywhere. Every ucihelper call is
+-- pcall-wrapped -- correctly, since a UCI error off-target must not take the
+-- inform loop down -- so the daemon starts, adopts, reports its ethernet ports
+-- and its statistics, and looks completely healthy, while get_radio_table()
+-- returns nothing and radio_table goes out EMPTY. The controller then has no
+-- radio to provision a WLAN onto: the push arrives, is accepted, and not one
+-- SSID is ever created. Nothing logs, nothing errors, and the controller UI
+-- shows the device Connected.
+--
+-- Observed for real on a JIDU6101: adopted, correct port table, live
+-- statistics, and four pushed WLANs that produced zero UCI sections. The very
+-- next config push after `apk add libuci-lua` created all of them.
+--
+-- Startup-only, and deliberately not fatal: a device with no UCI binding still
+-- reports statistics usefully, and killing the daemon would lose that too.
+-- Returns true when it warned, so this is testable without running the loop.
+function M._warn_missing_uci()
+	if package.loaded["uci"] then return false end
+	if pcall(require, "uci") then return false end
+	io.stderr:write(
+		"openuf: the Lua UCI binding is MISSING (require(\"uci\") failed).\n" ..
+		"openuf: WiFi provisioning cannot work at all: every radio and WLAN\n" ..
+		"openuf: read/write fails silently, the inform payload reports ZERO\n" ..
+		"openuf: radios, and the controller has nothing to push a WLAN onto --\n" ..
+		"openuf: adoption and statistics still work, so nothing else looks wrong.\n" ..
+		"openuf: Fix it with:  apk add libuci-lua      (25.12+)\n" ..
+		"openuf:               opkg install libuci-lua (24.10 and earlier)\n")
+	return true
+end
+
 -- dev.conf.net.lan_cpueth decides the device's IDENTITY, not just which port
 -- carries VLANs: its MAC is what the controller keys the adopted device on.
 -- Change it on an already-adopted device -- switching modelmaps, say -- and
@@ -2953,6 +2984,7 @@ function M.run(cfg, ufhw)
 	local prev_mac = st.mac
 	M._populate_net_info(st, cfg)
 	M._warn_identity_change(prev_mac, st, cfg)
+	M._warn_missing_uci()
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 	-- Blocked-client nft rules are live kernel state, not persisted UCI --
 	-- reapply from state.json on every fresh start (mirrors the bootstrap

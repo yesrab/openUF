@@ -763,10 +763,21 @@ head1 "Packages"
 info "refreshing the package index ($PKG update)"
 pkg_update || warn "index refresh failed; installs below may not resolve"
 
-# REQUIRED. lua-openssl is the one that decides whether adoption can complete
-# at all: UniFi 10.4.57 will not finish provisioning a device that has never
-# sent a genuine AES-128-GCM inform, and the openssl CLI fallback is CBC-only.
-REQUIRED="lua lua-cjson luasocket lua-openssl luabitop iw"
+# REQUIRED. Two of these decide whether openUF works at all rather than
+# merely working less well:
+#
+#   lua-openssl   AES-128-GCM. UniFi 10.4.57 will not finish provisioning a
+#                 device that has never sent a genuine GCM inform, and the
+#                 openssl CLI fallback is CBC-only.
+#   libuci-lua    require("uci"), which every wireless read and write goes
+#                 through. Without it the device still adopts and still reports
+#                 ports and statistics -- but radio_table goes out EMPTY, so the
+#                 controller has no radio to provision a WLAN onto and not one
+#                 pushed SSID ever appears. It fails silently because every
+#                 ucihelper call is pcall-wrapped, so this is checked here and
+#                 shouted about at daemon startup rather than left to be
+#                 discovered by a day of debugging.
+REQUIRED="lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw"
 # OPTIONAL. Each absence silently disables exactly one feature -- provisioning
 # still reports success while the feature does nothing -- so they go in when
 # they fit rather than being merely mentioned.
@@ -1152,6 +1163,114 @@ fi
 # Phase 5 — the access-point conversion
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Move the WAN socket into the LAN VLAN, in the switch, on a swconfig board.
+#
+# Rewrites the two anonymous `config switch_vlan` sections config_generate
+# wrote from the board's own DTS port labels: the WAN VLAN's non-CPU ports are
+# appended to the LAN VLAN and the WAN VLAN section is deleted. The socket is
+# then an ordinary LAN socket, switched in hardware, and the WAN CPU netdev
+# (eth0 on an Archer C5) is simply unused.
+#
+# Returns 0 only when every one of these held, and 1 -- changing nothing -- the
+# moment one does not. Getting this wrong moves the wrong socket or deletes the
+# wrong VLAN, and the first symptom is a device that does not come back from
+# the reboot, so every unknown is a refusal rather than a guess:
+#
+#   * the profile declares dev.conf.vlan (the CPU port numbers) and
+#     dev.conf.net.lan_vlanid -- UCI's port lists are bare numbers, and which
+#     of them are CPU ports is board truth that lives only in the profile
+#   * exactly one switch_vlan section carries the LAN VLAN id
+#   * exactly one OTHER switch_vlan section exists on the same switch device
+#     (a board with a third VLAN is doing something this does not model)
+#   * that section has at least one non-CPU port to move
+#
+# lua reads the three numbers rather than sed: they decide which physical
+# socket is reassigned, and a mis-parsed comment would move a different one.
+absorb_wan_swconfig() {
+	command -v lua >/dev/null 2>&1 || return 1
+
+	_mm() {   # _mm <lua expression over `d`> -> value, or empty
+		( cd "$SRC/openuf" 2>/dev/null && lua -e "
+			local ok, d = pcall(dofile, 'modelmap/$MODELMAP.lua')
+			if not ok or type(d) ~= 'table' then return end
+			local ok2, v = pcall(function() return $1 end)
+			if ok2 and v ~= nil then io.write(tostring(v)) end" 2>/dev/null )
+	}
+	_lan_vid=$(_mm "d.conf.net.lan_vlanid")
+	_cpu_lan=$(_mm "d.conf.vlan.cpu_lan")
+	_cpu_wan=$(_mm "d.conf.vlan.cpu_wan")
+	[ -n "$_lan_vid" ] && [ -n "$_cpu_lan" ] || {
+		info "profile declares no switch geometry; not touching the VLANs"
+		return 1
+	}
+
+	# index:vlan for every switch_vlan section, from one `uci show` pass.
+	_secs=$(uci show network 2>/dev/null \
+		| sed -n "s/^network\.@switch_vlan\[\([0-9]*\)\]\.vlan='*\([0-9]*\)'*\$/\1:\2/p")
+	[ -n "$_secs" ] || return 1
+
+	_lan_idx=""; _wan_idx=""; _wan_vid=""; _lan_n=0; _wan_n=0
+	for _e in $_secs; do
+		_i=${_e%%:*}; _v=${_e##*:}
+		if [ "$_v" = "$_lan_vid" ]; then
+			_lan_idx=$_i; _lan_n=$((_lan_n + 1))
+		else
+			_wan_idx=$_i; _wan_vid=$_v; _wan_n=$((_wan_n + 1))
+		fi
+	done
+	if [ "$_lan_n" != 1 ] || [ "$_wan_n" != 1 ]; then
+		info "$_lan_n LAN and $_wan_n other switch VLANs -- too unusual to rewrite"
+		return 1
+	fi
+
+	# Same switch, or these are two unrelated ASICs and merging them is meaningless.
+	_lan_swdev=$(uci -q get "network.@switch_vlan[$_lan_idx].device" || true)
+	_wan_swdev=$(uci -q get "network.@switch_vlan[$_wan_idx].device" || true)
+	[ "$_lan_swdev" = "$_wan_swdev" ] || {
+		info "the LAN and WAN VLANs are on different switches; not rewriting"
+		return 1
+	}
+
+	_lan_ports=$(uci -q get "network.@switch_vlan[$_lan_idx].ports" || true)
+	_wan_ports=$(uci -q get "network.@switch_vlan[$_wan_idx].ports" || true)
+	[ -n "$_lan_ports" ] && [ -n "$_wan_ports" ] || return 1
+
+	# The sockets to move: the WAN VLAN's ports minus the CPU ports. A port
+	# entry may carry a trailing "t" (tagged), which has to come off before
+	# comparing -- a tagged CPU port reads "6t" and would otherwise look like
+	# a socket and be moved into the LAN VLAN.
+	_move=""
+	for _p in $_wan_ports; do
+		_bare=${_p%t}; _bare=${_bare%u}
+		[ "$_bare" = "$_cpu_lan" ] && continue
+		[ -n "$_cpu_wan" ] && [ "$_bare" = "$_cpu_wan" ] && continue
+		_move="${_move:+$_move }$_bare"
+	done
+	[ -n "$_move" ] || {
+		info "the WAN VLAN holds only CPU ports; nothing to move"
+		return 1
+	}
+
+	# Untagged in the LAN VLAN, which is what a plain socket wants and what it
+	# already was in the WAN VLAN. Skip anything somehow already there.
+	_added=""
+	for _p in $_move; do
+		case " $_lan_ports " in
+			*" $_p "*|*" ${_p}t "*) continue ;;
+		esac
+		_lan_ports="$_lan_ports $_p"
+		_added="${_added:+$_added }$_p"
+	done
+	[ -n "$_added" ] || return 1
+
+	uci set "network.@switch_vlan[$_lan_idx].ports=$_lan_ports"
+	uci delete "network.@switch_vlan[$_wan_idx]"
+	ok "switch port(s) $_added moved into VLAN $_lan_vid; VLAN $_wan_vid deleted"
+	say "     the WAN socket is now an ordinary LAN socket, switched in"
+	say "     hardware -- ${WAN_DEV:-the WAN CPU netdev} is left unused"
+	return 0
+}
+
 if [ "$DO_AP_MODE" = 1 ]; then
 	head1 "Converting to an access point"
 
@@ -1180,8 +1299,30 @@ if [ "$DO_AP_MODE" = 1 ]; then
 		esac
 	done
 
-	# ── The WAN socket joins the LAN bridge ─────────────────────────────────
-	if [ "$AP_ABSORB_WAN" = 1 ] && [ -n "$WAN_DEV" ]; then
+	# ── The WAN socket joins the LAN side ───────────────────────────────────
+	#
+	# Two genuinely different jobs, because "the WAN port" is a different kind
+	# of thing on the two switch generations:
+	#
+	#   DSA         network.wan.device is the SOCKET's own netdev ("wan"), so
+	#               adding it to the LAN bridge really does put that socket on
+	#               the LAN, and frames between it and a LAN socket stay inside
+	#               the switch ASIC.
+	#   swconfig    network.wan.device is a CPU netdev ("eth0", or "eth0.2" on a
+	#               tagged-CPU board) reaching a socket the ASIC has segmented
+	#               into its own VLAN. Bridging that netdev into br-lan does
+	#               work, but every frame between the WAN socket and a LAN
+	#               socket then hairpins SoC-ward: switch -> CPU port -> bridge
+	#               -> other CPU port -> switch. On a 720 MHz QCA9558 that is
+	#               the difference between wire speed and ~100 Mbit/s, and the
+	#               CPU it burns is CPU openUF needs. The real fix there is to
+	#               move the socket into the LAN VLAN inside the switch, which
+	#               is what absorb_wan_swconfig does when it can prove which
+	#               socket that is -- and it falls back to the bridge, loudly,
+	#               when it cannot.
+	if [ "$AP_ABSORB_WAN" = 1 ] && [ "$HAS_SWCONFIG" = 1 ] && absorb_wan_swconfig; then
+		:   # done in the switch; no netdev goes into the bridge
+	elif [ "$AP_ABSORB_WAN" = 1 ] && [ -n "$WAN_DEV" ]; then
 		LAN_DEV=$(uci -q get network.lan.device || true)
 		BR_SECTION=""
 		if [ -n "$LAN_DEV" ]; then

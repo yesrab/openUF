@@ -149,10 +149,17 @@ device unreachable.
 1. **Interview** — every question first, before anything is changed.
 2. **Access-point conversion** — a device still acting as a router fights the real
    gateway for DHCP and NAT, so the router role goes: no WAN interface, the WAN
-   socket folded into the LAN bridge, DHCP server off, `firewall`/`dnsmasq`/`odhcpd`
+   socket folded into the LAN side, DHCP server off, `firewall`/`dnsmasq`/`odhcpd`
    stopped and out of the boot sequence, and the resolver pointed back at the real
    nameservers `dnsmasq` was fronting. The packages are left installed, only
    disabled, so it is one command to undo.
+
+   Folding in the WAN socket means two different things: on **DSA** it is the
+   socket's own netdev, so it joins the LAN bridge and stays hardware-switched. On
+   **swconfig** it is a CPU netdev reaching a socket the ASIC has segmented into its
+   own VLAN — bridging that in works but hairpins every frame through the SoC, so
+   `setup.sh` moves the port into the LAN VLAN in the switch instead, and only when
+   it can prove which port that is. See [USAGE](USAGE.md#moving-the-wan-socket-to-the-lan-side).
 3. **Hardware profile** — the board-specific profiles are listed with the detected
    one marked, the generics below them, and generating one from the running device
    at the bottom. Enter takes the detected board's profile, or a generic chosen by
@@ -190,7 +197,7 @@ point it at a different fork, branch, or a checkout already on the device.
 ```sh
 # 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk)
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
 
 # 2. Download and install the latest release (no git client or scp needed)
 mkdir openuf-install && cd openuf-install

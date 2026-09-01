@@ -8,7 +8,7 @@ OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
 
 ```sh
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
 ```
 
 | Package | Purpose |
@@ -18,6 +18,7 @@ apk add lua lua-cjson luasocket lua-openssl luabitop iw lldpd nftables hostapd-u
 | `luasocket` | TCP client for HTTP POST to controller |
 | `lua-openssl` | AES-128-CBC **and AES-128-GCM** (replaces `luacrypto`, which was dropped from the 25.12 feeds). Effectively mandatory — see the GCM note below |
 | `luabitop` | bit operations for Lua 5.1 |
+| `libuci-lua` | `require("uci")` — **every** wireless read and write goes through it (`ucihelper.lua`, `switchvlan.lua`, `usteer.lua`). Not pulled in by `lua`. Its absence is openUF's most invisible failure: the device adopts, reports its ports and statistics and looks perfectly healthy, but `radio_table` goes out **empty**, so the controller has no radio to provision a WLAN onto and not one pushed SSID is ever created. Confirmed on real hardware — four pushed WLANs, zero UCI sections, nothing logged. `openuf` now shouts about it at startup and `tools/check.sh` tests for it |
 | `iw` | Radio and station statistics |
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
@@ -104,7 +105,7 @@ until the reboot:
 
 | | Change |
 |---|---|
-| `network` | `wan` and `wan6` interfaces deleted; the WAN netdev added to the LAN bridge; `lan` set to DHCP or the given static address; `ip6assign` dropped |
+| `network` | `wan` and `wan6` interfaces deleted; the WAN socket moved to the LAN side (see below); `lan` set to DHCP or the given static address; `ip6assign` dropped |
 | `dhcp` | `dhcp.lan.ignore=1`, `dhcp.wan` deleted |
 | services | `firewall`, `dnsmasq`, `odhcpd` stopped and `disable`d — packages kept, so re-enabling is one command each |
 | resolver | `/tmp/resolv.conf` relinked to `resolv.conf.auto`, since nothing listens on 127.0.0.1 once `dnsmasq` is off and a hostname inform URL would stop resolving |
@@ -114,6 +115,44 @@ until the reboot:
 An interface with proto `pppoe`/`wwan`/`dhcpv6`/etc. is **named and left alone** rather
 than deleted — it may be a management link, and deleting a section the script did not put
 there is worse than leaving it.
+
+#### Moving the WAN socket to the LAN side
+
+"The WAN port" is a different kind of object on the two switch generations, so this is
+two different jobs:
+
+- **DSA** — `network.wan.device` is the *socket's own* netdev (`wan`), so adding it to the
+  LAN bridge genuinely puts that socket on the LAN, and traffic between it and a LAN socket
+  stays inside the switch ASIC. This is the canonical dumb-AP recipe and what `setup.sh`
+  does.
+- **swconfig** — `network.wan.device` is a *CPU* netdev (`eth0` on an Archer C5, or
+  `eth0.2` on a tagged-CPU board) reaching a socket the ASIC has segmented into its own
+  VLAN. Bridging that netdev into `br-lan` works, but every frame between the WAN socket
+  and a LAN socket then hairpins through the SoC — switch → CPU port → bridge → other CPU
+  port → switch. On a 720 MHz QCA9558 that is the difference between wire speed and roughly
+  100 Mbit/s, and it burns CPU openUF needs.
+
+  So on swconfig `setup.sh` does the real fix instead: it rewrites the `config switch_vlan`
+  sections, appending the WAN VLAN's non-CPU ports to the LAN VLAN and deleting the WAN
+  VLAN. The socket becomes an ordinary LAN socket, switched in hardware, and the WAN CPU
+  netdev is simply left unused. On an Archer C5 that is physical port 1 joining
+  `ports '2 3 4 5 0'` and the VLAN 2 section going away.
+
+  Because a wrong move here reassigns the wrong socket — and the first symptom is a device
+  that does not come back from the reboot — it proceeds **only** when all of these hold,
+  and otherwise falls back to bridging the netdev and says so:
+
+  - the chosen profile declares `dev.conf.vlan` (the CPU port numbers) and
+    `dev.conf.net.lan_vlanid`. UCI's port lists are bare numbers; which of them are CPU
+    ports is board truth that lives only in the profile
+  - exactly one `switch_vlan` section carries the LAN VLAN id
+  - exactly one *other* `switch_vlan` section exists, on the same switch device
+  - that section has at least one non-CPU port to move (a `t`/`u` suffix is stripped
+    before the comparison, so a tagged CPU port is never mistaken for a socket)
+
+  A side effect worth knowing: openUF suppresses wired clients on any socket whose pvid is
+  not the management VLAN, so before this change the Archer C5's WAN socket reported no
+  hosts even with a cable in it. Afterwards it is on VLAN 1 and reports them normally.
 
 openUF's own nftables tables live in `bridge openuf` and `bridge openuf_bcfilt`,
 deliberately outside `fw4`'s `inet fw4`, so client Block/Unblock and the Multicast and
@@ -752,7 +791,9 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
 | Locate/LED does nothing | `dev.conf.led` is `nil` in your modelmap — set it to a path from `ls /sys/class/leds` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
-| SSID not appearing after adoption | Check `uci show wireless`, check `loglevel` in `/var/log/openuf.log` |
+| **Adopted and healthy, but no pushed SSID is ever created** | **`libuci-lua` is missing** — the most likely cause by far, and it looks like nothing is wrong. Check with `lua -e 'print(pcall(require,"uci"))'`; fix with `apk add libuci-lua` and restart. Every wireless read/write is `pcall`-wrapped, so without it the device adopts, reports ports and statistics, and sends an **empty `radio_table`** — the controller has no radio to put a WLAN on, accepts the push, and creates nothing. openUF warns about this at startup (`logread \| grep openuf`) and `tools/check.sh` tests for it |
+| SSID not appearing after adoption | Confirm the controller actually pushed it: set `debug_dump_file` in `conf.lua`, restart, and look for `wireless.*`/`aaa.*` keys in the `setparam` `system_cfg`. If the controller only ever sends `noop`, it believes the device is already configured — clear `cfgversion` in `state.json` and restart to force a full re-push. Then check `uci show wireless \| grep openuf` |
+| Radios provisioned but a **5 GHz** SSID never comes up | hostapd's ACS picked a **DFS** channel and the driver's CAC failed — `logread \| grep DFS` shows `start_dfs_cac() failed` then `AP-DISABLED`. Common on mt7915/mt7986 (filogic). openUF faithfully writes the controller's channel **Auto** through as `channel=auto` and lets ACS choose, so the fix is controller-side: set the 5 GHz radio to a non-DFS channel (36–48 or 149–165, depending on your regulatory domain) instead of Auto |
 | `lldp_table` empty | `lldpd` not running — run `/etc/init.d/lldpd start` |
 | Bootstrap account (`ubnt`) doesn't lock after adoption, or doesn't re-enable after a factory reset | `inform.lua` must be running for this — it's what detects the state change and runs `passwd -l`/`-u` (see § SSH prerequisite). Check `/var/log/openuf.log`. |
 
