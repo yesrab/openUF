@@ -296,6 +296,7 @@ openUF implements the **TNBU binary inform protocol**:
 
 Key reference material:
 - [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md) — this project's own findings from running openUF against a real self-hosted UniFi controller; supersedes the below where they disagree
+- [REVERSE-ENGINEERING.md](REVERSE-ENGINEERING.md) — the open questions: protocol surfaces not implemented yet, what is known about each, and the experiment plan. Mesh/wireless uplink is the current head item
 - [amd989/unifi-gateway](https://github.com/amd989/unifi-gateway) — primary protocol reference; live Python daemon tested against real controllers
 - [jeffreykog/unifi-inform-protocol](https://github.com/jeffreykog/unifi-inform-protocol)
 - [fxkr/unifi-protocol-reverse-engineering](https://github.com/fxkr/unifi-protocol-reverse-engineering)

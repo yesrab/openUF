@@ -463,8 +463,15 @@ install.sh          file/service install and dependency resolution
 tools/              dist.sh (package), check.sh (preflight), simulate.sh (e2e),
                     strip.lua, test_controller.py, validation/ (docker controller)
 PROTOCOL-VALIDATION.md   evidence for every protocol claim — read before disputing one
+REVERSE-ENGINEERING.md   the open questions: unimplemented surfaces + experiment plans
 ```
 
 `PROTOCOL-VALIDATION.md` records what was confirmed against a live controller versus
 inferred from decompilation, and **supersedes README/USAGE where they disagree**. If you
 are about to change protocol behaviour, check there first for why it is the way it is.
+
+`REVERSE-ENGINEERING.md` is the other half: what is *not* implemented, what is known about
+each, and the next experiment. Before starting work on an unimplemented protocol feature,
+read its entry — several have a "do not re-attempt" list that will save you a session. Its
+first rule is the one to internalise: **never claim a capability bit openUF cannot honour**,
+because that turns a missing feature into a silently broken one.
