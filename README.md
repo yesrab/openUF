@@ -117,6 +117,14 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   to start CAC, and the radio is left down), and the controller's default mode for the
   emulated U6IW is 802.11n at 40 MHz on a 4x4 WiFi-6 phy — see
   [USAGE](USAGE.md#radio-policy-devconfradio)
+- **JioRouter AX6000 JIDU6J01 / JIDU6201 / JIDU6401 / JIDU6601 / JIDU6701** (MT7986A /
+  mediatek-filogic, dual-band 802.11ax) — use `modelmap/jiorouter-ax6000-jidu6j01.lua`.
+  **One profile for all five**: OpenWrt builds a single image from one DTS, so every
+  variant reports the same board name and differs only in where `board.d` reads the label
+  MAC from in the MFG partition — resolved at first boot, before openUF starts.
+  ⚠️ **Not yet confirmed on the hardware**: derived from the OpenWrt DTS plus the
+  JIDU6101 profile, which is the same SoC and the same MT7976 radios. It inherits that
+  board’s measured `dev.conf.radio` policy; the header flags what to re-check first
 
 Anything else: `modelmap/generic-dualband-ap.lua` or `modelmap/generic-singleband-ap.lua`,
 or let `setup.sh` generate a profile from the running device (DSA boards only, where every

@@ -161,24 +161,32 @@ dev.conf.radio = {
 		-- keeps its value, and openUF's hardware clamp still runs afterwards.
 		htmode_floor = "HE80",
 
-		-- ...and a ceiling, because this radio ADVERTISES 160 MHz and cannot
-		-- run it. Verified live, on every legal primary channel:
+		-- ...and a ceiling, in the same units. HE160 is the widest openUF ever
+		-- derives from a controller push, so as written this is a NO-OP that
+		-- documents the board rather than restricting it: with
+		-- config.country_override set (see conf.lua) 160 MHz runs here, live
+		-- on channel 44 at center1 5250.
+		--
+		-- It is kept set because this is the one control that can express "the
+		-- driver says yes and the radio then comes up DOWN", which `iw phy`
+		-- cannot: clamp_htmode asks the DRIVER, and this one advertises
+		-- "Supported Channel Width: 160 MHz" whether or not a 160 MHz block is
+		-- actually usable. It was doing real work before the override, and
+		-- lower it back to "HE80" if you run without one. Verified live, on
+		-- every legal primary channel, under the IN regdomain:
 		--     DFS-CAC-START freq=5180 chan=36 sec_chan=1 width=2 seg0=50
 		--     hostapd: DFS start_dfs_cac() failed, -1
 		--     hostapd: Interface initialization failed  -> AP-DISABLED
 		-- A 160 MHz block is 8 contiguous 20 MHz channels, and under IN every
-		-- one that fits overlaps DFS: ch36 centres on seg0=50 (36-64, and 52-64
-		-- are DFS), ch100 centres on 114 (100-128, all DFS). The only clear
-		-- range, 149-173, is 7 channels -- 140 MHz -- and 177 is disabled, so no
-		-- 160 MHz block fits there at all. With CAC broken in this driver, 160
-		-- MHz is therefore unreachable no matter which channel is chosen, and
+		-- one that fits overlaps DFS: ch36 centres on seg0=50 (36-64, and
+		-- 52-64 are DFS), ch100 centres on 114 (100-128, all DFS). The only
+		-- clear range, 149-173, is 7 channels -- 140 MHz -- and 177 is
+		-- disabled, so no 160 MHz block fits there at all. With CAC broken in
+		-- this driver 160 MHz was therefore unreachable at ANY channel, and
 		-- acs_exclude_dfs cannot help because a FIXED channel skips ACS
-		-- entirely.
-		--
-		-- `iw phy` reports "Supported Channel Width: 160 MHz", so clamp_htmode
-		-- passes HE160 straight through and the radio simply comes up down.
-		-- Only the board can know the difference; remove this if a future
-		-- driver/firmware fixes DFS.
+		-- entirely. A regdomain with a clear 160 MHz block is what removed the
+		-- constraint -- the DFS flags come from the regulatory domain, not the
+		-- hardware.
 		htmode_max = "HE160",
 	},
 	ng = {

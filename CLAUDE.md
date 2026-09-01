@@ -129,6 +129,29 @@ Two things worth knowing about what `config_generate` produces from those:
   the CPU port is tagged and the netdev becomes `eth0.<vlan>`. Roles become anonymous
   `config switch_vlan` sections with bare-number `ports` lists.
 
+**Check whether the board is really a FAMILY.** Look at its `define Device/…` block in
+`image/<sub>.mk`: a `DEVICE_ALT0_VARIANT` / `ALT1` / `ALT2` … list means OpenWrt builds
+**one image from one DTS** for several retail models, and every one of them reports the
+same `compatible` string. `ubus call system board` therefore cannot tell them apart, and
+neither can openUF.
+
+That is not a problem to work around — it is a shortcut. Write **one** map, claim the
+single family board name, and say so in the header. Then check what the variants actually
+differ in, in `board.d/02_network`; if the whole difference is where the label MAC is read
+from (the `jiorouter,ax6000-jidu6j01` case: four different MFG offsets and encodings), it
+is resolved at first boot long before openUF starts and there is nothing left to describe.
+
+The tempting mistake is to "complete" `dev.openwrt_boards` with the retail names. `ubus`
+never emits them, so they are dead weight that reads like coverage — and a real second map
+claiming one would make `setup.sh`'s choice between the two arbitrary. Pin it with a test
+(see `modelmap: one JIDU6J01 profile serves the whole retail family`).
+
+What *would* justify a second map is a variant that differs in something openUF reads:
+a different socket count, radio count, or LED wiring. Those come from the DTS, and a
+shared DTS means shared answers — but the DTS is written from one sample, so if a variant
+turns out to have fewer holes in the case than the DTS claims, that is a real divergence
+and the map needs a ⚠️ rather than silence.
+
 ### 2. Write the file
 
 `openuf/modelmap/<vendor>-<model>.lua`. Copy the closest existing map:
@@ -212,7 +235,9 @@ It also decides two other things, which is why DSA wants the bridge:
 - no LAN port collides with the WAN port or a CPU port
 
 Then add a **board-specific** test pinning the facts a generic invariant cannot catch —
-see the `archer-c5-v1` and `jiorouter-ax6000-jidu6101` cases. Pin the things that are
+see the `archer-c5-v1` and `JioRouter AX6000` cases (the latter checks both
+JIDU maps in one loop — they are the same SoC and radios, so anything that drifts apart
+should drift on purpose). Pin the things that are
 board truth (which physical port is the WAN socket, `lan_cpueth`, the LED) with a comment
 saying how you know.
 
@@ -238,6 +263,7 @@ Three places name the profiles and will drift silently:
 [ ] facts sourced from the OpenWrt DTS + board.d, and cited in the file header
 [ ] header line 2 reads "<Vendor> <Model> hardware profile." (the menu title)
 [ ] dev.openwrt_boards = {"vendor,model"}
+[ ] DEVICE_ALT*_VARIANT checked in image/<sub>.mk — a family gets ONE map, one board name
 [ ] lan_cpueth: bridge on DSA, CPU netdev/trunk on swconfig
 [ ] one ports entry per RJ45 socket; no static uplink flag
 [ ] DSA: uplink_detect = "fdb", NO dev.conf.vlan

@@ -175,50 +175,97 @@ return {
 		end
 	},
 	{
-		name = "modelmap: jiorouter-ax6000-jidu6101 uses the DSA netdev shape",
+		name = "modelmap: the JioRouter AX6000 maps use the DSA netdev shape",
 		fn = function()
-			-- Board-specific regression guard. This is the first DSA board in
-			-- the tree and it needs the OTHER of openUF's two port shapes: the
-			-- MT7531 is kernel-driven, so each socket is a netdev with its own
-			-- link state and FDB slice, and there is no swconfig to ask.
-			local dev = dofile(MODELMAP_DIR .. "/jiorouter-ax6000-jidu6101.lua")
+			-- Board-specific regression guard for both MT7986A profiles. These
+			-- are the tree's only DSA boards and they need the OTHER of
+			-- openUF's two port shapes: the MT7531 is kernel-driven, so each
+			-- socket is a netdev with its own link state and FDB slice, and
+			-- there is no swconfig to ask.
+			--
+			-- Checked as a pair because they ARE a pair -- same SoC, same
+			-- MT7976 radios, same shared dtsi -- and the JIDU6J01 map was
+			-- written from the JIDU6101 one. Anything that drifts apart here
+			-- should drift on purpose.
+			for _, map in ipairs({"jiorouter-ax6000-jidu6101",
+			                      "jiorouter-ax6000-jidu6j01"}) do
+				local dev = dofile(MODELMAP_DIR .. "/" .. map .. ".lua")
 
-			-- lan_cpueth is the BRIDGE, not a port: it decides the identity
-			-- MAC, and on a board where the cable can move between four
-			-- equally-valid socket netdevs, naming one of them would make the
-			-- device's identity depend on which hole the installer used. It is
-			-- also what a tagged SSID's sub-device hangs off (br-lan.20), and
-			-- a sub-device on a bridge PORT would never see a frame.
-			assert_eq(dev.conf.net.lan_cpueth, "br-lan", "identity/trunk is the bridge")
-			assert_eq(dev.conf.led, "green:status", "LED name set so Locate works")
+				-- lan_cpueth is the BRIDGE, not a port: it decides the
+				-- identity MAC, and on a board where the cable can move
+				-- between four equally-valid socket netdevs, naming one of
+				-- them would make the device's identity depend on which hole
+				-- the installer used. It is also what a tagged SSID's
+				-- sub-device hangs off (br-lan.20), and a sub-device on a
+				-- bridge PORT would never see a frame.
+				assert_eq(dev.conf.net.lan_cpueth, "br-lan",
+					map .. ": identity/trunk is the bridge")
+				assert_eq(dev.conf.led, "green:status",
+					map .. ": LED name set so Locate works")
 
-			-- No swconfig map: setting one would send inform.lua down the
-			-- switch path, shelling out to a swconfig that isn't installed,
-			-- and switchvlan.lua would have to detect DSA and refuse on every
-			-- push. Its absence is what keeps both on the netdev path.
-			assert_nil(dev.conf.vlan, "no swconfig port map on a DSA board")
+				-- No swconfig map: setting one would send inform.lua down the
+				-- switch path, shelling out to a swconfig that isn't
+				-- installed, and switchvlan.lua would have to detect DSA and
+				-- refuse on every push. Its absence keeps both on the netdev
+				-- path.
+				assert_nil(dev.conf.vlan, map .. ": no swconfig port map on a DSA board")
 
-			assert_eq(dev.conf.net.uplink_detect, "fdb",
-				"the uplink socket is measured, not declared")
-			local ports = dev.conf.net.ports
-			assert_eq(#ports, 5, "one port per socket (4 LAN + WAN)")
-			local names = {}
-			for _, p in ipairs(ports) do
-				assert_nil(p.uplink, "port " .. p.idx .. " is not statically flagged uplink")
-				assert_nil(p.swport, "port " .. p.idx .. " names no swconfig socket")
-				assert_not_nil(p.ifname, "port " .. p.idx .. " names a netdev")
-				names[#names + 1] = p.ifname
+				assert_eq(dev.conf.net.uplink_detect, "fdb",
+					map .. ": the uplink socket is measured, not declared")
+				local ports = dev.conf.net.ports
+				assert_eq(#ports, 5, map .. ": one port per socket (4 LAN + WAN)")
+				local names = {}
+				for _, p in ipairs(ports) do
+					assert_nil(p.uplink, map .. ": port " .. p.idx .. " is not statically flagged uplink")
+					assert_nil(p.swport, map .. ": port " .. p.idx .. " names no swconfig socket")
+					assert_not_nil(p.ifname, map .. ": port " .. p.idx .. " names a netdev")
+					names[#names + 1] = p.ifname
+				end
+				-- The SET is the invariant; the ORDER is a board choice. `idx`
+				-- is the UniFi port_idx and the controller keys per-port
+				-- settings on it, so what actually matters is that every
+				-- socket appears exactly once and that the numbering stays
+				-- PINNED once a device is adopted -- renumbering later moves
+				-- which physical socket the controller's "Port 1" means.
+				-- Asserting the declared order instead just made this test
+				-- fail every time a map was legitimately re-ordered.
+				--
+				-- Both boards land on the same five names even though their
+				-- DTS files disagree about which switch reg carries which
+				-- label (the 6101 rotates, the 6J01 is straight): a DSA netdev
+				-- is named for its label, not its reg.
+				table.sort(names)
+				assert_eq(table.concat(names, ","), "lan1,lan2,lan3,lan4,wan",
+					map .. ": all five sockets, each exactly once")
 			end
-			-- The SET is the invariant; the ORDER is a board choice. `idx` is the
-			-- UniFi port_idx and the controller keys per-port settings on it, so
-			-- what actually matters is that every socket appears exactly once and
-			-- that the numbering stays PINNED once a device is adopted --
-			-- renumbering later moves which physical socket the controller's
-			-- "Port 1" means. Asserting the declared order instead just made this
-			-- test fail every time the map was legitimately re-ordered.
-			table.sort(names)
-			assert_eq(table.concat(names, ","), "lan1,lan2,lan3,lan4,wan",
-				"all five sockets, each exactly once")
+		end
+	},
+	{
+		name = "modelmap: one JIDU6J01 profile serves the whole retail family",
+		fn = function()
+			-- OpenWrt builds ONE image for JIDU6J01/6201/6401/6601/6701 from a
+			-- single DTS, so all five report the same compatible string and
+			-- differ only in where board.d reads the label MAC from in the MFG
+			-- partition -- resolved at first boot, before openUF starts.
+			--
+			-- The tempting mistake is to "complete" the list by adding the
+			-- retail names. `ubus call system board` never emits them, so the
+			-- extra entries would be dead weight that reads like coverage, and
+			-- a real second map claiming any of them would make setup.sh's
+			-- choice between the two arbitrary.
+			local dev = dofile(MODELMAP_DIR .. "/jiorouter-ax6000-jidu6j01.lua")
+			assert_eq(#dev.openwrt_boards, 1, "exactly one board name for five variants")
+			assert_eq(dev.openwrt_boards[1], "jiorouter,ax6000-jidu6j01",
+				"the family compatible string, not a retail variant name")
+
+			-- The variant digits appear in no map's board list, in either
+			-- direction: not here, and not as a separate profile.
+			each_modelmap(function(name, d)
+				for _, b in ipairs(d.openwrt_boards or {}) do
+					assert_true(b:match("jidu6[2467]01$") == nil,
+						name .. ": '" .. b .. "' is a retail variant ubus never reports")
+				end
+			end)
 		end
 	},
 	{

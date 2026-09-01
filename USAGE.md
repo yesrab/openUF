@@ -228,6 +228,9 @@ dev = dofile("modelmap/tl-wr1043ndv2.lua")
 -- For JioRouter AX6000 JIDU6101 (MT7986A / filogic — a DSA board):
 dev = dofile("modelmap/jiorouter-ax6000-jidu6101.lua")
 
+-- For JioRouter AX6000 JIDU6J01 / 6201 / 6401 / 6601 / 6701 (one map, all five):
+dev = dofile("modelmap/jiorouter-ax6000-jidu6j01.lua")
+
 -- For any other dual-band OpenWrt AP:
 dev = dofile("modelmap/generic-dualband-ap.lua")
 
