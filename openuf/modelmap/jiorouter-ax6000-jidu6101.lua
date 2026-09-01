@@ -90,11 +90,11 @@ dev.conf.net = {
 	-- here. Per-port VLAN assignment is therefore unavailable on this board
 	-- (switchvlan.lua detects DSA and refuses rather than guessing).
 	ports = {
-		{idx = 1, ifname = "lan1"},
-		{idx = 2, ifname = "lan2"},
-		{idx = 3, ifname = "lan3"},
-		{idx = 4, ifname = "lan4"},
-		{idx = 5, ifname = "wan"},
+		{idx = 1, ifname = "wan"},
+		{idx = 2, ifname = "lan1"},
+		{idx = 3, ifname = "lan2"},
+		{idx = 4, ifname = "lan3"},
+		{idx = 5, ifname = "lan4"},
 	},
 
 	-- Find the uplink socket at runtime from the bridge FDB: the port the
@@ -179,7 +179,7 @@ dev.conf.radio = {
 		-- passes HE160 straight through and the radio simply comes up down.
 		-- Only the board can know the difference; remove this if a future
 		-- driver/firmware fixes DFS.
-		htmode_max = "HE80",
+		htmode_max = "HE160",
 	},
 	ng = {
 		-- No DFS on 2.4 GHz, so ACS needs no help here.
