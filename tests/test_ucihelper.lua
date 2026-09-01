@@ -2316,6 +2316,96 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: a country override programs the driver but reports the controller's",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio1"})
+				ucihelper._uci.cursor():set("wireless", "radio1", "band", "5g")
+				-- The regdomain decides which channels carry a DFS flag, and DFS
+				-- is unusable on an mt7915 (CAC never starts), so under a domain
+				-- that flags 52-144 there is no reachable 160MHz block at all.
+				-- Measured: under IN, HE160 never comes up; under PA the same
+				-- channels are unflagged and it comes up at centre 5250.
+				ucihelper.rf_config("radio1", nil, 36, nil, nil, nil, nil, nil,
+					"IN", nil, {country_override = "PA"})
+				assert_eq(db.wireless.radio1.country, "PA",
+					"the driver is programmed with the override")
+				assert_eq(db.wireless.radio1.openuf_country, "IN",
+					"and the controller's own value is stamped for reporting")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: get_radio_table reports the stamped country, not the override",
+		fn = function()
+			with_ucihelper(function()
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio1", "wifi-device")
+				cursor:set("wireless", "radio1", "band", "5g")
+				cursor:set("wireless", "radio1", "country", "PA")
+				cursor:set("wireless", "radio1", "openuf_country", "IN")
+				local rt = ucihelper.get_radio_table({"radio1"})
+				-- Echoing PA back would make the controller's own site setting
+				-- look as though it had changed.
+				assert_eq(rt[1].country, "IN", "the controller sees its own regdomain")
+			end)
+			with_ucihelper(function()
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio1", "wifi-device")
+				cursor:set("wireless", "radio1", "band", "5g")
+				cursor:set("wireless", "radio1", "country", "IN")
+				local rt = ucihelper.get_radio_table({"radio1"})
+				assert_eq(rt[1].country, "IN", "and with no stamp, the live value")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: removing the country override reverses both halves",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio1"})
+				ucihelper._uci.cursor():set("wireless", "radio1", "band", "5g")
+				ucihelper.rf_config("radio1", nil, 36, nil, nil, nil, nil, nil,
+					"IN", nil, {country_override = "PA"})
+				assert_eq(db.wireless.radio1.country, "PA", "override applied")
+				-- Withdrawn: leaving a foreign regdomain programmed would be the
+				-- worst outcome -- silently non-compliant with nothing in the
+				-- config saying why.
+				ucihelper.rf_config("radio1", nil, 36, nil, nil, nil, nil, nil,
+					nil, nil, {})
+				assert_eq(db.wireless.radio1.country, "IN",
+					"the controller's regdomain is put back, even with no country in this push")
+				assert_nil(db.wireless.radio1.openuf_country, "and the stamp is gone")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a malformed country override is ignored, not programmed",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return JIDU6101_IW_PHY end
+				seed_radios({"radio1"})
+				ucihelper._uci.cursor():set("wireless", "radio1", "band", "5g")
+				for _, bad in ipairs({"P", "PAN", "1A", "", "pa!"}) do
+					ucihelper.rf_config("radio1", nil, 36, nil, nil, nil, nil, nil,
+						"IN", nil, {country_override = bad})
+					assert_eq(db.wireless.radio1.country, "IN",
+						"'" .. bad .. "' is not a regdomain -- controller value kept")
+					assert_nil(db.wireless.radio1.openuf_country, "and nothing stamped")
+				end
+				-- Lower case IS accepted; a regdomain is case-insensitive and a
+				-- user typing "pa" means Panama.
+				ucihelper.rf_config("radio1", nil, 36, nil, nil, nil, nil, nil,
+					"IN", nil, {country_override = "pa"})
+				assert_eq(db.wireless.radio1.country, "PA", "'pa' normalises to PA")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: cap_htmode lowers kind and width independently",
 		fn = function()
 			-- For a width the driver ADVERTISES and the radio cannot run. On a

@@ -164,6 +164,7 @@ OPT_CONTROLLER=""
 OPT_BOOTSTRAP=""       # ""=ask 1=yes 0=no
 OPT_EXCLUSIVE=""       # ""=ask 1=yes 0=no  (conf.use_only_unifi_wlan)
 OPT_L2=""              # ""=derive 1=on 0=off
+OPT_COUNTRY=""         # ""=ask; "none" or a 2-letter code
 DO_REBOOT=""           # ""=ask 1=yes 0=no
 KEEP_WORK=0
 
@@ -197,6 +198,10 @@ is asked interactively (or takes its default under --yes).
                             let the controller's WLANs be the only SSIDs on
                             the radios, or keep hand-configured ones too
                             (default: exclusive)
+      --country CC          regulatory-domain override: a 2-letter ISO code
+                            programmed into the driver instead of the
+                            controller's (see the prompt for why). --no-country
+                            or an empty answer leaves it off (the default)
       --l2-announce / --no-l2-announce
                             L2 discovery broadcasts (default: derived — see
                             the "Adoption path" note during the run)
@@ -230,6 +235,8 @@ while [ $# -gt 0 ]; do
 		--no-bootstrap)      OPT_BOOTSTRAP=0 ;;
 		--exclusive-wlan)    OPT_EXCLUSIVE=1 ;;
 		--shared-wlan)       OPT_EXCLUSIVE=0 ;;
+		--country)           shift; need_val --country "$#"; OPT_COUNTRY=${1:-} ;;
+		--no-country)        OPT_COUNTRY=none ;;
 		--l2-announce)       OPT_L2=1 ;;
 		--no-l2-announce)    OPT_L2=0 ;;
 		--reboot)            DO_REBOOT=1 ;;
@@ -705,6 +712,38 @@ if [ -z "$OPT_EXCLUSIVE" ]; then
 	fi
 fi
 
+head1 "Regulatory domain (optional)"
+say "  Normally the controller's country setting is used and this stays off."
+say ""
+say "  It exists because the regdomain decides which channels carry a DFS flag,"
+say "  and DFS does not work on every driver -- an mt7915/MT7986 cannot start"
+say "  CAC at all. Under a domain that flags channels 52-144 that leaves NO"
+say "  usable 160 MHz block, because every one that fits overlaps DFS. Measured"
+say "  on a JIDU6101: under IN, 160 MHz never comes up; under PA the same"
+say "  channels carry no DFS flag and it comes up first try."
+say ""
+say "  The controller is still told its OWN country, not this one, so its site"
+say "  setting does not appear to change. Clearing it later puts the"
+say "  controller's regdomain back."
+say ""
+say "  This programs a regulatory domain the device may not be in. Which"
+say "  channels may be used, and at what power, is a legal limit rather than a"
+say "  preference -- that call is yours."
+if [ -z "$OPT_COUNTRY" ]; then
+	OPT_COUNTRY=$(ask "  Override code (2 letters, e.g. PA / DE -- blank for none)" "")
+fi
+case "$OPT_COUNTRY" in
+	""|none|NONE) OPT_COUNTRY=none ;;
+	[A-Za-z][A-Za-z])
+		OPT_COUNTRY=$(printf '%s' "$OPT_COUNTRY" | tr '[:lower:]' '[:upper:]')
+		ok "regdomain override: $OPT_COUNTRY"
+		;;
+	*)
+		die "'"'"'$OPT_COUNTRY'"'"' is not a 2-letter ISO 3166-1 country code.
+       Give something like PA, DE or US, or leave it blank for none."
+		;;
+esac
+
 # Adoption path. L2 discovery is the shipped default and is what makes the AP
 # appear in the controller by itself -- but a controller that discovered a
 # device over L2 insists on adopting it over SSH, and fails outright if it
@@ -736,6 +775,7 @@ say "  Controller        ${INFORM_URL:-L2 auto-discovery}"
 say "  Bootstrap account $([ "$OPT_BOOTSTRAP" = 1 ] && echo 'yes (ubnt/ubnt, self-locking)' || echo no)"
 say "  Controller WLANs  $([ "$OPT_EXCLUSIVE" = 1 ] && echo 'exclusive' || echo 'alongside existing SSIDs')"
 say "  L2 discovery      $([ "$OPT_L2" = 1 ] && echo on || echo 'off (L3 adoption)')"
+say "  Regdomain         $([ "$OPT_COUNTRY" = none ] && echo "the controller's" || echo "$OPT_COUNTRY (override; controller still told its own)")"
 if [ "$OPT_L2" = 0 ] && [ -z "$INFORM_URL" ]; then
 	warn "L2 discovery is off and no controller address was given, so nothing"
 	warn "will reach a controller. Set one later with:"
@@ -1090,6 +1130,14 @@ fi
 if [ -n "$INFORM_URL" ]; then
 	conf_set inform_url "\"$INFORM_URL\""
 	ok "inform_url      $INFORM_URL"
+fi
+
+if [ "$OPT_COUNTRY" = none ]; then
+	conf_set country_override nil
+	ok "regdomain       the controller's (no override)"
+else
+	conf_set country_override "\"$OPT_COUNTRY\""
+	ok "regdomain       $OPT_COUNTRY programmed into the driver"
 fi
 
 head1 "Installing openUF"

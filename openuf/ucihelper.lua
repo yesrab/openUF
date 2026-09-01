@@ -729,9 +729,33 @@ end
 -- Every one of them is absent by default: with no radio_policy, or no entry
 -- for this radio's band, behaviour is exactly as before.
 --
--- opts: optional table. opts.force_wifi4 suppresses htmode_floor for this
--- radio, because a WLAN on it has the controller's "Force WiFi 4 Mode" on --
--- see apply_config, where it is collected per radio.
+-- opts: optional table.
+--   opts.force_wifi4      suppresses htmode_floor for this radio, because a
+--                         WLAN on it has the controller's "Force WiFi 4 Mode"
+--                         on -- see apply_config, where it is collected per
+--                         radio.
+--   opts.country_override ISO 3166-1 alpha-2 regdomain to program into UCI
+--                         INSTEAD of the controller's, decoupling what the
+--                         driver enforces from what the controller is told.
+--
+-- Why the override exists. The regdomain decides which channels carry a DFS
+-- flag, and DFS is unusable on some drivers (mt7915 cannot start CAC), so under
+-- a domain that marks 52-144 as DFS there is no 160 MHz block left: every one
+-- that fits overlaps DFS. Measured on a JIDU6101 -- under IN, 52-144 are all
+-- "(radar detection)" and HE160 never comes up; under PA the same channels
+-- carry no DFS flag and the identical config comes up first try at
+-- "channel 36, width: 160 MHz, center1: 5250" with he_oper_chwidth=2.
+--
+-- The controller's value is still what gets REPORTED: it is stamped into
+-- openuf_country on the same section, which get_radio_table prefers over the
+-- live `country`. Without that the payload would echo the override back and the
+-- controller's own site setting would appear to have changed. Removing the
+-- override reverses both halves.
+--
+-- This programs a regulatory domain the device may not be in. Channel
+-- availability and TX power limits are legal constraints, not preferences --
+-- the operator owns that decision, which is why this is off unless explicitly
+-- configured.
 function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates,
 		disabled, country, radio_policy, opts)
 	local uci = get_uci()
@@ -756,13 +780,45 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 	if disabled ~= nil then
 		cursor:set("wireless", radio, "disabled", disabled and "1" or "0")
 	end
-	if country and country ~= cursor:get("wireless", radio, "country") then
-		-- The regdomain decides which channels are legal and how much power
-		-- each may use, so it has to be written BEFORE the channel and txpower
-		-- below -- and it invalidates the cached driver capabilities, whose
-		-- per-channel dBm limits are regdomain-derived.
-		cursor:set("wireless", radio, "country", country)
-		M._phy_caps_cache = nil
+	-- The regdomain decides which channels are legal and how much power each
+	-- may use, so it has to be written BEFORE the channel and htmode below --
+	-- and it invalidates the cached driver capabilities, whose per-channel dBm
+	-- limits and DFS flags are regdomain-derived.
+	local cc_override = nil
+	if type(opts) == "table" and type(opts.country_override) == "string"
+			and opts.country_override:match("^%a%a$") then
+		cc_override = opts.country_override:upper()
+	end
+	if cc_override then
+		-- Stamp what the controller asked for before overwriting it, so
+		-- get_radio_table can keep REPORTING the controller's own value. Only
+		-- when the controller actually sent one -- an absent country must not
+		-- stamp the override over itself and make the override unreversible.
+		if country and country ~= cc_override then
+			cursor:set("wireless", radio, "openuf_country", country)
+		end
+		if cc_override ~= cursor:get("wireless", radio, "country") then
+			io.stderr:write(string.format(
+				"openuf: %s: regdomain override -- programming %s into the driver, " ..
+				"reporting %s to the controller\n", radio, cc_override,
+				tostring(country or cursor:get("wireless", radio, "openuf_country")
+					or cc_override)))
+			cursor:set("wireless", radio, "country", cc_override)
+			M._phy_caps_cache = nil
+		end
+	else
+		-- No override (or it was removed): the controller's value goes back
+		-- into UCI and the stamp goes away, so turning the override off is a
+		-- full reversal rather than leaving a foreign regdomain programmed.
+		if cursor:get("wireless", radio, "openuf_country") then
+			country = country or cursor:get("wireless", radio, "openuf_country")
+			cursor:delete("wireless", radio, "openuf_country")
+			M._phy_caps_cache = nil
+		end
+		if country and country ~= cursor:get("wireless", radio, "country") then
+			cursor:set("wireless", radio, "country", country)
+			M._phy_caps_cache = nil
+		end
 	end
 	if chan then
 		cursor:set("wireless", radio, "channel", tostring(chan))
@@ -1026,7 +1082,9 @@ function M.apply_config(resp, cfg, opts)
 			M.rf_config(radio.name, radio.htmode, radio.channel, radio.tx_power,
 				radio.min_rssi_enabled, radio.min_rssi, rates, radio.disabled,
 				radio.country, cfg and cfg.radio,
-				{force_wifi4 = iot_by_radio[radio.name] or false})
+				{force_wifi4 = iot_by_radio[radio.name] or false,
+				 country_override = cfg and cfg.config
+					and cfg.config.country_override or nil})
 		end
 	end
 
@@ -1380,7 +1438,13 @@ function M.get_radio_table(hwassign)
 			tx_power         = s.txpower,
 			-- UCI regdomain (e.g. "CZ"); build_json maps it to the numeric
 			-- ISO 3166 country_code. Internal -- stripped before serializing.
-			country          = s.country,
+			--
+			-- openuf_country wins where it exists: it is the regdomain the
+			-- CONTROLLER set, stamped by rf_config when a country_override
+			-- programmed a different one into the driver. Reporting the live
+			-- `country` there would echo the override back and make the
+			-- controller's own site setting look like it had changed.
+			country          = s.openuf_country or s.country,
 			disabled         = (s.disabled == "1"),
 			builtin_antenna  = M.RADIO_DEFAULTS.builtin_antenna,
 			builtin_ant_gain = M.RADIO_DEFAULTS.builtin_ant_gain,

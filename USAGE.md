@@ -84,6 +84,7 @@ default answer for everything.
 | `--controller HOST` | IP, hostname, or a full inform URL | none (L2 discovery) |
 | `--bootstrap` / `--no-bootstrap` | create the `ubnt`/`ubnt` adoption account? | yes |
 | `--exclusive-wlan` / `--shared-wlan` | `use_only_unifi_wlan` | exclusive |
+| `--country CC` / `--no-country` | regulatory-domain override, 2-letter ISO code | none |
 | `--l2-announce` / `--no-l2-announce` | L2 discovery broadcasts | derived (see below) |
 | `--reboot` / `--no-reboot` | reboot at the end? | yes |
 | `-y`, `--yes` | take every default, ask nothing | — |
@@ -317,6 +318,12 @@ broken in this driver, 160 MHz is unreachable on any channel, and `acs_exclude_d
 help because a **fixed** channel skips ACS entirely. No capability check can catch this —
 only the board can say "advertised but unusable".
 
+There is one way to get 160 MHz on such a board: change the **regdomain**, since that is
+what applies the DFS flags in the first place. Under `PA` the same radio has no DFS
+channels at all and 160 MHz comes up first try — see `country_override` in §3. If you use
+it, raise `htmode_max` to `HE160` (or drop it) so the ceiling stops blocking what now
+works.
+
 #### swconfig boards vs DSA boards
 
 Which of these your board is decides the whole shape of `dev.conf.net.ports`, and
@@ -429,6 +436,28 @@ config = {
     bootstrap_adopt_user = nil,  -- see below
 }
 ```
+
+`country_override` — an ISO 3166-1 alpha-2 code programmed into the driver **instead of**
+the one the controller pushes. `nil` (default) means the controller's own value is used.
+
+It exists because the regdomain, not the hardware, decides which channels carry a DFS flag
+— and DFS does not work on every driver. Measured on a JIDU6101 (MT7986/mt7915, which
+cannot start CAC at all):
+
+| Regdomain | 5 GHz channels 52–144 | 160 MHz |
+|---|---|---|
+| `IN`, `DE`, `US` | all `(radar detection)` | **impossible** — every block that fits overlaps DFS |
+| `PA` | **no DFS flag at all** | works: `channel 44, width 160 MHz, center1 5250`, `he_oper_chwidth=2` |
+
+The controller is still told its **own** country, not the override: openUF stamps the
+controller's value per radio as `openuf_country` and `get_radio_table` reports that in
+preference to the live `country`, so the site setting does not appear to have changed.
+Clearing the option puts the controller's regdomain back into UCI and removes the stamp —
+it never leaves a foreign regdomain programmed with nothing in the config explaining why.
+
+> This programs a regulatory domain the device may not physically be in. Which channels may
+> be used, and at what power, is a legal limit rather than a preference. That call belongs
+> to whoever runs the AP, which is why the option is off unless deliberately set.
 
 `l2_announce` — on by default; sends the UDP discovery broadcasts that make the
 device appear in UniFi Discover with no `set-inform` at all. Set it to `false`

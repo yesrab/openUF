@@ -365,7 +365,14 @@ factory reset.
   `clamp_htmode` knocked it back to `HT40`, silently discarding the operator's setting.
   The width is the authoritative half; a width above 40 promotes to `VHT`. Confirmed live
   on a UCG Ultra.
-- **160 MHz on 5 GHz needs working DFS**, whatever `iw phy` claims. Every 160 MHz block is
+- **The REGDOMAIN, not the hardware, applies the DFS flags.** Measured on one JIDU6101:
+  under `IN`/`DE`/`US` channels 52–144 are all `(radar detection)`; under `PA` they carry no
+  flag at all, and the identical HE160 config that never came up starts first try. That is
+  what `config.country_override` is for — it programs the override into UCI `country` while
+  stamping the controller's own value in `openuf_country`, which `get_radio_table` reports
+  in preference, so the controller's site setting does not appear to change. Removing the
+  override reverses both halves; never leave a foreign regdomain programmed silently.
+- **160 MHz on 5 GHz needs working DFS** (or a regdomain that flags none), whatever `iw phy` claims. Every 160 MHz block is
   8 contiguous channels and every one that fits overlaps DFS (ch36 → seg0=50 spans 36–64;
   ch100 → 114 spans 100–128); the clear 149–173 range is only 140 MHz wide. So on a board
   with broken CAC, 160 MHz is unreachable on *any* channel and `acs_exclude_dfs` cannot

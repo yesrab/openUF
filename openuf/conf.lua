@@ -71,6 +71,29 @@ config = {
 	-- against a real UniFi controller -- see PROTOCOL-VALIDATION.md.
 	debug_dump_file = nil,
 
+	-- Regulatory domain override: an ISO 3166-1 alpha-2 code programmed into
+	-- the driver INSTEAD of the one the controller pushes. nil = off, and the
+	-- controller's own value is used (the normal case).
+	--
+	-- The regdomain decides which channels carry a DFS flag, and DFS is
+	-- unusable on some drivers -- an mt7915/MT7986 cannot start CAC at all. Set
+	-- against such a board that means every 160 MHz block is unreachable,
+	-- because every one that fits overlaps DFS spectrum. Measured on a
+	-- JIDU6101: under IN, channels 52-144 are all "(radar detection)" and HE160
+	-- never comes up; under PA the same channels carry no DFS flag and the
+	-- identical config comes up first try at 160 MHz, centre 5250.
+	--
+	-- The controller is still told its OWN value, not this one -- openUF stamps
+	-- it per radio (openuf_country) and reports that, so the site setting does
+	-- not appear to change. Clearing this option puts the controller's
+	-- regdomain back into UCI and removes the stamp.
+	--
+	-- Note this programs a regulatory domain the device may not physically be
+	-- in. Which channels may be used, and at what power, is a legal constraint
+	-- rather than a preference; that call belongs to whoever runs the AP, which
+	-- is why it is off unless deliberately set.
+	country_override = nil,
+
 	-- Set (by install.sh's --bootstrap-adopt, not by hand) to the name of a
 	-- temporary, non-root SSH bootstrap account matching real Ubiquiti
 	-- hardware's factory-default "ubnt" login -- lets first adoption succeed
