@@ -34,9 +34,9 @@ Concretely, carried over from how the confirmed work was done:
 
 | Role | Address | Notes |
 |---|---|---|
-| Controller | UniFi Cloud Gateway Ultra | Network **10.4.57** — same version as the pinned Docker baseline, so captures are comparable |
+| Controller | UniFi Cloud Gateway Ultra | Network **10.6.101** as of 2026-09-06 (`unifi.version` in its own `system_cfg`; it was 10.4.57 on 2026-09-01). The pinned Docker baseline is still 10.4.57, so a bytecode finding from it needs a live re-check before it is trusted against this gateway |
 | AP1 | `192.168.1.25` | openUF on `jiorouter,ax6000-*`, wired |
-| AP2 | `192.168.1.151` | openUF on `jiorouter,ax6000-jidu6101`, wired, `country_override = "PA"` |
+| AP2 | `192.168.1.149` (DHCP; was `.151` on 2026-09-01) | openUF on `jiorouter,ax6000-jidu6101`, wired, `country_override = "PA"`. root has no password and dropbear accepts the blank login, so `ssh -o BatchMode=yes root@192.168.1.149` works with no helper |
 
 Both APs present as `u6iw`. SSH credentials are deliberately **not** recorded here — this
 file is committed. Keep them in your own notes or a gitignored file.
@@ -298,6 +298,83 @@ no mesh topology in the UI, but the physical link is real. Three gotchas, all ve
 
 ---
 
+## Investigation 2 — RF scan trigger  🟡 GATED
+
+**Status:** the UniFi mobile app has an RF Environment "scan" action for an AP, and it
+does **not** reach the wire for an openUF device. Same shape as Investigation 1: the
+controller sends nothing, so the gate has to be found by static analysis or a REST probe,
+not by capture.
+
+### Evidence — 2026-09-06, live, UCG Ultra 10.6.101
+
+`debug_dump_file` + `debug_dump_requests` armed on AP2 across ~10 minutes while the RF scan
+was triggered from the app several times:
+
+```
+     60 "_type":"noop"
+      1 "_type":"setparam"      # a full config push at 11:45:33Z -- not a command
+```
+
+No `_type:"cmd"` of any kind. The one `setparam` is an ordinary complete `system_cfg`
+(the 5 GHz `ieee_mode` moved to `11naht160` in it) and carries, per radio,
+`radio.<n>.rfscan=disabled` and `radio.<n>.bgscan.status=disabled` — static keys that
+every push carries, not the trigger. openUF's own reply reported `spectrum_scanning:false`
+and no `spectrum_table` throughout, as expected with no command received.
+
+### What the device side already does
+
+`inform.lua`'s `cmd:"spectrum-scan"` handler runs `iw dev <if> scan` per radio and builds
+a per-channel `spectrum_table` from the survey dump; it has been exercised by invoking it
+directly on real radios (PROTOCOL-VALIDATION.md, feature 8). Scanning on the live AP
+interfaces works on this driver: 2.7 s on 5 GHz, 1.5 s on 2.4 GHz, measured 2026-09-06.
+So once the command arrives, the remaining unknowns are (a) its exact name and arguments,
+(b) whether the controller expects `spectrum_scanning` to go `true` for a while and then
+`false` with a fresh `spectrum_scan_timestamp` (a real AP takes the radios off the air for
+the scan), and (c) whether the `spectrum_table` field semantics (`width`, `interference`,
+`utilization`) are what the RF Environment view expects.
+
+### Experiment plan
+
+**Step 0 — the REST probe (needs a controller admin login; do this first).** The scan
+button ends up as the device-manager command `spectrum-scan`. Sending it directly tells
+apart the two possible gates in one shot: if the capture shows a `cmd` arriving, the gate is
+in the app's UI only; if the API answers `api.err.…`, the gate is in the controller and the
+error names the reason.
+
+```sh
+# UniFi OS login -> cookie + CSRF token
+curl -sk -c /tmp/uc.jar -D /tmp/uc.hdr -H 'Content-Type: application/json' \
+  -d '{"username":"<admin>","password":"<password>"}' https://192.168.1.1/api/auth/login >/dev/null
+TOKEN=$(sed -n 's/^x-csrf-token: *\([^\r]*\).*/\1/Ip' /tmp/uc.hdr)
+# the command the scan button issues
+curl -sk -b /tmp/uc.jar -H "x-csrf-token: $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"cmd":"spectrum-scan","mac":"ac:10:07:6f:c6:70"}' \
+  https://192.168.1.1/proxy/network/api/s/default/cmd/devmgr
+# then, on AP2:
+grep -v ' TX ' /tmp/openuf-dump.txt | grep '"cmd"'
+```
+
+**Step 1 — the frontend gate, same login.** UniFi OS answers 401 for
+`/proxy/network/manage/` without a session, so the Network app's chunks need the cookie
+from step 0. Fetch them and grep for `spectrum`, `rfScan`, `rf_scan`, `RF Environment`;
+the button's enable condition names the device field or capability bit.
+
+**Step 2 — the bytecode.** `com.ubnt.data.uuvchZbWVhirD`'s `hasFirmwareCapability` /
+`hasWifiCapability*` callers, looking for the one guarding the `spectrum-scan` devmgr
+command (grep the jar for the string `spectrum-scan` first — Java keeps it in the constant
+pool). The Docker baseline is 10.4.57 and the gateway is 10.6.101; a bit found there must
+be confirmed by step 0 against the live controller before it is claimed.
+
+**Step 3 — claim and capture.** `debug_caps` on AP2, trigger from the app, read the `cmd`
+and the app's behaviour while the device reports `spectrum_scanning`.
+
+### Do not re-attempt
+
+- **Triggering from the app and waiting for a `cmd` with the shipped capability bits.**
+  Measured: 60/60 `noop` plus one unrelated config push over ~10 minutes and several taps.
+
+---
+
 ## Backlog — other unimplemented surfaces
 
 Ordered by (value ÷ effort). None started.
@@ -309,7 +386,7 @@ Ordered by (value ÷ effort). None started.
 | 4 | **Per-STA `noise`** | Same — available from `iw`/survey, not currently reported. | As above. |
 | 5 | **Expected throughput / `linkscore`** | Both currently report `0`. `iw` gives `expected throughput` per station. | Confirm whether the controller consumes it before implementing. |
 | 6 | **WiFiman** | Investigated and **closed**: it is a separate proprietary agent, not part of the inform protocol. Zero references in the repo, nothing on the wire. | Nothing. Do not re-investigate without new evidence. |
-| 7 | **AirView / spectrum scan trigger** | Handler implemented and exercised against real radios; **no UI affordance exists in 10.4.57** to fire it. AirView is fed passively. | Nothing until a controller version exposes a trigger. |
+| 7 | **AirView / spectrum scan trigger** | Handler implemented and exercised against real radios. The web UI of 10.4.57 had no trigger; the **mobile app has one**, and against 10.6.101 it sends the device nothing — see Investigation 2. | Investigation 2, step 0: the REST `spectrum-scan` probe. |
 
 ---
 
@@ -318,4 +395,5 @@ Ordered by (value ÷ effort). None started.
 | Date | Subject | Outcome |
 |---|---|---|
 | 2026-09-01 | Mesh / wireless uplink | Blocked at the capability gate. Controller sends nothing (83/83 `noop`); RF and scan reporting ruled out; experiment plan written. Deprioritised by choice. |
+| 2026-09-06 | RF scan trigger | The app's RF Environment scan, triggered several times against AP2 on the now-10.6.101 gateway, produced no `cmd` at all (60/60 `noop`, one unrelated `setparam`). Gated like mesh. Investigation 2 written; REST probe is the next step and needs a controller login. Also confirmed live: the kernel's BSS cache forgets neighbours ~30 s after a scan, `iw scan` works on the live AP interfaces here, and iw 6.17 prints neither the `ms ago` nor the `BSS operating channel width` lines the parser relied on (both fixed). |
 | 2026-09-06 | Pre-research hardening | Code review of openUF before resuming. Fixed ahead of the mesh work: non-AP `wifi-iface` sections are neither disabled by `use_only_unifi_wlan` nor reported as VAPs; each VAP reports its own BSSID; `debug_caps` / `debug_payload_extra` / `debug_dump_requests` / `neighbour_scan_interval` added to `conf.lua` so steps 2–3 need no code change. Independent bugs fixed in the same pass: `state.load` dropped every field but eight (the identity-MAC warning could never fire, the switch ledger was lost on restart), `state.save` was not atomic, the L2 announce never reflected adoption or the current IP, `phy_caps` re-cached the old regdomain before the reload, the inform loop had no error boundary, wire values reached `ip`/`nft`/`hostapd_cli` unvalidated, and `install.sh` overwrote `conf.lua` on reinstall. |

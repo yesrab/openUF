@@ -314,14 +314,49 @@ end
 function M.scan_table(ifname)
 	if not ifname then return {} end
 	local output = M._run_cmd("iw dev " .. ifname .. " scan dump")
+	-- For the [boottime] form of "last seen" below: /proc/uptime and the
+	-- driver's stamp are both on the CLOCK_BOOTTIME axis.
+	local now_up = M.uptime()
 	local nets = {}
 	local cur = nil
 	local seen_rsn, seen_wpa, seen_privacy = false, false, false
+	-- Width evidence from the operation elements, per BSS (see flush).
+	local vht_w, vht_seg1, vht_seg2, ht_sec = nil, nil, nil, nil
 
 	local function flush()
 		if not cur then return end
 		if not cur.age then cur.age = 0 end
-		if not cur.bw then cur.bw = 20 end
+		-- Channel width. The "BSS operating channel width: N MHz" summary line
+		-- is only printed by some iw builds -- iw 6.17, as shipped by OpenWrt
+		-- 25.12, prints no such line at all (confirmed live on a JIDU6101), so
+		-- every neighbour went out as 20 MHz. What that iw does print is the
+		-- operation elements themselves:
+		--   VHT operation:  * channel width: 1 (80 MHz)
+		--                   * center freq segment 1: 58
+		--                   * center freq segment 2: 50
+		--   HT operation:   * secondary channel offset: above|below|no secondary
+		-- VHT width field 1 with a non-zero segment 2 is either 160 MHz (the
+		-- two segments 8 channels apart, the modern encoding -- AP1 live:
+		-- seg1 58, seg2 50) or non-contiguous 80+80 (further apart; reported
+		-- as its 80 MHz primary segment, since the controller's vocabulary is
+		-- 20/40/80/160). Fields 2 and 3 are the deprecated direct encodings
+		-- of the same two. No VHT operation and a secondary channel offset
+		-- means HT40; nothing at all means 20.
+		if not cur.bw then
+			if vht_w and vht_w >= 1 then
+				local seg2 = vht_seg2 or 0
+				if vht_w == 2 or (vht_w == 1 and seg2 > 0
+						and math.abs(seg2 - (vht_seg1 or 0)) == 8) then
+					cur.bw = 160
+				else
+					cur.bw = 80
+				end
+			elseif ht_sec == "above" or ht_sec == "below" then
+				cur.bw = 40
+			else
+				cur.bw = 20
+			end
+		end
 		if seen_rsn then cur.security = "wpa2"
 		elseif seen_wpa then cur.security = "wpa"
 		elseif seen_privacy then cur.security = "wep"
@@ -335,13 +370,34 @@ function M.scan_table(ifname)
 			flush()
 			cur = {bssid = bssid}
 			seen_rsn, seen_wpa, seen_privacy = false, false, false
+			vht_w, vht_seg1, vht_seg2, ht_sec = nil, nil, nil, nil
 		elseif cur then
+			-- Operation-element width evidence, consumed by flush(). The VHT
+			-- line is anchored on "* channel width:" so the HT capability
+			-- line "STA channel width: any" cannot match it.
+			local w = line:match("^%s*%*%s+channel width:%s+(%d+)")
+			if w then vht_w = tonumber(w) end
+			local s1 = line:match("center freq segment 1:%s+(%d+)")
+			if s1 then vht_seg1 = tonumber(s1) end
+			local s2 = line:match("center freq segment 2:%s+(%d+)")
+			if s2 then vht_seg2 = tonumber(s2) end
+			local sec = line:match("secondary channel offset:%s+(%a+)")
+			if sec then ht_sec = sec end
 			local freq     = line:match("freq:%s+(%d+)")
 			-- Anchored for the same reason as the station-dump copy above,
 			-- defensively: scan output carries no ack-signal lines today.
 			local signal   = line:match("^%s*signal:%s+(-?%d+)")
 			local ssid     = line:match("^\tSSID:%s?(.*)$")
 			local last_ms  = line:match("last seen:%s+(%d+) ms ago")
+			-- Newer iw also prints the driver's BOOTTIME stamp: "last seen:
+			-- 403.024s [boottime]". On a 25.12 JIDU6101 most entries carried
+			-- ONLY this form, which the pattern above never matched, so their
+			-- age stayed at the 0 default -- every neighbour reported as seen
+			-- this instant, however stale. The "ms ago" line wins when both
+			-- are printed for one BSS (it is what the controller's own
+			-- staleness rule is written against); this form fills in when
+			-- it is the only one.
+			local last_bt  = line:match("last seen:%s+([%d%.]+)s %[boottime%]")
 			local bw       = line:match("BSS operating channel width:%s+(%d+) MHz")
 			if freq then
 				cur.freq    = tonumber(freq)
@@ -349,7 +405,11 @@ function M.scan_table(ifname)
 			end
 			if signal then cur.signal = tonumber(signal) end
 			if ssid and not cur.essid then cur.essid = ssid end
-			if last_ms then cur.age = math.floor(tonumber(last_ms) / 1000) end
+			if last_ms then
+				cur.age = math.floor(tonumber(last_ms) / 1000)
+			elseif last_bt and cur.age == nil and now_up > 0 then
+				cur.age = math.max(0, math.floor(now_up - tonumber(last_bt)))
+			end
 			if bw then cur.bw = tonumber(bw) end
 			if line:find("capability:.*Privacy") then seen_privacy = true end
 			if line:find("^\tRSN:") then seen_rsn = true end

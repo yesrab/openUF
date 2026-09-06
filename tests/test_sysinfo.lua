@@ -877,6 +877,86 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: scan_table() derives age from iw's [boottime] form when that is all it prints",
+		fn = function()
+			-- Live on a 25.12 JIDU6101: "last seen: 403.024s [boottime]" and
+			-- no "ms ago" line for most entries, so age stayed 0 for every
+			-- neighbour however stale -- and the controller's age >= 30 rule
+			-- never got to fire. Both stamps are CLOCK_BOOTTIME, as is
+			-- /proc/uptime's first field.
+			local dump = "BSS aa:bb:cc:dd:ee:01(on wlan0)\n"
+				.. "\tlast seen: 470.250s [boottime]\n\tfreq: 2412\n\tSSID: stale\n"
+				.. "BSS aa:bb:cc:dd:ee:02(on wlan0)\n"
+				.. "\tlast seen: 499.900s [boottime]\n\tfreq: 2437\n\tSSID: fresh\n"
+				.. "BSS aa:bb:cc:dd:ee:03(on wlan0)\n"
+				.. "\tlast seen: 100.000s [boottime]\n\tlast seen: 2500 ms ago\n"
+				.. "\tfreq: 2462\n\tSSID: both\n"
+			with_fixtures({["/proc/uptime"] = "500.00 900.00\n"}, {["scan dump"] = dump}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(#nets, 3, "three neighbours")
+				assert_eq(nets[1].age, 29, "500 - 470.25, floored")
+				assert_eq(nets[2].age, 0, "seen a tenth of a second ago")
+				assert_eq(nets[3].age, 2, "the 'ms ago' line wins when both are printed")
+			end)
+			-- Without a readable uptime there is no axis to subtract on: keep
+			-- the old default rather than inventing a huge age.
+			with_fixtures({}, {["scan dump"] = dump}, function()
+				assert_eq(sysinfo.scan_table("wlan0")[1].age, 0, "no uptime -> 0, as before")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: scan_table() derives bw from the operation elements when iw prints no summary line",
+		fn = function()
+			-- Verbatim shapes from `iw dev phy1-ap0 scan` on a JIDU6101 running
+			-- OpenWrt 25.12 (iw 6.17), which prints no "BSS operating channel
+			-- width" line at all -- so every neighbour, including AP1 at 160
+			-- MHz, went out as 20 MHz.
+			local dump = table.concat({
+				"BSS 78:bb:c1:fe:3f:cb(on phy1-ap0)",         -- AP1: 160 MHz
+				"\tfreq: 5260.0", "\tsignal: -11.00 dBm", "\tSSID: The SCP Foundation",
+				"\tHT capabilities:", "\t\tCapabilities: 0x9ef", "\t\t\tHT20/HT40",
+				"\tHT operation:", "\t\t * primary channel: 52",
+				"\t\t * secondary channel offset: above", "\t\t * STA channel width: any",
+				"\tVHT operation:", "\t\t * channel width: 1 (80 MHz)",
+				"\t\t * center freq segment 1: 58", "\t\t * center freq segment 2: 50",
+				"BSS 20:89:8a:a9:5b:a3(on phy1-ap0)",         -- plain 80 MHz
+				"\tfreq: 5220.0", "\tsignal: -84.00 dBm", "\tSSID: Bhaktha Reddy 5G",
+				"\tHT operation:", "\t\t * primary channel: 44",
+				"\t\t * secondary channel offset: above",
+				"\tVHT operation:", "\t\t * channel width: 1 (80 MHz)",
+				"\t\t * center freq segment 1: 42", "\t\t * center freq segment 2: 0",
+				"BSS 00:11:22:33:44:55(on phy1-ap0)",         -- 80+80: primary segment
+				"\tfreq: 5180.0", "\tSSID: noncontig",
+				"\tVHT operation:", "\t\t * channel width: 1 (80 MHz)",
+				"\t\t * center freq segment 1: 42", "\t\t * center freq segment 2: 155",
+				"BSS 00:11:22:33:44:66(on phy0-ap0)",         -- HT40, no VHT
+				"\tfreq: 2412.0", "\tSSID: fortyonly",
+				"\tHT operation:", "\t\t * primary channel: 1",
+				"\t\t * secondary channel offset: above", "\t\t * STA channel width: any",
+				"BSS 00:11:22:33:44:77(on phy0-ap0)",         -- HT20
+				"\tfreq: 2437.0", "\tSSID: twenty",
+				"\tHT operation:", "\t\t * primary channel: 6",
+				"\t\t * secondary channel offset: no secondary",
+				"BSS 00:11:22:33:44:88(on phy0-ap0)",         -- older iw's summary line still wins
+				"\tfreq: 2462.0", "\tSSID: summary",
+				"\tBSS operating channel width: 40 MHz",
+				"\tHT operation:", "\t\t * secondary channel offset: no secondary",
+			}, "\n") .. "\n"
+			with_fixtures({}, {["scan dump"] = dump}, function()
+				local by = {}
+				for _, n in ipairs(sysinfo.scan_table("phy1-ap0")) do by[n.essid] = n end
+				assert_eq(by["The SCP Foundation"].bw, 160, "VHT width 1 with segments 8 apart is 160")
+				assert_eq(by["The SCP Foundation"].channel, 52, "the float freq line still parses")
+				assert_eq(by["Bhaktha Reddy 5G"].bw, 80, "VHT width 1 with no second segment is 80")
+				assert_eq(by["noncontig"].bw, 80, "80+80 reports its primary segment")
+				assert_eq(by["fortyonly"].bw, 40, "HT with a secondary channel is 40")
+				assert_eq(by["twenty"].bw, 20, "HT with no secondary is 20")
+				assert_eq(by["summary"].bw, 40, "an explicit summary line is authoritative")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: _phy_info() caches `iw phy` per phy and re-reads after the TTL",
 		fn = function()
 			-- Tens of kilobytes parsed per radio per heartbeat, for data that

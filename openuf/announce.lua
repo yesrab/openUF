@@ -348,7 +348,14 @@ function M.run(cfg)
 	-- fails with EACCES. Force real socket creation first via a bind.
 	udpb:setsockname("*", 0)
 	udpb:setoption("broadcast", true)
-	udpb:setpeername(M.BROADCAST_ADDR, M.PORT)
+	-- sendto on the unconnected socket, NOT setpeername + send. At boot this
+	-- process comes up before br-lan has an address; setpeername to the
+	-- broadcast address then fails with ENETUNREACH -- returning nil rather
+	-- than raising -- and the first send raised "calling 'send' on bad self
+	-- (udp{connected} expected)" and took the process down. procd respawned
+	-- it five seconds later so it healed itself, but every boot logged a
+	-- crash (seen on a JIDU6101, OpenWrt 25.12.5). A failed sendto is logged
+	-- and simply retried next tick.
 
 	local counter  = cfg.counter or 0
 	local interval = cfg.interval or 10
@@ -361,7 +368,10 @@ function M.run(cfg)
 		cfg.uptime = (cfg.uptime or 0) + interval
 		M._refresh(cfg)
 
-		udpb:send(M.build_packet(cfg))
+		local ok, err = udpb:sendto(M.build_packet(cfg), M.BROADCAST_ADDR, M.PORT)
+		if not ok then
+			io.stderr:write("announce: send failed: " .. tostring(err) .. "\n")
+		end
 		socket.select(nil, nil, interval)
 	end
 end
