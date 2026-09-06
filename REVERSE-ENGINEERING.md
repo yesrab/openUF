@@ -88,11 +88,13 @@ Unset them when the experiment is over.
 ### Neighbour visibility
 
 `scan_radio_table` is read from the kernel's BSS cache, which forgets a network ~30 s
-after it was last seen (and the controller drops `age >= 30`). Nothing in openUF scans
-on its own, so the Environment view — and any parent-AP list built from neighbours — is
-only populated right after a scan. `neighbour_scan_interval = 300` in `conf.lua` adds a
-background scan per radio at that cadence (off by default: each scan stalls clients for
-a moment). The 13-neighbour figure below was measured right after a manual `iw scan`.
+after it was last seen (and the controller drops `age >= 30`). The AP itself never scans
+unless asked, so the Environment view — and any parent-AP list built from neighbours — is
+only populated right after a scan. Two `conf.lua` options fill it: `rrm_enrichment` (on by
+default, adopted from upstream) asks one 802.11k-capable client at a time to sweep and
+report, at no cost to the AP; `neighbour_scan_interval = 300` makes the AP sweep itself at
+that cadence (off by default: each scan stalls clients for a moment). The 13-neighbour
+figure below was measured right after a manual `iw scan`.
 
 To force a re-push when the controller has gone quiet, blank `cfgversion` in
 `/etc/openuf/state.json` and restart. **Note:** this stopped working reliably part-way
@@ -395,5 +397,6 @@ Ordered by (value ÷ effort). None started.
 | Date | Subject | Outcome |
 |---|---|---|
 | 2026-09-01 | Mesh / wireless uplink | Blocked at the capability gate. Controller sends nothing (83/83 `noop`); RF and scan reporting ruled out; experiment plan written. Deprioritised by choice. |
+| 2026-09-06 | Upstream review and selective adoption | jonasevcik/openUF had 20 commits since the fork point (677f732). Adopted, re-implemented in this tree's style with their hardware-verified tests: 802.11k neighbour enrichment (`rrmscan.lua`), per-port VLAN on DSA as a bridge move, Locate restoring and persisting the LED trigger, the `ft_psk_generate_local` removal, the Minimum RSSI fixed offset, the `[A-Za-z0-9_]` section-name rule (our hash suffix kept), the 2.4 GHz 40 MHz cap, the bare-`ht` best-PHY rule (done in `rf_config` so it composes with the floor and Force WiFi 4), the bridge-scoped uplink lookup, `kmod-nft-bridge` / `kmod-sched-act-police` / `kmod-leds-gpio`, the `os.execute` normalisation, and the AX3000T profile. Kept ours where ours was stronger: atomic state writes and generic field passthrough, `_tick` error boundaries, wire validation, caches, `--replace-conf`, the debug switches. Not a git merge. |
 | 2026-09-06 | RF scan trigger | The app's RF Environment scan, triggered several times against AP2 on the now-10.6.101 gateway, produced no `cmd` at all (60/60 `noop`, one unrelated `setparam`). Gated like mesh. Investigation 2 written; REST probe is the next step and needs a controller login. Also confirmed live: the kernel's BSS cache forgets neighbours ~30 s after a scan, `iw scan` works on the live AP interfaces here, and iw 6.17 prints neither the `ms ago` nor the `BSS operating channel width` lines the parser relied on (both fixed). |
 | 2026-09-06 | Pre-research hardening | Code review of openUF before resuming. Fixed ahead of the mesh work: non-AP `wifi-iface` sections are neither disabled by `use_only_unifi_wlan` nor reported as VAPs; each VAP reports its own BSSID; `debug_caps` / `debug_payload_extra` / `debug_dump_requests` / `neighbour_scan_interval` added to `conf.lua` so steps 2–3 need no code change. Independent bugs fixed in the same pass: `state.load` dropped every field but eight (the identity-MAC warning could never fire, the switch ledger was lost on restart), `state.save` was not atomic, the L2 announce never reflected adoption or the current IP, `phy_caps` re-cached the old regdomain before the reload, the inform loop had no error boundary, wire values reached `ip`/`nft`/`hostapd_cli` unvalidated, and `install.sh` overwrote `conf.lua` on reinstall. |

@@ -358,4 +358,36 @@ return {
 			end)
 		end
 	},
+	{
+		name = "modelmap: xiaomi-ax3000t reports its real sockets on a DSA board",
+		fn = function()
+			-- Upstream's first DSA board, adopted here. Its shape differs from
+			-- the JioRouter maps in one deliberate way: lan_cpueth names the
+			-- uplink SOCKET (whose MAC is the board's label MAC), not the
+			-- bridge -- so sysinfo.lan_bridge has to find br-lan through the
+			-- socket's master, and this pins that the map still asks for FDB
+			-- detection like every other DSA map here.
+			local dev = dofile("openuf/modelmap/xiaomi-ax3000t.lua")
+			assert_eq(dev.conf.net.lan_cpueth, "wan",
+				"the uplink socket, whose MAC is the board's label MAC")
+			assert_eq(dev.conf.net.uplink_detect, "fdb", "uplink is detected, never declared")
+			assert_eq(dev.conf.led, "blue:status",
+				"the board's real case LED, not the unwired mt76 radio LED")
+			assert_eq(dev.openwrt_boards[1], "xiaomi,mi-router-ax3000t",
+				"claims the stock board name so setup.sh preselects it")
+			assert_eq(dev.openwrt_boards[2], "xiaomi,mi-router-ax3000t-ubootmod",
+				"and the ubootmod build, which shares the DTS sockets")
+			local ports = dev.conf.net.ports
+			assert_eq(#ports, 4, "four sockets -- this board has no lan1")
+			local names = {}
+			for _, p in ipairs(ports) do
+				assert_nil(p.uplink, "port " .. p.idx .. " is not statically flagged uplink")
+				assert_nil(p.swport, "port " .. p.idx .. " carries no swconfig port")
+				names[#names + 1] = p.ifname
+			end
+			table.sort(names)
+			assert_eq(table.concat(names, ","), "lan2,lan3,lan4,wan", "the board's real DSA port names")
+			assert_nil(dev.conf.vlan, "no swconfig port map on a DSA board")
+		end
+	},
 }

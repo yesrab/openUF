@@ -14,6 +14,16 @@ local function new_mock_uci()
 	local cursor = {}
 
 	function cursor:set(config, section, a, b)
+		-- libuci accepts only [A-Za-z0-9_] in a section name, and enforces it
+		-- SILENTLY: set() returns true, commit() returns true, and the section
+		-- is discarded before it ever reaches /etc/config. A permissive mock
+		-- therefore hides the one bug this can cause -- and did: wlan_add's
+		-- sanitizer kept "-", so every SSID with a hyphen provisioned nothing
+		-- while every test passed (upstream found it live). Fail loudly here.
+		if not tostring(section):match("^[%w_]+$") then
+			error("mock uci: invalid section name '" .. tostring(section)
+				.. "' -- libuci would silently discard this", 2)
+		end
 		db[config] = db[config] or {}
 		if not db[config][section] then
 			db[config][section] = {[".name"] = section}
@@ -170,6 +180,16 @@ local JIDU_POLICY = {
 	ng = {htmode_floor = "HE20"},
 }
 
+-- Run fn with stderr swallowed: rf_config narrates every PHY upgrade, floor
+-- and clamp, which is right on a device and noise in a test run.
+local function silently_uci(fn)
+	local real = io.stderr
+	io.stderr = {write = function() end}
+	local ok, err = pcall(fn)
+	io.stderr = real
+	if not ok then error(err, 0) end
+end
+
 local function seed_radios(names)
 	local cursor = ucihelper._uci.cursor()
 	for _, r in ipairs(names or {"radio0", "radio1"}) do
@@ -213,6 +233,45 @@ Wiphy phy0
 		* [ VHT_IBSS ]: VHT-IBSS
 		* [ RRM ]: RRM
 		* [ AIRTIME_FAIRNESS ]: airtime fairness
+]]
+
+-- Real `iw phy` output from a Xiaomi Mi Router AX3000T (mediatek/filogic,
+-- MT7981, OpenWrt 25.12.5; upstream's capture): mt76 radios that are HE on
+-- BOTH bands -- phy1 is 5GHz with VHT160, phy0 is 2.4GHz with HE but only HT40
+-- channels. Trimmed to the lines the parser reads, band indexes in real order.
+--
+-- The 2.4GHz half is the point: every earlier board here was HT-only there,
+-- so "HE implies 80MHz" was never wrong before this hardware arrived. The
+-- JIDU6101's 2.4GHz radio is the same shape.
+local AX3000T_IW_PHY = [[
+Wiphy phy1
+	Band 2:
+		Capabilities: 0x9ff
+			HT20/HT40
+		VHT Capabilities (0x339a59f6):
+			Supported Channel Width: 160 MHz
+		HE Iftypes: AP
+			HE PHY Capabilities: (0x0c204e926f12afd0000c00):
+				20MHz in 160/80+80MHz HE PPDU
+		Frequencies:
+			* 5180.0 MHz [36] (20.0 dBm)
+			* 5745.0 MHz [149] (20.0 dBm) (no IR)
+			* 5845.0 MHz [169] (disabled)
+	Supported extended features:
+		* [ BEACON_RATE_LEGACY ]: legacy beacon rate setting
+Wiphy phy0
+	Band 1:
+		Capabilities: 0x9ff
+			HT20/HT40
+		HE Iftypes: AP
+			HE PHY Capabilities: (0x02204e926f09afc8000c00):
+				HE40/2.4GHz
+		Frequencies:
+			* 2412.0 MHz [1] (20.0 dBm)
+			* 2437.0 MHz [6] (20.0 dBm)
+			* 2472.0 MHz [13] (20.0 dBm) (no IR)
+	Supported extended features:
+		* [ BEACON_RATE_LEGACY ]: legacy beacon rate setting
 ]]
 
 -- The same board if its 2.4GHz driver COULD set the beacon frame rate, to pin
@@ -443,8 +502,14 @@ return {
 				assert_eq(s.mobility_domain, ucihelper.derive_mobility_domain("corp"),
 					"mobility_domain derived from the ssid")
 				assert_eq(#s.mobility_domain, 4, "mobility_domain is 4 hex chars")
-				assert_eq(s.ft_psk_generate_local, "1", "local PMK generation enabled")
 				assert_eq(s.ft_over_ds, "0", "over-DS disabled by default")
+				-- Deliberately absent. Forcing it to "1" is FT-PSK-only local
+				-- key generation, and setting it at all stops OpenWrt
+				-- configuring the r0kh/r1kh key holders FT-SAE cannot work
+				-- without -- which silently cost every WPA3 client its fast
+				-- roaming. OpenWrt's own default already keys on auth_type.
+				assert_nil(s.ft_psk_generate_local,
+					"left to OpenWrt, which picks per auth_type (psk -> 1, sae -> 0)")
 			end)
 		end
 	},
@@ -2543,17 +2608,32 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: no radio policy means exactly the old behaviour",
+		name = "ucihelper: no radio policy invents no ACS option, and the width is written as pushed",
 		fn = function()
+			-- The one thing a missing policy DOES change now: the PHY. The
+			-- wire's bare "ht" is not a request for 802.11n (see rf_config),
+			-- so on this HE board HT40 arrives as HE40 -- at the pushed 40,
+			-- never widened. The ACS options still need a policy to exist.
 			with_ucihelper(function(db)
 				ucihelper._popen = function() return JIDU6101_IW_PHY end
 				seed_radios({"radio1"})
 				ucihelper._uci.cursor():set("wireless", "radio1", "band", "5g")
-				ucihelper.rf_config("radio1", "HT40", "auto", nil, nil, nil, nil, nil, nil)
-				assert_eq(db.wireless.radio1.htmode, "HT40",
-					"the controller's mode is written through untouched")
+				silently_uci(function()
+					ucihelper.rf_config("radio1", "HT40", "auto", nil, nil, nil, nil, nil, nil)
+				end)
+				assert_eq(db.wireless.radio1.htmode, "HE40",
+					"the wire's width, the hardware's PHY")
 				assert_nil(db.wireless.radio1.acs_exclude_dfs, "no ACS option invented")
 				assert_nil(db.wireless.radio1.channels, "no chanlist invented")
+			end)
+			-- An HT-only board is the literal old behaviour.
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio1"})
+				ucihelper._uci.cursor():set("wireless", "radio1", "band", "2g")
+				ucihelper.rf_config("radio1", "HT40", "auto", nil, nil, nil, nil, nil, nil)
+				assert_eq(db.wireless.radio1.htmode, "HT40",
+					"an n-only radio still gets HT40, untouched")
 			end)
 		end
 	},
@@ -2900,6 +2980,174 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: an SSID with punctuation still lands in a valid UCI section",
+		fn = function()
+			-- A UCI section name may contain only [A-Za-z0-9_]. libuci enforces
+			-- it silently: set() returns true, commit() returns true, and the
+			-- section never reaches /etc/config. So an unsanitized character
+			-- costs the whole WLAN with nothing reported anywhere -- upstream
+			-- confirmed it live, where an SSID of "openuf-verify" pushed
+			-- correctly, parsed correctly, and simply never provisioned.
+			-- Hyphens are common in SSIDs; this was a wide hole.
+			for _, ssid in ipairs({"openuf-verify", "Guest WiFi", "caf\195\169!",
+					"a.b:c", "5GHz-Fast"}) do
+				with_ucihelper(function(db)
+					ucihelper.wlan_add("radio0", ssid, "wpa2", "hunter22")
+					local found
+					for name in pairs(db.wireless or {}) do
+						if name:match("^openuf_radio0_") then found = name end
+					end
+					assert_not_nil(found, ssid .. ": a section was created")
+					assert_true(found:match("^[%w_]+$") ~= nil,
+						ssid .. ": section name " .. tostring(found) .. " is valid for libuci")
+					assert_eq(db.wireless[found].ssid, ssid,
+						ssid .. ": the SSID itself is stored unmangled")
+				end)
+			end
+		end
+	},
+	{
+		name = "ucihelper: a WPA3 WLAN is left able to configure FT key holders",
+		fn = function()
+			-- The failure this pins is invisible in UCI and on the air: the
+			-- WLAN advertises FT-SAE and the right mobility domain, and the
+			-- transition still falls back to a full SAE + 4-way. It hinges
+			-- entirely on openUF NOT pinning ft_psk_generate_local, because
+			-- OpenWrt only derives r0kh/r1kh when that option is 0 -- and it
+			-- only defaults it to 0 when nothing overrode it.
+			for _, sec in ipairs({"wpa3", "wpa2/wpa3", "wpa2"}) do
+				with_ucihelper(function(db)
+					seed_radios({"radio0"})
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = sec,
+						 x_passphrase = "hunter22", fast_roaming_enabled = true},
+					}}, nil)
+					local s = db.wireless.openuf_radio0_corp
+					assert_eq(s.ieee80211r, "1", sec .. ": FT enabled")
+					assert_nil(s.ft_psk_generate_local,
+						sec .. ": openUF does not pin the key-generation mode")
+				end)
+			end
+		end
+	},
+	{
+		name = "ucihelper: 2.4GHz caps at 40MHz even on an HE radio",
+		fn = function()
+			-- An HE 2.4GHz radio is HE *and* 40MHz-only; the band has no
+			-- 80MHz channel to widen into. Deriving the width from the PHY
+			-- alone reported 80 here, and clamp_htmode only narrows to 40 for
+			-- kind "HT", so a pushed HE80 reached hostapd unchanged -- which
+			-- treats a width it cannot program as fatal and never starts the
+			-- radio.
+			with_ucihelper(function()
+				ucihelper._popen = function() return AX3000T_IW_PHY end
+				local caps = ucihelper.phy_caps()
+				assert_eq(caps.ng.max_kind, 3, "the 2.4GHz radio really is HE")
+				assert_eq(caps.ng.max_width, 40, "and still tops out at 40MHz")
+				assert_eq(ucihelper.clamp_htmode("ng", "HE80"), "HE40",
+					"a wide 2.4GHz push is narrowed, not passed through")
+				local out, requested = ucihelper.clamp_htmode("ng", "HE40")
+				assert_eq(out, "HE40", "HE40 fits and is left alone")
+				assert_nil(requested, "so nothing is reported as clamped")
+				-- and the cap is per band: 5GHz keeps its 160.
+				assert_eq(caps.na.max_width, 160, "5GHz keeps its 160MHz")
+				assert_eq(ucihelper.clamp_htmode("na", "HE160"), "HE160", "an HE160 push on 5GHz is honoured")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a bare HT<width> runs the band's best PHY at that width",
+		fn = function()
+			-- "11naht40" is all a real controller ever sends -- to a real
+			-- U6-InWall as much as to us -- and that AP runs it as HE40. The
+			-- token names the band and the width; the PHY is the device's own
+			-- business. Read literally it pinned an HE radio to 802.11n. Done
+			-- in rf_config, next to the floor, the ceiling and the clamp.
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return AX3000T_IW_PHY end
+				seed_radios({"radio0", "radio1"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "2g")
+				cursor:set("wireless", "radio1", "band", "5g")
+				silently_uci(function()
+					ucihelper.rf_config("radio1", "HT40", 36)
+					ucihelper.rf_config("radio0", "HT20", 6)
+				end)
+				assert_eq(db.wireless.radio1.htmode, "HE40", "5GHz: HE, at the pushed 40")
+				assert_eq(db.wireless.radio0.htmode, "HE20", "2.4GHz: HE, at the pushed 20")
+				-- Width is never invented: 80 was not asked for.
+				silently_uci(function() ucihelper.rf_config("radio1", "HT20", 36) end)
+				assert_eq(db.wireless.radio1.htmode, "HE20", "a PHY upgrade, not a widening")
+				-- An explicit PHY is honoured as written.
+				silently_uci(function() ucihelper.rf_config("radio1", "VHT80", 36) end)
+				assert_eq(db.wireless.radio1.htmode, "VHT80", "vht stays vht")
+				-- Force WiFi 4 Mode keeps 802.11n: that WLAN asked for an n beacon.
+				silently_uci(function()
+					ucihelper.rf_config("radio0", "HT20", 6, nil, nil, nil, nil, nil, nil, nil,
+						{force_wifi4 = true})
+				end)
+				assert_eq(db.wireless.radio0.htmode, "HT20", "WiFi 4 stays HT")
+			end)
+			-- Unknown hardware (no iw): the literal reading, never a guess up.
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return "" end
+				seed_radios({"radio1"})
+				ucihelper._uci.cursor():set("wireless", "radio1", "band", "5g")
+				ucihelper.rf_config("radio1", "HT40", 36)
+				assert_eq(db.wireless.radio1.htmode, "HT40", "capabilities unknown -> HT40 as pushed")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: keep_vlans builds and preserves a VLAN bridge no WLAN mentions",
+		fn = function()
+			-- A wired port assigned to VLAN 10 on a DSA board lives in
+			-- br-openuf10, whether or not a tagged SSID sits there. Without
+			-- this the prune deleted the bridge on every push and switchvlan
+			-- rebuilt it -- a network reload per inform.
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				ucihelper._uci.cursor():set("network", "anydev", "device")
+				ucihelper.apply_config({radio_table = {}, vap_table = {}},
+					{net = {lan_cpueth = "br-lan"}}, {keep_vlans = {[10] = true}})
+				assert_not_nil(db.network.openuf_brdev10, "the VLAN 10 bridge exists")
+				assert_eq(db.network.openuf_brdev10.ports[1], "br-lan.10", "with its tagged uplink")
+				-- and survives a later push that still keeps it, while a VLAN
+				-- nobody wants any more is pruned as before.
+				ucihelper.ensure_vlan_network("br-lan", 20)
+				ucihelper.apply_config({radio_table = {}, vap_table = {}},
+					{net = {lan_cpueth = "br-lan"}}, {keep_vlans = {[10] = true}})
+				assert_not_nil(db.network.openuf_brdev10, "kept")
+				assert_nil(db.network.openuf_brdev20, "unwanted VLAN pruned")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: ensure_vlan_network adds the uplink to an existing bridge without evicting others",
+		fn = function()
+			-- OWNERSHIP: switchvlan puts DSA sockets into this same bridge.
+			-- Setting `ports` outright handed the bridge back and forth on
+			-- every push and reloaded the network each time.
+			with_ucihelper(function(db)
+				ucihelper._uci.cursor():set("network", "anydev", "device")
+				ucihelper.ensure_vlan_network("br-lan", 10)
+				assert_eq(table.concat(db.network.openuf_brdev10.ports, ","), "br-lan.10", "created with the uplink")
+				-- switchvlan moved a socket in
+				ucihelper._uci.cursor():set("network", "openuf_brdev10", "ports", {"br-lan.10", "lan3"})
+				ucihelper._network_dirty = false
+				ucihelper.ensure_vlan_network("br-lan", 10)
+				assert_eq(table.concat(db.network.openuf_brdev10.ports, ","), "br-lan.10,lan3",
+					"the socket member survives")
+				assert_false(ucihelper._network_dirty, "and nothing was marked dirty")
+				-- the uplink itself is re-added if someone removed it
+				ucihelper._uci.cursor():set("network", "openuf_brdev10", "ports", {"lan3"})
+				ucihelper.ensure_vlan_network("br-lan", 10)
+				assert_eq(table.concat(db.network.openuf_brdev10.ports, ","), "lan3,br-lan.10",
+					"the uplink is guaranteed, the rest left alone")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: wlan_add keeps SSIDs that sanitize alike as separate sections",
 		fn = function()
 			-- "Guest WiFi" and "Guest_WiFi" both sanitize to Guest_WiFi and
@@ -2908,16 +3156,20 @@ return {
 			-- name, so nothing an existing install relies on moves.
 			with_ucihelper(function(db)
 				ucihelper.wlan_add("radio0", "Guest WiFi", "wpa2", "hunter22")
+				ucihelper.wlan_add("radio0", "Guest-WiFi", "wpa2", "hunter22")
 				ucihelper.wlan_add("radio0", "Guest_WiFi", "wpa2", "hunter22")
-				local ssids = {}
+				local ssids, n = {}, 0
 				for name, s in pairs(db.wireless) do
-					if s[".type"] == "wifi-iface" then ssids[s.ssid] = name end
+					if s[".type"] == "wifi-iface" then ssids[s.ssid] = name; n = n + 1 end
 				end
+				assert_eq(n, 3, "three WLANs, three sections -- upstream collapses these to one")
 				assert_eq(ssids["Guest_WiFi"], "openuf_radio0_Guest_WiFi",
 					"the clean name keeps the section name it always had")
-				assert_not_nil(ssids["Guest WiFi"], "the punctuated one survives alongside")
-				assert_true(ssids["Guest WiFi"]:match("^openuf_radio0_Guest_WiFi_%x%x%x%x$") ~= nil,
-					"under a hash-suffixed name")
+				for _, punct in ipairs({"Guest WiFi", "Guest-WiFi"}) do
+					assert_not_nil(ssids[punct], punct .. " survives alongside")
+					assert_true(ssids[punct]:match("^openuf_radio0_Guest_WiFi_%x%x%x%x$") ~= nil,
+						punct .. " under a hash-suffixed, libuci-valid name")
+				end
 			end)
 		end
 	},

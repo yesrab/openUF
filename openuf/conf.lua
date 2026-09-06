@@ -10,6 +10,7 @@
 	  tl-wr1043ndv2.lua                  TP-Link WR1043ND v2    (swconfig, 1-band)
 	  jiorouter-ax6000-jidu6101.lua      JioRouter AX6000       (DSA, 2-band)
 	  jiorouter-ax6000-jidu6j01.lua      JioRouter AX6000 J-fam (DSA, 2-band)
+	  xiaomi-ax3000t.lua                 Xiaomi Mi Router AX3000T (DSA, 2-band)
 	  generic-dualband-ap.lua            any other dual-band swconfig board
 	  generic-singleband-ap.lua          any other single-band swconfig board
 
@@ -109,6 +110,28 @@ config = {
 	-- boot. A scan takes the radio off-channel briefly (clients see a short
 	-- stall), which is why this is off unless you turn it on; 300 is sane.
 	neighbour_scan_interval = 0,
+
+	-- Client-assisted RF environment enrichment (802.11k beacon reports) --
+	-- the mechanism Ubiquiti's Channel AI describes as "neighbor reports and
+	-- automated RRM scans", and the no-cost complement to the scan interval
+	-- above. The Environment view is otherwise fed from the kernel's PASSIVE
+	-- scan cache, which only ever holds neighbours on the channel a radio is
+	-- already serving (measured on AP2: 0 on 5 GHz, 4 co-channel on 2.4 GHz).
+	-- With this on, openUF periodically asks ONE 802.11k-capable client to
+	-- sweep and report back; the client goes off-channel, the AP never does.
+	-- A single answer returned 15 BSSes across both bands upstream.
+	--
+	-- Costs the AP nothing. Costs a participating client roughly a second
+	-- off-channel, once per rrm_request_interval, and only clients that
+	-- advertise active/passive beacon measurement are ever asked -- a
+	-- minority in practice. false never sends a beacon request; an absent
+	-- key means on, so a conf.lua kept across an upgrade picks this up.
+	rrm_enrichment = true,
+
+	-- Seconds between beacon requests, across all radios and clients combined
+	-- (they are asked one at a time, round-robin). Deliberately slow: the
+	-- point is to keep the Environment view honest, not to poll.
+	rrm_request_interval = 600,
 
 	-- Regulatory domain override: an ISO 3166-1 alpha-2 code programmed into
 	-- the driver INSTEAD of the one the controller pushes. nil = off, and the

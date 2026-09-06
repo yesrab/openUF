@@ -105,7 +105,7 @@ controller the whole LAN is plugged into it, or a VLAN push strands the device.
 | `dev.conf.net.ports` entries | `{idx = 1, swport = "lan1"}` | `{idx = 1, ifname = "lan1"}` |
 | `dev.conf.vlan` | **required** | **must be absent** |
 | `lan_cpueth` | the CPU netdev / trunk (`eth1`) | the LAN **bridge** (`br-lan`) |
-| Per-port VLAN assignment | supported | detected and refused |
+| Per-port VLAN assignment | `switch_vlan` sections | the socket moves into the VLAN's `br-openuf<id>` bridge (Native VLAN only) |
 
 On the device: `swconfig list` printing `Found:` means swconfig; a
 `/sys/class/net/*/dsa` directory or per-socket `lanN` netdevs with no swconfig means DSA.
@@ -471,6 +471,43 @@ factory reset.
 - **8 MB flash is not enough** from a stock image: `lua-openssl` pulls in `libopenssl3`
   (~4.35 MB installed) and a stock 8 MB build leaves ~1.6 MB of overlay. Needs a custom
   image with the crypto in squashfs, or extroot.
+- **A UCI section name may contain only `[A-Za-z0-9_]`, and libuci discards anything else
+  silently** (`set` and `commit` both return true). `wlan_add` sanitizes with `[^%w_]` and
+  appends a hash of the original SSID when it had to change anything; the test mocks refuse
+  an invalid name so the class cannot quietly widen again. An SSID with a hyphen used to
+  provision nothing.
+- **Minimum RSSI is a fixed wire offset, `dBm = raw - 95`**, not "raw plus the live noise
+  floor". The controller never learns a radio's noise floor, so it has nothing but a
+  constant to encode with; the old conversion drifted 12 dB between drivers.
+- **Never set `ft_psk_generate_local`.** It is FT-PSK-only, and pinning it stops OpenWrt
+  configuring the key holders FT-SAE needs, so WPA3 clients silently lose fast roaming.
+- **Two kernel modules are not implied by their packages.** `kmod-nft-bridge` for the
+  Multicast/Broadcast Blocker's `meta` rule (everything else in that table builds without
+  it, so the control looks enabled and filters nothing) and `kmod-sched-act-police` for the
+  upload half of WiFi Speed Limit. Both modules now warn by name when `nft`/`tc` reject the
+  rule, and both installers add them. `os.execute` returns the raw exit status on Lua 5.1
+  (0 = success, non-zero = failure, BOTH truthy), so any "did it work" check needs
+  `exec_ok`, not a bare truth test.
+- **The wire's `11naht40` names a width, not 802.11n.** `rf_config` runs a bare `HT<width>`
+  at the band's best PHY (`best_phy`) unless the WLAN has Force WiFi 4 Mode; the modelmap
+  `htmode_floor` is now only needed to raise the WIDTH. 2.4 GHz is capped at 40 MHz in
+  `parse_phy_caps` whatever the PHY says.
+- **`uplink_detect = "fdb"` reads ONE bridge's FDB** (`sysinfo.lan_bridge` resolves
+  `lan_cpueth` whether it names the bridge or a socket). The whole-FDB read took whichever
+  learned line came first for the gateway's MAC, which on an AP with a tagged SSID can be
+  the VLAN bridge's own port.
+- **DSA per-port VLAN is a bridge move, never `bridge-vlan`.** `switchvlan.dsa_apply` moves
+  the socket into `br-openuf<id>`; `ucihelper.ensure_vlan_network` owns the tagged uplink
+  member and never evicts anyone else; `apply_config`'s `keep_vlans` keeps a wired-only
+  VLAN's bridge alive. The ledger is `st.dsa_brlan_ports`, and a push with no `switch.*`
+  keys counts as "off" only while a ledger exists.
+- **A station's RRM capability bits are not a promise.** AP2's one "capable" client
+  advertises passive, active and table beacon measurement and answers every request with
+  mode 0x02 "incapable" -- and hostapd never notifies a bodiless refusal over ubus, so the
+  only signal is silence. `_rrm_tick` asks a station at most `RRM_MAX_UNANSWERED` times
+  without a mode-0 report before benching it for `RRM_BENCH_SECONDS`; the operating class
+  follows the band the station is on (81 for 2.4 GHz, 115 for 5 GHz), because a 2.4-only
+  client cannot measure a 5 GHz class at all.
 - **WPA-Enterprise is unsupported and skipped**, not mis-provisioned: the wire protocol
   carries no RADIUS server, port or secret.
 
@@ -493,6 +530,7 @@ openuf/
   bcfilter.lua      multicast/broadcast blocker (nft `bridge openuf_bcfilt`)
   shaper.lua        WiFi speed limit (tc)       usteer.lua  band steering
   lldp.lua          neighbour table via lldpctl
+  rrmscan.lua       802.11k beacon-report neighbour enrichment (from upstream)
   state.lua         /etc/openuf/state.json (authkey, adopted, cfgversion, inform_url)
   lib/lib.lua       globals every script expects; wraps `bit` so the same source runs
                     on the device's Lua 5.1 (luabitop) and a 5.3+ dev interpreter

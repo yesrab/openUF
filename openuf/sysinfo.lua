@@ -693,31 +693,75 @@ end
 -- Returns nil whenever any link of the chain is missing (no default route, no
 -- ARP entry for the gateway, no `bridge` binary, gateway not yet learned);
 -- callers must then refuse to attribute hosts to any socket rather than guess.
-function M.uplink_netdev()
-	local gw_ip = tostring(M._run_cmd("ip route show default") or "")
-		:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
-	if not gw_ip then return nil end
-	local arp_out = M._read_file("/proc/net/arp")
-	if not arp_out then return nil end
-	local gw_mac
-	for line in arp_out:gmatch("[^\n]+") do
-		local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-		if ip == gw_ip and mac then gw_mac = mac:lower(); break end
-	end
-	if not gw_mac then return nil end
-	-- Same discriminator M.mac_table() uses: a LEARNED host is `master`-ed and
-	-- neither `self` nor `permanent`. The excluded shapes are the device's own
-	-- addresses -- present on both the bridge and each of its ports, and on a
-	-- DSA board there is one per socket, so a bare `master` test would happily
-	-- answer with whichever port the AP's own MAC is filed under.
-	local fdb = tostring(M._run_cmd("bridge fdb show") or "")
-	for line in fdb:gmatch("[^\n]+") do
-		if not line:find("self") and not line:find("permanent") and line:find("master") then
-			local mac, dev = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+dev%s+(%S+)")
-			if mac and mac:lower() == gw_mac then return dev end
+-- The bridge a netdev is enslaved to, or nil when it is not a bridge port.
+-- /sys/class/net/<if>/master symlinks to the enslaving device.
+function M.bridge_of(ifname)
+	if not ifname then return nil end
+	local m = M._run_cmd("readlink /sys/class/net/" .. ifname .. "/master")
+	m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
+	if m and m ~= "" and m ~= ifname then return m end
+	return nil
+end
+
+-- The bridge whose FDB answers "which socket is the gateway behind", given
+-- what a modelmap names as lan_cpueth. That is EITHER the bridge itself (the
+-- JioRouter maps name br-lan, for the reasons in their headers) OR one of its
+-- ports (upstream's AX3000T map names the wan socket, whose MAC is the
+-- board's label MAC). A bridge has a /sys/class/net/<if>/bridge directory
+-- with the bridge id in it; a port has a master. nil when it is neither,
+-- which callers treat as "cannot tell" -- never a name guessed from "br-".
+function M.lan_bridge(ifname)
+	if not ifname then return nil end
+	local id = M._read_file("/sys/class/net/" .. ifname .. "/bridge/bridge_id")
+	if type(id) == "string" and id:match("^%s*%x+%.%x+") then return ifname end
+	return M.bridge_of(ifname)
+end
+
+-- {[mac] = port_ifname} for every host the bridge has LEARNED, from one
+-- `bridge fdb show br <bridge>`. The DSA analogue of switch_status().arl.
+--
+-- Scoped to ONE bridge on purpose. An earlier version read the whole FDB
+-- (`bridge fdb show`) and took the first learned line for the gateway's MAC
+-- -- but a UniFi gateway uses the same MAC on its VLAN interfaces, so on an
+-- AP carrying a tagged SSID that MAC is also learned on the VLAN bridge's
+-- own port (br-lan.10 in br-openuf10). Which of the two came first was up to
+-- the kernel, and the wrong one names a port no modelmap lists, which then
+-- reads as "uplink unknown" and suppresses every wired client.
+--
+-- Same filter discipline as M.mac_table, and for the same reasons. The
+-- load-bearing half is "permanent": the port's own address arrives as
+-- `<mac> dev wan master br-lan permanent` -- a master line like any other,
+-- separable only by that word, and counting it would put the AP's own socket
+-- MAC in its own client list.
+function M.bridge_fdb_ports(bridge)
+	local ports = {}
+	if not bridge then return ports end
+	local out = M._run_cmd("bridge fdb show br " .. bridge)
+	if not out or out == "" then return ports end
+	for line in out:gmatch("[^\n]+") do
+		if line:find("master") and not line:find("self")
+			and not line:find("permanent") then
+			local mac, port = line:match(
+				"^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+dev%s+(%S+)")
+			if mac and port then ports[mac:lower()] = port end
 		end
 	end
-	return nil
+	return ports
+end
+
+-- Which bridge port -- i.e. which socket -- the uplink cable is in, as an
+-- ifname. Same contract as M.uplink_phys_port: measured, never declared, and
+-- nil rather than a guess when the chain cannot be completed.
+function M.uplink_bridge_port(bridge)
+	if not bridge then return nil end
+	local gw_mac = M._default_gateway_mac()
+	if not gw_mac then return nil end
+	return M.bridge_fdb_ports(bridge)[gw_mac]
+end
+
+-- The name inform.lua's port_table has always used for this question.
+function M.uplink_netdev(bridge)
+	return M.uplink_bridge_port(bridge)
 end
 
 -- === swconfig: what the CPU netdev cannot tell you =========================
@@ -801,6 +845,18 @@ end
 -- callers must then fall back to the netdev-only port rather than guess.
 function M.uplink_phys_port(arl)
 	if type(arl) ~= "table" then return nil end
+	local gw_mac = M._default_gateway_mac()
+	return gw_mac and arl[gw_mac] or nil
+end
+
+-- The MAC of the default gateway: its IP from the default route, then that
+-- IP's hardware address from the kernel's ARP cache. Lowercased. nil whenever
+-- any link of the chain is missing -- no default route, no ARP entry yet.
+--
+-- This is the "which way is the controller" question, and both uplink
+-- detectors are only different ways of asking the switch where that MAC
+-- lives: swconfig's ARL table on ath79, the bridge FDB on DSA.
+function M._default_gateway_mac()
 	local gw_ip = tostring(M._run_cmd("ip route show default") or "")
 		:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
 	if not gw_ip then return nil end
@@ -808,7 +864,7 @@ function M.uplink_phys_port(arl)
 	if not arp_out then return nil end
 	for line in arp_out:gmatch("[^\n]+") do
 		local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-		if ip == gw_ip and mac then return arl[mac:lower()] end
+		if ip == gw_ip and mac then return mac:lower() end
 	end
 	return nil
 end

@@ -487,7 +487,7 @@ return {
 					["ip route"]        = "default via 10.0.0.1 dev br-lan \n",
 				},
 				function()
-					assert_eq(sysinfo.uplink_netdev(), "lan1", "gateway learned on lan1")
+					assert_eq(sysinfo.uplink_netdev("br-lan"), "lan1", "gateway learned on lan1")
 				end
 			)
 			-- The AP's own MAC is filed permanent on a port AND on the bridge.
@@ -503,7 +503,7 @@ return {
 					["ip route"]        = "default via 10.0.0.1 dev br-lan \n",
 				},
 				function()
-					assert_true(sysinfo.uplink_netdev() == nil,
+					assert_true(sysinfo.uplink_netdev("br-lan") == nil,
 						"a permanent/self entry is not a learned host")
 				end
 			)
@@ -517,7 +517,7 @@ return {
 				{["/proc/net/arp"] = fixture("proc_net_arp_switch.txt")},
 				{["bridge fdb show"] = fixture("bridge_fdb_dsa.txt")},
 				function()
-					assert_true(sysinfo.uplink_netdev() == nil, "no default route -> nil")
+					assert_true(sysinfo.uplink_netdev("br-lan") == nil, "no default route -> nil")
 				end
 			)
 			-- Default route whose gateway has not been ARP-resolved.
@@ -528,7 +528,7 @@ return {
 					["ip route"]        = "default via 10.0.0.254 dev br-lan \n",
 				},
 				function()
-					assert_true(sysinfo.uplink_netdev() == nil, "gateway not in arp -> nil")
+					assert_true(sysinfo.uplink_netdev("br-lan") == nil, "gateway not in arp -> nil")
 				end
 			)
 			-- Gateway resolved but the bridge has not learned it (or there is
@@ -537,9 +537,129 @@ return {
 				{["/proc/net/arp"] = fixture("proc_net_arp_switch.txt")},
 				{["ip route"] = "default via 10.0.0.1 dev br-lan \n"},
 				function()
-					assert_true(sysinfo.uplink_netdev() == nil, "gateway not in fdb -> nil")
+					assert_true(sysinfo.uplink_netdev("br-lan") == nil, "gateway not in fdb -> nil")
 				end
 			)
+			-- And with no bridge to ask at all -- never the whole FDB.
+			with_fixtures(
+				{["/proc/net/arp"] = fixture("proc_net_arp_switch.txt")},
+				{["bridge fdb show"] = fixture("bridge_fdb_dsa.txt"),
+				 ["ip route"] = "default via 10.0.0.1 dev br-lan \n"},
+				function()
+					assert_true(sysinfo.uplink_netdev(nil) == nil, "no bridge -> nil")
+				end
+			)
+		end
+	},
+	{
+		name = "sysinfo: uplink lookups are scoped to one bridge, not the whole FDB",
+		fn = function()
+			-- A UniFi gateway uses one MAC on all its VLAN interfaces, so on an
+			-- AP carrying a tagged SSID the gateway is learned on br-lan's
+			-- socket AND on the VLAN bridge's own port (br-lan.10 in
+			-- br-openuf10). A whole-FDB read took whichever came first -- and
+			-- the wrong one names a port no modelmap lists, which reads as
+			-- "uplink unknown" and suppresses every wired client.
+			local cmds = {}
+			-- 10.0.0.1 is aa:bb:cc:dd:ee:ff in the ARP fixture.
+			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_switch.txt")}, {
+				["bridge fdb show br br-lan"] = "aa:bb:cc:dd:ee:ff dev lan1 master br-lan \n",
+				["ip route"] = "default via 10.0.0.1 dev br-lan \n",
+			}, function()
+				local orig = sysinfo._run_cmd
+				sysinfo._run_cmd = function(cmd) cmds[#cmds + 1] = cmd; return orig(cmd) end
+				local got = sysinfo.uplink_bridge_port("br-lan")
+				sysinfo._run_cmd = orig
+				assert_eq(got, "lan1", "found on br-lan's socket")
+			end)
+			local scoped = false
+			for _, c in ipairs(cmds) do
+				if c == "bridge fdb show br br-lan" then scoped = true end
+				assert_true(c ~= "bridge fdb show", "never the unscoped dump")
+			end
+			assert_true(scoped, "the read names the bridge")
+		end
+	},
+	{
+		name = "sysinfo: lan_bridge() accepts the bridge itself or one of its ports",
+		fn = function()
+			-- The JioRouter maps name br-lan as lan_cpueth; the AX3000T map
+			-- names the wan socket. Both have to resolve to the bridge whose
+			-- FDB knows where the gateway is.
+			with_fixtures({["/sys/class/net/br-lan/bridge/bridge_id"] = "8000.ac10076fc670\n"},
+				{}, function()
+					assert_eq(sysinfo.lan_bridge("br-lan"), "br-lan", "a bridge is its own answer")
+				end)
+			with_fixtures({}, {["readlink"] = "../../../../../virtual/net/br-lan\n"},
+				function()
+					assert_eq(sysinfo.lan_bridge("wan"), "br-lan", "a port resolves to its master")
+				end)
+			-- An empty bridge_id file is not a bridge (test doubles return ""
+			-- for unknown paths), and a port with no master is nothing.
+			with_fixtures({["/sys/class/net/eth0/bridge/bridge_id"] = ""}, {}, function()
+				assert_true(sysinfo.lan_bridge("eth0") == nil, "neither -> nil")
+			end)
+			assert_true(sysinfo.lan_bridge(nil) == nil, "nil -> nil")
+		end
+	},
+	{
+		name = "sysinfo: bridge_fdb_ports() maps learned MACs to their DSA socket",
+		fn = function()
+			-- Real `bridge fdb show br br-lan` off a Xiaomi AX3000T (upstream's
+			-- capture). The entry that has to be thrown away is the port's OWN
+			-- address, which arrives as a master line like any other and is
+			-- separable only by the trailing "permanent" -- counting it would
+			-- put the AP's own socket MAC in its own client list.
+			with_fixtures({},
+				{["bridge fdb show br"] = fixture("bridge_fdb_br_dsa.txt")},
+				function()
+					local ports = sysinfo.bridge_fdb_ports("br-lan")
+					assert_eq(ports["5a:d6:1f:40:e2:f6"], "wan", "gateway is on wan")
+					assert_eq(ports["00:04:4b:86:81:77"], "wan", "a host is on wan")
+					assert_true(ports["d4:53:2a:38:80:cf"] == nil,
+						"the port's own permanent address is not a learned host")
+				end)
+			assert_eq(next(sysinfo.bridge_fdb_ports(nil)), nil, "nil bridge -> empty")
+			with_fixtures({}, {}, function()
+				assert_eq(next(sysinfo.bridge_fdb_ports("br-lan")), nil, "no output -> empty")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: uplink_bridge_port() finds the socket the gateway is behind",
+		fn = function()
+			local cmds = {
+				["bridge fdb show br"] = fixture("bridge_fdb_br_dsa.txt"),
+				["ip route"] = "default via 192.168.200.1 dev br-lan \n",
+			}
+			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_dsa.txt")}, cmds,
+				function()
+					assert_eq(sysinfo.uplink_bridge_port("br-lan"), "wan", "uplink socket is wan")
+				end)
+			-- Same board, cable moved to another socket: the answer follows
+			-- the FDB, not a constant.
+			local moved = "5a:d6:1f:40:e2:f6 dev lan3 master br-lan \n"
+				.. "00:04:4b:86:81:77 dev lan3 master br-lan \n"
+			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_dsa.txt")},
+				{["bridge fdb show br"] = moved,
+				 ["ip route"] = "default via 192.168.200.1 dev br-lan \n"},
+				function()
+					assert_eq(sysinfo.uplink_bridge_port("br-lan"), "lan3",
+						"uplink socket followed the cable")
+				end)
+		end
+	},
+	{
+		name = "sysinfo: bridge_of() names the bridge a socket is enslaved to",
+		fn = function()
+			with_fixtures({}, {["readlink"] =
+				"../../../../../../../../virtual/net/br-lan\n"}, function()
+					assert_eq(sysinfo.bridge_of("lan3"), "br-lan", "lan3 is in br-lan")
+				end)
+			with_fixtures({}, {}, function()
+				assert_true(sysinfo.bridge_of("eth0") == nil, "not enslaved -> nil")
+			end)
+			assert_true(sysinfo.bridge_of(nil) == nil, "nil ifname -> nil")
 		end
 	},
 	{

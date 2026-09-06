@@ -152,13 +152,18 @@ dev.conf.radio = {
 		-- exactly what fails, while excluding 149-165 -- the channels that
 		-- actually work here.
 
-		-- The UCG Ultra pushes radio.2.ieee_mode=11naht40 to this AP -- 802.11n
-		-- at 40 MHz -- which is what openUF then writes, throwing away most of
-		-- a 4x4 WiFi-6 radio (a client associated at MCS 15, 144 Mbit/s). It is
-		-- a controller-side default for the emulated model rather than an
-		-- intent, so this board raises it. Kind and width are raised
-		-- independently, so a controller that genuinely asks for MORE than this
-		-- keeps its value, and openUF's hardware clamp still runs afterwards.
+		-- The UCG Ultra pushes radio.2.ieee_mode=11naht40 to this AP. The "ht"
+		-- half is no longer a problem: rf_config runs a bare HT<width> at the
+		-- band's best PHY (that token never named one -- a real U6-InWall runs
+		-- it as HE40 too), so without any floor this radio would come up HE40.
+		-- What the floor still does here is the WIDTH: 40 MHz is the
+		-- controller's default for the emulated model rather than an intent,
+		-- and it throws away most of a 4x4 WiFi-6 radio (a client associated
+		-- at MCS 15, 144 Mbit/s), so this board raises it to 80. Kind and
+		-- width are raised independently, so a controller that genuinely asks
+		-- for MORE than this keeps its value, and openUF's hardware clamp
+		-- still runs afterwards. Remove the floor if you would rather the
+		-- controller's width setting be honoured as pushed.
 		htmode_floor = "HE80",
 
 		-- ...and a ceiling, in the same units. HE160 is the widest openUF ever
@@ -192,11 +197,12 @@ dev.conf.radio = {
 	ng = {
 		-- No DFS on 2.4 GHz, so ACS needs no help here.
 		--
-		-- HE20 as a floor means "at least 802.11ax, at least 20 MHz": the
-		-- controller's 11nght40 keeps its 40 MHz (the floor only raises what is
-		-- below it) and gains the HE generation. Set HE40 here if you want to
-		-- force 40 MHz, but on 2.4 GHz with three non-overlapping channels that
-		-- is usually the wrong trade.
+		-- HE20 as a floor means "at least 802.11ax, at least 20 MHz". Since
+		-- rf_config now runs a bare HT<width> at the band's best PHY anyway,
+		-- this is documentation rather than a correction: the controller's
+		-- 11nght40 keeps its 40 MHz and comes up HE40 with or without it. Set
+		-- HE40 here if you want to force 40 MHz, but on 2.4 GHz with three
+		-- non-overlapping channels that is usually the wrong trade.
 		htmode_floor = "HE20",
 	},
 }

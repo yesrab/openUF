@@ -202,6 +202,28 @@ return {
 		end
 	},
 	{
+		name = "state: a wrong-typed persisted field is dropped, whether or not it has a default",
+		fn = function()
+			-- state.json is edited by operators and written by syswrapper. A
+			-- `locating: "no"` read as truthy would make the next start tear
+			-- down a Locate that never happened; a `dsa_brlan_ports: "lan1"`
+			-- would make restore() iterate a string.
+			with_tmp(function()
+				local f = io.open(TMP, "w")
+				f:write('{"adopted":true,"authkey":"aabbccddeeff00112233445566778899",'
+					.. '"locating":"no","dsa_brlan_ports":"lan1","led_enabled":true,'
+					.. '"mac":42,"some_future_field":"kept"}')
+				f:close()
+				local st = state.load()
+				assert_nil(st.locating, "wrong-typed locating is absent, not truthy")
+				assert_nil(st.dsa_brlan_ports, "wrong-typed ledger is absent")
+				assert_nil(st.mac, "wrong-typed mac is absent")
+				assert_eq(st.led_enabled, true, "a well-typed neighbour survives")
+				assert_eq(st.some_future_field, "kept", "an unknown field still passes through")
+			end)
+		end
+	},
+	{
 		name = "state: a JSON null on disk is dropped rather than carried as a userdata",
 		fn = function()
 			with_tmp(function()

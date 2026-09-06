@@ -231,6 +231,17 @@ local function parse_phy_caps(out)
 			if b.vht or b.he then width = math.max(width, 80) end
 			if b.w160 then width = math.max(width, 160) end
 			if b.eht and b.w320 then width = math.max(width, 320) end
+			-- 2.4GHz stops at 40MHz -- there is no 80MHz channel in the band
+			-- to be had, whatever the PHY generation. The widths above are
+			-- derived from the PHY (a VHT or HE radio can do 80), which was
+			-- accurate while every 2.4GHz radio here was HT-only and wrong
+			-- the moment one was not: an HE 2.4GHz radio reported max_width
+			-- 80, clamp_htmode passed a pushed HE80 straight through (it
+			-- narrows to 40 only for kind "HT"), and hostapd treats a channel
+			-- width it cannot program as fatal -- the radio never starts.
+			-- (Upstream's finding on an AX3000T; the JIDU6101's 2.4GHz radio
+			-- is HE too.)
+			if key == "ng" then width = math.min(width, 40) end
 			local prev = caps[key]
 			-- Two radios can serve the same band (rare, but a 2.4GHz-only and a
 			-- dual-band phy in one device do it); keep the more capable view.
@@ -271,6 +282,18 @@ function M.phy_caps()
 		M._phy_caps_read_at = now
 	end
 	return M._phy_caps_cache
+end
+
+-- The best PHY generation the given band's hardware can run ("HT"/"VHT"/
+-- "HE"/"EHT"), or nil when the capabilities are unknown -- which callers must
+-- treat as "do not upgrade anything".
+--
+-- The counterpart to clamp_htmode: that one refuses to give a radio a PHY it
+-- cannot do, this one says what it CAN do, for a caller whose only other
+-- source is a wire format that does not carry the answer (see rf_config).
+function M.best_phy(band)
+	local caps = M.phy_caps()[band]
+	return caps and RANK_PHY[caps.max_kind] or nil
 end
 
 -- Clamp an OpenWrt htmode ("HE80", "VHT40", "HT20", ...) to what the given
@@ -554,9 +577,20 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	-- against a real controller: only the last-processed radio's VAP
 	-- survived. name:gsub("[^%w_-]", "_") sanitizes radio the same way ssid
 	-- already was, though UCI radio names ("radio0"/"radio1") never need it.
-	local safe_ssid = ssid:gsub("[^%w_-]", "_")
-	-- Sanitizing is lossy: "Guest WiFi" and "Guest_WiFi" both become
-	-- Guest_WiFi, so two WLANs on one radio whose names differ only in
+	-- The character class must NOT keep "-". A UCI section name may contain
+	-- only [A-Za-z0-9_], and libuci enforces that in the most unhelpful way
+	-- available: cursor:set() returns true, cursor:commit() returns true, and
+	-- the section is silently discarded -- it never reaches /etc/config and
+	-- never appears in `uci show`. So an SSID with a hyphen produced a
+	-- wlan_add that reported success at every step and left no WLAN behind,
+	-- with nothing in any log to say so. Upstream confirmed it live: an SSID
+	-- "openuf-verify" pushed correctly, parsed correctly into vap_table, and
+	-- simply never provisioned. Hyphens are common in SSIDs, so this was a
+	-- wide hole. (The test suite's mock cursor now refuses such a name, so
+	-- the class cannot quietly widen again.)
+	local safe_ssid = ssid:gsub("[^%w_]", "_")
+	-- Sanitizing is lossy: "Guest WiFi", "Guest-WiFi" and "Guest_WiFi" all
+	-- become Guest_WiFi, so two WLANs on one radio whose names differ only in
 	-- punctuation collapsed into one section, the second silently
 	-- overwriting the first. When the name had to be altered, a short hash
 	-- of the ORIGINAL keeps them apart; a name that needed no alteration
@@ -564,7 +598,7 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	if safe_ssid ~= ssid then
 		safe_ssid = safe_ssid .. "_" .. M.derive_mobility_domain(ssid)
 	end
-	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_-]", "_")
+	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_]", "_")
 		.. "_" .. safe_ssid
 	local enc = SECURITY_MAP[security] or "psk2"
 	cursor:set("wireless", section_name, "wifi-iface")
@@ -657,6 +691,26 @@ function M.ensure_vlan_network(cpueth, vlan_id)
 			cursor:set("network", br_section, "name", br_name)
 			cursor:set("network", br_section, "ports", {ifname})
 			changed = true
+		else
+			-- OWNERSHIP, since two modules write this bridge. This function
+			-- guarantees one thing: the tagged uplink sub-device is a member.
+			-- Any OTHER member is left alone, because on a DSA board
+			-- switchvlan puts the physical sockets assigned to this VLAN into
+			-- the same bridge -- per-port VLAN and a tagged SSID on the same
+			-- VID are the same L2 there, and must be. Setting `ports`
+			-- outright here handed the bridge back and forth on every push:
+			-- this reset it to the uplink alone, switchvlan added the sockets
+			-- again, and the network reloaded on every inform.
+			local ports = cursor:get("network", br_section, "ports")
+			if type(ports) == "string" then ports = {ports} end
+			ports = ports or {}
+			local have = false
+			for _, p in ipairs(ports) do if p == ifname then have = true end end
+			if not have then
+				ports[#ports + 1] = ifname
+				cursor:set("network", br_section, "ports", ports)
+				changed = true
+			end
 		end
 		if cursor:get("network", section_name, "device") ~= br_name then
 			cursor:set("network", section_name, "interface")
@@ -930,6 +984,31 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 	if htmode then
 		local want = htmode
 		local force_wifi4 = (type(opts) == "table" and opts.force_wifi4) or false
+		-- The wire never names a PHY generation. "11naht40" is what a real
+		-- controller sends to a real U6-InWall as well, and that AP runs it as
+		-- HE40: the token's vocabulary is Atheros-era (the same push calls the
+		-- VAPs ath0/ath1) and carries the band and the WIDTH, nothing more.
+		-- Read literally it pinned an 802.11ax radio to 802.11n for good --
+		-- invisible in the controller, which shows the width (correct), and
+		-- visible only in `iw dev`. Upstream found it on an AX3000T; the
+		-- JIDU6101 maps were compensating with an htmode_floor. So a bare
+		-- HT<width> is treated as "PHY unspecified" and run at the best PHY
+		-- this band's hardware has, at exactly the pushed width. An explicit
+		-- vht/he/eht token (the parser maps those to VHT/HE/EHT) is honoured
+		-- as written, unknown capabilities keep the literal reading, and
+		-- Force WiFi 4 Mode keeps HT -- that WLAN asked for an 802.11n beacon.
+		-- Done here rather than at parse time so it composes with the floor,
+		-- the ceiling and the clamp below in one place.
+		local kind, width = want:match("^(%u+)(%d+)$")
+		if kind == "HT" and width and not force_wifi4 then
+			local best = M.best_phy(band)
+			if best and PHY_RANK[best] and PHY_RANK[best] > PHY_RANK.HT then
+				io.stderr:write(string.format(
+					"openuf: %s: the wire names width %s and no PHY -- running the "
+					.. "band's %s at that width\n", radio, want, best))
+				want = best .. width
+			end
+		end
 		if policy and policy.htmode_floor and not force_wifi4 then
 			local raised, from = M.raise_htmode(want, policy.htmode_floor)
 			if from then
@@ -1072,7 +1151,10 @@ end
 -- cfg:  device configuration (from conf.lua); used for dev.conf.net.lan_cpueth
 --       when a VAP requires a VLAN-tagged network. VLAN tagging is skipped
 --       (falls back to "lan") if cfg is nil.
--- opts: optional table; opts.band_steering_active (boolean) forces 802.11k +
+-- opts: optional table. opts.keep_vlans is a set of VLAN ids that must keep
+--       their L2 even when no WLAN sits on them -- a wired port assigned to
+--       that VLAN on a DSA board lives in the same bridge (see switchvlan's
+--       DSA section). opts.band_steering_active (boolean) forces 802.11k +
 --       BSS Transition on for every managed iface regardless of each WLAN's
 --       own bss_transition setting, since usteer (Band Steering) needs it
 --       network-wide to function at all -- see openuf/usteer.lua. nil/false
@@ -1195,8 +1277,27 @@ function M.apply_config(resp, cfg, opts)
 			if ft_enabled then
 				extra.ieee80211r = "1"
 				extra.mobility_domain = M.derive_mobility_domain(vap.ssid)
-				extra.ft_psk_generate_local = "1"
 				extra.ft_over_ds = "0"
+				-- ft_psk_generate_local is deliberately NOT set. It used to be
+				-- forced to "1", which silently disabled fast roaming for every
+				-- WPA3 client: local key generation is FT-PSK only (each AP
+				-- derives PMK-R0/R1 from the PSK it already has), while FT-SAE
+				-- derives PMK-R0 from the per-session SAE PMK, which no
+				-- passphrase can reproduce. Its PMK-R1 has to be pulled from
+				-- the originating AP over the r0kh/r1kh key-holder
+				-- relationship -- and forcing local generation is exactly what
+				-- stops OpenWrt configuring one. Upstream observed it live on
+				-- a sae-mixed WLAN: both APs advertised FT-SAE and the mobility
+				-- domain, and a station that had negotiated FT-SAE still
+				-- reassociated with auth_alg=sae plus a full 4-way handshake,
+				-- even between two BSSes on the SAME radio.
+				--
+				-- OpenWrt's own default is already right: hostapd.sh keys it on
+				-- auth_type (psk -> 1, anything else -> 0) and, when it is 0,
+				-- derives wildcard key holders from md5(mobility_domain/psk) --
+				-- deterministic, so every AP sharing an SSID and passphrase
+				-- computes the same key with no coordination, the same
+				-- reasoning behind derive_mobility_domain above.
 			end
 			if opts and opts.band_steering_active then
 				-- usteer requires 802.11k (neighbor reports) + BSS
@@ -1392,6 +1493,18 @@ function M.apply_config(resp, cfg, opts)
 
 			M.wlan_add(vap.radio, vap.ssid, vap.security, vap.x_passphrase, extra,
 				network, vap.wlanconf_id)
+		end
+	end
+
+	-- A VLAN no WLAN uses may still be wanted by a wired port assigned to it
+	-- (DSA per-port VLAN puts the socket in this same bridge -- see
+	-- ensure_vlan_network's OWNERSHIP note). Its bridge must survive the
+	-- prune below, and be built even when no WLAN mentions the VID at all.
+	for vid in pairs((opts and opts.keep_vlans) or {}) do
+		local n = tonumber(vid) or vid
+		if not wanted_vlans[n] and cpueth then
+			M.ensure_vlan_network(cpueth, n)
+			wanted_vlans[n] = true
 		end
 	end
 

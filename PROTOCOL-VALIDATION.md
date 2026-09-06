@@ -735,10 +735,13 @@ stamgr.1.loadbalance.status=false
 ```
 
 **The threshold is not plain dBm.** UI `-80 dBm` → wire `15`; UI `-85 dBm` → wire `10` —
-consistent with `wire = dbm + 95`, an offset from an assumed -95 dBm noise floor (a madwifi
-convention, matching `aaa.1.driver=madwifi`). openUF stores the raw wire value in UCI and
-converts to dBm only where a live noise-floor reading exists (`sysinfo.radio_stats()`'s
-`iw survey dump` parse), falling back to the -95 assumption otherwise.
+`wire = dbm + 95` exactly, a fixed madwifi-era encoding (matching `aaa.1.driver=madwifi`).
+openUF stores the raw wire value in UCI and converts back with the same constant. **It is
+NOT "dB above the live noise floor"** — an earlier version added `sysinfo.radio_stats()`'s
+noise reading instead, which the controller cannot possibly have encoded against (it never
+learns a radio's noise floor) and which only looked right on a radio whose floor happens to
+be -95: an ath9k 2.4 GHz radio reads -107 and turned a requested -80 into -92, mt76 radios
+read -90/-92 and turned it into -75. Corrected 2026-09-06, adopting upstream's fix.
 
 `loadbalance.status` is a sibling sub-feature sharing the block; unimplemented.
 
@@ -1027,7 +1030,7 @@ through 0/3/4/5/6/7/15/31/255 only changed *which* of two near-identical errors 
 | `disabled`, `builtin_antenna`, `builtin_ant_gain`, `max_txpower` | |
 | `nss`, `is_11ac`, `is_11ax`, `is_11be`, `has_dfs`, `has_fccdfs`, `has_ht160`, `has_eht240`, `has_eht320` | Read directly off each entry by `PGOcbDWlbnYQdFW`'s `copyAttrsIfPresent`, **independent of `radio_caps`**. Derived by `sysinfo.radio_caps()` from `iw phy phyN info`. |
 | **`radio_caps`** | A separate **integer bitmask**, not `nss`. See below. |
-| `min_rssi`, `min_rssi_enabled` | `min_rssi` is **dBm** on the wire (converted from the raw `stamgr` units using the live noise floor) |
+| `min_rssi`, `min_rssi_enabled` | `min_rssi` is **dBm** on the wire (converted from the raw `stamgr` units with the fixed `raw - 95` offset, see the `stamgr` section) |
 | **`athstats`** | Nested `{cu_total, cu_self_rx, cu_self_tx, cu_interf}`. See below. |
 
 **An empty `radio_table` blocks a large amount of downstream behavior.** The controller checks
@@ -1091,8 +1094,8 @@ this radio's own tx/rx.
 > Deriving `cu_*` from `stats[1]` therefore divided a busy figure by a ~3 ms active time and
 > reported a genuinely 24%-busy 2.4GHz channel to the controller as **100%**, and a 1.9%-busy
 > 5GHz channel as **75%** — which is what made both APs look like they were drowning in
-> interference. The same wrong entry also fed the noise floor used to convert Minimum RSSI
-> back to dBm. Fixed by flagging `in_use` in `sysinfo.radio_stats()` and selecting it in
+> interference. The same wrong entry also fed the noise floor Minimum RSSI was, at the time,
+> (wrongly) converted with. Fixed by flagging `in_use` in `sysinfo.radio_stats()` and selecting it in
 > `inform.lua`'s `_in_use_survey()`; the test fixture now mirrors the real ordering, and
 > reverting the selection fails 4 tests.
 
@@ -1534,6 +1537,34 @@ are exactly where unanchored patterns go wrong.
 
 ---
 
+## Adopted from upstream (jonasevcik/openUF), 2026-09-06
+
+This fork left upstream at `677f732`. Upstream's twenty commits of 1–2 September 2026 were
+reviewed and the parts that were better than ours re-implemented here (not merged); the
+hardware evidence below is **theirs**, gathered on a Xiaomi Mi Router AX3000T (mediatek/filogic
+MT7981, OpenWrt 25.12.5) against the same model of gateway, and each item is marked with what
+this fork has and has not re-verified on its own JioRouter boards.
+
+| Finding | Evidence | Status here |
+|---|---|---|
+| A UCI section name may contain only `[A-Za-z0-9_]`; libuci discards anything else with `set()` and `commit()` both returning true | An SSID `openuf-verify` pushed, parsed, and never provisioned | Sanitizer fixed; our hash suffix keeps punctuation-only variants distinct. Mock cursors now refuse an invalid name |
+| Minimum RSSI is `dBm = raw - 95`, not raw plus the live noise floor | UI -80 ↔ 15 and -85 ↔ 10 on every radio; the noise-floor version drifted -92…-75 across ath9k/ath10k/mt76 | Adopted; AP2's mt76 radios were exactly the -90/-92 case |
+| `ft_psk_generate_local=1` disables FT-SAE | A station that negotiated FT-SAE reassociated with `auth_alg=sae` plus a 4-way, even between BSSes on one radio | Removed; OpenWrt's `auth_type`-keyed default derives the key holders |
+| `kmod-nft-bridge` is required by the Blocker's `meta` rule and not implied by `nftables`; `kmod-sched-act-police` by the upload half of Speed Limit | Table and set built, only the drop rule rejected; `tc filter … police` failed with "Failed to load TC action module" | Both installers add them; both modules warn by name on rejection. **AP2 lacked both**, so its Blocker and upload cap were silently inert |
+| The `ht` in `11naht40` is not a PHY request | 5 GHz radio came up HT40 on hardware that does HE160; a real U6-InWall runs the same token as HE40 | Adopted, in `rf_config` rather than the parser so it composes with the floor, ceiling, clamp and Force WiFi 4 |
+| 2.4 GHz has no 80 MHz channel whatever the PHY | An HE 2.4 GHz radio reported `max_width` 80 and a pushed HE80 was fatal to hostapd | Adopted in `parse_phy_caps` |
+| A tagged SSID needs no switch trunk on DSA; the 8021q device on the bridge port claims the VID before the bridge | `wan.10` on the `wan` bridge port carried VLAN 10 with `vlan_filtering` off | Consistent with AP2's `br-lan.10` on the bridge, which also works; both shapes supported via `sysinfo.lan_bridge` |
+| Per-port VLAN on DSA as a bridge move (socket out of `br-lan`, into `br-openuf<id>`), never `bridge-vlan` | Verified on an mt7530: the driver accepts a user port in a second bridge; counters on the socket and the tagged uplink climb by the same amount | Adopted with their tests. **Not yet exercised on an mt7531** (the JioRouter switch, same driver family) |
+| "Port VLAN off" can arrive as a `system_cfg` with no `switch.*` keys at all | Observed live after unticking the box | Adopted: absence counts as off while a reversibility ledger exists |
+| Locate must restore the LED's previous trigger, persist it, and be torn down at startup | A radio LED stayed on the identify blink across three Locate cycles | Adopted with their tests |
+| 802.11k beacon reports as an Environment-tab source | One request to one client returned 15 BSSes across both bands; 9 of 13 clients advertised no 802.11k | Adopted as `rrmscan.lua`, on by default (`rrm_enrichment`). Complements this fork's `neighbour_scan_interval` |
+| `bridge fdb show br <bridge>` names the socket each MAC was learned on | Fixtures are real captures | Adopted, and it fixed a latent bug of ours: the whole-FDB read could pick the gateway's MAC as learned on the VLAN bridge's own port |
+| Xiaomi Mi Router AX3000T profile | Adoption, LLDP, ports, wired clients, both radios, Locate, tagged VLAN all verified there | Adopted with `uplink_detect = "fdb"` and its board names added; **not run on this fork's hardware** |
+
+Kept as ours where ours was stronger: atomic `state.json` writes and generic field
+passthrough, the `_tick` error boundaries and debug switches, wire-value validation, the
+per-pass ubus and `iw phy` caches, `--replace-conf`, the `iw` 6.17 parser fixes.
+
 ## Feature matrix
 
 Every controller-UI control exercised against a live openUF device. "Confirmed" means driven
@@ -1558,12 +1589,12 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 15 | Power / PoE | `power_source`, `power_source_voltage`, `psu_table`, `power-monitor`, `total_max_power`, `led_state`, `outlet_table` — copied straight off the inform when present | 🔍 Not implemented. The "Power: -" element lives in the **Parent Device** subsection (properties of the upstream LLDP-linked switch), and this environment has no PoE switch. Field names confirmed; values/format not researched, and openUF has no local signal for a real PoE class. |
 | 16 | Set Replacement Device / Load Configuration | **None** — controller-side Mongo document clone (`commonDeviceCloneConfigService`), then an ordinary adopt + `setparam` | ✅ Both confirmed live; zero product code needed. Replacement auto-adopts the target ~50 s after the source goes away. |
 | 17 | Wired clients | `port_table[]` + per-port `mac_table[]` | ✅ Confirmed live: both fake hosts under Connection → Wired, on the correct port; Ports view renders them. Hosts are placed on the physical socket the switch learned them on (ARL table) as of 2026-08-02 — before that, real wired clients behind an AP were reported by nobody and the controller credited them to the gateway's port |
-| 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ⚠️ Wire format fully mapped live 2026-07-19 (gate, per-VLAN table, per-port `pvid` + tagged/untagged/exclude matrix, teardown). The **controller side** is confirmed — it accepts the assignment and pushes an actionable table. Device-side apply is swconfig-only and unverifiable here (the validation AP has no switch). Note it was unreachable on both real boards until 2026-08-02: the only port they reported was the uplink, which is exactly the port that must never be reassigned |
+| 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ⚠️ Wire format fully mapped live 2026-07-19 (gate, per-VLAN table, per-port `pvid` + tagged/untagged/exclude matrix, teardown). The **controller side** is confirmed — it accepts the assignment and pushes an actionable table. Device-side apply on swconfig is unverifiable here (the validation AP has no switch); on DSA it is a bridge move adopted from upstream, verified there on an mt7530 — see [Adopted from upstream](#adopted-from-upstream-jonasevcikopenuf-2026-09-06). Note it was unreachable on both real boards until 2026-08-02: the only port they reported was the uplink, which is exactly the port that must never be reassigned |
 | 19 | Client block / unblock | `cmd:"block-sta"` / `"unblock-sta"` | ✅ Confirmed live including real nftables enforcement and survival across a simulated reboot. `hostapd_cli` deauth is unit-tested only (no real hostapd here). |
 | 20 | Environment / rogue-AP scan | `scan_radio_table[]` | ✅ openUF's payload and the controller's ingestion both confirmed correct (10/10 direct API polls). The tab's own display bug is [controller-side](#controller-side-ui-quirks). |
 | 21 | Radios tab + client MIMO/generation | `radio_table` capability fields; per-station `nss`/`is_11*` | ✅ Confirmed live on four stations spanning HT/VHT/HE/legacy |
 | 22 | Radios tab Avg. Signal / Interference / Airtime / MIMO | `vap_table.avg_client_signal`; `radio_table.athstats`; `radio_table.radio_caps` | ✅ All four confirmed live on a fresh reset (`-64`/`-50 dBm`, `3%`, `7%`, `2x2`), with bidirectional filter behavior verified |
-| 23 | Minimum RSSI | `system_cfg` `stamgr.<n>.*`; outbound `min_rssi`/`min_rssi_enabled` | ✅ Wire format and field names confirmed. Enforcement (`kick_station`) is unit-tested only — no real radios here. |
+| 23 | Minimum RSSI | `system_cfg` `stamgr.<n>.*`; outbound `min_rssi`/`min_rssi_enabled` | ✅ Wire format and field names confirmed; conversion is the fixed `raw - 95` (corrected 2026-09-06 — the live-noise-floor version was wrong on every radio but one). Enforcement (`kick_station`) is unit-tested only — no real radios here. |
 | 24 | Security tab WPA2/WPA3 protocol options | **None** | ℹ️ Not capability-driven from anything openUF sends. No security-capability field exists in the payload; `ucihelper`'s `SECURITY_MAP` (`wpa2`→`psk2`, `wpa3`→`sae`, `wpa2/wpa3`→`sae-mixed`, `wpa-enterprise`→`wpa2+ccmp`) is a one-way map of a choice the controller has already made. The dropdown's options come from the controller's own internal per-model database, keyed on the reported `model`/`platform`. Not fixable here. |
 | 25 | Band Steering / BSS Transition / DTIM | `wireless.<n>.no2ghz_oui` / `aaa.<n>.bss_transition` / `wireless.<n>.dtim_period` | ✅ All three confirmed live by individual before/after `system_cfg` diffs |
 | 26 | Show AP Name in Beacon | `wifi_caps2` bit `0x40` → `wireless.<n>.advertise_ap_name` | ✅ Wire protocol and capability gating confirmed live, both directions. **The OpenWrt/hostapd side is not verified** — implemented via the WPS/WSC Device Name attribute (`wps_device_name` + `ap_setup_locked=1`, the standard mechanism, per hostapd's README-WPS/`beacon.c` and OpenWrt's wifi-iface schema) rather than an unknown Ubiquiti vendor IE. Needs real hardware to confirm hostapd accepts it and the beacon changes. |

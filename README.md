@@ -65,7 +65,8 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | WiFi Experience / satisfaction score | ✅ Working — device-computed, confirmed rendering live |
 | Ethernet port statistics (`port_table[]`) | ✅ Working — one entry per **physical socket** on swconfig boards, each with the link speed and duplex that socket actually negotiated, read from the switch (the CPU netdev only ever knows the internal SoC↔switch link, which is always 1000/full). Which socket is the uplink is detected from the switch's ARL table, so it follows the cable. Per-port byte counters from the switch's MIB, which openUF switches on at startup where the driver ships it off (`ar8xxx_mib_poll_interval`); packet/multicast/broadcast/drop counts are not available per socket, so those columns stay empty rather than carrying the CPU port's totals. Anomaly, STP and Profile are controller-side or USW-only — they read `-` for a real UniFi gateway's ports too. Boards with no readable switch keep the netdev-based single-port shape |
 | Wired client statistics (`port_table[].mac_table`) | ✅ Working — hosts are placed on the socket they are really plugged into, from the switch's ARL table (`bridge fdb` can only ever say "behind the CPU port"). The uplink socket and any socket outside the management VLAN report none, and the AP's own MACs and its wireless stations are never reported as wired clients |
-| Environment / rogue-AP scanning (`scan_radio_table`) | ✅ Working — confirmed rendering live in the Environment tab |
+| Environment / rogue-AP scanning (`scan_radio_table`) | ✅ Working — confirmed rendering live in the Environment tab. Read from the kernel's passive BSS cache, so on its own it lists only neighbours on the radio's **own** channel (measured: 0 on 5 GHz, co-channel only on 2.4 GHz); an optional `neighbour_scan_interval` adds a real sweep at the cost of a brief client stall |
+| RF environment enrichment (802.11k beacon reports) | ✅ Working — the mechanism Ubiquiti's Channel AI describes as *"neighbor reports and automated RRM scans"*, adopted from upstream. openUF periodically asks one 802.11k-capable **client** to sweep and report back; the client goes off-channel, the AP never does. Upstream measured a 5 GHz Environment list going from 0 neighbours to 4. Off with `rrm_enrichment = false` |
 | LLDP topology announcement | ✅ Working (via `lldpd`) — **set `lldpd.config.cid_interface` to your LAN network**, or the controller shows the wrong Parent Device: lldpd's default chassis ID is some other interface's MAC, which the controller can't match to the MAC openUF is adopted under. See [USAGE](USAGE.md#7-lldp-topology) |
 | RF/spectrum scan | ⚠️ Best-effort trigger only — the result-reporting wire format is unconfirmed |
 
@@ -73,11 +74,11 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 
 | Feature | Status |
 |---|---|
-| Locate (LED identify blink) | ✅ Working — requires `dev.conf.led` set per board |
-| Manage → LED steady on/off toggle | ✅ Working — same `dev.conf.led` requirement |
+| Locate (LED identify blink) | ✅ Working — requires `dev.conf.led` set per board, naming an LED that is **actually wired** (see USAGE § 3). Locate snapshots whatever trigger the LED was driving, persists it, and restores it on stop, so it survives a restart landing between `set-locate` and `unset-locate`; an interrupted Locate is torn down at the next start rather than blinking forever |
+| Manage → LED steady on/off toggle | ✅ Working — same `dev.conf.led` requirement. Persisted and re-applied at startup, so it survives a reboot; also re-asserted when a Locate ends, since restoring the blink's previous trigger alone would leave a status LED dark |
 | Client block / unblock | ✅ Working — enforced via nftables, persists across restarts |
 | IP Settings (DHCP / static) | ✅ Working — reconfigures the device's own management interface, including the DNS servers (`resolv.nameserver.<k>.ip` → `/etc/resolv.conf`, in the controller's primary/secondary order). DNS is applied on the static path only; on DHCP the lease supplies it |
-| Per-port VLAN assignment | ⚠️ Wire format fully mapped live (`switch.*`: device-level gate, per-VLAN table, per-port `pvid` plus a tagged/untagged/`exclude` matrix joined on `port_table[].port_idx`); requires reporting the `hasOWRTSwitch` capability bit and ticking **Port VLAN** on the device. Applied as swconfig `switch_vlan` sections — **swconfig boards only** (DSA is detected and refused rather than guessed at), requires a `dev.conf.vlan` port map plus a `swport` on the port, never touches the socket the uplink cable is in (detected at runtime, and refused outright when it cannot be determined), and is reversible — unticking the device-level **Port VLAN** box tears openUF's sections down and restores the stock port strings. The generated UCI is unit-tested, but that it programs a real switch ASIC is **not verified** (no switch hardware here) |
+| Per-port VLAN assignment | ⚠️ Wire format fully mapped live (`switch.*`: device-level gate, per-VLAN table, per-port `pvid` plus a tagged/untagged/`exclude` matrix joined on `port_table[].port_idx`); requires reporting the `hasOWRTSwitch` capability bit and ticking **Port VLAN** on the device. Applied two ways. On **swconfig** boards, as `switch_vlan` sections: requires a `dev.conf.vlan` port map plus a `swport` on the port, never touches the socket the uplink cable is in (detected at runtime, and refused outright when it cannot be determined), and is reversible — unticking the device-level **Port VLAN** box tears openUF's sections down and restores the stock port strings; the generated UCI is unit-tested, but that it programs a real switch ASIC is **not verified**. On **DSA** boards (adopted from upstream, verified there on an AX3000T) there is no switch table to write and `bridge-vlan` is deliberately not used: the assigned socket is moved out of `br-lan` and into that VLAN's `br-openuf<id>` bridge — the same L2 a tagged SSID on the same VLAN already uses. `br-lan` keeps the uplink and the management address and nothing runs with `vlan_filtering`, so a wrong answer cannot strand the AP. Native VLAN only; a tagged-only port is refused out loud. ⚠️ Not yet exercised on this fork's JioRouter boards |
 | Set Replacement Device / Load Configuration | ✅ Working — both are controller-side clones; no device-side protocol involved |
 | Power / PoE reporting | Not applicable — the flagged UI field belongs to the upstream parent device, not the AP |
 | Speed test | Not applicable — gateway-only feature in current UniFi Network |
@@ -106,6 +107,14 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   **client Block/Unblock** and the **Multicast and Broadcast Blocker**. Its radio order is
   also the reverse of the Archer C5's — `radio0` is 2.4 GHz here
 - **TP-Link WR1043ND v2** (single-band 802.11n) — use `modelmap/tl-wr1043ndv2.lua`
+- **Xiaomi Mi Router AX3000T** (dual-band 802.11ax, 2x2, MT7981 / mediatek-filogic) — use
+  `modelmap/xiaomi-ax3000t.lua`. Profile adopted from upstream (jonasevcik/openUF), where
+  it is verified on the hardware: HE on both bands, 160 MHz on 5 GHz, DSA. Its four sockets
+  are the netdevs `wan`/`lan2`/`lan3`/`lan4` (no `lan1`), and its case LED needs
+  **`kmod-leds-gpio`** or the board has no drivable LED at all — `install.sh` adds the
+  module when it sees only radio LEDs registered. ⚠️ Not yet run on this fork's own
+  hardware; the map differs from the JioRouter ones in naming the uplink socket as
+  `lan_cpueth` rather than the bridge, which openUF now handles either way
 - **JioRouter AX6000 JIDU6101** (MT7986A / mediatek-filogic, dual-band 802.11ax) — use
   `modelmap/jiorouter-ax6000-jidu6101.lua`. ⚠️ **Not yet confirmed on the hardware**: the
   profile is derived from the board's OpenWrt DTS and `board.d` entry rather than from a
@@ -142,7 +151,7 @@ report the whole LAN, gateway included, as hosts plugged into it:
 | Port link speed / duplex | `swconfig dev switch0 show` | the netdev's own sysfs |
 | Which socket a host is on | the switch's ARL table | that socket's bridge-FDB slice |
 | Uplink socket | `dev.conf.vlan` + ARL lookup | `dev.conf.net.uplink_detect = "fdb"` |
-| Per-port VLAN assignment | supported | not available (detected and refused) |
+| Per-port VLAN assignment | supported (`switch_vlan` sections) | supported (the socket moves into the VLAN's bridge; Native VLAN only) |
 | `dev.conf.vlan` | required | must be **absent** |
 
 The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end — `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
@@ -210,7 +219,7 @@ point it at a different fork, branch, or a checkout already on the device.
 ```sh
 # 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk)
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny kmod-sched-act-police wpad-wolfssl
 
 # 2. Download and install (no git client or scp needed). This is the source
 #    tree; install.sh comment-strips it on the way in. A tagged release

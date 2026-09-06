@@ -53,6 +53,13 @@ local function new_apply_env()
 	local section_order = {}
 	local cursor = {}
 	function cursor:set(config, section, a, b)
+		-- libuci accepts only [A-Za-z0-9_] in a section name and discards
+		-- anything else without an error; a permissive mock hides that (see
+		-- test_ucihelper.lua's mock for the hyphen incident).
+		if not tostring(section):match("^[%w_]+$") then
+			error("mock uci: invalid section name '" .. tostring(section)
+				.. "' -- libuci would silently discard this", 2)
+		end
 		db[config] = db[config] or {}
 		if not db[config][section] then
 			db[config][section] = {[".name"] = section}
@@ -127,15 +134,18 @@ local function with_tick_env(fn)
 	local o_build, o_handle, o_post, o_mtime, o_uci, o_run, o_time =
 		inform.build_json, inform.handle_response, inform._http_post,
 		inform._state_mtime, inform._ucihelper, inform._run_cmd, inform._time
-	local o_warned = inform._warned_400
+	local o_warned, o_rrm = inform._warned_400, inform._rrmscan
 	inform.build_json = function() return '{"_type":"state"}' end
 	inform._state_mtime = function() return 1 end
 	inform._warned_400 = false
+	-- The 802.11k enrichment is on unless conf.lua says otherwise, and its
+	-- tick shells out (pgrep, ubus). Not in a unit test.
+	inform._rrmscan = nil
 	local ok, err = pcall(fn)
 	inform.build_json, inform.handle_response, inform._http_post,
 		inform._state_mtime, inform._ucihelper, inform._run_cmd, inform._time =
 		o_build, o_handle, o_post, o_mtime, o_uci, o_run, o_time
-	inform._warned_400 = o_warned
+	inform._warned_400, inform._rrmscan = o_warned, o_rrm
 	if not ok then error(err, 0) end
 end
 
@@ -739,15 +749,25 @@ return {
 			local orig_run   = inform._sysinfo._run_cmd
 			local orig_read  = inform._sysinfo._read_file
 			inform._ucihelper = ucihelper
-			inform._sysinfo.radio_stats = function()
-				return {{freq = 2437, noise = -90, channel_time = 100, channel_time_busy = 10}}
-			end
 			inform._sysinfo._run_cmd = function() return "" end
 			inform._sysinfo._read_file = function() return "" end
 			local ok, err = pcall(function()
-				local d = require("cjson").decode(inform.build_json(sample_state(), nil, nil))
-				assert_true(d.radio_table[1].min_rssi_enabled, "enabled flag survived the chain")
-				assert_eq(d.radio_table[1].min_rssi, -75, "15 raw + (-90 live noise) = -75 dBm")
+				-- Driven with three different noise floors, because the
+				-- conversion must NOT depend on one. The wire encoding is a
+				-- fixed raw = dbm + 95 (the controller never learns a radio's
+				-- noise floor, so it has nothing else to encode with), and
+				-- adding live noise instead made the same setting mean -75 on
+				-- an mt76 radio and -92 on an ath9k one.
+				for _, noise in ipairs({-90, -107, -95}) do
+					inform._sysinfo.radio_stats = function()
+						return {{freq = 2437, noise = noise, in_use = true,
+							channel_time = 100, channel_time_busy = 10}}
+					end
+					local d = require("cjson").decode(inform.build_json(sample_state(), nil, nil))
+					assert_true(d.radio_table[1].min_rssi_enabled, "enabled flag survived the chain")
+					assert_eq(d.radio_table[1].min_rssi, -80,
+						"15 raw -> -80 dBm whatever the noise floor reads (" .. noise .. ")")
+				end
 			end)
 			inform._ucihelper = orig_uci
 			inform._sysinfo.radio_stats = orig_stats
@@ -1773,9 +1793,14 @@ return {
 			local radio_table, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
 			ucihelper.apply_config({radio_table = radio_table, vap_table = vap_table}, nil)
 
-			-- wlan_add's sanitizer keeps "-", so the section is
-			-- openuf_radio0_openuf-test (bracket syntax, not a dotted key).
-			local s = db.wireless and db.wireless["openuf_radio0_openuf-test"]
+			-- The hyphen is sanitized to "_" (a UCI section name may only
+			-- contain [A-Za-z0-9_]; libuci discards anything else silently)
+			-- and, because the name had to change, a hash of the real SSID
+			-- is appended. Find the section by the SSID it carries.
+			local s
+			for _, sec in pairs(db.wireless or {}) do
+				if sec[".type"] == "wifi-iface" and sec.ssid == "openuf-test" then s = sec end
+			end
 			assert_true(s ~= nil, "vap section created from a real system_cfg blob")
 			assert_eq(s.proxy_arp, "1", "aaa.<n>.proxy_arp reached UCI proxy_arp")
 			assert_eq(s.isolate, "1", "wireless.<n>.l2_isolation reached UCI isolate")
@@ -2886,6 +2911,133 @@ return {
 		end
 	},
 	{
+		name = "inform: _rrm_tick is on unless conf.lua says false, so a kept conf.lua picks it up",
+		fn = function()
+			-- install.sh keeps a device's conf.lua across upgrades, so a device
+			-- installed before rrm_enrichment existed has no such key. Absent
+			-- must mean the documented default (on); only `false` turns it off.
+			local calls = {}
+			local o_rrm = inform._rrmscan
+			inform._rrmscan = {
+				collector_ensure = function() calls[#calls + 1] = "ensure" end,
+				harvest          = function() return {} end,
+				hostapd_objects  = function() return {} end,
+				capable_stations = function() return {} end,
+				request          = function() end,
+			}
+			local ok, err = pcall(function()
+				assert_false(inform._rrm_tick(nil), "no cfg at all -> off")
+				assert_false(inform._rrm_tick({}), "no config block -> off")
+				assert_false(inform._rrm_tick({config = {rrm_enrichment = false}}), "explicit false -> off")
+				assert_eq(#calls, 0, "and nothing ran")
+				assert_true(inform._rrm_tick({config = {}}), "absent key -> on (the kept-conf.lua case)")
+				assert_true(inform._rrm_tick({config = {rrm_enrichment = true}}), "explicit true -> on")
+				assert_eq(#calls, 2, "the collector was kept alive on each on-tick")
+			end)
+			inform._rrmscan = o_rrm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: _rrm_tick asks a 2.4 GHz station for operating class 81, a 5 GHz one for 115",
+		fn = function()
+			-- A 2.4 GHz-only client asked for the 5 GHz class 115 answers
+			-- "incapable" (report mode 0x02) and reports nothing -- AP2's one
+			-- capable station did exactly that on the first live request.
+			local reqs = {}
+			local o_rrm, o_sys, o_time = inform._rrmscan, inform._sysinfo, inform._time
+			inform._rrmscan = {
+				collector_ensure = function() end,
+				harvest          = function() return {} end,
+				hostapd_objects  = function() return {"hostapd.phy0-ap0", "hostapd.phy1-ap0"} end,
+				capable_stations = function(ifname)
+					if ifname == "phy0-ap0" then return {"d2:cf:3e:f3:52:f5"} end
+					return {"aa:bb:cc:dd:ee:55"}
+				end,
+				request          = function(ifname, sta, opts)
+					reqs[#reqs + 1] = ifname .. " " .. sta .. " " .. tostring(opts and opts.op_class)
+				end,
+			}
+			inform._sysinfo = {radio_caps = function(ifname)
+				if ifname == "phy0-ap0" then return {channel = 1} end
+				return {channel = 161}
+			end}
+			local t = 5000
+			inform._time = function() return t end
+			local ok, err = pcall(function()
+				inform._rrm_next_request = 0
+				inform._rrm_rr = 0
+				local cfg = {config = {rrm_request_interval = 100}}
+				inform._rrm_tick(cfg)
+				t = t + 100
+				inform._rrm_tick(cfg)
+				assert_eq(reqs[1], "phy0-ap0 d2:cf:3e:f3:52:f5 81", "2.4 GHz station: class 81")
+				assert_eq(reqs[2], "phy1-ap0 aa:bb:cc:dd:ee:55 115", "5 GHz station: class 115")
+				t = t + 50
+				inform._rrm_tick(cfg)
+				assert_eq(#reqs, 2, "no request inside the interval")
+			end)
+			inform._rrmscan, inform._sysinfo, inform._time = o_rrm, o_sys, o_time
+			inform._rrm_next_request, inform._rrm_rr = 0, 0
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: _rrm_tick benches a station that never answers, and forgives one that does",
+		fn = function()
+			-- AP2's one "capable" station advertises every measurement mode
+			-- (rrm byte 0xF9) and answers all of them with "incapable" -- and
+			-- hostapd does not notify a bodiless refusal, so from here it is a
+			-- station that never reports. Asking it forever costs it an ack
+			-- per interval and finds nothing.
+			local reqs, reporters = {}, {}
+			local o_rrm, o_sys, o_time = inform._rrmscan, inform._sysinfo, inform._time
+			inform._rrmscan = {
+				collector_ensure = function() end,
+				harvest          = function() local r = reporters; reporters = {}; return {}, r end,
+				hostapd_objects  = function() return {"hostapd.phy0-ap0"} end,
+				capable_stations = function() return {"d2:cf:3e:f3:52:f5", "aa:bb:cc:dd:ee:55"} end,
+				request          = function(_, sta) reqs[#reqs + 1] = sta end,
+			}
+			inform._sysinfo = {radio_caps = function() return {channel = 1} end}
+			local t = 10000
+			inform._time = function() return t end
+			local cfg = {config = {rrm_request_interval = 100}}
+			local out = with_stderr(function()
+				inform._rrm_next_request, inform._rrm_rr, inform._rrm_asked = 0, 0, {}
+				-- Round-robin: A, B, A, B -- after which each has two unanswered asks.
+				for _ = 1, 4 do inform._rrm_tick(cfg); t = t + 100 end
+				assert_eq(table.concat(reqs, ","),
+					"d2:cf:3e:f3:52:f5,aa:bb:cc:dd:ee:55,d2:cf:3e:f3:52:f5,aa:bb:cc:dd:ee:55",
+					"both asked twice, in turn")
+				-- Both benched: intervals pass, nobody is asked.
+				for _ = 1, 3 do inform._rrm_tick(cfg); t = t + 100 end
+				assert_eq(#reqs, 4, "benched stations are not asked again")
+				-- B answers (a mode-0 report body carried its address): B is
+				-- forgiven and asked again; A stays benched.
+				reporters = {["aa:bb:cc:dd:ee:55"] = true}
+				inform._rrm_tick(cfg); t = t + 100
+				assert_eq(reqs[#reqs], "aa:bb:cc:dd:ee:55", "the answering station is asked again")
+				inform._rrm_tick(cfg); t = t + 100
+				assert_eq(reqs[#reqs], "aa:bb:cc:dd:ee:55", "and only it -- the silent one stays benched")
+				-- The bench expires: A gets one more try.
+				t = t + inform.RRM_BENCH_SECONDS
+				inform._rrm_tick(cfg); t = t + 100
+				inform._rrm_tick(cfg); t = t + 100
+				local saw_a = false
+				for i = #reqs - 1, #reqs do if reqs[i] == "d2:cf:3e:f3:52:f5" then saw_a = true end end
+				assert_true(saw_a, "after the bench the silent station is tried again")
+			end)
+			inform._rrmscan, inform._sysinfo, inform._time = o_rrm, o_sys, o_time
+			inform._rrm_next_request, inform._rrm_rr, inform._rrm_asked = 0, 0, {}
+			assert_contains(out, "answered none of", "the benching is logged")
+			-- Three benchings in this scenario: A once, B once, and B again
+			-- after its forgiveness was followed by two more unanswered asks.
+			assert_eq(select(2, out:gsub("not asking again", "")), 3,
+				"one log line per benching, never per skipped interval")
+		end
+	},
+	{
 		name = "inform: _warn_debug_overrides is silent by default and loud when the overrides are set",
 		fn = function()
 			assert_false(inform._warn_debug_overrides(nil), "no cfg")
@@ -2964,6 +3116,130 @@ return {
 			assert_true(st.blocked_stas == nil, "state untouched")
 			assert_false(touched, "firewall untouched")
 			assert_contains(out, "malformed MAC", "and the refusal is logged")
+		end
+	},
+	{
+		name = "inform packet: a Locate persists the trigger it took over",
+		fn = function()
+			-- set-locate and unset-locate are two independent commands with
+			-- nothing bounding the gap between them, so a restart lands there
+			-- easily. Holding the snapshot only in memory means the process
+			-- that stops the blink is not the one that started it and has
+			-- nothing to put back -- on a board whose only LED belongs to a
+			-- radio, that costs the activity light until someone notices.
+			local st = sample_state()
+			local writes = {}
+			local orig_w, orig_r = inform._led._write_file, inform._led._read_file
+			inform._led._write_file = function(path, contents)
+				writes[#writes + 1] = {path = path, contents = contents}
+				return true
+			end
+			inform._led._read_file = function(path)
+				if path:find("/trigger", 1, true) then
+					return "none timer [phy0tpt] phy1tpt\n"
+				end
+				return nil
+			end
+			local cfg = {led = "/sys/class/leds/mt76-phy0"}
+			local ok, err = pcall(function()
+				inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st, cfg)
+				assert_true(st.locating, "locating set")
+				assert_eq(st.locate_prev_trigger, "phy0tpt",
+					"and the trigger it took over is in state, not just in memory")
+				-- The restart: a fresh module with no in-memory snapshot.
+				inform._led._saved_trigger = {}
+				inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st, cfg)
+				assert_eq(writes[#writes].contents, "phy0tpt",
+					"the persisted trigger is what gets restored")
+				assert_nil(st.locate_prev_trigger, "and is cleared once spent")
+			end)
+			inform._led._write_file, inform._led._read_file = orig_w, orig_r
+			inform._led._saved_trigger = {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: stopping a Locate returns the LED to its chosen idle state",
+		fn = function()
+			-- Restoring the trigger is not the whole idle state. A dedicated
+			-- status LED's normal look is "trigger none, brightness on" --
+			-- exactly what set_enabled leaves behind -- so restoring only the
+			-- trigger brings it back on none/0, i.e. dark.
+			local st = sample_state({led_enabled = true})
+			local writes = {}
+			local orig_w, orig_r = inform._led._write_file, inform._led._read_file
+			inform._led._write_file = function(path, contents)
+				writes[#writes + 1] = {path = path, contents = contents}
+				return true
+			end
+			inform._led._read_file = function(path)
+				if path:find("/trigger", 1, true) then return "[none] timer\n" end
+				return nil
+			end
+			local cfg = {led = "/sys/class/leds/green:status"}
+			local ok, err = pcall(function()
+				inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st, cfg)
+				inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st, cfg)
+				local last = writes[#writes]
+				assert_eq(last.path, "/sys/class/leds/green:status/brightness",
+					"the last write is the brightness, not the trigger")
+				assert_eq(last.contents, "1", "and it puts the LED back on")
+			end)
+			-- Never pushed: the board's own default must be left alone.
+			local st2 = sample_state()
+			local n_before
+			local ok2, err2 = pcall(function()
+				inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st2, cfg)
+				n_before = #writes
+				inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st2, cfg)
+				assert_eq(#writes, n_before + 1,
+					"one write -- the trigger restore -- and no brightness assertion")
+			end)
+			inform._led._write_file, inform._led._read_file = orig_w, orig_r
+			inform._led._saved_trigger = {}
+			if not ok then error(err, 0) end
+			if not ok2 then error(err2, 0) end
+		end
+	},
+	{
+		name = "inform packet: a push with no switch block tears per-port VLAN down only when a ledger says it was applied",
+		fn = function()
+			-- Turning Port VLAN off does not always announce itself: a device
+			-- that had it on and then has it unticked gets a full system_cfg
+			-- with no switch.* keys at all. Absence counts as off -- but only
+			-- while openUF holds a reversibility ledger, which is the proof it
+			-- ever applied anything.
+			local calls = {}
+			local orig_sw = inform._switchvlan
+			inform._switchvlan = {
+				apply       = function() calls[#calls + 1] = "apply"; return false end,
+				restore     = function(st, cfg)
+					calls[#calls + 1] = "restore"; st.dsa_brlan_ports = nil; return true
+				end,
+				dsa_members = function() return {} end,
+			}
+			local cfg = {net = {lan_cpueth = "br-lan"}}
+			local push = '{"_type":"setparam","system_cfg":"radio.status=enabled\\n"}'
+			local function restores()
+				local n = 0
+				for _, c in ipairs(calls) do if c == "restore" then n = n + 1 end end
+				return n
+			end
+			local ok, err = pcall(function()
+				-- (apply(nil, ...) is still called and is a no-op by contract;
+				-- what must not happen without a ledger is a teardown.)
+				inform.handle_response(push, sample_state(), cfg)
+				assert_eq(restores(), 0, "no ledger -> nothing to undo, no restore")
+				local st = sample_state({dsa_brlan_ports = {"lan1", "lan2", "wan"}})
+				inform.handle_response(push, st, cfg)
+				assert_eq(calls[#calls], "restore", "a ledger makes the absence an off signal")
+				assert_nil(st.dsa_brlan_ports, "and restore spent it, so it cannot flap")
+				local st2 = sample_state({swvlan_backup = {["1"] = "0t 1 2 3 4"}})
+				inform.handle_response(push, st2, cfg)
+				assert_eq(calls[#calls], "restore", "the swconfig ledger counts the same way")
+			end)
+			inform._switchvlan = orig_sw
+			if not ok then error(err, 0) end
 		end
 	},
 	{

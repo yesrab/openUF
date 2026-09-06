@@ -209,14 +209,41 @@ case "$ACTION" in
 		# OPTIONAL: each one silently disables exactly one feature when absent
 		# -- provisioning still reports success while the feature does nothing
 		# -- so they are installed when affordable rather than merely mentioned.
+		# Only where the board declares gpio LEDs its running kernel cannot
+		# drive: a Xiaomi AX3000T's case LED is a gpio pair the stock filogic
+		# image has no driver for, so /sys/class/leds holds only the mt76 radio
+		# LEDs -- which on that board are wired to nothing. Locate then
+		# "succeeds" against an LED that does not physically exist. 9 KB, and
+		# pointless on a board whose LEDs already registered (the JIDU6101's
+		# three status LEDs do), hence the check rather than an unconditional
+		# install. (Upstream's finding.)
+		if [ -d /sys/bus/platform/devices/leds ] \
+			&& ! ls /sys/class/leds 2>/dev/null | grep -qv '^mt76-'; then
+			try_optional kmod-leds-gpio "status LED (Locate, Manage > LED)"
+		fi
 		try_optional lldpd         "LLDP topology / neighbour discovery"
 		try_optional hostapd-utils "Minimum RSSI, client kick, block-deauth"
 		try_optional usteer        "Band Steering"
 		try_optional ip-bridge     "wired clients behind the AP (bridge fdb)"
 		try_optional nftables      "client Block/Unblock + Multicast/Broadcast Blocker"
+		# ...and the Blocker half additionally needs the bridge family's `meta`
+		# expression, which lives in nft_meta_bridge and is NOT pulled in by
+		# nftables. Missing on a stock filogic AND ath79 image alike. Without
+		# it the table, chain and allow-list set all build fine and only the
+		# drop rule is rejected, so the control reports success everywhere and
+		# blocks nothing. firewall.lua's block-sta uses `ether saddr` only,
+		# needs no module, and is unaffected -- which is what hid this.
+		try_optional kmod-nft-bridge "Multicast/Broadcast Blocker (bridge meta)"
 		# shaper.lua shells out to `tc` for the WiFi Speed Limit, and nothing
 		# installed it -- busybox has no tc. tc-tiny is enough (htb + fq_codel).
 		try_optional tc-tiny       "WiFi Speed Limit (tc)"
+		# ...and the DOWNLINK half needs sch_htb while the UPLINK half needs the
+		# act_police action, which is a separate module and is not in every
+		# image. A filogic board has sch_htb, sch_ingress, act_gact, act_mirred
+		# and act_skbedit but NO act_police: `tc filter ... police` fails with
+		# "Failed to load TC action module", so the download cap applies and the
+		# upload cap silently does not. Half a feature reporting success.
+		try_optional kmod-sched-act-police "WiFi Speed Limit, upload half (tc police)"
 		# inform.lua detects an out-of-process state.json write (syswrapper's
 		# SSH set-adopt, a manual reset-inform) with `stat -c %Y`. Some builds
 		# ship no stat applet at all -- confirmed on a real WDR3500 -- and

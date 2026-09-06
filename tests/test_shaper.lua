@@ -144,4 +144,42 @@ return {
 			end)
 		end
 	},
+	{
+		name = "shaper: a rejected police filter is reported and names the module",
+		fn = function()
+			-- act_police is its own kernel module (kmod-sched-act-police) and a
+			-- stock filogic image ships without it, so the ingress qdisc adds
+			-- and the filter fails: the download cap applies, the upload cap
+			-- silently does not. On Lua 5.1 os.execute returns the raw exit
+			-- status (1, truthy), which is why a bare truth test never noticed.
+			local orig = shaper._exec
+			local cmds = {}
+			shaper._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				if cmd:find("police", 1, true) then return 1 end
+				return 0
+			end
+			local real, buf = io.stderr, {}
+			io.stderr = {write = function(_, s) buf[#buf + 1] = tostring(s) end}
+			local ok, err = pcall(function()
+				local rc = shaper.reconcile({{ifname = "wlan0", down_kbps = 33000, up_kbps = 17000}})
+				assert_true(rc == false, "reconcile reports the failure")
+			end)
+			io.stderr = real
+			shaper._exec = orig
+			if not ok then error(err, 0) end
+			local out = table.concat(buf)
+			assert_true(out:find("kmod%-sched%-act%-police") ~= nil, "names the package that fixes it")
+			assert_true(out:find("wlan0", 1, true) ~= nil, "names the interface")
+			-- and a healthy run (exit status 0 everywhere) says nothing
+			shaper._exec = function() return 0 end
+			io.stderr = {write = function(_, s) buf[#buf + 1] = tostring(s) end}
+			buf = {}
+			local rc2 = shaper.reconcile({{ifname = "wlan0", down_kbps = 33000, up_kbps = 17000}})
+			io.stderr = real
+			shaper._exec = orig
+			assert_true(rc2 == true, "exit status 0 is success")
+			assert_true(#buf == 0, "no warning on a healthy reconcile")
+		end
+	},
 }

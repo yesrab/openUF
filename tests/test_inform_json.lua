@@ -216,6 +216,9 @@ local function build_dsa(opts)
 	inform._sysinfo._read_file = function(path)
 		if path:find("net/dev") then return fixture("proc_net_dev_dsa.txt") end
 		if path:find("net/arp") then return fixture("proc_net_arp_switch.txt") end
+		-- lan_cpueth names the bridge itself on this board; sysinfo.lan_bridge
+		-- recognises a bridge by its sysfs bridge_id.
+		if path:find("/net/br%-lan/bridge/bridge_id") then return "8000.deadbeef0001\n" end
 		return base_read(path)
 	end
 	inform._sysinfo._run_cmd = function(cmd)
@@ -267,6 +270,75 @@ local function build_dsa(opts)
 	inform._read_file = orig_read
 	if not ok then error(res, 0) end
 	return res
+end
+
+-- Upstream's DSA shape (a Xiaomi AX3000T): lan_cpueth names the uplink
+-- SOCKET rather than the bridge, four sockets wan/lan2/lan3/lan4 in br-lan,
+-- and the same FDB detection. opts.fdb overrides the captured
+-- `bridge fdb show br br-lan`; opts.live names the cabled socket.
+local AX_CFG = {
+	net = {
+		lan_cpueth = "wan", lan_vlanid = 1, uplink_detect = "fdb",
+		ports = {
+			{idx = 1, ifname = "wan"},
+			{idx = 2, ifname = "lan2"},
+			{idx = 3, ifname = "lan3"},
+			{idx = 4, ifname = "lan4"},
+		},
+	},
+}
+
+local function build_ax3000t(opts)
+	opts = opts or {}
+	inject_sysinfo(false, false, false, false)
+	local base_read = inform._sysinfo._read_file
+	local base_cmd  = inform._sysinfo._run_cmd
+	inform._sysinfo._read_file = function(path)
+		if path:find("net/arp") then return fixture("proc_net_arp_dsa.txt") end
+		if path:find("/bridge/bridge_id") then return nil end   -- a socket is not a bridge
+		return base_read(path)
+	end
+	inform._sysinfo._run_cmd = function(cmd)
+		if cmd:find("swconfig") then return "" end   -- no such binary on DSA
+		if cmd:find("ip route") then
+			return "default via 192.168.200.1 dev br-lan \n"
+		end
+		if cmd:find("readlink") then
+			return "../../../../../../../../virtual/net/br-lan\n"
+		end
+		if cmd:find("bridge fdb show br", 1, true) then
+			return opts.fdb or fixture("bridge_fdb_br_dsa.txt")
+		end
+		if cmd:find("bridge fdb show dev lan3", 1, true) then
+			return "aa:bb:cc:dd:ee:01 master br-lan\n"
+		end
+		if cmd:find("bridge fdb show dev", 1, true) then return "" end
+		return base_cmd(cmd)
+	end
+	local orig_rf = inform._read_file
+	inform._read_file = function(path)
+		local iface = path:match("/sys/class/net/([^/]+)/")
+		if iface == (opts.live or "wan") then
+			if path:find("speed")   then return "1000\n" end
+			if path:find("duplex")  then return "full\n" end
+			if path:find("carrier") then return "1\n"    end
+		elseif iface then
+			if path:find("speed")   then return "-1\n"   end
+			if path:find("carrier") then return "0\n"    end
+		end
+		return nil
+	end
+	local st = {
+		authkey = state.DEFAULT_KEY, adopted = true, cfgversion = "",
+		inform_url = "http://192.168.200.1:8080/inform",
+		mac = "d4:53:2a:38:80:cf", ip = "192.168.200.4", hostname = "testap",
+	}
+	local ok, out = pcall(function()
+		return cjson.decode(inform.build_json(st, opts.cfg or AX_CFG, ufhw))
+	end)
+	inform._read_file = orig_rf
+	if not ok then error(out, 0) end
+	return out
 end
 
 -- Index a payload's port_table by port_idx.
@@ -815,7 +887,7 @@ return {
 		-- (an offset from the driver's noise floor, not dBm) -- build_json
 		-- converts it using the live noise reading from radio_stats()'s
 		-- survey dump (fixture noise: -95 dBm; raw 25 -> -95+25 = -70 dBm).
-		name = "inform json: radio_table converts min_rssi from raw wire units to dBm using live noise floor",
+		name = "inform json: radio_table converts min_rssi from raw wire units to dBm with the fixed wire offset",
 		fn = function()
 			inject_sysinfo(true)
 			inject_ucihelper()
@@ -833,7 +905,7 @@ return {
 			}
 			local d = cjson.decode(inform.build_json(st, nil, ufhw))
 			assert_eq(d.radio_table[1].min_rssi_enabled, true, "min_rssi_enabled echoed")
-			assert_eq(d.radio_table[1].min_rssi, -70, "min_rssi converted: 25 + (-95 noise) = -70 dBm")
+			assert_eq(d.radio_table[1].min_rssi, -70, "min_rssi converted: 25 raw - 95 = -70 dBm")
 			assert_nil(d.radio_table[1].min_rssi_raw, "raw wire units not leaked into the outbound payload")
 		end
 	},
@@ -1806,6 +1878,117 @@ return {
 			for _, host in ipairs(d.port_table[2].mac_table) do wired_macs[host.mac] = true end
 			assert_true(not wired_macs["aa:bb:cc:dd:ee:01"], "device's own MAC excluded from its own mac_table")
 			assert_true(wired_macs["aa:bb:cc:dd:ee:02"], "the other bridge-learned host is still reported")
+		end
+	},
+	{
+		name = "inform json: 802.11k beacon reports enrich scan_radio_table",
+		fn = function()
+			-- The whole point of rrmscan.lua: the passive `iw scan dump` cache
+			-- only ever holds neighbours on the channel the radio is already
+			-- serving, so BSSes a CLIENT saw off-channel have to reach the
+			-- payload through here or they reach it not at all.
+			local prev = inform._rrm_neighbours
+			inform._rrm_neighbours = {
+				{bssid = "aa:bb:cc:dd:ee:01", channel = 6, band = "ng",
+				 signal = -70, seen_at = os.time()},          -- already scanned: not duplicated
+				{bssid = "84:78:48:a4:fb:21", channel = 1, band = "ng",
+				 signal = -73, seen_at = os.time()},          -- only the client could see it
+				{bssid = "54:af:97:55:14:78", channel = 48, band = "na",
+				 signal = -80, seen_at = os.time()},          -- other band: not this radio's
+			}
+			local ok, d = pcall(build, {with_uci = true, with_scan = true})
+			inform._rrm_neighbours = prev
+			assert_true(ok, "build_json survives the merge")
+			local srt = d.scan_radio_table[1]
+			assert_eq(srt.radio, "ng", "the 2.4 GHz radio")
+			local seen = {}
+			for _, e in ipairs(srt.scan_table) do
+				assert_nil(seen[e.bssid], "no BSSID appears twice: " .. tostring(e.bssid))
+				seen[e.bssid] = e
+			end
+			assert_eq(#srt.scan_table, 3, "two scanned + one client-only neighbour")
+			assert_eq(seen["aa:bb:cc:dd:ee:01"].essid, "NeighborNet",
+				"the scanned record wins over the beacon report")
+			assert_eq(seen["aa:bb:cc:dd:ee:01"].signal, -55, "and keeps its own signal")
+			local added = seen["84:78:48:a4:fb:21"]
+			assert_not_nil(added, "the client-only neighbour reached the payload")
+			assert_eq(added.channel, 1, "on the channel the client reported")
+			assert_eq(added.signal, -73, "with the RCPI-derived signal")
+			assert_eq(added.band, "ng", "band set or the row silently vanishes")
+			assert_nil(seen["54:af:97:55:14:78"], "a 5 GHz sighting is not filed under 2.4 GHz")
+		end
+	},
+	{
+		name = "inform json: stale beacon reports never reach the payload",
+		fn = function()
+			local prev = inform._rrm_neighbours
+			inform._rrm_neighbours = {
+				{bssid = "84:78:48:a4:fb:21", channel = 1, band = "ng",
+				 signal = -73, seen_at = os.time() - 120},
+			}
+			local ok, d = pcall(build, {with_uci = true, with_scan = true})
+			inform._rrm_neighbours = prev
+			assert_true(ok, "build_json survives")
+			assert_eq(#d.scan_radio_table[1].scan_table, 2,
+				"only the two scanned neighbours; the stale sighting is dropped")
+		end
+	},
+	{
+		name = "inform json: a DSA board whose map names a socket reports each socket from its own netdev",
+		fn = function()
+			-- Upstream's AX3000T shape: lan_cpueth is the wan SOCKET, and the
+			-- bridge is found through its master. No swconfig, no ARL.
+			local d = build_ax3000t()
+			assert_eq(#d.port_table, 4, "one entry per socket")
+			local p = by_idx(d.port_table)
+			assert_true(p[1].up, "the cabled socket is up")
+			assert_eq(p[1].speed, 1000, "at the speed it negotiated")
+			assert_true(p[1].full_duplex, "and its duplex")
+			assert_false(p[2].up, "an empty socket has no link")
+			assert_eq(p[2].speed, 0, "and no speed, rather than the 1000 fallback")
+			assert_true(p[1].is_uplink, "wan carries the gateway as cabled today")
+			assert_true(p[1].mac_table == nil, "so it reports no hosts of its own")
+			assert_false(p[2].is_uplink, "and no other socket claims to")
+			assert_eq(#p[3].mac_table, 1, "the host plugged into lan3")
+			assert_eq(p[3].mac_table[1].mac, "aa:bb:cc:dd:ee:01", "its mac")
+			assert_eq(#p[2].mac_table, 0, "and nothing on the empty socket")
+		end
+	},
+	{
+		name = "inform json: is_uplink follows the cable on a socket-named DSA map too",
+		fn = function()
+			local moved = build_ax3000t({
+				live = "lan3",
+				fdb  = "5a:d6:1f:40:e2:f6 dev lan3 master br-lan \n"
+					.. "aa:bb:cc:dd:ee:01 dev lan3 master br-lan \n",
+			})
+			local q = by_idx(moved.port_table)
+			assert_true(q[3].is_uplink, "the flag followed the cable to lan3")
+			assert_false(q[1].is_uplink, "and left wan")
+			assert_true(q[3].mac_table == nil, "lan3 now suppresses its hosts")
+			assert_eq(#q[1].mac_table, 0, "and wan reports its own again")
+		end
+	},
+	{
+		name = "inform json: a detected uplink on a port no map lists keeps a declared flag, not nobody",
+		fn = function()
+			-- Detection that names a socket this board does not report (a
+			-- guest bridge port, a stale FDB) must not leave every entry
+			-- unflagged when the modelmap still carries a static flag.
+			local cfg = {net = {lan_cpueth = "wan", lan_vlanid = 1, uplink_detect = "fdb", ports = {
+				{idx = 1, ifname = "wan", uplink = true},
+				{idx = 2, ifname = "lan2"},
+			}}}
+			local d = build_ax3000t({cfg = cfg, fdb = "5a:d6:1f:40:e2:f6 dev tap0 master br-lan \n"})
+			local p = by_idx(d.port_table)
+			assert_true(p[1].is_uplink, "fell back to the modelmap's own flag")
+			assert_false(p[2].is_uplink, "and only that one")
+			-- Gateway not learned at all: same flag, and -- our discipline --
+			-- no wired clients attributed to anyone.
+			local d2 = build_ax3000t({cfg = cfg, fdb = ""})
+			local q = by_idx(d2.port_table)
+			assert_true(q[1].is_uplink, "empty FDB keeps the declared flag")
+			assert_true(q[2].mac_table == nil, "and reports no wired clients while the uplink is unknown")
 		end
 	},
 	{

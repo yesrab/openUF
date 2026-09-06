@@ -821,8 +821,20 @@ REQUIRED="lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw"
 # OPTIONAL. Each absence silently disables exactly one feature -- provisioning
 # still reports success while the feature does nothing -- so they go in when
 # they fit rather than being merely mentioned.
-OPTIONAL="lldpd hostapd-utils usteer ip-bridge nftables tc-tiny"
+# kmod-nft-bridge: the Multicast/Broadcast Blocker's one bridge-family `meta`
+# rule needs nft_meta_bridge, which nftables does not pull in -- without it
+# the table builds and filters nothing. kmod-sched-act-police: the upload
+# half of WiFi Speed Limit; a stock filogic image ships sch_htb but no
+# act_police, so only the download cap applied. Both found by upstream.
+OPTIONAL="lldpd hostapd-utils usteer ip-bridge nftables kmod-nft-bridge tc-tiny kmod-sched-act-police"
 command -v stat >/dev/null 2>&1 || OPTIONAL="$OPTIONAL coreutils-stat"
+# A board whose device tree declares gpio LEDs the running kernel cannot drive
+# registers only its radio LEDs (which may be wired to nothing); the gpio
+# driver is 9 KB and pointless where the LEDs already registered.
+if [ -d /sys/bus/platform/devices/leds ] \
+	&& ! ls /sys/class/leds 2>/dev/null | grep -qv '^mt76-'; then
+	OPTIONAL="$OPTIONAL kmod-leds-gpio"
+fi
 case "$INFORM_URL" in https*) OPTIONAL="$OPTIONAL luasec" ;; esac
 
 MISSING=""

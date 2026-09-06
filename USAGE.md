@@ -23,6 +23,9 @@ apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftable
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
 | `nftables` | Client block/unblock (`openuf/firewall.lua`) **and** the Multicast/Broadcast Blocker (`openuf/bcfilter.lua`). ~490 KB with its kernel modules — the first thing that won't fit on a small-flash board, which leaves both features unavailable (openUF logs that rather than pretending) |
+| `kmod-nft-bridge` | The Multicast/Broadcast Blocker only. `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally, and the control reports success while filtering nothing. openUF now logs the rejection and names this package. Client block/unblock matches on `ether saddr` alone and does not need it |
+| `kmod-sched-act-police` | The **upload** half of WiFi Speed Limit. `tc-tiny` brings `sch_htb` (download) but the ingress `police` action is a separate module a stock filogic image lacks, so only the download cap applied. openUF logs the rejection and names this package |
+| `kmod-leds-gpio` | Only on a board whose device tree declares GPIO LEDs the image has no driver for (an AX3000T registers nothing but its radio LEDs, which are wired to nothing). `install.sh` adds it when it sees that situation |
 | `hostapd-utils` | `hostapd_cli` — immediate deauth of a just-blocked wireless client, client kick (Roaming Assistance) and Minimum RSSI enforcement |
 | `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced |
 | `coreutils-stat` | `stat` — only if your build has no `stat` applet (some do not). `inform.lua` uses `stat -c %Y` to notice an out-of-process `state.json` write, i.e. an SSH `set-adopt` or a manual `reset-inform`; without it those are ignored until restart. Enabling busybox's own `stat` applet is smaller |
@@ -234,6 +237,9 @@ dev = dofile("modelmap/jiorouter-ax6000-jidu6101.lua")
 -- For JioRouter AX6000 JIDU6J01 / 6201 / 6401 / 6601 / 6701 (one map, all five):
 dev = dofile("modelmap/jiorouter-ax6000-jidu6j01.lua")
 
+-- For Xiaomi Mi Router AX3000T (MT7981 / filogic — DSA; adopted from upstream):
+dev = dofile("modelmap/xiaomi-ax3000t.lua")
+
 -- For any other dual-band OpenWrt AP:
 dev = dofile("modelmap/generic-dualband-ap.lua")
 
@@ -290,20 +296,34 @@ With the flag set, the same radio came up first try — `ACS-COMPLETED channel=1
 under `IN`, `iw phy` marks 52–64 and 100–144 "(radar detection)", so capping at 128 would
 leave every failing channel in range while excluding 149–165, which are the ones that work.
 
-**Why `htmode_floor` exists.** A UCG Ultra pushes `radio.2.ieee_mode=11naht40` to this
-emulated U6IW — 802.11n at 40 MHz — at a 4x4 WiFi-6 radio, and a client duly associated at
-MCS 15 / 144 Mbit/s. That is a controller-side default for the model it thinks it is
-talking to rather than an intent, so a board may declare a floor to raise it back. This is
-the **one exception** to openUF's otherwise absolute "clamp downward only" rule, which is
-why it is opt-in per board and logged when it fires:
+**The PHY generation comes from the hardware, not from the wire.** What a real controller
+sends is `radio.<n>.ieee_mode=11nght20` / `11naht40` — its vocabulary is Atheros-era (the
+same push names the VAPs `ath0`/`ath1`/`ath2`), and that `ht` is *not* a request for 802.11n.
+It is all this key has ever said: the **band** and the **width**. A real U6-InWall receiving
+`11naht40` runs it as HE40. So openUF takes the width from the wire and the PHY from `iw phy`
+(`ucihelper.best_phy`), then clamps as above — a 2.4 GHz-capable ax radio given `11nght20`
+gets `HE20`, an n-only one gets `HT20`. Reading the token literally had pinned every 802.11ax
+radio to 802.11n permanently, which is invisible in the controller (it shows the width, which
+was right) and visible only in `iw dev`. An explicit `vht`/`he`/`eht` token, if one ever
+arrives, is honoured as written, and a WLAN with **Force WiFi 4 Mode** keeps the radio on
+HT, because that mode asked for an 802.11n beacon. (Found by upstream on an AX3000T; the
+JioRouter maps had been compensating with an `htmode_floor`.)
+
+**Why `htmode_floor` still exists.** The PHY is automatic now, but the WIDTH is what the
+wire says, and a UCG Ultra pushes `11naht40` — 40 MHz — to this emulated U6IW at a 4x4
+WiFi-6 radio, which threw away most of it (a client associated at MCS 15 / 144 Mbit/s).
+That is a controller-side default for the model it thinks it is talking to rather than an
+intent, so a board may declare a floor to raise the width back. This is the **one
+exception** to openUF's otherwise absolute "clamp downward only" rule, which is why it is
+opt-in per board and logged when it fires:
 
 ```
-openuf: radio1: controller asked for htmode VHT80, board floor is HE80 -- raised to HE80
+openuf: radio1: controller asked for htmode HE40, board floor is HE80 -- raised to HE80
 ```
 
-`HE20` as the 2.4 GHz floor means "at least 802.11ax, at least 20 MHz": a pushed
-`11nght40` keeps its 40 MHz and gains the HE generation. (2.4 GHz may still transmit at 20
-MHz on air — hostapd applies 802.11 40 MHz coexistence when it sees neighbouring BSSes.
+`HE20` as the 2.4 GHz floor is now documentation rather than a correction: a pushed
+`11nght40` keeps its 40 MHz and comes up HE40 with or without it. (2.4 GHz may still transmit
+at 20 MHz on air — hostapd applies 802.11 40 MHz coexistence when it sees neighbouring BSSes.
 That is standard behaviour, not a misconfiguration.)
 
 **Why `htmode_max` exists.** A JIDU6101's `iw phy` reports `Supported Channel Width: 160
@@ -444,6 +464,8 @@ config = {
     debug_caps = nil,            -- RESEARCH ONLY: override the claimed capability bits
     debug_payload_extra = nil,   -- RESEARCH ONLY: extra top-level payload fields
     neighbour_scan_interval = 0, -- seconds between background neighbour scans, 0 = never
+    rrm_enrichment = true,       -- ask 802.11k clients to report neighbours (see below)
+    rrm_request_interval = 600,  -- seconds between those requests, one client at a time
     country_override = nil,      -- see below
     bootstrap_adopt_user = nil,  -- see below
 }
@@ -531,6 +553,26 @@ anything with `age >= 30` on top — and nothing else in openUF scans, so after 
 boot-time ACS sweep the list drains to empty. A scan takes the radio off-channel for a
 moment (clients see a brief stall), which is why it is off unless you turn it on; `300`
 is a sane value. The first scan happens one interval after start, never at boot.
+
+`rrm_enrichment` / `rrm_request_interval` — client-assisted neighbour discovery, adopted
+from upstream. Every `rrm_request_interval` seconds (default 600) openUF asks **one**
+802.11k-capable client for an active beacon measurement: the *client* leaves the channel,
+sweeps, and reports what it saw, while the AP keeps serving. This is the mechanism
+Ubiquiti's Channel AI describes as *"neighbor reports and automated RRM scans"*, and the
+no-cost complement to `neighbour_scan_interval` above. One answer returned 15 BSSes across
+both bands upstream, and a client on 5 GHz routinely reports 2.4 GHz too. Only clients
+advertising active or passive beacon measurement are asked (beacon-table-only clients
+acknowledge and never answer); a minority of clients qualify, so this supplements the
+passive cache rather than replacing it. Two refinements over upstream's version, both from
+the first live run on AP2: the operating class follows the band the client is on (81 for a
+2.4 GHz client, 115 for 5 GHz — a 2.4-only client answers a 5 GHz class with "incapable"),
+and a client that advertises the capability but never produces a report is benched after
+two unanswered requests for six hours, with one log line saying so, instead of being asked
+forever. Rows sourced this way show a blank WiFi Name and
+Security, because a beacon report carries neither — openUF will not invent a security mode
+it did not measure. See § 6 for how to watch it work. `false` never sends a request; an
+*absent* key means on, so a `conf.lua` kept across an upgrade (see § 2) picks the feature up
+without an edit. The other new options default to off when absent.
 
 `bootstrap_adopt_user` — set by `install.sh install --bootstrap-adopt`, not by
 hand. Names the temporary SSH bootstrap account (see § SSH prerequisite below)
@@ -748,6 +790,31 @@ written through unchanged rather than clamped to a guess. The same probe supplie
 each radio's real `max_txpower` (the ceiling the controller's TX Power slider
 uses) instead of a static default.
 
+> **SSID punctuation is sanitized into the UCI section name.** A UCI section name may
+> contain only `[A-Za-z0-9_]`, so an SSID of `Guest-WiFi` becomes a section named
+> `openuf_radio0_Guest_WiFi_<hash>` — the SSID *itself* is stored and broadcast unchanged,
+> and the short hash of the original name keeps `Guest-WiFi`, `Guest WiFi` and `Guest_WiFi`
+> as three distinct sections. This matters because libuci enforces the rule **silently**:
+> `set()` returns true, `commit()` returns true, and a section whose name contains anything
+> else is discarded before it reaches `/etc/config`. openUF's sanitizer used to keep `-`,
+> so an SSID with a hyphen cost the entire WLAN with nothing logged anywhere (found by
+> upstream, live, with an SSID of `openuf-verify`).
+
+**Fast Roaming (802.11r) and the `ft_psk_generate_local` trap.** openUF sets
+`ieee80211r`, a `mobility_domain` derived from the SSID (so every AP computes the same one
+with no coordination) and `ft_over_ds=0` — and deliberately does **not** set
+`ft_psk_generate_local`. It used to force it to `1`, which silently disabled fast roaming
+for every WPA3 client: local key generation only exists for **FT-PSK**, while FT-SAE derives
+its keys from the per-session SAE PMK and needs the `r0kh`/`r1kh` key holders OpenWrt only
+configures when that option is `0`. Left unset, `hostapd.sh` keys it on the auth type and
+derives deterministic wildcard key holders from `md5(mobility_domain/psk)`, so independent
+APs sharing an SSID and passphrase agree without coordination. Upstream observed the failure
+live: a station that had negotiated FT-SAE still reassociated with `auth_alg=sae` plus a full
+4-way handshake, even between two BSSes on the same radio. To tell a real fast transition
+apart, force one with `hostapd_cli bss_tm_req` and read the target AP's log: `auth_alg=ft`
+**and no `EAPOL-4WAY-HS-COMPLETED`** is fast; `auth_alg=sae` followed by a 4-way is the
+fallback.
+
 **VLAN-tagged SSIDs** (assigning a WiFi network to a non-native network) need three
 things on the AP, and openUF builds all three:
 
@@ -800,12 +867,44 @@ down again — only `openuf_`-prefixed sections are ever removed.
 device-level box is ticked the per-port VLAN controls stay greyed out and nothing reaches
 the wire.
 
-openUF applies it only on **swconfig** boards (ath79-era). It writes one
-`config switch_vlan` section per VLAN, named `openuf_swvlan<id>`, translating the
-controller's `untagged`/`tagged`/`exclude` per-port modes into swconfig's port syntax
-(`1`, `1t`, omitted) with the CPU port always tagged in. On a DSA board (OpenWrt 21.02+,
-where this would be `config bridge-vlan`) it logs and does nothing rather than emitting
-config nobody has verified.
+On **swconfig** boards (ath79-era) openUF writes one `config switch_vlan` section per
+VLAN, named `openuf_swvlan<id>`, translating the controller's `untagged`/`tagged`/`exclude`
+per-port modes into swconfig's port syntax (`1`, `1t`, omitted) with the CPU port always
+tagged in.
+
+**On a DSA board it works differently, and deliberately not via `config bridge-vlan`**
+(adopted from upstream, who verified it on an AX3000T's mt7530; the JioRouter boards'
+mt7531 is the same driver family). The socket assigned to VLAN 10 is moved out of `br-lan`
+and into `br-openuf10` — the bridge that already holds the tagged uplink sub-device
+(`br-lan.10` on the JioRouter maps, `wan.10` on the AX3000T's), and the IoT VAP if a tagged
+SSID sits on the same VLAN:
+
+```
+device on lan3 --untagged--> lan3 -> br-openuf10 -> <uplink>.10 --tagged--> uplink -> gateway
+```
+
+That a wired port and a wireless client on VLAN 10 land in the *same* bridge is the point,
+not a coincidence: they are one broadcast domain and the controller models them as one
+network. `br-lan` keeps the uplink socket, the unassigned sockets and the AP's management
+address, untouched, and nothing anywhere runs with `vlan_filtering`, so a wrong answer
+cannot strand the AP. The `bridge-vlan` route was rejected because turning `vlan_filtering`
+on `br-lan` means every VLAN, the management one included, must be declared exactly right
+or the device is stranded — and because an 8021q device on a bridge *port* claims tagged
+frames before the bridge ever sees them, so a `bridge-vlan` declaring the same VID would
+receive nothing while looking correct in UCI.
+
+Scope on DSA: **Native VLAN only.** A bridge gives a port exactly one untagged home, which
+is what a Native VLAN is. A port given nothing but *tagged* VLANs is refused with a log line
+rather than half-applied (the controller's default "Tagged VLAN Management: Allow All" marks
+every non-native VLAN tagged — a default, not a request, and not warned about). The socket
+the uplink cable is in is never moved, and when the bridge FDB cannot say which socket that
+is, every port is refused. Reversibility is `st.dsa_brlan_ports`: `br-lan`'s port list as
+the board shipped it, snapshotted once before the first move; unticking **Port VLAN** puts it
+back verbatim. Note the off signal can be an *absence*: a device that had Port VLAN on and
+then has it unticked receives a `system_cfg` with no `switch.*` keys at all rather than the
+gates set to `disabled`. openUF treats that as off only while it holds a ledger, so there is
+something to undo. Moving a socket between bridges is invisible to the attached host, which
+keeps its old lease on the wrong subnet — bounce the port or power-cycle the device.
 
 Three things must line up or the port is skipped rather than guessed at:
 
@@ -836,12 +935,37 @@ that restore automatically (the wire keeps the `switch.*` block with both gates 
 > that these sections actually program the switch ASIC, and that
 > `/etc/init.d/network reload` behaves on real ath79, are unconfirmed.
 
+The **Environment** tab (Insights → AirView) is fed from `iw dev <ifname> scan dump`, the
+kernel's passive BSS cache. That cache is filled from beacons the radio overhears **on the
+channel it is already serving**, and the kernel forgets an entry about 30 s after it was
+last seen — so on its own the tab lists co-channel neighbours and, after the boot-time ACS
+sweep, nothing else. Measured on AP2 (a JIDU6101): 0 neighbours on 5 GHz, 4 co-channel on
+2.4 GHz. Two options close that gap, and they compose: `neighbour_scan_interval` makes the
+AP itself sweep (a brief client stall per scan, off by default), and `rrm_enrichment` asks
+802.11k-capable *clients* to sweep and report (costs the AP nothing, on by default; see § 3).
+To see the latter work: `pgrep -f 'ubus subscribe hostapd'` is the collector that receives
+the reports (hostapd delivers them as ubus *notifications*, so `ubus listen` shows nothing —
+only `ubus subscribe` works), `logread | grep BEACON-REQ-TX-STATUS` shows requests going
+out, and `/tmp/openuf-rrm.jsonl` is the spool, drained on every inform. Rows sourced this
+way show a blank WiFi Name and Security.
+
 The **Multicast and Broadcast Blocker** has no hostapd or OpenWrt equivalent — hostapd
 can suppress group-addressed frames wholesale but has no notion of an allow-list — so
 openUF enforces it with nftables, in its own `bridge openuf_bcfilt` table (separate
 from the client-blocking `bridge openuf` table, which is rebuilt wholesale on every
 block/unblock and would otherwise wipe these rules). Frames leaving a filtered SSID are
 dropped unless the *sender's* MAC is allow-listed.
+
+This needs **`kmod-nft-bridge`**, and it is the only feature that does. The drop rule is
+openUF's one bridge-family `meta` match, and `nft_meta_bridge` is a separate module that
+`nftables` does not depend on — absent from a stock filogic *and* ath79 image alike (AP2 did
+not have it). The failure is quiet in the worst way: the table, the chain and the per-VAP
+allow-list set are all created and populated, and only the drop rule is rejected, so the
+control reads as enabled in the controller and `nft list table bridge openuf_bcfilt` shows a
+table that filters nothing. openUF now logs `nft rejected the drop rule for <ifname> --
+install kmod-nft-bridge` when this happens, and `install.sh`/`setup.sh` install the module.
+Upstream verified the ruleset on real hardware: with the sender not allow-listed, 14 of 14
+broadcast frames heading out the IoT VAP were dropped; allow-listed, 0 of 15.
 
 > **This deliberately breaks DHCP for wireless clients unless you add the DHCP server's
 > MAC to the excepted-devices list.** That is Ubiquiti's own documented behavior for
@@ -862,7 +986,7 @@ additionally trims `supported_rates`. Rate options openUF writes are stamped wit
 omits every `minrate_*` key) tears down exactly the marked options, while rate options
 you hand-tuned on an unmarked radio are never touched.
 
-Minimum RSSI is a *radio* setting in the controller UI (Devices → AP → Radios), not a per-WLAN one, and the wire value is an offset from an assumed noise floor rather than a dBm figure — openUF converts it using a live noise reading. The controller signals *disable* by omitting the whole `stamgr.<n>` block from the next config push; openUF treats that as an explicit off and clears `minrssi_enabled` in UCI (the stored threshold stays parked for a later re-enable).
+Minimum RSSI is a *radio* setting in the controller UI (Devices → AP → Radios), not a per-WLAN one, and the wire value is not dBm but a fixed offset from it (`wire = dBm + 95`; UI -80 ↔ wire 15, UI -85 ↔ wire 10) — openUF converts it back with that same constant. An earlier version added the *live* noise floor instead, which only looked right on a radio whose floor happens to be -95 and drifted 12 dB between drivers (upstream's finding). The controller signals *disable* by omitting the whole `stamgr.<n>` block from the next config push; openUF treats that as an explicit off and clears `minrssi_enabled` in UCI (the stored threshold stays parked for a later re-enable).
 
 The reported **country code** comes from the wifi-device's UCI `country` option (the
 regulatory domain OpenWrt programs), mapped best-effort from ISO alpha-2 to the numeric

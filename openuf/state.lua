@@ -49,9 +49,15 @@ local function defaults()
 end
 
 -- The fields with a fixed type. Anything else in the file is carried through
--- untouched (see the header), but these fall back to their default when the
--- on-disk value has the wrong type -- a corrupted `adopted: "yes"` must not
--- become truthy.
+-- untouched (see the header), but these are DROPPED when the on-disk value
+-- has the wrong type -- the eight with a default fall back to it, the rest
+-- come back absent. A corrupted `adopted: "yes"` must not become truthy, and
+-- a `locating: "no"` must not read as "still locating" at startup. The list
+-- is documentation as much as protection: every field openUF persists is
+-- named here with its type, without making the name a registration step a
+-- new field can forget (upstream's whitelist approach reintroduced exactly
+-- that hazard). state.json is not a trusted input -- an operator edits it,
+-- syswrapper writes it.
 local TYPED = {
 	authkey                   = "string",
 	adopted                   = "boolean",
@@ -61,6 +67,34 @@ local TYPED = {
 	upgrade_requested_version = "string",
 	upgrade_requested_url     = "string",
 	blocked_stas              = "table",
+	-- Identity, re-derived at startup by inform's _populate_net_info. Kept
+	-- so the PREVIOUS run's values are readable at that moment: M.run
+	-- compares the loaded mac against the live one to catch a modelmap
+	-- change that silently re-identifies an adopted device.
+	mac                       = "string",
+	ip                        = "string",
+	hostname                  = "string",
+	-- Controller-pushed IP settings. ip_mode is the "was I static before?"
+	-- guard on the DHCP path, which must not flush a working lease just
+	-- because a steady-state push reaffirmed DHCP.
+	ip_mode                   = "string",
+	static_ip                 = "string",
+	static_netmask            = "string",
+	static_gateway            = "string",
+	static_dns                = "table",
+	-- Live kernel state, not UCI, so it is reapplied from here at startup the
+	-- way the blocked-client rules are. locate_prev_trigger is the LED
+	-- trigger a Locate displaced, for the unset-locate that may arrive after
+	-- a restart.
+	led_enabled               = "boolean",
+	locating                  = "boolean",
+	locate_prev_trigger       = "string",
+	-- The per-port VLAN reversibility ledgers: the stock switch_vlan `ports`
+	-- strings openUF overwrote (swconfig), and br-lan's port list exactly as
+	-- the board shipped it (DSA). Without them restore() has nothing to put
+	-- back and the board keeps openUF's VLAN config forever.
+	swvlan_backup             = "table",
+	dsa_brlan_ports           = "table",
 }
 
 -- Load state from disk. Missing file returns defaults. Applies security

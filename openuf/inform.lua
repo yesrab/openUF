@@ -59,6 +59,7 @@ local netconfig = _require_sibling("netconfig")
 local firewall  = _require_sibling("firewall")
 local usteer    = _require_sibling("usteer")
 local switchvlan = _require_sibling("switchvlan")
+local rrmscan   = _require_sibling("rrmscan")
 
 local M = {}
 
@@ -77,6 +78,42 @@ M._netconfig = netconfig
 M._firewall  = firewall
 M._usteer    = usteer
 M._switchvlan = switchvlan
+M._rrmscan    = rrmscan
+
+-- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
+-- flat list build_json merges from. Clients report asynchronously and only
+-- some of them ever answer, so this is a best-effort side-channel that
+-- supplements the passive scan cache -- see rrmscan.lua for the whole story.
+M._rrm_cache        = {}
+M._rrm_neighbours   = {}
+M._rrm_next_request = 0
+M._rrm_rr           = 0
+
+-- Stations asked for a beacon report that have not answered, keyed by MAC:
+-- {n = unanswered requests so far, at = when the last one went out}. A
+-- station's RRM capability bits are not a promise. AP2's one "capable"
+-- station advertises passive, active AND table measurement (rrm byte 0xF9)
+-- and answers every variant -- passive, active, table, single channel,
+-- either operating class -- with report mode 0x02, "incapable". hostapd
+-- does not notify a bodiless refusal over ubus, so from here it is simply a
+-- station that never reports; asking it again every interval forever would
+-- only ever cost it an ack. After RRM_MAX_UNANSWERED asks with nothing back
+-- it is left alone for RRM_BENCH_SECONDS, then tried once more. Any report
+-- from it -- refused or not -- clears the count.
+M._rrm_asked        = {}
+M.RRM_MAX_UNANSWERED = 2
+M.RRM_BENCH_SECONDS  = 6 * 3600
+
+-- How often to ask ONE station for a sweep, when conf.lua does not say. An
+-- active beacon measurement takes the client off-channel for roughly
+-- duration x channels (~1.3 s for a full operating class at 50 TU), so this is
+-- deliberately slow: the point is to keep the Environment view honest, not to
+-- poll.
+M.RRM_REQUEST_INTERVAL = 600
+
+-- Matches rrmscan.merge_into's own cutoff, which exists because the
+-- controller's rogue-AP ingestion silently drops any entry with age >= 30.
+local RRM_MAX_AGE = 30
 
 -- In-memory only (not persisted to state.json): per-radio spectrum-scan
 -- results, keyed by radio name. Ephemeral live data, same category as
@@ -494,7 +531,7 @@ end
 -- both APs, a genuinely 24%-busy 2.4GHz channel was reported to the
 -- controller as 100% and a 1.9%-busy 5GHz channel as 75%, which is what made
 -- the APs look like they were drowning in interference. The same wrong entry
--- also supplied the noise floor used to convert Minimum RSSI back to dBm.
+-- also supplied the noise floor Minimum RSSI was (wrongly) converted with.
 --
 -- Falls back to the first entry when nothing is marked, which keeps drivers
 -- (and test doubles) that omit the marker behaving exactly as before.
@@ -734,22 +771,36 @@ function M.build_json(st, cfg, ufhw)
 					end
 				end
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
-				-- min_rssi (outbound field, confirmed via decompile alongside
-				-- radio_caps/tx_power/athstats in the same DTO) needs the
-				-- live noise floor to convert rf_config()'s stored raw wire
-				-- units back to dBm -- minrssi.rssi is an offset from the
-				-- driver's noise floor, NOT plain dBm (confirmed live: UI
-				-- "-80 dBm" <-> wire "15", UI "-85 dBm" <-> wire "10", both
-				-- consistent with raw = dbm + 95). Falls back to that -95
-				-- assumption only when a live noise reading isn't available.
 				local in_use = ok_rs and _in_use_survey(stats) or nil
-				local noise = (in_use and in_use.noise) or -95
+				-- min_rssi (outbound field, confirmed via decompile alongside
+				-- radio_caps/tx_power/athstats in the same DTO) converts
+				-- rf_config()'s stored raw wire units back to dBm with the
+				-- SAME FIXED offset the controller encoded them with:
+				-- confirmed live, UI "-80 dBm" <-> wire "15" and UI "-85 dBm"
+				-- <-> wire "10", i.e. raw = dbm + 95 exactly.
+				--
+				-- This used to add the LIVE noise floor instead, on the reading
+				-- that the value is "dB above noise". It is not, and cannot be:
+				-- the controller never learns a radio's noise floor, so it has
+				-- nothing but a constant to encode with -- which is why both
+				-- data points land on one. Live noise also broke the round
+				-- trip, reporting a min_rssi the UI would render as a number
+				-- the operator never chose. It looked right only because it
+				-- was written against a radio whose floor happens to be exactly
+				-- -95 (an Archer C5's ath10k 5GHz). Every other radio disagreed,
+				-- in both directions: the same board's ath9k 2.4GHz reads -107,
+				-- turning a requested -80 into -92 and barely kicking anyone,
+				-- while AP2's mt76 radios read -90/-92 and turned it into -75,
+				-- kicking clients the operator meant to keep. A threshold that
+				-- drifts 12 dB with the driver is worse than no threshold.
+				-- (Upstream's finding, adopted.)
+				local MINRSSI_WIRE_OFFSET = 95
 				-- min_rssi_raw can legitimately be missing with the flag set
 				-- (inconsistent UCI, e.g. a hand-edit or interrupted write) --
-				-- without the guard this was `nil + noise`, killing the whole
-				-- inform build.
+				-- without the guard this was arithmetic on nil, killing the
+				-- whole inform build.
 				if radio.min_rssi_enabled and radio.min_rssi_raw then
-					radio.min_rssi = radio.min_rssi_raw + noise
+					radio.min_rssi = radio.min_rssi_raw - MINRSSI_WIRE_OFFSET
 					minrssi_threshold_by_radio[radio.name] = radio.min_rssi
 				end
 				if in_use then
@@ -874,6 +925,23 @@ function M.build_json(st, cfg, ufhw)
 							security   = net.security,
 							essid      = net.essid,
 						}
+					end
+					-- 802.11k enrichment: BSSes a CLIENT went off-channel
+					-- and saw, which this radio never could from its own
+					-- passive cache. Merged on the reported channel's BAND,
+					-- not on the interface the request went out of, because a
+					-- client sitting on 5 GHz routinely reports 2.4 GHz too --
+					-- so one report fills both radios' lists. Anything the
+					-- passive cache already knows wins, since a beacon report
+					-- carries no SSID, security or width. See rrmscan.lua.
+					if M._rrmscan and #M._rrm_neighbours > 0 then
+						pcall(M._rrmscan.merge_into, scan_table,
+							M._rrm_neighbours, {
+								band       = radio.radio,
+								radio      = radio.radio,
+								radio_name = radio.name,
+								max_age    = RRM_MAX_AGE,
+							})
 					end
 					scan_radio_table[#scan_radio_table + 1] = {
 						radio      = radio.radio,
@@ -1260,8 +1328,15 @@ function M.build_json(st, cfg, ufhw)
 	-- empty mac_table.
 	local uplink_dev, uplink_unknown = nil, false
 	if cfg and cfg.net and cfg.net.uplink_detect == "fdb" then
-		local ok_ud, dev = pcall(M._sysinfo.uplink_netdev)
-		if ok_ud then uplink_dev = dev end
+		-- Asked of the LAN bridge alone. sysinfo.lan_bridge resolves
+		-- lan_cpueth whether the map names the bridge itself (the JioRouter
+		-- maps) or one of its sockets (the AX3000T map); see
+		-- sysinfo.bridge_fdb_ports for why reading the whole FDB was wrong.
+		local ok_br, br = pcall(M._sysinfo.lan_bridge, cfg.net.lan_cpueth)
+		if ok_br and br then
+			local ok_ud, dev = pcall(M._sysinfo.uplink_netdev, br)
+			if ok_ud then uplink_dev = dev end
+		end
 		uplink_unknown = (uplink_dev == nil)
 	end
 	local mgmt_vlan = (cfg and cfg.net and cfg.net.lan_vlanid) or 1
@@ -2593,6 +2668,25 @@ function M.handle_response(json_str, st, cfg)
 			-- empty trunk list that fails silently.
 			local radio_table, vap_table = M._parse_wifi_system_cfg(sys_raw)
 
+			-- VLANs that a WIRED port is assigned to. Computed before the
+			-- WiFi pass because their L2 is the same bridge a tagged SSID
+			-- uses, and apply_config prunes any bridge no WLAN wants --
+			-- which would delete the one a per-port assignment is about to
+			-- need, on every push, then have switchvlan rebuild it. DSA
+			-- only: on swconfig a port VLAN is a switch table entry, not a
+			-- bridge. Safe when nothing is pushed (an empty set).
+			local port_vlans = {}
+			if M._switchvlan and M._switchvlan.dsa_members
+				and not (cfg and cfg.vlan and cfg.vlan.ports) then
+				pcall(function()
+					local br = M._sysinfo.lan_bridge(cfg and cfg.net and cfg.net.lan_cpueth)
+					local up = br and M._sysinfo.uplink_bridge_port(br) or nil
+					local m = M._switchvlan.dsa_members(
+						M._parse_switch_system_cfg(sys_raw), cfg, up)
+					for vid in pairs(m or {}) do port_vlans[vid] = true end
+				end)
+			end
+
 			local ufuci = M._ucihelper
 			if ufuci and ufuci.apply_config then
 				if #radio_table > 0 or #vap_table > 0 then
@@ -2610,7 +2704,8 @@ function M.handle_response(json_str, st, cfg)
 					M._usteer.set_enabled(steering_active, cfg)
 					pcall(ufuci.apply_config,
 						{radio_table = radio_table, vap_table = vap_table, network_table = {}},
-						cfg, {band_steering_active = steering_active, device_name = device_name})
+						cfg, {band_steering_active = steering_active,
+							device_name = device_name, keep_vlans = port_vlans})
 				end
 			end
 
@@ -2631,13 +2726,37 @@ function M.handle_response(json_str, st, cfg)
 					end
 					-- Which socket the uplink cable is in, so a pushed port
 					-- VLAN can never be applied to it (see physical_port).
-					local uplink_phys = nil
+					-- Asked of whichever source this board has: the switch's
+					-- ARL table on swconfig, the LAN bridge's FDB on DSA.
+					local uplink_phys, uplink_ifname = nil, nil
 					if cfg and cfg.vlan and cfg.vlan.ports then
 						local swst = M._sysinfo.switch_status(cfg.vlan.device)
 						uplink_phys = M._sysinfo.uplink_phys_port(swst.arl)
+					else
+						local br = M._sysinfo.lan_bridge(cfg and cfg.net and cfg.net.lan_cpueth)
+						if br then uplink_ifname = M._sysinfo.uplink_bridge_port(br) end
 					end
 					local sw = M._parse_switch_system_cfg(sys_raw)
-					if sw and not sw.enabled then
+					-- Turning Port VLAN off does not always announce itself.
+					-- The gates were once observed staying on the wire at
+					-- =disabled, but a device that has HAD the feature on and
+					-- then has it unticked gets a full system_cfg with no
+					-- switch.* keys at all -- upstream confirmed it live on an
+					-- AX3000T, where the teardown therefore never ran and
+					-- br-lan kept openUF's port list forever.
+					--
+					-- So absence counts as off too, but only when openUF holds
+					-- a reversibility ledger: that is proof it applied
+					-- something, which in turn is proof the controller was
+					-- sending switch.* until now. With no ledger there is
+					-- nothing to undo and this is a no-op anyway. Safe on a
+					-- partial push -- the worst case is a restore to stock
+					-- that the next full push re-applies -- and it cannot
+					-- flap, since restore() spends the ledger. Reachable only
+					-- inside `type(sys_raw) == "string"`, never on a noop.
+					local had_applied = st.swvlan_backup ~= nil
+						or st.dsa_brlan_ports ~= nil
+					if (sw and not sw.enabled) or (sw == nil and had_applied) then
 						-- Explicit disable: unticking the device-level "Port
 						-- VLAN" box keeps the switch.* block on the wire with
 						-- both gates at =disabled (confirmed live -- the
@@ -2656,13 +2775,24 @@ function M.handle_response(json_str, st, cfg)
 						-- take the wireless trunk with it and silently kill
 						-- the IoT WLAN's uplink. apply() reconciles both
 						-- concerns in one pass.
-						if #wireless_vlans > 0 then
-							M._switchvlan.apply(sw, cfg, st, wireless_vlans, uplink_phys)
+						--
+						-- That hazard is SWCONFIG-ONLY, and gating on the
+						-- wireless VLANs alone got it wrong on DSA: there the
+						-- tagged SSID needs no trunk at all and its bridge
+						-- belongs to ucihelper, so restore() cannot harm it --
+						-- it only hands br-lan its original port list back.
+						-- Skipping restore there left the ledger unspent and
+						-- br-lan holding the port ORDER openUF had left it in.
+						if (cfg and cfg.vlan and cfg.vlan.ports)
+							and #wireless_vlans > 0 then
+							M._switchvlan.apply(sw, cfg, st, wireless_vlans,
+								uplink_phys, uplink_ifname)
 						else
-							M._switchvlan.restore(st)
+							M._switchvlan.restore(st, cfg)
 						end
 					else
-						M._switchvlan.apply(sw, cfg, st, wireless_vlans, uplink_phys)
+						M._switchvlan.apply(sw, cfg, st, wireless_vlans,
+							uplink_phys, uplink_ifname)
 					end
 				end)
 			end
@@ -2713,8 +2843,29 @@ function M.handle_response(json_str, st, cfg)
 
 		if cmd == "set-locate" or cmd == "unset-locate" then
 			local led_path = cfg and cfg.led
-			if cmd == "set-locate" then M._led.locate_start(led_path)
-			else M._led.locate_stop(led_path) end
+			if cmd == "set-locate" then
+				-- The trigger the LED was on is persisted, not just held in
+				-- memory: the controller sends set-locate and unset-locate as
+				-- two independent commands with nothing bounding the gap, so
+				-- a restart can easily land between them, and only this copy
+				-- then knows what to put back. See M.run's startup handling.
+				local _, prev = M._led.locate_start(led_path)
+				st.locate_prev_trigger = prev
+			else
+				M._led.locate_stop(led_path, st.locate_prev_trigger)
+				st.locate_prev_trigger = nil
+				-- Restoring the TRIGGER is not the whole idle state. An LED
+				-- whose normal look is "trigger none, brightness on" -- which
+				-- is exactly what set_enabled leaves behind, and what a
+				-- dedicated status LED like green:status sits at -- comes
+				-- back from a Locate on trigger none and brightness 0, i.e.
+				-- dark. So re-assert the steady state the operator actually
+				-- chose, the same way M.run does at startup. nil means never
+				-- pushed: leave the board alone.
+				if st.led_enabled ~= nil then
+					M._led.set_enabled(led_path, st.led_enabled)
+				end
+			end
 			st.locating = (cmd == "set-locate")
 			M._state.save(st)
 		elseif cmd == "block-sta" or cmd == "unblock-sta" then
@@ -3207,6 +3358,112 @@ function M._maybe_scan_neighbours(cfg, ctx)
 	return issued > 0
 end
 
+-- One cycle of the client-assisted enrichment: keep the notification
+-- collector alive, fold in whatever clients have reported since last time,
+-- expire what the controller would discard anyway, and -- at most every
+-- rrm_request_interval -- ask one more station to go and look.
+--
+-- Everything here is pcall-wrapped and best-effort: no hostapd, no ubus, no
+-- capable client and no answer are all ordinary outcomes, and none of them may
+-- interrupt an inform. Returns true when enrichment is on.
+function M._rrm_tick(cfg)
+	local rrm = M._rrmscan
+	if not rrm then return false end
+	if not (cfg and cfg.config) then return false end
+	-- Off only when conf.lua says `false`. An ABSENT key means the documented
+	-- default (on): install.sh keeps a device's existing conf.lua across
+	-- upgrades, so every device installed before this option existed has no
+	-- such key -- AP2 was exactly that, and the collector never started.
+	if cfg.config.rrm_enrichment == false then return false end
+
+	pcall(rrm.collector_ensure)
+
+	local ok, fresh, reporters = pcall(rrm.harvest)
+	if ok then
+		for _, n in ipairs(fresh or {}) do
+			-- Keyed by BSSID so a neighbour two clients both saw is carried
+			-- once, at whichever sighting is freshest.
+			local prev = M._rrm_cache[n.bssid]
+			if not prev or n.seen_at >= prev.seen_at then
+				M._rrm_cache[n.bssid] = n
+			end
+		end
+		-- A station that reported anything at all is one that answers.
+		for mac in pairs(type(reporters) == "table" and reporters or {}) do
+			M._rrm_asked[mac] = nil
+		end
+	end
+
+	local now  = M._time()
+	local live = {}
+	for bssid, n in pairs(M._rrm_cache) do
+		if now - n.seen_at < RRM_MAX_AGE then
+			live[#live + 1] = n
+		else
+			M._rrm_cache[bssid] = nil
+		end
+	end
+	table.sort(live, function(a, b) return a.bssid < b.bssid end)
+	M._rrm_neighbours = live
+
+	if now < M._rrm_next_request then return true end
+	M._rrm_next_request = now +
+		(tonumber(cfg.config.rrm_request_interval) or M.RRM_REQUEST_INTERVAL)
+
+	-- Round-robin across every capable station on every BSS, one per
+	-- interval. Asking them all at once would take every 802.11k-capable
+	-- client in the house off-channel simultaneously.
+	local cands = {}
+	local ok_o, objs = pcall(rrm.hostapd_objects)
+	for _, obj in ipairs(ok_o and objs or {}) do
+		local ifname = obj:match("^hostapd%.(.+)$")
+		local ok_s, stas = pcall(rrm.capable_stations, ifname)
+		for _, sta in ipairs(ok_s and stas or {}) do
+			local key   = tostring(sta):lower()
+			local asked = M._rrm_asked[key]
+			local benched = asked and asked.n >= M.RRM_MAX_UNANSWERED
+				and (now - asked.at) < M.RRM_BENCH_SECONDS
+			if asked and asked.n >= M.RRM_MAX_UNANSWERED and not benched then
+				-- Bench over: one more try, from a clean count.
+				M._rrm_asked[key] = nil
+				benched = false
+			end
+			if not benched then
+				cands[#cands + 1] = {ifname = ifname, sta = sta}
+			end
+		end
+	end
+	if #cands == 0 then return true end
+	M._rrm_rr = (M._rrm_rr % #cands) + 1
+	local c = cands[M._rrm_rr]
+	local key = tostring(c.sta):lower()
+	local asked = M._rrm_asked[key] or {n = 0}
+	asked.n, asked.at = asked.n + 1, now
+	M._rrm_asked[key] = asked
+	if asked.n == M.RRM_MAX_UNANSWERED then
+		io.stderr:write(string.format(
+			"openuf: rrm: %s on %s advertises beacon measurement but has answered none of %d "
+			.. "requests -- not asking again for %d h\n",
+			c.sta, c.ifname, asked.n - 1, math.floor(M.RRM_BENCH_SECONDS / 3600)))
+	end
+	-- The operating class has to be one the CLIENT can measure. Upstream asks
+	-- every station for class 115 (5 GHz U-NII-1) and relies on dual-band
+	-- clients answering for 2.4 GHz as well -- which they do -- but a
+	-- 2.4 GHz-only client answers a 5 GHz class with report mode 0x02,
+	-- "incapable", and an all-zero BSSID. Seen live on AP2 the first time
+	-- this ran: the one 802.11k-capable station was a 1x1 HT IoT device on
+	-- 2.4 GHz, and its only report was that refusal. So a station on a
+	-- 2.4 GHz BSS is asked for class 81 (2.4 GHz, channels 1-13), one on
+	-- 5 GHz for 115 as before; the band comes from the BSS's live channel.
+	local op_class = 115
+	local ok_c, caps = pcall(M._sysinfo.radio_caps, c.ifname)
+	if ok_c and type(caps) == "table" and caps.channel and caps.channel <= 14 then
+		op_class = 81
+	end
+	pcall(rrm.request, c.ifname, c.sta, {op_class = op_class})
+	return true
+end
+
 -- One heartbeat: build, send, dispatch. Returns the number of seconds the
 -- caller should wait before the next one -- 0 means "again, now", the
 -- config-applied / command-executed case where a real AP re-informs at once.
@@ -3229,6 +3486,9 @@ function M._tick(st, cfg, ufhw, ctx)
 
 	ctx.last_mtime = M._reload_if_changed(st, cfg, ctx.last_mtime)
 	M._maybe_scan_neighbours(cfg, ctx)
+	-- Before build_json, so anything a client reported since the last cycle
+	-- rides out on THIS inform rather than waiting for the next.
+	pcall(M._rrm_tick, cfg)
 
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
 	-- build_json opens a ucihelper lookup pass and closes it on its normal
@@ -3289,6 +3549,37 @@ function M.run(cfg, ufhw)
 	-- reapply from state.json on every fresh start (mirrors the bootstrap
 	-- account reconciliation just above).
 	M._firewall.reconcile(st.blocked_stas)
+	-- A Locate does NOT survive a restart, and must not: it is a transient
+	-- "which box is it" blink, nobody is still standing in front of the AP,
+	-- and unset-locate only ever arrives while someone is watching the
+	-- controller. Left alone the device comes back still blinking with no
+	-- snapshot of what the LED was on, and the next unset-locate -- if one
+	-- ever comes -- restores nothing. Worse, a second set-locate would
+	-- snapshot the blink itself as the thing to restore. Upstream observed
+	-- exactly that on an AX3000T, whose radio LED stayed on the identify
+	-- blink across three Locate cycles.
+	if st.locating then
+		-- Only when the LED is really still blinking: a device that REBOOTED
+		-- mid-Locate comes back with the kernel's own default trigger already
+		-- restored, and "stopping" that would write none over it.
+		if M._led.locate_active(cfg and cfg.led) then
+			M._led.locate_stop(cfg and cfg.led, st.locate_prev_trigger)
+		end
+		st.locating = false
+		st.locate_prev_trigger = nil
+		M._state.save(st)
+	end
+	-- LED brightness is live kernel state too, not UCI -- the same reason the
+	-- blocked-client rules are reapplied above. The controller pushes
+	-- led_enabled once, in mgmt_cfg, and never again, so without this the
+	-- Manage > LED toggle silently forgets itself on every reboot while the
+	-- controller goes on believing it took. Applied AFTER the locate teardown:
+	-- if both have something to say, the steady state the operator chose wins
+	-- over whatever trigger the blink displaced. nil means it was never
+	-- pushed, which must leave the board's own default alone.
+	if st.led_enabled ~= nil then
+		M._led.set_enabled(cfg and cfg.led, st.led_enabled)
+	end
 	-- Per-port byte counters are a switch-driver setting that some boards ship
 	-- switched off; without it every socket reports 0 B in the Ports view.
 	if M._switchvlan then pcall(M._switchvlan.enable_mib_polling, cfg) end
