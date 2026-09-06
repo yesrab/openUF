@@ -130,22 +130,27 @@ end
 -- fixed payload (no sysinfo, no UCI), the state file never changes, and
 -- _http_post is whatever the test installs. Every seam is restored after,
 -- even when fn raises.
+local STATUS_TMP = "/tmp/openuf_test_status"
 local function with_tick_env(fn)
 	local o_build, o_handle, o_post, o_mtime, o_uci, o_run, o_time =
 		inform.build_json, inform.handle_response, inform._http_post,
 		inform._state_mtime, inform._ucihelper, inform._run_cmd, inform._time
-	local o_warned, o_rrm = inform._warned_400, inform._rrmscan
+	local o_warned, o_rrm, o_status = inform._warned_400, inform._rrmscan, inform.STATUS_FILE
 	inform.build_json = function() return '{"_type":"state"}' end
 	inform._state_mtime = function() return 1 end
 	inform._warned_400 = false
 	-- The 802.11k enrichment is on unless conf.lua says otherwise, and its
 	-- tick shells out (pgrep, ubus). Not in a unit test.
 	inform._rrmscan = nil
+	-- The heartbeat file goes to a scratch path, never /tmp/openuf-status.
+	inform.STATUS_FILE = STATUS_TMP
+	os.remove(STATUS_TMP)
 	local ok, err = pcall(fn)
 	inform.build_json, inform.handle_response, inform._http_post,
 		inform._state_mtime, inform._ucihelper, inform._run_cmd, inform._time =
 		o_build, o_handle, o_post, o_mtime, o_uci, o_run, o_time
-	inform._warned_400, inform._rrmscan = o_warned, o_rrm
+	inform._warned_400, inform._rrmscan, inform.STATUS_FILE = o_warned, o_rrm, o_status
+	os.remove(STATUS_TMP)
 	if not ok then error(err, 0) end
 end
 
@@ -2873,6 +2878,39 @@ return {
 				assert_contains(body, ' TX {"_type":"state"}', "the request, tagged")
 				assert_contains(body, " ERR HTTP 400", "the transport failure, tagged")
 				assert_true(body:match("^%d%d%d%d%-%d%d%-%d%dT") ~= nil, "every line is timestamped")
+			end)
+		end
+	},
+	{
+		name = "inform: every completed cycle leaves a heartbeat file the updater can wait on",
+		fn = function()
+			-- update.sh restarts the daemon and then has to decide whether the
+			-- new version is alive and talking to the controller before it
+			-- commits (or rolls back). This file is that signal: last_ok moves
+			-- on a successful cycle, last_fail on a transport failure, and both
+			-- are kept so a controller outage after a good update reads as
+			-- "up but unanswered", not as a broken daemon.
+			with_tick_env(function()
+				local t = 7000
+				inform._time = function() return t end
+				local st, ctx = sample_state({adopted = true, cfgversion = "abc"}), fresh_ctx()
+				inform._http_post = function() return response('{"_type":"noop"}', st) end
+				inform._tick(st, nil, nil, ctx)
+				local f = io.open(STATUS_TMP, "r"); local body = f:read("*a"); f:close()
+				assert_contains(body, "last_ok=7000", "success stamps last_ok")
+				assert_contains(body, "last_type=noop", "and what came back")
+				assert_contains(body, "adopted=true", "adoption state for check.sh")
+				assert_contains(body, "cfgversion=abc", "the config version the device is at")
+				assert_contains(body, "mac=aa:bb:cc:dd:ee:ff", "and the identity it informs under")
+				assert_contains(body, "build=", "and the installed build stamp")
+				t = 7010
+				inform._http_post = function() return nil, "connect failed: timeout" end
+				with_stderr(function() inform._tick(st, nil, nil, ctx) end)
+				f = io.open(STATUS_TMP, "r"); body = f:read("*a"); f:close()
+				assert_contains(body, "last_fail=7010", "a failure stamps last_fail")
+				assert_contains(body, "last_fail_msg=connect failed: timeout", "with the reason")
+				assert_contains(body, "last_ok=7000", "and the last success is still there")
+				assert_nil(io.open(STATUS_TMP .. ".tmp", "r"), "written atomically, no temp file left")
 			end)
 		end
 	},

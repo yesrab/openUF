@@ -35,7 +35,7 @@ Concretely, carried over from how the confirmed work was done:
 | Role | Address | Notes |
 |---|---|---|
 | Controller | UniFi Cloud Gateway Ultra | Network **10.6.101** as of 2026-09-06 (`unifi.version` in its own `system_cfg`; it was 10.4.57 on 2026-09-01). The pinned Docker baseline is still 10.4.57, so a bytecode finding from it needs a live re-check before it is trusted against this gateway |
-| AP1 | `192.168.1.25` | openUF on `jiorouter,ax6000-*`, wired |
+| AP1 | `192.168.1.22` (DHCP; was `.25` on 2026-09-01) | openUF on `jiorouter,ax6000-jidu6j01`, wired. Runs a custom OpenWrt SNAPSHOT image (r36016+4, kernel 6.18.44) whose package feed carries no `kmod-nft-bridge` / `kmod-sched-act-police`, so the Blocker's `meta` rule and the upload shaper are inert on it until the image is rebuilt with both. root has a password (not recorded here — `OPENUF_SSH_PASS` for `tools/deploy.sh`). Clock is UTC, AP2's is local |
 | AP2 | `192.168.1.149` (DHCP; was `.151` on 2026-09-01) | openUF on `jiorouter,ax6000-jidu6101`, wired, `country_override = "PA"`. root has no password and dropbear accepts the blank login, so `ssh -o BatchMode=yes root@192.168.1.149` works with no helper |
 
 Both APs present as `u6iw`. SSH credentials are deliberately **not** recorded here — this
@@ -167,6 +167,26 @@ dropdown is still empty. Therefore the parent list is built from **adopted, mesh
 devices**, and capability is asserted by the device — not derived from scan data. Neither
 AP claims it, so the site contains no eligible parent, the form is invalid, and Apply is a
 no-op.
+
+### Evidence — 2026-09-06, AP1's log, UCG Ultra 10.6.101
+
+The first mesh-related command recorded in this lab. AP1's `logread` holds, at 10:59:05
+UTC (that box's clock is UTC), between two ordinary config pushes:
+
+```
+inform: cmd: mesh-halt
+```
+
+That is the `cmd` dispatcher logging a command it does not handle — so the controller
+*does* have a device-facing mesh verb, and it sent it to a device that claims no mesh
+capability at all. It arrived during the RF-scan session against AP2, while the app was in
+use against both APs; nothing was captured on AP1 that day (`debug_dump_file` was armed on
+AP2 only), so it is not yet tied to a specific action. Worth chasing before step 1 of the
+experiment plan, because it is a capture that needs no capability claim: arm
+`debug_dump_file` on AP1, repeat what the app was doing around that time (ticking and
+un-ticking **mesh connect** on either AP, the uplink priority dropdown, an RF scan), and
+see whether `mesh-halt` carries a body — and whether it has a counterpart that *starts*
+something.
 
 ### The three gaps in openUF
 
@@ -399,4 +419,5 @@ Ordered by (value ÷ effort). None started.
 | 2026-09-01 | Mesh / wireless uplink | Blocked at the capability gate. Controller sends nothing (83/83 `noop`); RF and scan reporting ruled out; experiment plan written. Deprioritised by choice. |
 | 2026-09-06 | Upstream review and selective adoption | jonasevcik/openUF had 20 commits since the fork point (677f732). Adopted, re-implemented in this tree's style with their hardware-verified tests: 802.11k neighbour enrichment (`rrmscan.lua`), per-port VLAN on DSA as a bridge move, Locate restoring and persisting the LED trigger, the `ft_psk_generate_local` removal, the Minimum RSSI fixed offset, the `[A-Za-z0-9_]` section-name rule (our hash suffix kept), the 2.4 GHz 40 MHz cap, the bare-`ht` best-PHY rule (done in `rf_config` so it composes with the floor and Force WiFi 4), the bridge-scoped uplink lookup, `kmod-nft-bridge` / `kmod-sched-act-police` / `kmod-leds-gpio`, the `os.execute` normalisation, and the AX3000T profile. Kept ours where ours was stronger: atomic state writes and generic field passthrough, `_tick` error boundaries, wire validation, caches, `--replace-conf`, the debug switches. Not a git merge. |
 | 2026-09-06 | RF scan trigger | The app's RF Environment scan, triggered several times against AP2 on the now-10.6.101 gateway, produced no `cmd` at all (60/60 `noop`, one unrelated `setparam`). Gated like mesh. Investigation 2 written; REST probe is the next step and needs a controller login. Also confirmed live: the kernel's BSS cache forgets neighbours ~30 s after a scan, `iw scan` works on the live AP interfaces here, and iw 6.17 prints neither the `ms ago` nor the `BSS operating channel width` lines the parser relied on (both fixed). |
+| 2026-09-06 | Upgrade path | `update.sh` (installed as `openuf-update`) and `tools/deploy.sh` added: backup → `install.sh install` keeping `conf.lua` → restart → wait for the new daemon's first completed inform through `/tmp/openuf-status` (new; `_tick` rewrites it every cycle) → roll back on failure; a `BUILD` stamp from `dist.sh` / `git describe` says what an AP runs. Both APs updated from this tree with it, no re-adoption; AP1 (now `.22`, root password set) received the day's work for the first time. AP1's custom SNAPSHOT feed has neither `kmod-nft-bridge` nor `kmod-sched-act-police`, so the Blocker `meta` rule and the upload shaper are inert there. The first deploy exposed two script bugs — a pipeline hiding `dist.sh`'s failure, and a stale tarball being shipped — both fixed and written into CLAUDE.md. AP1's log also holds `inform: cmd: mesh-halt` from 10:59 UTC, the first device-facing mesh verb seen from a controller here (Investigation 1). |
 | 2026-09-06 | Pre-research hardening | Code review of openUF before resuming. Fixed ahead of the mesh work: non-AP `wifi-iface` sections are neither disabled by `use_only_unifi_wlan` nor reported as VAPs; each VAP reports its own BSSID; `debug_caps` / `debug_payload_extra` / `debug_dump_requests` / `neighbour_scan_interval` added to `conf.lua` so steps 2–3 need no code change. Independent bugs fixed in the same pass: `state.load` dropped every field but eight (the identity-MAC warning could never fire, the switch ledger was lost on restart), `state.save` was not atomic, the L2 announce never reflected adoption or the current IP, `phy_caps` re-cached the old regdomain before the reload, the inform loop had no error boundary, wire values reached `ip`/`nft`/`hostapd_cli` unvalidated, and `install.sh` overwrote `conf.lua` on reinstall. |

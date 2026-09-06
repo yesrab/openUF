@@ -60,10 +60,18 @@ done
 chmod +x "$STAGE/etc/init.d/openuf" "$STAGE/hook/syswrapper.sh" \
 	"$STAGE/hook/adopt-shell.sh"
 
+# Build stamp: which commit this tarball is, so `openuf-update --check` on a
+# device can say what it runs. "-dirty" means uncommitted changes were in the
+# tree, which is exactly what a lab deploy from a working tree is.
+printf '%s %s\n' "$(git describe --always --dirty 2>/dev/null || echo unknown)" \
+	"$(date -u +%Y-%m-%dT%H:%MZ)" > "$STAGE/BUILD"
+
 # setup.sh ships alongside install.sh: it is the entry point the README
 # documents, and a release tarball that lacked it left a user who
-# downloaded the tarball with no way to run the guided install.
-cp install.sh setup.sh LICENSE "$BUILD/"
+# downloaded the tarball with no way to run the guided install. update.sh is
+# what upgrades an installed AP from this same tarball (tools/deploy.sh hands
+# it over; install.sh installs it as /usr/bin/openuf-update).
+cp install.sh setup.sh update.sh LICENSE "$BUILD/"
 
 # ── Verify ──────────────────────────────────────────────────────────────────
 # README.md/USAGE.md are deliberately not shipped: ~21 KB transferred to and
@@ -120,7 +128,7 @@ fi
 
 # ── Package ─────────────────────────────────────────────────────────────────
 rm -f "$TARBALL"
-tar czf "$TARBALL" -C "$BUILD" openuf install.sh setup.sh LICENSE
+tar czf "$TARBALL" -C "$BUILD" openuf install.sh setup.sh update.sh LICENSE
 
 before=$(find openuf -type f -exec cat {} + | wc -c | tr -d ' ')
 after=$(find "$STAGE" -type f -exec cat {} + | wc -c | tr -d ' ')

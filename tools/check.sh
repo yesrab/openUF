@@ -140,6 +140,32 @@ else
 fi
 echo ""
 
+# ── Running daemon ───────────────────────────────────────────────────────────
+# inform.lua rewrites /tmp/openuf-status after every completed cycle; this is
+# the same file update.sh waits on after a restart.
+echo "[ Running daemon ]"
+if [ -f /tmp/openuf-status ]; then
+	_now=$(date +%s)
+	_ok=$(sed -n 's/^last_ok=//p' /tmp/openuf-status | head -1)
+	_fail=$(sed -n 's/^last_fail=//p' /tmp/openuf-status | head -1)
+	info "build $(sed -n 's/^build=//p' /tmp/openuf-status | head -1)"
+	if [ -n "$_ok" ] && [ "$_ok" -gt 0 ] 2>/dev/null; then
+		if [ $((_now - _ok)) -le 60 ]; then
+			ok "last inform $((_now - _ok))s ago ($(sed -n 's/^last_type=//p' /tmp/openuf-status | head -1))"
+		else
+			fail "last successful inform was $((_now - _ok))s ago"
+		fi
+	else
+		fail "no successful inform yet"
+	fi
+	if [ -n "$_fail" ] && [ "$_fail" -gt 0 ] 2>/dev/null; then
+		info "last failure $((_now - _fail))s ago: $(sed -n 's/^last_fail_msg=//p' /tmp/openuf-status | head -1)"
+	fi
+else
+	info "no /tmp/openuf-status -- daemon not running, or older than this check"
+fi
+echo ""
+
 # ── /etc/openuf state directory ──────────────────────────────────────────────
 echo "[ State directory ]"
 if [ -d /etc/openuf ]; then

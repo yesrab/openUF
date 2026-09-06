@@ -229,6 +229,8 @@ tar xzf openuf-src.tar.gz && cd openUF-main
 sh install.sh install
 #    Re-running this later upgrades in place and KEEPS the device's conf.lua
 #    (its modelmap above all); add --replace-conf to start from the default.
+#    Later upgrades: `openuf-update` on the device, or from your dev machine
+#    `sh tools/deploy.sh <ap-ip>...` (USAGE § 2, "Upgrading an installed AP").
 
 # 3a. L2 adoption (device and controller on same subnet)
 #     — The device will appear in UniFi Discover automatically.

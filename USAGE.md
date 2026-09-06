@@ -213,6 +213,63 @@ To uninstall:
 sh install.sh uninstall
 ```
 
+### Upgrading an installed AP
+
+Nothing about an upgrade needs a re-adoption, provided `conf.lua` survives it: it holds the
+modelmap, the modelmap holds `lan_cpueth`, and that interface's MAC is the identity the
+controller adopted the device under. `install.sh install` keeps it, `state.json` is never
+touched, and a daemon restart between two ten-second informs is invisible to both the
+controller and the clients (`wifi reload` only ever happens on a config push). Three ways
+to run that, from the least to the most involved:
+
+**On the device.** `install.sh` installs the updater as `openuf-update`:
+
+```sh
+openuf-update --check                     # what is installed: build stamp, modelmap,
+                                          # identity, last inform, whether the daemons run
+openuf-update                             # fetch main from GitHub and upgrade in place
+openuf-update --ref v1.2.0                # a tag or branch instead
+openuf-update --from /tmp/openuf.tar.gz   # a tarball already on the device
+```
+
+It backs up `/opt/openuf` and `/etc/openuf` to a tarball in `/tmp`, runs `install.sh
+install` (which also installs any dependency the new version added), restarts the service,
+and then **waits for the new daemon to complete an inform** — the daemon rewrites
+`/tmp/openuf-status` after every cycle — before declaring success. No completed cycle
+within 75 s, or no daemon left running, and it puts the backup back and restarts the old
+version. A daemon that is up but whose controller is not answering is reported and kept,
+since the old version would face the same controller. It also lists the options that the
+shipped `conf.lua.dist` knows and your kept `conf.lua` does not name; they take their
+documented defaults, and this is how a new knob gets noticed.
+
+**From your development machine, to several APs.** `tools/deploy.sh` builds the release
+tarball (`tools/dist.sh --verify`, so the suite gates every deploy), copies it to each AP
+over ssh and runs the same updater there, one AP at a time — a failure stops before the
+next host:
+
+```sh
+sh tools/deploy.sh --check 192.168.1.22 192.168.1.149   # what each AP runs; nothing changes
+sh tools/deploy.sh 192.168.1.22 192.168.1.149           # build, push, update, verify
+OPENUF_SSH_PASS='...' sh tools/deploy.sh 192.168.1.22   # an AP whose root has a password
+```
+
+By default ssh runs non-interactively (a key in `/etc/dropbear/authorized_keys`, or a root
+account with no password yet). `OPENUF_SSH_PASS` hands the password to ssh through a
+throwaway askpass helper, so it is never written to a file; `OPENUF_SSH` replaces the ssh
+command entirely (`OPENUF_SSH='ssh -i ~/.ssh/aps'`).
+
+**By hand** is the same thing without the safety net: download the tree, `sh install.sh
+install` (no `--replace-conf`), `/etc/init.d/openuf restart`. Every path leaves a build
+stamp in `/opt/openuf/BUILD` (`git describe` of the tree plus a UTC time; `-dirty` means
+uncommitted changes were in it), which `openuf-update --check` and `tools/check.sh` print.
+
+What to expect afterwards: the controller sees no disconnect; new options are documented in
+`conf.lua.dist` next to your kept copy; a modelmap you hand-edited on the device is
+**overwritten** (the backup tarball has your copy). Downgrading is the same command with an
+older `--ref`, or `tar xzf /tmp/openuf-backup-<stamp>.tgz -C / && /etc/init.d/openuf
+restart` while the backup still exists — `/tmp` is tmpfs, so that means until the next
+reboot.
+
 ---
 
 ## 3. Configuration

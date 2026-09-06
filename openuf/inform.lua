@@ -3464,6 +3464,50 @@ function M._rrm_tick(cfg)
 	return true
 end
 
+-- Where the loop leaves its heartbeat for the outside world: a flat key=value
+-- file rewritten (atomically) after every completed cycle. It is what
+-- update.sh waits on to decide whether a freshly installed daemon is alive and
+-- talking to the controller before it commits to the new version -- and what
+-- tools/check.sh shows an operator. tmpfs, so a reboot starts it clean.
+M.STATUS_FILE = "/tmp/openuf-status"
+
+-- The build stamp dist.sh / install.sh leave next to the code, read once.
+M._build = nil
+local function build_stamp()
+	if M._build == nil then
+		local s = M._read_file("BUILD") or M._read_file("openuf/BUILD")
+		M._build = s and s:match("^%s*(.-)%s*$") or "unknown"
+	end
+	return M._build
+end
+
+-- fields: {last_ok = epoch, last_type = "noop"} on success, or
+-- {last_fail = epoch, last_fail_msg = "..."} on a transport failure. The
+-- other side's last value is carried forward so the file always shows both
+-- the last success and the last failure.
+M._status = {}
+function M._write_status(st, fields)
+	for k, v in pairs(fields) do M._status[k] = v end
+	local s = M._status
+	local lines = {
+		"last_ok="       .. tostring(s.last_ok or 0),
+		"last_type="     .. tostring(s.last_type or ""),
+		"last_fail="     .. tostring(s.last_fail or 0),
+		"last_fail_msg=" .. tostring(s.last_fail_msg or ""):gsub("[\r\n]", " "),
+		"adopted="       .. tostring(st and st.adopted or false),
+		"cfgversion="    .. tostring(st and st.cfgversion or ""),
+		"mac="           .. tostring(st and st.mac or ""),
+		"inform_url="    .. tostring(st and st.inform_url or ""),
+		"build="         .. build_stamp(),
+	}
+	local tmp = M.STATUS_FILE .. ".tmp"
+	local f = io.open(tmp, "w")
+	if not f then return false end
+	f:write(table.concat(lines, "\n"), "\n")
+	f:close()
+	return os.rename(tmp, M.STATUS_FILE) and true or false
+end
+
 -- One heartbeat: build, send, dispatch. Returns the number of seconds the
 -- caller should wait before the next one -- 0 means "again, now", the
 -- config-applied / command-executed case where a real AP re-informs at once.
@@ -3512,6 +3556,7 @@ function M._tick(st, cfg, ufhw, ctx)
 		io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
 		if dump_tx then M._debug_append(cfg, "ERR", tostring(err)) end
 		M._warn_http_400(err, st, cfg)
+		pcall(M._write_status, st, {last_fail = M._time(), last_fail_msg = tostring(err)})
 		ctx.backoff = math.min(ctx.backoff * 2, 60)
 		return ctx.backoff
 	end
@@ -3521,13 +3566,16 @@ function M._tick(st, cfg, ufhw, ctx)
 	local parse_ok, json_body = pcall(M.parse_packet, body, st)
 	if not parse_ok then
 		io.stderr:write("inform: parse error: " .. tostring(json_body) .. "\n")
+		pcall(M._write_status, st, {last_fail = M._time(), last_fail_msg = "parse error"})
 		return ctx.interval
 	end
+	local rtype = tostring(json_body):match('"_type"%s*:%s*"([%w_%-]+)"') or "?"
 	local ok_h, applied = pcall(M.handle_response, json_body, st, cfg)
 	if not ok_h then
 		io.stderr:write("inform: handle_response failed: " .. tostring(applied) .. "\n")
 		return ctx.interval
 	end
+	pcall(M._write_status, st, {last_ok = M._time(), last_type = rtype})
 	if applied then return 0 end
 	return ctx.interval
 end

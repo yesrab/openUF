@@ -30,6 +30,11 @@ sh tools/simulate.sh --adopt          # needs pycryptodome, luasocket, lua-cjson
 # to the source and still passes the suite
 sh tools/dist.sh --verify
 
+# Push this tree to adopted APs: builds with --verify, then runs the on-device updater
+# on each (backup → install keeping conf.lua → restart → wait for an inform → roll back)
+sh tools/deploy.sh --check <ap-ip>...   # read-only: what each AP runs
+sh tools/deploy.sh <ap-ip>...           # OPENUF_SSH_PASS=... for a password-protected root
+
 # Shell syntax — BOTH, every time (see "Shell code" below)
 bash -n setup.sh && dash -n setup.sh
 ```
@@ -66,13 +71,21 @@ streams before and after, so it catches a "comment" edit that changed behaviour.
 
 `install.sh`, `setup.sh` and `tools/*.sh` run under **busybox ash**, not bash. Check with
 `bash -n` *and* `dash -n` — dash is the strictest POSIX shell available on a runner and
-catches bashisms `bash -n` accepts. CI does both for `setup.sh` and `install.sh`.
+catches bashisms `bash -n` accepts. CI does both for `setup.sh`, `install.sh`, `update.sh`
+and `tools/deploy.sh`.
 
 - `sed -i` with no suffix (GNU/busybox form). This **fails on macOS/BSD** — use
   `/opt/homebrew/opt/gnu-sed/libexec/gnubin` in `PATH` when testing locally.
 - Avoid `case` inside `$( )`. It has bitten this repo: a `)` in a case pattern terminated
   the substitution early and wrote a garbage netmask. Assign to a variable first.
 - `local` is fine inside functions, never at top level.
+- A pipeline's exit status is its **last** command's. `sh tools/dist.sh --verify | tail -3`
+  reported success while dist.sh had failed, and `deploy.sh` shipped the previous run's
+  tarball. Send output to a file and test the command itself, and delete stale outputs
+  before building.
+- Test POSIX snippets under `sh`, not in the zsh you are typing into: zsh does not
+  word-split an unquoted `$var`, so `for k in $list` runs once over the whole string and a
+  correct `case`/`for` loop looks broken — or a broken one looks fine.
 - Support both package managers: OpenWrt 25.12 uses `apk`, 24.10 and earlier `opkg`, with
   identical package names. Both scripts define `pkg_installed` / `pkg_add` wrappers — use
   them rather than naming a manager.
@@ -365,6 +378,17 @@ overwrites, and `setup.sh` passes it because it has just written `conf.lua` from
 interview. Options come after the action and an unknown one is an error, so a mistyped
 flag cannot install silently without what it asked for.
 
+**`update.sh` is the upgrade path, and it leans on two things `install.sh` provides.** It
+installs `update.sh` as `/usr/bin/openuf-update` (a copy, not a symlink — it has to survive
+its own `rm -rf /opt/openuf` during a rollback), and it leaves a build stamp in
+`/opt/openuf/BUILD` (`dist.sh` writes one into a release tarball; a git checkout gets
+`git describe`). The updater's health check reads `/tmp/openuf-status`, which `_tick`
+rewrites after every completed cycle — `last_ok` on success, `last_fail` on a transport
+failure, both kept, so a controller outage after a good update reads as "up but
+unanswered" and is not rolled back. Keep that file flat `key=value`: busybox `sed` is what
+parses it. `tools/deploy.sh` is the same updater driven from the dev machine over ssh, one
+host at a time, with `dist.sh --verify` gating every push.
+
 `--bootstrap-adopt` creates the locked-down non-root `ubnt`/`ubnt` account, scoped to
 running `syswrapper.sh set-adopt` only, which self-locks once adopted and re-enables on
 factory reset.
@@ -541,7 +565,10 @@ openuf/
   etc/init.d/openuf procd service: announce + inform instances
 setup.sh            guided installer: AP conversion + deps + install
 install.sh          file/service install and dependency resolution
+update.sh           on-device updater (installed as openuf-update): backup, install keeping
+                    conf.lua, restart, wait for /tmp/openuf-status, roll back on failure
 tools/              dist.sh (package), check.sh (preflight), simulate.sh (e2e),
+                    deploy.sh (push a build to adopted APs and run update.sh on each),
                     strip.lua, test_controller.py, validation/ (docker controller)
 PROTOCOL-VALIDATION.md   evidence for every protocol claim — read before disputing one
 REVERSE-ENGINEERING.md   the open questions: unimplemented surfaces + experiment plans

@@ -157,12 +157,27 @@ case "$ACTION" in
 			done
 		fi
 
+		# A build stamp, so `openuf-update --check` can say what is running.
+		# dist.sh writes one into a release tarball; a git checkout gets one
+		# from git here; anything else keeps whatever the source carried.
+		if [ ! -f "$INSTALL_DIR/BUILD" ] && command -v git >/dev/null 2>&1 \
+			&& git rev-parse --short HEAD >/dev/null 2>&1; then
+			printf '%s %s\n' "$(git describe --always --dirty 2>/dev/null)" \
+				"$(date -u +%Y-%m-%dT%H:%MZ)" > "$INSTALL_DIR/BUILD"
+		fi
+
 		# Create state directory
 		mkdir -p "$STATE_DIR"
 
 		# Symlink syswrapper.sh into PATH
 		ln -sf "$INSTALL_DIR/hook/syswrapper.sh" "$BIN_LINK"
 		chmod +x "$BIN_LINK"
+
+		# The updater, as a command. Copied rather than symlinked: it has to
+		# survive its own `rm -rf /opt/openuf` during a rollback.
+		if [ -f update.sh ]; then
+			cp update.sh /usr/bin/openuf-update && chmod +x /usr/bin/openuf-update
+		fi
 
 		# Install init.d service
 		cp openuf/etc/init.d/openuf "$INIT_SCRIPT"
@@ -395,8 +410,8 @@ case "$ACTION" in
 			rm -f "$INIT_SCRIPT"
 		fi
 
-		# Remove symlink
-		rm -f "$BIN_LINK"
+		# Remove symlink, and the updater command
+		rm -f "$BIN_LINK" /usr/bin/openuf-update
 
 		# Remove the SSH bootstrap account/group if present (hygiene --
 		# symmetric with what install --bootstrap-adopt added, regardless of

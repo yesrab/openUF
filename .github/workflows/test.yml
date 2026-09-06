@@ -79,7 +79,9 @@ jobs:
         run: |
           bash -n install.sh
           bash -n setup.sh
+          bash -n update.sh
           bash -n tools/check.sh
+          bash -n tools/deploy.sh
           bash -n tools/dist.sh
           bash -n tools/simulate.sh
           bash -n openuf/hook/syswrapper.sh
@@ -91,3 +93,5 @@ jobs:
           # OpenWrt box, so it is checked twice.
           dash -n setup.sh
           dash -n install.sh
+          dash -n update.sh
+          dash -n tools/deploy.sh
