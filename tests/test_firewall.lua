@@ -81,4 +81,26 @@ return {
 			end)
 		end
 	},
+	{
+		name = "firewall: reconcile skips a malformed MAC and deauth refuses one",
+		fn = function()
+			-- The list comes from the controller by way of state.json, which is
+			-- also hand-editable; every entry is spliced into a command line.
+			local real = io.stderr
+			io.stderr = {write = function() end}
+			local ok, err = pcall(with_capture, function(cmds)
+				firewall.reconcile({"aa:bb:cc:dd:ee:01", "aa }' ; reboot ; '{"})
+				local joined = table.concat(cmds, "\n")
+				assert_contains(joined, "'{ aa:bb:cc:dd:ee:01 }'", "the well-formed MAC is added")
+				assert_true(joined:find("reboot", 1, true) == nil, "the malformed one never reaches nft")
+				local n = #cmds
+				assert_false(firewall.deauth("aa }' ; reboot", {"wlan0"}), "deauth refuses it")
+				assert_eq(#cmds, n, "and runs nothing")
+				assert_true(firewall.deauth("aa:bb:cc:dd:ee:01", {"wlan0"}), "a real MAC still works")
+				assert_eq(#cmds, n + 1, "one hostapd_cli call")
+			end)
+			io.stderr = real
+			if not ok then error(err, 0) end
+		end
+	},
 }

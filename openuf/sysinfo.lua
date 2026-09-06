@@ -404,12 +404,33 @@ function M.sae_supported()
 	return found
 end
 
+-- `iw phy phyN info` is tens of kilobytes and was fetched and parsed for
+-- every radio on every heartbeat, although it describes the hardware plus
+-- the regulatory domain and changes only with the latter. Cached per phy with
+-- a TTL: long enough to take the parse off the 10-second path, short enough
+-- that a regdomain change is reflected within minutes. (ucihelper keeps its
+-- own, separately invalidated cache of `iw phy` for its clamping decisions.)
+-- `iw dev <if> info` is NOT cached -- it carries the live channel and TX
+-- power, which is the point of reading it every time.
+M.PHY_INFO_TTL = 300
+M._phy_info_cache = {}
+function M._phy_info(phy)
+	local now = M._time()
+	local c = M._phy_info_cache[phy]
+	if c and (now - c.at) < M.PHY_INFO_TTL then return c.text end
+	local text = M._run_cmd("iw phy phy" .. phy .. " info")
+	if text and text ~= "" then
+		M._phy_info_cache[phy] = {text = text, at = now}
+	end
+	return text
+end
+
 function M.radio_caps(ifname)
 	if not ifname then return {} end
 	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")
 	local phy = dev_info:match("wiphy%s+(%d+)")
 	if not phy then return {} end
-	local phy_info = M._run_cmd("iw phy phy" .. phy .. " info")
+	local phy_info = M._phy_info(phy)
 	if not phy_info or phy_info == "" then return {} end
 
 	local has_dfs = phy_info:find("radar detection") ~= nil
@@ -488,7 +509,30 @@ end
 -- for a learned MAC).
 -- Injectable/resettable by tests, same pattern as M._prev_cpu above.
 M._mac_first_seen = {}
+M._mac_last_seen  = {}
 M._time = os.time
+
+-- Record that key was seen now; returns when it was first seen. Also the only
+-- place the two tables ever shrink: a host not seen for an hour is forgotten,
+-- so a daemon that runs for months does not keep every MAC that ever crossed
+-- the bridge. A host back after that long gets a fresh uptime, which is what
+-- a real switch would report for it as well.
+local MAC_FORGET_AFTER = 3600
+function M._note_seen(key, now)
+	local first = M._mac_first_seen[key]
+	if not first then
+		first = now
+		M._mac_first_seen[key] = now
+	end
+	M._mac_last_seen[key] = now
+	for k, last in pairs(M._mac_last_seen) do
+		if now - last > MAC_FORGET_AFTER then
+			M._mac_last_seen[k]  = nil
+			M._mac_first_seen[k] = nil
+		end
+	end
+	return first
+end
 
 -- MAC -> IP from /proc/net/arp (the header line has no MAC and is skipped by
 -- the pattern itself). Shared by both wired-host sources below.
@@ -559,12 +603,7 @@ function M.mac_table(ifname)
 	local now = M._time()
 	local hosts = {}
 	for _, mac in ipairs(macs) do
-		local key = ifname .. " " .. mac
-		local first_seen = M._mac_first_seen[key]
-		if not first_seen then
-			first_seen = now
-			M._mac_first_seen[key] = now
-		end
+		local first_seen = M._note_seen(ifname .. " " .. mac, now)
 		hosts[#hosts + 1] = {
 			mac      = mac,
 			ip       = ip_by_mac[mac:lower()],
@@ -742,12 +781,7 @@ function M.switch_mac_table(phys, arl)
 	local now = M._time()
 	local hosts = {}
 	for _, mac in ipairs(macs) do
-		local key = "swport" .. tostring(phys) .. " " .. mac
-		local first_seen = M._mac_first_seen[key]
-		if not first_seen then
-			first_seen = now
-			M._mac_first_seen[key] = now
-		end
+		local first_seen = M._note_seen("swport" .. tostring(phys) .. " " .. mac, now)
 		hosts[#hosts + 1] = {
 			mac      = mac,
 			ip       = ip_by_mac[mac],

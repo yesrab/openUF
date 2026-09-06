@@ -64,8 +64,35 @@ grep -o '"_type":"[a-z_]*"' /tmp/openuf-dump.txt | sort | uniq -c   # is anythin
 grep -v '"_type":"noop"' /tmp/openuf-dump.txt                       # only the real pushes
 ```
 
+To see both directions, add `debug_dump_requests = true`: every payload openUF sends is
+appended as a line tagged ` TX ` and every transport failure as ` ERR ` (an `ERR HTTP
+400` streak is the identity-MAC problem, see CLAUDE.md). Response lines stay untagged,
+so the two recipes above keep working; `grep -v ' TX '` hides the requests again.
+
 ⚠️ The file contains PSKs and the `authkey`. It is on tmpfs (gone on reboot); set the
 option back to `nil` and delete the file when done.
+
+### Claiming a capability without a code change
+
+`conf.lua` has two research-only switches for exactly the experiments below:
+
+```lua
+debug_caps = {wifi_caps2 = 0x41},              -- replace a claimed mask (nil = shipped value)
+debug_payload_extra = {uplink = {type = "wireless"}},   -- extra top-level payload fields
+```
+
+`inform.lua`'s rule is "never claim a bit openUF cannot honour"; these are the sanctioned
+exception, and the daemon logs `DEBUG OVERRIDES ACTIVE` at every start while either is set.
+Unset them when the experiment is over.
+
+### Neighbour visibility
+
+`scan_radio_table` is read from the kernel's BSS cache, which forgets a network ~30 s
+after it was last seen (and the controller drops `age >= 30`). Nothing in openUF scans
+on its own, so the Environment view — and any parent-AP list built from neighbours — is
+only populated right after a scan. `neighbour_scan_interval = 300` in `conf.lua` adds a
+background scan per radio at that cadence (off by default: each scan stalls clients for
+a moment). The 13-neighbour figure below was measured right after a manual `iw scan`.
 
 To force a re-push when the controller has gone quiet, blank `cfgversion` in
 `/etc/openuf/state.json` and restart. **Note:** this stopped working reliably part-way
@@ -198,15 +225,19 @@ a decompile. Fetch the chunks from the live controller and grep for `mesh`, `upl
 - `com.ubnt.service.config.eWivisHeQsnaqDtx` — the `system_cfg` generator; find the branch
   that would emit backhaul fields, which previews step 3 for free.
 
-**Step 2 — the go/no-go.** Claim the candidate bit on **both** APs, restart, and look at
-the dropdown. If AP1 appears as a selectable parent, the gate is understood and everything
-downstream is ordinary work. If it stays empty, the gate is elsewhere — likely the model
-registry or a field we have not found. This is a one-line change and a 30-second test;
-do it before writing any implementation.
+**Step 2 — the go/no-go.** Claim the candidate bit on **both** APs via `debug_caps` in
+`conf.lua` (see "Claiming a capability without a code change" above), restart, and look
+at the dropdown. If AP1 appears as a selectable parent, the gate is understood and
+everything downstream is ordinary work. If it stays empty, the gate is elsewhere — likely
+the model registry or a field we have not found. This is a `conf.lua` edit and a
+30-second test; do it before writing any implementation. If the candidate is a payload
+field rather than a bit, `debug_payload_extra` puts it on the wire the same way.
 
-**Step 3 — only now is the wire useful.** With the bit claimed, arm `debug_dump_file` on
-both APs, select the parent, Apply, and capture. That push is the backhaul specification:
-SSID, PSK/derivation, and whichever `radio.<n>`/`wireless.<n>` keys carry it.
+**Step 3 — only now is the wire useful.** With the bit claimed, arm `debug_dump_file`
+(plus `debug_dump_requests`, so the capture shows what was claimed next to what came
+back) on both APs, select the parent, Apply, and capture. That push is the backhaul
+specification: SSID, PSK/derivation, and whichever `radio.<n>`/`wireless.<n>` keys carry
+it.
 
 **Step 4 — implement.** `uplink` in the payload, sta-or-mesh mode in `ucihelper`, and the
 adopt-over-wireless bootstrap if it turns out to be separate.
@@ -249,9 +280,13 @@ two APs, bridged into `br-lan`. The controller keeps seeing a wired uplink — a
 inform payload is concerned it *is* wired, since the uplink is a bridge port — so there is
 no mesh topology in the UI, but the physical link is real. Three gotchas, all verified:
 
-- **`use_only_unifi_wlan = true` (currently set on AP2) would disable it.** That option
-  disables every `wifi-iface` not named `openuf_*`. Set it `false`. Naming the section
-  `openuf_backhaul` is worse, not better — `wlan_prune` *deletes* `openuf_*` sections.
+- **`use_only_unifi_wlan` no longer disables it, and it is not reported as a VAP.** Since
+  2026-09-06 that option exempts every `wifi-iface` whose `mode` is not `ap`, and
+  `get_vap_table` skips them, so an 802.11s or `sta` backhaul survives with the option
+  left `true` and does not show up in the controller as a nameless phantom SSID. Only
+  an AP-mode section needs listing in `keep_wlan_sections`. Naming the section
+  `openuf_backhaul` is still wrong — `wlan_clear` *deletes* `openuf_*` sections on every
+  push.
 - **The channel must be fixed in the controller, on both APs.** A mesh/WDS station has to
   sit on the parent's channel, and openUF rewrites `radio.<n>.channel` from every push.
   Both radios are currently `channel='auto'`, which is exactly why they drifted apart to
@@ -283,3 +318,4 @@ Ordered by (value ÷ effort). None started.
 | Date | Subject | Outcome |
 |---|---|---|
 | 2026-09-01 | Mesh / wireless uplink | Blocked at the capability gate. Controller sends nothing (83/83 `noop`); RF and scan reporting ruled out; experiment plan written. Deprioritised by choice. |
+| 2026-09-06 | Pre-research hardening | Code review of openUF before resuming. Fixed ahead of the mesh work: non-AP `wifi-iface` sections are neither disabled by `use_only_unifi_wlan` nor reported as VAPs; each VAP reports its own BSSID; `debug_caps` / `debug_payload_extra` / `debug_dump_requests` / `neighbour_scan_interval` added to `conf.lua` so steps 2–3 need no code change. Independent bugs fixed in the same pass: `state.load` dropped every field but eight (the identity-MAC warning could never fire, the switch ledger was lost on restart), `state.save` was not atomic, the L2 announce never reflected adoption or the current IP, `phy_caps` re-cached the old regdomain before the reload, the inform loop had no error boundary, wire values reached `ip`/`nft`/`hostapd_cli` unvalidated, and `install.sh` overwrote `conf.lua` on reinstall. |

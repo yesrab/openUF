@@ -38,6 +38,9 @@ M._read_file = function(path)
 	return s
 end
 
+-- Injectable clock, for the time-bounded capability cache below.
+M._time = os.time
+
 -- Static radio capability defaults, used when UCI/driver introspection can't
 -- supply a real value. Tune per target hardware (see u6iw.lua's fw.ver note
 -- for the same caveat pattern).
@@ -135,10 +138,27 @@ local PHY_RANK = {HT = 1, VHT = 2, HE = 3, EHT = 4}
 local RANK_PHY = {"HT", "VHT", "HE", "EHT"}
 
 -- Cached because it describes hardware, which does not change while openUF
--- runs. Reset it (M._phy_caps_cache = nil) after anything that changes what
--- the driver reports -- notably a regdomain change, which moves the per-channel
--- TX power limits below.
+-- runs -- with one exception. A regdomain change moves the per-channel TX
+-- power limits and the DFS flags, so rf_config drops the cache when it writes
+-- a new country. But the DRIVER only picks the new domain up when `wifi
+-- reload` restarts the radios, which happens later in the same apply_config
+-- pass and asynchronously at that -- while rf_config itself re-reads the caps
+-- moments after dropping them (clamp_htmode, the beacon_rate check). So the
+-- cache came straight back holding the OLD domain's figures and kept them
+-- until the daemon restarted, and the max_txpower reported to the controller
+-- -- the bound on its TX Power slider -- was the wrong regdomain's. Hence the
+-- settle window: for PHY_CAPS_SETTLE seconds after a regdomain write, cached
+-- caps are trusted for at most PHY_CAPS_REREAD seconds at a time.
 M._phy_caps_cache = nil
+M._phy_caps_read_at = nil
+M._phy_caps_unstable_until = nil
+local PHY_CAPS_SETTLE = 60   -- the reload is long done inside this
+local PHY_CAPS_REREAD = 10   -- one heartbeat
+
+local function regdomain_changed()
+	M._phy_caps_cache = nil
+	M._phy_caps_unstable_until = M._time() + PHY_CAPS_SETTLE
+end
 
 -- Parse `iw phy` output into per-band capabilities, keyed by band_for_device's
 -- own vocabulary ("ng"/"na"). Each band is identified by the frequencies it
@@ -237,8 +257,18 @@ end
 -- An empty table (no `iw`, unparseable output) means "unknown", which every
 -- caller must treat as "leave the controller's request alone".
 function M.phy_caps()
-	if not M._phy_caps_cache then
+	local now = M._time()
+	local stale = false
+	if M._phy_caps_cache and M._phy_caps_unstable_until then
+		if now < M._phy_caps_unstable_until then
+			stale = (now - (M._phy_caps_read_at or 0)) >= PHY_CAPS_REREAD
+		else
+			M._phy_caps_unstable_until = nil   -- settled: back to cache-forever
+		end
+	end
+	if not M._phy_caps_cache or stale then
 		M._phy_caps_cache = parse_phy_caps(M._popen("iw phy") or "")
+		M._phy_caps_read_at = now
 	end
 	return M._phy_caps_cache
 end
@@ -395,19 +425,46 @@ local AUTODISABLED = OPENUF_PREFIX .. "autodisabled"
 -- documented (README/USAGE) and shipped as true in conf.lua, but a missing
 -- config is treated as false: openUF should not start disabling a stranger's
 -- SSIDs just because a caller failed to thread cfg through.
-function M.set_wlan_exclusive(enabled)
+--
+-- Two kinds of section are exempt, in both directions:
+--   * names listed in `keep` (conf.lua keep_wlan_sections): an explicit
+--     "this one is mine, leave it alone";
+--   * any wifi-iface whose mode is not "ap". The option is about SSIDs
+--     competing with the controller's on the air; a mesh point or a station
+--     interface is a LINK, not a competing SSID -- it may well be this AP's
+--     own uplink (the 802.11s backhaul in REVERSE-ENGINEERING.md's mesh
+--     fallback) -- and disabling it takes the device off the network.
+-- An exempt section that openUF had already switched off on an earlier pass
+-- (it carries the stamp) is switched back on once, so exempting it is enough
+-- to bring it back without a hand edit.
+-- keep: optional list of section names.
+function M.set_wlan_exclusive(enabled, keep)
 	local uci = get_uci()
 	local cursor = uci.cursor()
+	local kept = {}
+	for _, name in ipairs(type(keep) == "table" and keep or {}) do
+		kept[tostring(name)] = true
+	end
 	local targets = {}
 	cursor:foreach("wireless", "wifi-iface", function(s)
 		local name = s[".name"]
 		if name and name:sub(1, #OPENUF_PREFIX) ~= OPENUF_PREFIX then
-			targets[#targets + 1] = {name = name, disabled = s.disabled,
-				stamped = (s[AUTODISABLED] == "1")}
+			local stamped = (s[AUTODISABLED] == "1")
+			if kept[name] or (s.mode ~= nil and s.mode ~= "ap") then
+				if stamped then
+					targets[#targets + 1] = {name = name, release = true}
+				end
+			else
+				targets[#targets + 1] = {name = name, disabled = s.disabled,
+					stamped = stamped}
+			end
 		end
 	end)
 	for _, t in ipairs(targets) do
-		if enabled then
+		if t.release then
+			cursor:set("wireless", t.name, "disabled", "0")
+			cursor:set("wireless", t.name, AUTODISABLED, "0")
+		elseif enabled then
 			if t.disabled ~= "1" then
 				cursor:set("wireless", t.name, "disabled", "1")
 				cursor:set("wireless", t.name, AUTODISABLED, "1")
@@ -497,8 +554,18 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	-- against a real controller: only the last-processed radio's VAP
 	-- survived. name:gsub("[^%w_-]", "_") sanitizes radio the same way ssid
 	-- already was, though UCI radio names ("radio0"/"radio1") never need it.
+	local safe_ssid = ssid:gsub("[^%w_-]", "_")
+	-- Sanitizing is lossy: "Guest WiFi" and "Guest_WiFi" both become
+	-- Guest_WiFi, so two WLANs on one radio whose names differ only in
+	-- punctuation collapsed into one section, the second silently
+	-- overwriting the first. When the name had to be altered, a short hash
+	-- of the ORIGINAL keeps them apart; a name that needed no alteration
+	-- keeps the section name it has always had.
+	if safe_ssid ~= ssid then
+		safe_ssid = safe_ssid .. "_" .. M.derive_mobility_domain(ssid)
+	end
 	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_-]", "_")
-		.. "_" .. ssid:gsub("[^%w_-]", "_")
+		.. "_" .. safe_ssid
 	local enc = SECURITY_MAP[security] or "psk2"
 	cursor:set("wireless", section_name, "wifi-iface")
 	cursor:set("wireless", section_name, "device", radio)
@@ -804,7 +871,7 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 				tostring(country or cursor:get("wireless", radio, "openuf_country")
 					or cc_override)))
 			cursor:set("wireless", radio, "country", cc_override)
-			M._phy_caps_cache = nil
+			regdomain_changed()
 		end
 	else
 		-- No override (or it was removed): the controller's value goes back
@@ -813,11 +880,11 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 		if cursor:get("wireless", radio, "openuf_country") then
 			country = country or cursor:get("wireless", radio, "openuf_country")
 			cursor:delete("wireless", radio, "openuf_country")
-			M._phy_caps_cache = nil
+			regdomain_changed()
 		end
 		if country and country ~= cursor:get("wireless", radio, "country") then
 			cursor:set("wireless", radio, "country", country)
-			M._phy_caps_cache = nil
+			regdomain_changed()
 		end
 	end
 	if chan then
@@ -1341,7 +1408,8 @@ function M.apply_config(resp, cfg, opts)
 	-- Hand-configured (non-openuf_) SSIDs: disable or restore them per
 	-- conf.lua's use_only_unifi_wlan. Runs after the vap loop so it sees the
 	-- final section set, and before the reload so both land in one restart.
-	M.set_wlan_exclusive(cfg and cfg.config and cfg.config.use_only_unifi_wlan == true)
+	M.set_wlan_exclusive(cfg and cfg.config and cfg.config.use_only_unifi_wlan == true,
+		cfg and cfg.config and cfg.config.keep_wlan_sections)
 
 	-- A VLAN bridge that only exists in UCI carries no traffic: netifd has to
 	-- be told, and `wifi reload` alone does not create a bridge device. Runs
@@ -1360,6 +1428,9 @@ function M.apply_config(resp, cfg, opts)
 
 	-- Reload wireless
 	M._run_cmd("wifi reload")
+	-- netifd may hand the interfaces new netdev names on the way back up, so
+	-- the lookups below must not reuse anything read before the reload.
+	M._ws_cache = nil
 
 	-- "Multicast and Broadcast Blocker" enforcement. Deliberately after the
 	-- reload: the rules key off each VAP's live netdev name, which only exists
@@ -1491,18 +1562,45 @@ local function get_cjson()
 	return cjson_mod
 end
 
+-- The decoded `ubus call network.wireless status`, shared by the two lookups
+-- below. Cached only inside a pass opened by begin_pass() -- inform.lua's
+-- build_json opens one per payload and closes it on return -- and dropped by
+-- end_pass() and after every `wifi reload`, so a netdev name read before
+-- netifd rebuilt the interfaces is never reused after. Outside a pass every
+-- call forks ubus exactly as before, which is also what keeps the test
+-- suite's per-test _popen stubs independent of one another. Inside one,
+-- what used to be ten identical forks per heartbeat on a two-radio,
+-- four-SSID box is one.
+M._ws_cache = nil      -- {status = <decoded table> | false} while a pass is open
+M._ws_pass  = false
+function M.begin_pass() M._ws_pass = true;  M._ws_cache = nil end
+function M.end_pass()   M._ws_pass = false; M._ws_cache = nil end
+
+local function wireless_status()
+	if M._ws_pass and M._ws_cache then
+		return M._ws_cache.status or nil
+	end
+	local status = nil
+	local output = M._popen("ubus call network.wireless status")
+	if output ~= "" then
+		local cjson = get_cjson()
+		if cjson then
+			local ok_d, decoded = pcall(cjson.decode, output)
+			if ok_d and type(decoded) == "table" then status = decoded end
+		end
+	end
+	if M._ws_pass then M._ws_cache = {status = status or false} end
+	return status
+end
+
 -- Resolve a UCI radio name (e.g. "radio0") to its live wireless netdev name
 -- (e.g. "wlan0"), as assigned at runtime by netifd. Needed because sta_table()/
 -- radio_stats() operate on the live `iw`-visible interface, not the UCI config
 -- name. Returns nil if unresolvable (e.g. off-target, radio disabled).
 function M.get_ifname_for_radio(radio)
 	if not radio then return nil end
-	local output = M._popen("ubus call network.wireless status")
-	if output == "" then return nil end
-	local cjson = get_cjson()
-	if not cjson then return nil end
-	local ok_d, status = pcall(cjson.decode, output)
-	if not ok_d or type(status) ~= "table" then return nil end
+	local status = wireless_status()
+	if not status then return nil end
 	local dev = status[radio]
 	if type(dev) == "table" and type(dev.interfaces) == "table" then
 		for _, iface in ipairs(dev.interfaces) do
@@ -1522,12 +1620,8 @@ end
 -- silently apply one SSID's filter to another. Returns nil if unresolvable.
 function M.get_ifname_for_vap(radio, ssid)
 	if not radio or not ssid then return nil end
-	local output = M._popen("ubus call network.wireless status")
-	if output == "" then return nil end
-	local cjson = get_cjson()
-	if not cjson then return nil end
-	local ok_d, status = pcall(cjson.decode, output)
-	if not ok_d or type(status) ~= "table" then return nil end
+	local status = wireless_status()
+	if not status then return nil end
 	local dev = status[radio]
 	if type(dev) ~= "table" or type(dev.interfaces) ~= "table" then return nil end
 	for _, iface in ipairs(dev.interfaces) do
@@ -1588,9 +1682,21 @@ function M.get_vap_table()
 		-- how a WLAN the controller itself disabled keeps showing up as
 		-- disabled rather than vanishing.
 		if s.disabled == "1" and not s.openuf_wlanconf_id then return end
+		-- Only access points are VAPs. A mesh point or a station interface
+		-- (the 802.11s backhaul REVERSE-ENGINEERING.md's mesh fallback adds,
+		-- bridged into br-lan) has no SSID to report and is not a BSS the
+		-- controller can provision; it went out as a nameless phantom VAP
+		-- with no clients. An absent mode is OpenWrt's default of "ap".
+		if s.mode ~= nil and s.mode ~= "ap" then return end
 		local radio = radio_by_name[s.device]
+		-- This VAP's own netdev, not the radio's first one. Two SSIDs on a
+		-- radio have two BSSIDs (netifd derives the second from the first
+		-- with the locally-administered bit set), and reporting the first
+		-- one's for both gave the controller two VAPs on one BSSID. The
+		-- earlier per-VAP fix for sta_table left this field on the
+		-- per-radio lookup. Unresolvable -> "", never a neighbour's address.
 		local bssid = ""
-		local ok_if, ifname = pcall(M.get_ifname_for_radio, s.device)
+		local ok_if, ifname = pcall(M.get_ifname_for_vap, s.device, s.ssid)
 		if ok_if and ifname then
 			local mac_raw = M._read_file("/sys/class/net/" .. ifname .. "/address")
 			if mac_raw then bssid = mac_raw:match("^([%x:]+)") or "" end

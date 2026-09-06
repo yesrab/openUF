@@ -55,6 +55,13 @@ jobs:
           sh tools/simulate.sh --adopt
           sh tools/simulate.sh
 
+      # dist.sh --verify proves the comment-stripped tree is bytecode-identical
+      # to the source and still passes the suite. It used to run only when a
+      # release tag was pushed, so a strip regression could sit on main
+      # unnoticed until the next release was cut.
+      - name: Package and verify the stripped tree
+        run: sh tools/dist.sh --verify
+
   python-controller-syntax:
     name: Python controller syntax check
     runs-on: ubuntu-latest

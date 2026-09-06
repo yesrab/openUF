@@ -119,6 +119,35 @@ local function with_stderr(fn)
 	return table.concat(buf)
 end
 
+-- Run fn with the inform loop's collaborators stubbed: build_json returns a
+-- fixed payload (no sysinfo, no UCI), the state file never changes, and
+-- _http_post is whatever the test installs. Every seam is restored after,
+-- even when fn raises.
+local function with_tick_env(fn)
+	local o_build, o_handle, o_post, o_mtime, o_uci, o_run, o_time =
+		inform.build_json, inform.handle_response, inform._http_post,
+		inform._state_mtime, inform._ucihelper, inform._run_cmd, inform._time
+	local o_warned = inform._warned_400
+	inform.build_json = function() return '{"_type":"state"}' end
+	inform._state_mtime = function() return 1 end
+	inform._warned_400 = false
+	local ok, err = pcall(fn)
+	inform.build_json, inform.handle_response, inform._http_post,
+		inform._state_mtime, inform._ucihelper, inform._run_cmd, inform._time =
+		o_build, o_handle, o_post, o_mtime, o_uci, o_run, o_time
+	inform._warned_400 = o_warned
+	if not ok then error(err, 0) end
+end
+
+-- A controller response as parse_packet will accept it. The TNBU framing is
+-- symmetric, so build_packet under the device's own key produces exactly the
+-- bytes a controller would have sent under that key.
+local function response(json, st) return inform.build_packet(json, st) end
+
+-- ctx as run() hands it to the first _tick: last_mtime already equal to what
+-- the stubbed _state_mtime returns, so no spurious reload fires.
+local function fresh_ctx() return {interval = 10, backoff = 10, last_mtime = 1} end
+
 local MAGIC = "TNBU"
 
 -- Parse header fields from a raw TNBU packet for assertions
@@ -2670,6 +2699,299 @@ return {
 			assert_eq(#calls, 1, "bootstrap account synced")
 			assert_contains(calls[1], "passwd -l",
 				"locked since reloaded state is adopted")
+		end
+	},
+	{
+		name = "inform: _tick survives a build_json error -- one heartbeat, one log line, no POST",
+		fn = function()
+			-- One nil in one field once took the whole daemon down (`nil +
+			-- noise`), and procd's respawn turned it into a crash loop that
+			-- reported nothing. The loop body is now pcall-bounded per stage.
+			with_tick_env(function()
+				inform.build_json = function() error("nil + noise") end
+				local posted = false
+				inform._http_post = function() posted = true; return nil, "unreachable" end
+				local st, ctx = sample_state(), fresh_ctx()
+				local wait
+				local out = with_stderr(function() wait = inform._tick(st, nil, nil, ctx) end)
+				assert_eq(wait, 10, "waits one ordinary interval")
+				assert_false(posted, "nothing is sent when there is nothing to send")
+				assert_contains(out, "build_json failed", "and the failure is logged")
+				assert_contains(out, "nil + noise", "with the error text")
+			end)
+		end
+	},
+	{
+		name = "inform: _tick ends the ucihelper lookup pass even when build_json throws",
+		fn = function()
+			-- build_json opens a per-payload ubus cache and closes it on its
+			-- normal return; an error skips the close, and a stale open pass
+			-- would then feed handle_response pre-reload interface names.
+			with_tick_env(function()
+				local ended = false
+				inform._ucihelper = {end_pass = function() ended = true end}
+				inform.build_json = function() error("boom") end
+				with_stderr(function() inform._tick(sample_state(), nil, nil, fresh_ctx()) end)
+				assert_true(ended, "the pass is closed on the error path")
+			end)
+		end
+	},
+	{
+		name = "inform: _tick backs off on POST failure, to a 60 s ceiling, and resets on success",
+		fn = function()
+			with_tick_env(function()
+				inform._http_post = function() return nil, "connect failed: timeout" end
+				local st, ctx = sample_state(), fresh_ctx()
+				local waits = {}
+				with_stderr(function()
+					for _ = 1, 5 do waits[#waits + 1] = inform._tick(st, nil, nil, ctx) end
+				end)
+				assert_eq(table.concat(waits, ","), "20,40,60,60,60", "doubles, then holds at 60")
+				inform._http_post = function() return response('{"_type":"noop"}', st) end
+				assert_eq(inform._tick(st, nil, nil, ctx), 10, "a success waits the plain interval")
+				inform._http_post = function() return nil, "connect failed: timeout" end
+				with_stderr(function() waits = {inform._tick(st, nil, nil, ctx)} end)
+				assert_eq(waits[1], 20, "and the backoff starts over from the interval")
+			end)
+		end
+	},
+	{
+		name = "inform: a persistent HTTP 400 on an adopted device is explained once per streak",
+		fn = function()
+			-- The startup identity warning needs a previous MAC to compare
+			-- against; this one fires on the symptom itself so the log names
+			-- the likely cause instead of filling with anonymous 400s.
+			with_tick_env(function()
+				inform._http_post = function() return nil, "HTTP 400" end
+				local st  = sample_state({adopted = true})
+				local cfg = {net = {lan_cpueth = "br-lan"}}
+				local ctx = fresh_ctx()
+				local out = with_stderr(function()
+					inform._tick(st, cfg, nil, ctx)
+					inform._tick(st, cfg, nil, ctx)
+				end)
+				assert_eq(select(2, out:gsub("HTTP 400 although", "")), 1, "warned exactly once")
+				assert_contains(out, "aa:bb:cc:dd:ee:ff", "names the MAC it informs as")
+				assert_contains(out, "br-lan", "and the setting that decides it")
+				assert_contains(out, "re-adopt", "and how to fix it")
+				-- A success re-arms it for the next streak.
+				inform._http_post = function() return response('{"_type":"noop"}', st) end
+				inform._tick(st, cfg, nil, ctx)
+				inform._http_post = function() return nil, "HTTP 400" end
+				out = with_stderr(function() inform._tick(st, cfg, nil, ctx) end)
+				assert_contains(out, "HTTP 400 although", "warned again after the streak broke")
+				-- Unadopted: a 400 is not an identity problem and stays plain.
+				inform._warned_400 = false
+				out = with_stderr(function() inform._tick(sample_state(), cfg, nil, fresh_ctx()) end)
+				assert_true(out:find("although", 1, true) == nil, "no identity hint when unadopted")
+			end)
+		end
+	},
+	{
+		name = "inform: _tick waits the interval on noop and re-informs at once after a command",
+		fn = function()
+			with_tick_env(function()
+				local st, ctx = sample_state(), fresh_ctx()
+				inform._http_post = function() return response('{"_type":"noop"}', st) end
+				assert_eq(inform._tick(st, nil, nil, ctx), 10, "noop: one interval")
+				inform._http_post = function()
+					return response('{"_type":"cmd","cmd":"mfi-output"}', st)
+				end
+				local wait
+				with_stderr(function() wait = inform._tick(st, nil, nil, ctx) end)
+				assert_eq(wait, 0, "command executed: inform again immediately")
+			end)
+		end
+	},
+	{
+		name = "inform: _tick survives a parse error and a handler error",
+		fn = function()
+			with_tick_env(function()
+				local st, ctx = sample_state(), fresh_ctx()
+				inform._http_post = function() return "not a TNBU packet at all" end
+				local wait
+				local out = with_stderr(function() wait = inform._tick(st, nil, nil, ctx) end)
+				assert_eq(wait, 10, "parse error: one interval")
+				assert_contains(out, "parse error", "logged as such")
+				inform._http_post = function() return response('{"_type":"noop"}', st) end
+				inform.handle_response = function() error("dispatcher bug") end
+				out = with_stderr(function() wait = inform._tick(st, nil, nil, ctx) end)
+				assert_eq(wait, 10, "handler error: one interval, daemon alive")
+				assert_contains(out, "handle_response failed", "logged")
+				assert_contains(out, "dispatcher bug", "with the error")
+			end)
+		end
+	},
+	{
+		name = "inform: debug_dump_requests adds tagged TX/ERR lines and leaves response lines untagged",
+		fn = function()
+			-- The documented capture recipes grep the untagged response
+			-- lines; requests and transport errors are opt-in and tagged so
+			-- they can be filtered in or out.
+			with_tick_env(function()
+				local path = "/tmp/openuf_test_dump_tx.log"
+				os.remove(path)
+				local st, ctx = sample_state(), fresh_ctx()
+				local cfg = {config = {debug_dump_file = path}}
+				inform._http_post = function() return response('{"_type":"noop"}', st) end
+				inform._tick(st, cfg, nil, ctx)
+				local f = io.open(path, "r"); local body = f:read("*a"); f:close()
+				assert_true(body:find(" TX ", 1, true) == nil, "no TX line unless asked for")
+				assert_contains(body, ' {"_type":"noop"}', "the response line, untagged")
+
+				cfg.config.debug_dump_requests = true
+				inform._tick(st, cfg, nil, ctx)
+				inform._http_post = function() return nil, "HTTP 400" end
+				with_stderr(function() inform._tick(st, cfg, nil, ctx) end)
+				f = io.open(path, "r"); body = f:read("*a"); f:close()
+				os.remove(path)
+				assert_contains(body, ' TX {"_type":"state"}', "the request, tagged")
+				assert_contains(body, " ERR HTTP 400", "the transport failure, tagged")
+				assert_true(body:match("^%d%d%d%d%-%d%d%-%d%dT") ~= nil, "every line is timestamped")
+			end)
+		end
+	},
+	{
+		name = "inform: _maybe_scan_neighbours is off by default, skips its first pass, then scans per radio",
+		fn = function()
+			with_tick_env(function()
+				local cmds = {}
+				inform._run_cmd = function(cmd) cmds[#cmds + 1] = cmd; return "" end
+				inform._ucihelper = {
+					get_radio_table = function() return {{name = "radio0"}, {name = "radio1"}} end,
+					get_ifname_for_radio = function(r)
+						if r == "radio0" then return "phy0-ap0" end
+						return "phy1-ap0"
+					end,
+				}
+				local t = 1000
+				inform._time = function() return t end
+				assert_false(inform._maybe_scan_neighbours({config = {}}, {}), "off with no interval")
+				assert_false(inform._maybe_scan_neighbours({config = {neighbour_scan_interval = 0}}, {}),
+					"off at 0")
+				local cfg, ctx = {config = {neighbour_scan_interval = 300}}, {}
+				assert_false(inform._maybe_scan_neighbours(cfg, ctx),
+					"never on the first pass -- ACS is still scanning at boot")
+				t = 1299
+				assert_false(inform._maybe_scan_neighbours(cfg, ctx), "not before the interval")
+				t = 1300
+				assert_true(inform._maybe_scan_neighbours(cfg, ctx), "scans once the interval is up")
+				assert_eq(#cmds, 2, "one scan per radio")
+				assert_eq(cmds[1], "iw dev phy0-ap0 scan", "the same form the spectrum-scan cmd uses")
+				assert_eq(cmds[2], "iw dev phy1-ap0 scan", "on the second radio too")
+				t = 1301
+				assert_false(inform._maybe_scan_neighbours(cfg, ctx), "and then waits again")
+				assert_eq(#cmds, 2, "no extra scans")
+			end)
+		end
+	},
+	{
+		name = "inform: _warn_debug_overrides is silent by default and loud when the overrides are set",
+		fn = function()
+			assert_false(inform._warn_debug_overrides(nil), "no cfg")
+			assert_false(inform._warn_debug_overrides({config = {}}), "nothing set")
+			assert_false(inform._warn_debug_overrides({config = {debug_caps = {}}}), "empty table = unset")
+			local out = with_stderr(function()
+				assert_true(inform._warn_debug_overrides({config = {
+					debug_caps = {wifi_caps2 = 0x41},
+					debug_payload_extra = {uplink = {}},
+				}}), "warns")
+			end)
+			assert_contains(out, "DEBUG OVERRIDES ACTIVE", "unmistakable")
+			assert_contains(out, "wifi_caps2=0x41", "names the overridden mask")
+			assert_contains(out, "uplink", "and the extra field")
+			assert_contains(out, "does\nopenuf: not implement", "says what the risk is")
+		end
+	},
+	{
+		name = "inform: _populate_net_info warns when lan_cpueth has no MAC, and keeps the persisted identity",
+		fn = function()
+			-- A generic profile's eth1 on a DSA board, say. The MAC state.json
+			-- persisted from the previous run is kept rather than informing
+			-- as 00:00:00:00:00:00 -- but that hides the misconfiguration, so
+			-- the log has to name it.
+			local st = {mac = "e8:de:27:5f:62:7a"}
+			local out = with_stderr(function()
+				inform._populate_net_info(st, {net = {lan_cpueth = "openuf-nosuch0"}})
+			end)
+			assert_contains(out, "cannot read a MAC", "warns")
+			assert_contains(out, "openuf-nosuch0", "names the interface")
+			assert_eq(st.mac, "e8:de:27:5f:62:7a", "the persisted identity is kept")
+		end
+	},
+	{
+		name = "inform packet: handle_response refuses an IP Settings push with a malformed address",
+		fn = function()
+			-- These values are spliced into `ip addr`/`ip route` command lines
+			-- by netconfig.lua, and pre-adoption the inform channel is plain
+			-- HTTP under the well-known key. Nothing may run, and nothing may
+			-- be recorded either -- a recorded static_ip would drive the
+			-- DHCP-revert logic later.
+			local st = sample_state()
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd) cmds[#cmds + 1] = cmd; return true end
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			local out = with_stderr(function()
+				inform.handle_response('{"_type":"setparam","system_cfg":'
+					.. '"netconf.1.ip=10.0.0.5; reboot\\nnetconf.1.netmask=255.255.255.0\\n'
+					.. 'route.1.gateway=10.0.0.1\\n"}', st, cfg)
+				inform.handle_response('{"_type":"setparam","system_cfg":'
+					.. '"netconf.1.ip=10.0.0.5\\nnetconf.1.netmask=255.255.255.0\\n'
+					.. 'route.1.gateway=$(reboot)\\n"}', st, cfg)
+			end)
+			inform._netconfig._exec = orig
+			assert_eq(#cmds, 0, "nothing was run")
+			assert_nil(st.ip_mode, "nothing was recorded")
+			assert_nil(st.static_ip, "no static address remembered")
+			assert_eq(select(2, out:gsub("malformed", "")), 2, "each refusal is logged")
+		end
+	},
+	{
+		name = "inform packet: handle_response cmd block-sta ignores a malformed MAC",
+		fn = function()
+			local st = sample_state()
+			local touched = false
+			inform._firewall = {
+				reconcile = function() touched = true end,
+				deauth    = function() touched = true end,
+			}
+			local out = with_stderr(function()
+				inform.handle_response(
+					'{"_type":"cmd","cmd":"block-sta","mac":"aa:bb }\' ; reboot ; \'{"}', st)
+			end)
+			inform._firewall = { reconcile = function() end, deauth = function() end }
+			assert_true(st.blocked_stas == nil, "state untouched")
+			assert_false(touched, "firewall untouched")
+			assert_contains(out, "malformed MAC", "and the refusal is logged")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg drops malformed bcfilt and macacl MACs",
+		fn = function()
+			local blob = table.concat({
+				"wireless.1.ssid=corp", "wireless.1.parent=radio0", "wireless.1.devname=ath0",
+				"wireless.1.bcfilt.status=enabled",
+				"wireless.1.bcfilt.1.mac=01:00:5e:00:00:fb", "wireless.1.bcfilt.1.status=enabled",
+				"wireless.1.bcfilt.2.mac=01:00 }' ; reboot ; '{", "wireless.1.bcfilt.2.status=enabled",
+				"aaa.1.ssid=corp", "aaa.1.wpa=2", "aaa.1.wpa.psk=hunter22",
+				"aaa.1.wpa.key.1.mgmt=WPA-PSK",
+				"macacl.status=enabled", "macacl.1.devname=ath0", "macacl.1.status=enabled",
+				"macacl.1.acl.status=enabled", "macacl.1.acl.policy=allow",
+				"macacl.1.acl.1.mac=02:11:22:33:44:55", "macacl.1.acl.1.status=enabled",
+				"macacl.1.acl.2.mac=not-a-mac", "macacl.1.acl.2.status=enabled",
+			}, "\n") .. "\n"
+			local vaps
+			local out = with_stderr(function()
+				local _
+				_, vaps = inform._parse_wifi_system_cfg(blob)
+			end)
+			assert_eq(#vaps, 1, "one vap")
+			assert_eq(#vaps[1].bcfilt_macs, 1, "one blocker entry survives")
+			assert_eq(vaps[1].bcfilt_macs[1], "01:00:5e:00:00:fb", "the well-formed one")
+			assert_eq(#vaps[1].mac_filter_list, 1, "one filter entry survives")
+			assert_eq(vaps[1].mac_filter_list[1], "02:11:22:33:44:55", "the well-formed one")
+			assert_eq(select(2, out:gsub("malformed MAC", "")), 2, "both refusals logged")
 		end
 	},
 }

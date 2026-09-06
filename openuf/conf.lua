@@ -44,12 +44,22 @@ config = {
 	-- exactly those and leaves ones you disabled yourself alone.
 	use_only_unifi_wlan = true,
 
+	-- wifi-iface section names use_only_unifi_wlan must leave alone, e.g.
+	-- {"mesh0"} for a hand-made 802.11s backhaul. Sections whose mode is not
+	-- "ap" (mesh, sta) are exempt without being listed -- a link is not a
+	-- competing SSID, and it may be this AP's own uplink -- so this is for an
+	-- AP-mode SSID you want kept regardless. A listed section openUF had
+	-- already switched off is switched back on.
+	keep_wlan_sections = {},
+
 	-- URL the inform loop posts to.  Overwritten at runtime when the controller
 	-- sends a new URL or when syswrapper.sh set-inform is called.
 	-- The value here is only used on first boot (before state.json exists).
 	inform_url = "http://unifi:8080/inform",
 
-	-- Path for persistent state (authkey, adopted flag, cfgversion, inform_url).
+	-- Path for persistent state (authkey, adopted flag, cfgversion, inform_url,
+	-- and everything else state.lua's header lists). Read by inform.lua,
+	-- announce.lua and syswrapper.lua alike.
 	state_file = "/etc/openuf/state.json",
 
 	-- L2 discovery broadcasts (announce.lua, UDP port 10001). On by default:
@@ -71,6 +81,34 @@ config = {
 	-- default. Used to capture ground-truth payload shapes when validating
 	-- against a real UniFi controller -- see PROTOCOL-VALIDATION.md.
 	debug_dump_file = nil,
+
+	-- With debug_dump_file set: also record what openUF SENDS (one "TX" line
+	-- per inform, i.e. every 10 s) and any transport failure ("ERR" lines,
+	-- e.g. "HTTP 400"). Response lines keep their untagged shape, so the
+	-- capture recipes in REVERSE-ENGINEERING.md still work; filter with
+	-- grep ' TX ' / grep -v ' TX '. Off by default because it multiplies the
+	-- file's growth and the payload carries no secrets the responses do not.
+	debug_dump_requests = false,
+
+	-- RESEARCH ONLY. Override the capability bitmasks the payload claims:
+	--   debug_caps = {fw_caps = 0x110, wifi_caps = 0x0, wifi_caps2 = 0x40},
+	-- and/or merge extra top-level fields into every payload verbatim:
+	--   debug_payload_extra = {uplink = {type = "wireless"}},
+	-- A claimed bit makes the controller push config and show UI for a
+	-- feature this device does not implement -- the one thing openUF
+	-- otherwise never does (see inform.lua's build_json). These exist so the
+	-- go/no-go experiments in REVERSE-ENGINEERING.md are a conf.lua edit and
+	-- a restart; the daemon shouts at startup while either is set. nil = off.
+	debug_caps = nil,
+	debug_payload_extra = nil,
+
+	-- Seconds between background neighbour scans (`iw dev <if> scan` on each
+	-- radio), 0 = never. The Environment view is fed from the kernel's cached
+	-- BSS list, which forgets a network ~30 s after it was last seen -- and
+	-- nothing else in openUF ever scans, so the view drains to empty after
+	-- boot. A scan takes the radio off-channel briefly (clients see a short
+	-- stall), which is why this is off unless you turn it on; 300 is sane.
+	neighbour_scan_interval = 0,
 
 	-- Regulatory domain override: an ISO 3166-1 alpha-2 code programmed into
 	-- the driver INSTEAD of the one the controller pushes. nil = off, and the

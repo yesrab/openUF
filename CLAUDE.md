@@ -35,7 +35,10 @@ bash -n setup.sh && dash -n setup.sh
 ```
 
 A new test file must be added to the hardcoded `test_files` list in
-`tests/run_tests.lua` — it is not globbed, and an unregistered file silently never runs.
+`tests/run_tests.lua` — it is not globbed. The runner now fails the run if a
+`tests/test_*.lua` exists on disk that is not in the list, so forgetting is loud rather
+than silent. CI also runs `tools/dist.sh --verify` on every push, not only on a release
+tag.
 
 ---
 
@@ -354,6 +357,14 @@ shortage costs a feature, never openUF.
 `try_optional` only installs when there is room to spare *afterwards*: filling an overlay
 to 100% breaks `state.json` writes, the package database, and any later upgrade.
 
+**An existing `conf.lua` is kept.** It holds the modelmap the device was adopted under,
+and overwriting it on a reinstall (the natural upgrade path) reset the modelmap to the
+generic one — on a DSA board that moves `lan_cpueth`, hence the identity MAC, hence
+HTTP 400 forever. The shipped default lands as `conf.lua.dist`; `--replace-conf`
+overwrites, and `setup.sh` passes it because it has just written `conf.lua` from its
+interview. Options come after the action and an unknown one is an error, so a mistyped
+flag cannot install silently without what it asked for.
+
 `--bootstrap-adopt` creates the locked-down non-root `ubnt`/`ubnt` account, scoped to
 running `syswrapper.sh set-adopt` only, which self-locks once adopted and re-enables on
 factory reset.
@@ -362,6 +373,38 @@ factory reset.
 
 ## Landmines
 
+- **`state.save` writes the whole table and `state.load` reads all of it back.** Eight
+  fields are type-checked with defaults; everything else round-trips as-is. That
+  symmetry is load-bearing: `swvlan_backup` (the switch reversibility ledger), `ip_mode`
+  and the `static_*` fields, `locating`, `led_enabled` and the previous run's `mac` all
+  live there, and `_warn_identity_change` only works because the previous MAC comes back.
+  `load()` used to whitelist the eight and drop the rest on every start. The write is
+  temp-file-and-rename, because a truncated file reads as "defaults" and un-adopts the
+  device.
+- **The inform loop is `_tick()`, and every stage in it is pcall-wrapped.** `build_json`
+  shells out to a dozen tools; one nil in one field once crash-looped the daemon under
+  procd. A bad cycle costs one heartbeat and one log line. Keep new stages inside the
+  boundary, and keep `M.run` as nothing but the sleep loop around `_tick`.
+- **Wire values that reach a shell are shape-checked first.** `netconf.1.ip`, the netmask,
+  `route.1.gateway`, block-sta's `resp.mac`, the bcfilt allow-list and the MAC filter all
+  go through `is_ipv4`/`is_mac` at the parser *and* again in netconfig/firewall/bcfilter.
+  Pre-adoption the inform channel is plain HTTP under the well-known key, so a forged
+  `setparam` is within reach of anyone on the path; without these it was a root shell.
+- **`get_vap_table` reports AP-mode sections only, and `use_only_unifi_wlan` never touches
+  a non-AP one.** A mesh point or station interface (a wireless backhaul) is a link, not a
+  competing SSID, and may be the device's own uplink. `keep_wlan_sections` exempts named
+  AP sections. Each VAP reports its own BSSID via `get_ifname_for_vap`, not the radio's
+  first interface's.
+- **`debug_caps` / `debug_payload_extra` are the one sanctioned exception to "never claim a
+  capability you cannot honour".** They exist so the mesh go/no-go experiment is a
+  `conf.lua` edit; the daemon shouts at startup while either is set. Never ship a default
+  for them, and never let a real feature depend on them.
+- **`ubus call network.wireless status` is cached per `build_json` pass** (`begin_pass` /
+  `end_pass`), and `iw phy phyN info` per phy with a five-minute TTL in sysinfo. Both
+  caches are dropped after `wifi reload`; `phy_caps` additionally re-reads for a minute
+  after a regdomain write, because the driver applies the new domain only when the
+  radios come back up. Tests that stub `_popen`/`_run_cmd` must reset these (the harnesses
+  do).
 - **AES-GCM is mandatory for adoption.** UniFi 10.4.57 will not finish provisioning a
   device that has never sent a genuine GCM inform; a CBC-only device sticks at "Adopting"
   forever. Needs a GCM-capable `lua-openssl`; the `openssl` CLI fallback is CBC-only.

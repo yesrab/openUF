@@ -8,7 +8,7 @@
 	Binary packet format (TNBU, "UBNT" reversed):
 	  Offset  Len  Field
 	   0       4   Magic: 0x54 0x4E 0x42 0x55 ("TNBU")
-	   4       4   Packet version (uint32 BE) — always 0
+	   4       4   Packet version (uint32 BE) — 1 (PKT_VERSION below)
 	   8       6   Device MAC
 	  14       2   Flags (uint16 BE):
 	               0x01 = payload encrypted (AES-128-CBC or GCM)
@@ -249,6 +249,19 @@ end
 local function is_hex32(s)
 	return type(s) == "string" and #s == 32 and s:match("^[0-9a-fA-F]+$") ~= nil
 end
+
+-- Exactly "aa:bb:cc:dd:ee:ff". Wire-supplied MACs -- block-sta's resp.mac, the
+-- Multicast/Broadcast Blocker's allow-list, the MAC filter -- end up inside
+-- nft and hostapd_cli command lines (firewall.lua, bcfilter.lua) or in UCI
+-- lists hostapd parses, so anything not of this shape is refused at the
+-- boundary rather than escaped. The controller is authenticated once
+-- adopted, but before that the inform channel is plain HTTP under the
+-- well-known default key, and a forged setparam is within reach of anyone on
+-- the path; this is what keeps that from becoming a shell.
+local function is_mac(s)
+	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
+end
+M._is_mac = is_mac
 
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 
@@ -554,6 +567,13 @@ function M.build_json(st, cfg, ufhw)
 	-- fail off-target, so individual calls are still pcall-wrapped below)
 	local ufuci = M._ucihelper
 	if ufuci and ufuci.get_vap_table then
+		-- One `ubus call network.wireless status` for the whole payload:
+		-- every get_ifname_for_radio/vap below (one per VAP in get_vap_table,
+		-- one per radio, one per VAP again) otherwise re-runs it with the
+		-- same answer -- ten identical forks per heartbeat on a two-radio,
+		-- four-SSID box. Feature-detected: test doubles inject a ucihelper
+		-- without it. _tick() ends the pass even when this function throws.
+		if ufuci.begin_pass then ufuci.begin_pass() end
 		local ok_v, rv = pcall(ufuci.get_vap_table)
 		if ok_v then vap_table = rv end
 		-- The modelmap's hwassign restricts which radios are reported; absent,
@@ -1181,6 +1201,15 @@ function M.build_json(st, cfg, ufhw)
 				vap.cu_interf  = cu.cu_interf
 			end
 		end
+		-- Forget stations not seen for ten minutes. Each entry is tiny, but
+		-- the table is keyed by client MAC and was never emptied, so on a
+		-- daemon that runs for months in a venue with transient clients it
+		-- only ever grew. A station back after that long is a fresh
+		-- association, and a 0-throughput first sample is the honest figure
+		-- for it anyway. Assigning nil during pairs() is defined behaviour.
+		for mac, s in pairs(M._sta_stats_cache) do
+			if now - s.time > 600 then M._sta_stats_cache[mac] = nil end
+		end
 	end
 
 	-- port_table: the device's own ethernet ports plus, per non-uplink port,
@@ -1372,6 +1401,19 @@ function M.build_json(st, cfg, ufhw)
 		end
 	end
 
+	-- conf.lua debug_caps: research-only overrides for the three capability
+	-- bitmasks. The rule everywhere else in this file is "never claim a bit
+	-- openUF cannot honour", because a claimed bit makes the controller emit
+	-- config and change its UI for a feature that then silently does nothing.
+	-- This is the deliberate, logged exception to that rule: the mesh
+	-- investigation (REVERSE-ENGINEERING.md) cannot capture the controller's
+	-- mesh push until some device claims the gating bit, so the go/no-go
+	-- experiment has to be a conf.lua edit and a restart, not a code deploy.
+	-- nil for a mask means the shipped value; wifi_caps is not sent at all
+	-- unless overridden, exactly as before.
+	local dbg_caps = cfg and cfg.config and type(cfg.config.debug_caps) == "table"
+		and cfg.config.debug_caps or nil
+
 	local payload = {
 		_type            = "state",
 		["default"]      = not st.adopted,
@@ -1424,7 +1466,11 @@ function M.build_json(st, cfg, ufhw)
 		-- "Capability bitmasks" for the full derivation (traced through
 		-- an obfuscation-induced macOS case-folding extraction bug along
 		-- the way).
-		fw_caps          = 0x110,
+		fw_caps          = (dbg_caps and tonumber(dbg_caps.fw_caps)) or 0x110,
+		-- wifi_caps gates supportBandsteering()/supportZeroHandoff() and is
+		-- deliberately absent (see PROTOCOL-VALIDATION.md); only debug_caps
+		-- can put it on the wire.
+		wifi_caps        = dbg_caps and tonumber(dbg_caps.wifi_caps) or nil,
 		-- Bit 0x40 (64): Device.supportAdvertisingDeviceNameInBeacon() in the
 		-- decompiled controller is exactly hasWifiCapability2(64) -- i.e. bit
 		-- 6 of a SECOND capability bitmask, wifi_caps2, entirely separate
@@ -1440,7 +1486,7 @@ function M.build_json(st, cfg, ufhw)
 		-- features (Mesh MLO parent/child, assisted roaming, etc., see
 		-- PROTOCOL-VALIDATION.md) that openUF does not implement and must
 		-- not claim.
-		wifi_caps2       = 0x40,
+		wifi_caps2       = (dbg_caps and tonumber(dbg_caps.wifi_caps2)) or 0x40,
 		-- Device-level (not per-radio -- see radio_table_stats above)
 		-- Device-level Experience: the mean of every connected client's own
 		-- satisfaction, across all VAPs. Same reasoning as the per-VAP copy
@@ -1472,6 +1518,17 @@ function M.build_json(st, cfg, ufhw)
 		lldp_table       = arr(lldp_table),
 	}
 
+	-- conf.lua debug_payload_extra: research-only top-level fields merged in
+	-- verbatim (an `uplink` object, say, to see what shape the controller
+	-- accepts) -- same caveat, same log line at startup as debug_caps. A key
+	-- that already exists is overwritten on purpose: that is how a shipped
+	-- field's value is experimented with.
+	local extra = cfg and cfg.config and cfg.config.debug_payload_extra
+	if type(extra) == "table" then
+		for k, v in pairs(extra) do payload[k] = v end
+	end
+
+	if ufuci and ufuci.end_pass then ufuci.end_pass() end
 	return M._fix_empty_arrays(cjson.encode(payload))
 end
 
@@ -1756,7 +1813,16 @@ function M._parse_wifi_system_cfg(sys_raw)
 			for k, val in pairs(e) do
 				local ki = k:match("^acl%.(%d+)%.mac$")
 				if ki and e["acl." .. ki .. ".status"] == "enabled" then
-					macs[#macs + 1] = val
+					-- The list becomes a UCI maclist hostapd parses; a
+					-- malformed entry would fail the whole BSS, and the
+					-- controller's UI cannot produce one, so dropping it
+					-- (loudly) is the safe reading.
+					if is_mac(val) then
+						macs[#macs + 1] = val
+					else
+						io.stderr:write(("inform: macacl: ignoring malformed MAC %q\n")
+							:format(tostring(val)))
+					end
 				end
 			end
 			table.sort(macs)
@@ -1890,8 +1956,15 @@ function M._parse_wifi_system_cfg(sys_raw)
 			for k, val in pairs(w) do
 				local idx = k:match("^bcfilt%.(%d+)%.mac$")
 				if idx and _wire_bool(w["bcfilt." .. idx .. ".status"]) then
-					bcfilt_macs = bcfilt_macs or {}
-					bcfilt_macs[#bcfilt_macs + 1] = val
+					-- These go into an `nft add element` command line
+					-- (bcfilter.lua), so only a real MAC may pass.
+					if is_mac(val) then
+						bcfilt_macs = bcfilt_macs or {}
+						bcfilt_macs[#bcfilt_macs + 1] = val
+					else
+						io.stderr:write(("inform: bcfilt: ignoring malformed MAC %q\n")
+							:format(tostring(val)))
+					end
 				end
 			end
 			if bcfilt_macs then table.sort(bcfilt_macs) end
@@ -2462,6 +2535,24 @@ function M.handle_response(json_str, st, cfg)
 				for _, i in ipairs(idxs) do dns[#dns + 1] = dns_by_idx[i] end
 			end
 
+			-- Shape check BEFORE anything is recorded or run. These three
+			-- values are interpolated into `ip addr`/`ip route` command lines
+			-- by netconfig.lua (which refuses them again itself), and this is
+			-- what keeps a malformed push out of state.json as well: with the
+			-- record written first, a refused apply would still leave
+			-- ip_mode=static and a bogus static_ip behind for the DHCP-revert
+			-- logic to act on. Feature-detected so a test double standing in
+			-- for netconfig need not carry the validator.
+			local ipv4 = M._netconfig.is_ipv4
+			if ip and ipv4 and not (ipv4(ip)
+					and (netmask == nil or netmask == "" or ipv4(netmask))
+					and (gateway == nil or gateway == "" or ipv4(gateway))) then
+				io.stderr:write(("inform: ignoring IP Settings push with a malformed "
+					.. "address (ip=%q netmask=%q gateway=%q)\n"):format(
+					tostring(ip), tostring(netmask), tostring(gateway)))
+				ip = nil
+			end
+
 			if ip then
 				local iface = cfg and cfg.net and cfg.net.lan_cpueth
 				if dhcp then
@@ -2635,7 +2726,13 @@ function M.handle_response(json_str, st, cfg)
 			-- Persisted in state.blocked_stas and re-applied at M.run()
 			-- startup (M._firewall.reconcile), so it survives a restart.
 			local mac = resp.mac
-			if type(mac) == "string" then
+			if type(mac) == "string" and not is_mac(mac) then
+				-- It is about to become part of an nft and a hostapd_cli
+				-- command line; see is_mac.
+				io.stderr:write(("inform: %s: ignoring malformed MAC %q\n")
+					:format(cmd, mac))
+			end
+			if is_mac(mac) then
 				st.blocked_stas = st.blocked_stas or {}
 				if cmd == "block-sta" then
 					local already = false
@@ -2895,6 +2992,18 @@ function M._populate_net_info(st, cfg)
 		st.mac = string.format("%02x:%02x:%02x:%02x:%02x:%02x",
 			mac_tbl[1], mac_tbl[2], mac_tbl[3],
 			mac_tbl[4], mac_tbl[5], mac_tbl[6])
+	else
+		-- The interface the modelmap names does not exist here (a generic
+		-- profile's eth1 on a DSA board, say, after an install.sh run that
+		-- reset conf.lua). st.mac keeps whatever state.json persisted from
+		-- the previous run, so the device goes on informing under the
+		-- identity it was adopted as rather than as 00:00:00:00:00:00 --
+		-- but that only hides the misconfiguration, so say so.
+		io.stderr:write(string.format(
+			"openuf: cannot read a MAC from dev.conf.net.lan_cpueth = %s -- no such\n" ..
+			"openuf: interface on this device; check the modelmap in conf.lua.\n" ..
+			"openuf: Informing as %s meanwhile.\n",
+			tostring(iface), tostring(st.mac or "00:00:00:00:00:00")))
 	end
 	local ip_tbl = announce.get_ip(iface)
 	if ip_tbl then
@@ -2990,16 +3099,191 @@ function M._warn_identity_change(prev_mac, st, cfg)
 	return true
 end
 
+-- The debug_caps / debug_payload_extra options make the device claim things it
+-- does not implement -- the one thing this file otherwise never does. They
+-- exist for protocol experiments (REVERSE-ENGINEERING.md), and a device left
+-- running with them by accident would show the controller features that then
+-- silently do nothing, so the log says so at every start. Returns true when
+-- it warned, so this is testable without running the loop.
+function M._warn_debug_overrides(cfg)
+	local c = cfg and cfg.config
+	if not c then return false end
+	local caps  = type(c.debug_caps) == "table" and next(c.debug_caps) ~= nil
+	local extra = type(c.debug_payload_extra) == "table" and next(c.debug_payload_extra) ~= nil
+	if not (caps or extra) then return false end
+	local parts = {}
+	if caps then
+		for _, k in ipairs({"fw_caps", "wifi_caps", "wifi_caps2"}) do
+			if c.debug_caps[k] ~= nil then
+				parts[#parts + 1] = string.format("%s=0x%x", k,
+					math.floor(tonumber(c.debug_caps[k]) or 0))
+			end
+		end
+	end
+	if extra then
+		local keys = {}
+		for k in pairs(c.debug_payload_extra) do keys[#keys + 1] = tostring(k) end
+		table.sort(keys)
+		parts[#parts + 1] = "extra payload fields: " .. table.concat(keys, ", ")
+	end
+	io.stderr:write(
+		"openuf: DEBUG OVERRIDES ACTIVE (conf.lua debug_caps / debug_payload_extra):\n" ..
+		"openuf:   " .. table.concat(parts, "; ") .. "\n" ..
+		"openuf: the controller is being told about capabilities this device does\n" ..
+		"openuf: not implement. For protocol experiments only -- unset when done.\n")
+	return true
+end
+
+-- Appends one line -- UTC timestamp, a direction tag, the text -- to
+-- cfg.config.debug_dump_file. Responses are written by handle_response with
+-- NO tag, which is the line shape every documented grep recipe expects and
+-- must stay; requests ("TX") and transport failures ("ERR") are tagged so they
+-- can be filtered in or out, and only appear at all with debug_dump_requests
+-- set. Returns true when a line was written.
+function M._debug_append(cfg, tag, text)
+	local path = cfg and cfg.config and cfg.config.debug_dump_file
+	if not path then return false end
+	local f = io.open(path, "a")
+	if not f then return false end
+	f:write(os.date("!%Y-%m-%dT%H:%M:%SZ") .. " " .. tag .. " " .. text .. "\n")
+	f:close()
+	return true
+end
+
+-- An adopted device whose informs are answered 400 is, in every case seen so
+-- far, informing under a MAC the controller has no adoption for -- see
+-- _warn_identity_change, which needs the previous MAC to compare against and
+-- fires at startup. This one fires on the symptom itself, once per streak, so
+-- the log names the likely cause instead of filling with anonymous 400s.
+-- Returns true when it warned.
+M._warned_400 = false
+function M._warn_http_400(err, st, cfg)
+	if M._warned_400 or not (st and st.adopted) then return false end
+	if not (type(err) == "string" and err:match("^HTTP 400")) then return false end
+	M._warned_400 = true
+	io.stderr:write(string.format(
+		"openuf: the controller rejects every inform with HTTP 400 although this\n" ..
+		"openuf: device is adopted. That is what happens when the identity MAC\n" ..
+		"openuf: changed underneath an adoption: this run informs as %s off\n" ..
+		"openuf: dev.conf.net.lan_cpueth = %s. If the controller adopted a\n" ..
+		"openuf: different MAC, Forget the device there and re-adopt, or point\n" ..
+		"openuf: lan_cpueth back at the interface it was adopted under.\n",
+		tostring(st.mac), tostring(cfg and cfg.net and cfg.net.lan_cpueth)))
+	return true
+end
+
+-- Opt-in background neighbour scan (conf.lua neighbour_scan_interval, in
+-- seconds; 0/nil = off). scan_radio_table is read from the kernel's cached
+-- BSS list, and cfg80211 drops a cached BSS about 30 s after it was last
+-- seen -- and the controller drops anything with age >= 30 on top. Nothing
+-- else in openUF ever scans (the spectrum-scan cmd is never issued by
+-- 10.4.57), so after the boot-time ACS sweep the Environment view drains to
+-- empty, and any parent-AP list built from neighbours would have nothing to
+-- work from. A scan takes the radio off-channel for a moment, which clients
+-- see as a brief stall -- the reason this is off by default. Same `iw dev
+-- <if> scan` form the spectrum-scan handler uses, which is known to work on
+-- these boards' AP interfaces. Returns true when a scan was issued.
+function M._maybe_scan_neighbours(cfg, ctx)
+	local every = tonumber(cfg and cfg.config and cfg.config.neighbour_scan_interval)
+	if not every or every <= 0 then return false end
+	local now = M._time()
+	-- Never on the first pass: hostapd's own ACS scan is still running at
+	-- boot, and a restart must not cost every client a stall.
+	if not ctx.last_scan then ctx.last_scan = now; return false end
+	if now - ctx.last_scan < every then return false end
+	ctx.last_scan = now
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return false end
+	local ok_r, radios = pcall(ufuci.get_radio_table, cfg and cfg.uap and cfg.uap.hwassign)
+	if not ok_r or type(radios) ~= "table" then return false end
+	local issued = 0
+	for _, radio in ipairs(radios) do
+		local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+		if ok_if and ifname then
+			M._run_cmd("iw dev " .. ifname .. " scan")
+			issued = issued + 1
+		end
+	end
+	return issued > 0
+end
+
+-- One heartbeat: build, send, dispatch. Returns the number of seconds the
+-- caller should wait before the next one -- 0 means "again, now", the
+-- config-applied / command-executed case where a real AP re-informs at once.
+-- ctx carries the loop's own state (interval, backoff, last_mtime,
+-- last_scan) so run() is nothing but `while true do wait(_tick()) end` and
+-- the error boundaries and the backoff can be tested without a socket.
+--
+-- Every stage is pcall-wrapped, and that is the point of the split.
+-- build_json shells out to a dozen tools and does arithmetic on their
+-- output; one nil in one field once took the whole daemon down (`nil +
+-- noise`, from a radio with the minrssi flag set and no threshold), and
+-- procd's respawn turned that into a crash loop every five seconds that
+-- reported no statistics and logged nothing beyond the traceback. A bad
+-- cycle now costs one heartbeat and one log line, and the next cycle gets
+-- another go.
+function M._tick(st, cfg, ufhw, ctx)
+	ctx.interval = ctx.interval or 10
+	ctx.backoff  = ctx.backoff  or ctx.interval
+	local dump_tx = cfg and cfg.config and cfg.config.debug_dump_requests
+
+	ctx.last_mtime = M._reload_if_changed(st, cfg, ctx.last_mtime)
+	M._maybe_scan_neighbours(cfg, ctx)
+
+	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
+	-- build_json opens a ucihelper lookup pass and closes it on its normal
+	-- return; an error skips the close, and a stale pass would then feed
+	-- handle_response's own lookups pre-reload interface names.
+	if M._ucihelper and M._ucihelper.end_pass then pcall(M._ucihelper.end_pass) end
+	if not ok_b then
+		io.stderr:write("inform: build_json failed: " .. tostring(json_str) .. "\n")
+		return ctx.interval
+	end
+	if dump_tx then M._debug_append(cfg, "TX", json_str) end
+
+	local ok_p, pkt = pcall(M.build_packet, json_str, st)  -- use_gcm read from st.use_gcm
+	if not ok_p then
+		io.stderr:write("inform: build_packet failed: " .. tostring(pkt) .. "\n")
+		return ctx.interval
+	end
+
+	local body, err = M.http_post(st.inform_url, pkt)
+	if not body then
+		io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
+		if dump_tx then M._debug_append(cfg, "ERR", tostring(err)) end
+		M._warn_http_400(err, st, cfg)
+		ctx.backoff = math.min(ctx.backoff * 2, 60)
+		return ctx.backoff
+	end
+	ctx.backoff = ctx.interval
+	M._warned_400 = false
+
+	local parse_ok, json_body = pcall(M.parse_packet, body, st)
+	if not parse_ok then
+		io.stderr:write("inform: parse error: " .. tostring(json_body) .. "\n")
+		return ctx.interval
+	end
+	local ok_h, applied = pcall(M.handle_response, json_body, st, cfg)
+	if not ok_h then
+		io.stderr:write("inform: handle_response failed: " .. tostring(applied) .. "\n")
+		return ctx.interval
+	end
+	if applied then return 0 end
+	return ctx.interval
+end
+
 -- Start the inform heartbeat loop (blocks forever).
 -- cfg, ufhw: passed through to build_json()
 function M.run(cfg, ufhw)
 	local st = state.load()
-	-- The MAC persisted by the previous run, before _populate_net_info
+	-- The MAC persisted by the previous run (state.save writes the whole
+	-- table and state.load now reads it all back), before _populate_net_info
 	-- overwrites it with the live one read off dev.conf.net.lan_cpueth.
 	local prev_mac = st.mac
 	M._populate_net_info(st, cfg)
 	M._warn_identity_change(prev_mac, st, cfg)
 	M._warn_missing_uci()
+	M._warn_debug_overrides(cfg)
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 	-- Blocked-client nft rules are live kernel state, not persisted UCI --
 	-- reapply from state.json on every fresh start (mirrors the bootstrap
@@ -3009,34 +3293,15 @@ function M.run(cfg, ufhw)
 	-- switched off; without it every socket reports 0 B in the Ports view.
 	if M._switchvlan then pcall(M._switchvlan.enable_mib_polling, cfg) end
 
-	local socket   = require("socket")
-	local interval = 10
-	local backoff  = interval
-	local last_mtime = M._state_mtime(M._state._state_file)
-
+	local socket = require("socket")
+	local ctx = {
+		interval   = 10,
+		backoff    = 10,
+		last_mtime = M._state_mtime(M._state._state_file),
+	}
 	while true do
-		last_mtime = M._reload_if_changed(st, cfg, last_mtime)
-		local json_str = M.build_json(st, cfg, ufhw)
-		local pkt      = M.build_packet(json_str, st)  -- use_gcm read from st.use_gcm
-		local body, err = M.http_post(st.inform_url, pkt)
-
-		if not body then
-			io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
-			backoff = math.min(backoff * 2, 60)
-			socket.select(nil, nil, backoff)
-		else
-			backoff = interval
-			local parse_ok, json_body, resp_flags = pcall(M.parse_packet, body, st)
-			if parse_ok then
-				local config_applied = M.handle_response(json_body, st, cfg)
-				if not config_applied then
-					socket.select(nil, nil, interval)
-				end
-			else
-				io.stderr:write("inform: parse error: " .. tostring(json_body) .. "\n")
-				socket.select(nil, nil, interval)
-			end
-		end
+		local wait = M._tick(st, cfg, ufhw, ctx)
+		if wait > 0 then socket.select(nil, nil, wait) end
 	end
 end
 
@@ -3049,6 +3314,13 @@ if not OPENUF_TEST_MODE then
 			if not ok2 then dofile("openuf/lib/lib.lua") end
 		end
 		dofile("conf.lua")
+		-- conf.lua's state_file was documented as the state path for years
+		-- and read by nothing: every entry point used state.lua's hardcoded
+		-- default. announce.lua and hook/syswrapper.lua honour it the same
+		-- way, so the three processes that touch the file agree on where it is.
+		if config and type(config.state_file) == "string" and config.state_file ~= "" then
+			state._state_file = config.state_file
+		end
 		local ufhw = {uap = dofile("ufmodel/" .. dev.openuf.uap.ufmodel .. ".lua")}
 		-- config (debug_dump_file, state_file, ...) is a separate global set by
 		-- conf.lua, not a field of dev.conf -- merge it in under .config so

@@ -125,4 +125,19 @@ return {
 			end)
 		end
 	},
+	{
+		name = "bcfilter: reconcile skips a malformed allow-list entry",
+		fn = function()
+			local real = io.stderr
+			io.stderr = {write = function() end}
+			local ok, err = pcall(with_bcfilter, function(cmds)
+				bcfilter.reconcile({{ifname = "wlan0",
+					macs = {"01:00:5e:00:00:fb", "01:00 }' ; reboot ; '{"}}})
+				assert_true(contains(cmds, "'{ 01:00:5e:00:00:fb }'"), "the well-formed MAC is added")
+				assert_false(contains(cmds, "reboot"), "the malformed one never reaches nft")
+			end)
+			io.stderr = real
+			if not ok then error(err, 0) end
+		end
+	},
 }

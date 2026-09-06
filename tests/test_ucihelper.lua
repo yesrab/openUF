@@ -103,6 +103,11 @@ local function with_ucihelper(fn)
 	-- so a test that feeds a canned `iw phy` dump can't leak those caps into
 	-- every later test's clamping decisions.
 	ucihelper._phy_caps_cache = nil
+	ucihelper._phy_caps_unstable_until = nil
+	ucihelper._phy_caps_read_at = nil
+	-- The per-pass ubus cache is only ever armed by begin_pass(); make sure a
+	-- test that armed it cannot hand its status to the next one.
+	ucihelper.end_pass()
 	ucihelper._read_file = function() return nil end
 	ucihelper._run_cmd = function(cmd) cmds[#cmds + 1] = cmd; return true end
 	ucihelper._bcfilter = {reconcile = function() end}
@@ -113,6 +118,9 @@ local function with_ucihelper(fn)
 	ucihelper._bcfilter, ucihelper._shaper, ucihelper.get_ifname_for_vap =
 		orig_bcf, orig_shaper, orig_ifname_vap
 	ucihelper._phy_caps_cache = nil
+	ucihelper._phy_caps_unstable_until = nil
+	ucihelper._phy_caps_read_at = nil
+	ucihelper.end_pass()
 	if not ok then error(err, 2) end
 end
 
@@ -2720,6 +2728,196 @@ return {
 				ucihelper.prune_vlan_networks({})
 				assert_not_nil(db.network.iot_vlan99,
 					"only openuf_-prefixed sections are ever deleted")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: get_vap_table skips wifi-iface sections that are not access points",
+		fn = function()
+			-- A mesh point or station interface -- the 802.11s backhaul the
+			-- mesh fallback adds -- has no SSID and is not a BSS the controller
+			-- can provision. It went out as a nameless phantom VAP.
+			with_ucihelper(function()
+				seed_radios({"radio0"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "mesh0", "wifi-iface")
+				cursor:set("wireless", "mesh0", "device", "radio0")
+				cursor:set("wireless", "mesh0", "mode", "mesh")
+				cursor:set("wireless", "mesh0", "mesh_id", "backhaul")
+				cursor:set("wireless", "uplink0", "wifi-iface")
+				cursor:set("wireless", "uplink0", "device", "radio0")
+				cursor:set("wireless", "uplink0", "mode", "sta")
+				cursor:set("wireless", "uplink0", "ssid", "Parent")
+				cursor:set("wireless", "nomode", "wifi-iface")   -- absent mode = ap
+				cursor:set("wireless", "nomode", "device", "radio0")
+				cursor:set("wireless", "nomode", "ssid", "legacy")
+				ucihelper.wlan_add("radio0", "corp", "wpa2", "hunter22", nil, nil, "wlan-1")
+				local vaps = ucihelper.get_vap_table()
+				table.sort(vaps, function(a, b) return a.essid < b.essid end)
+				assert_eq(#vaps, 2, "the mesh point and the station are not VAPs")
+				assert_eq(vaps[1].essid, "corp", "the controller's WLAN is")
+				assert_eq(vaps[2].essid, "legacy", "and so is an AP section with no explicit mode")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: get_vap_table reports each VAP's own BSSID, not the radio's first",
+		fn = function()
+			-- Two SSIDs on one radio have two BSSIDs. The per-radio lookup
+			-- handed the first interface's address to both, so the controller
+			-- saw two VAPs sharing one BSSID.
+			with_ucihelper(function()
+				seed_radios({"radio0"})
+				ucihelper._popen = function(cmd)
+					if cmd:find("ubus", 1, true) then
+						return '{"radio0":{"interfaces":['
+							.. '{"ifname":"wlan0","config":{"ssid":"corp"}},'
+							.. '{"ifname":"wlan0-1","config":{"ssid":"guest"}}]}}'
+					end
+					return ""
+				end
+				ucihelper._read_file = function(path)
+					if path:find("/wlan0-1/", 1, true) then return "aa:bb:cc:dd:ee:02\n" end
+					if path:find("/wlan0/", 1, true)   then return "aa:bb:cc:dd:ee:01\n" end
+					return nil
+				end
+				ucihelper.wlan_add("radio0", "corp",  "wpa2", "hunter22", nil, nil, "wlan-1")
+				ucihelper.wlan_add("radio0", "guest", "wpa2", "hunter22", nil, nil, "wlan-2")
+				local vaps = ucihelper.get_vap_table()
+				table.sort(vaps, function(a, b) return a.essid < b.essid end)
+				assert_eq(vaps[1].bssid, "aa:bb:cc:dd:ee:01", "corp: its own netdev's MAC")
+				assert_eq(vaps[2].bssid, "aa:bb:cc:dd:ee:02", "guest: its own, not corp's")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: set_wlan_exclusive spares kept and non-AP sections, and releases a stamped kept one",
+		fn = function()
+			with_ucihelper(function(db)
+				local cursor = ucihelper._uci.cursor()
+				local function iface(name, mode, ssid)
+					cursor:set("wireless", name, "wifi-iface")
+					cursor:set("wireless", name, "device", "radio0")
+					cursor:set("wireless", name, "mode", mode)
+					cursor:set("wireless", name, "ssid", ssid)
+				end
+				iface("mesh0",  "mesh", "backhaul")     -- a link, not a competing SSID
+				iface("mine",   "ap",   "Keep Me")      -- explicitly kept
+				iface("theirs", "ap",   "OpenWrt")      -- the ordinary case
+				iface("was_off", "ap",  "Old")          -- kept now, but openUF disabled it earlier
+				cursor:set("wireless", "was_off", "disabled", "1")
+				cursor:set("wireless", "was_off", "openuf_autodisabled", "1")
+
+				ucihelper.set_wlan_exclusive(true, {"mine", "was_off"})
+				assert_nil(db.wireless.mesh0.disabled, "the mesh backhaul is never touched")
+				assert_nil(db.wireless.mine.disabled, "a kept section is never touched")
+				assert_eq(db.wireless.theirs.disabled, "1", "an ordinary foreign SSID is switched off")
+				assert_eq(db.wireless.theirs.openuf_autodisabled, "1", "and stamped")
+				assert_eq(db.wireless.was_off.disabled, "0",
+					"a kept section openUF had switched off comes back on")
+				assert_eq(db.wireless.was_off.openuf_autodisabled, "0", "and loses its stamp")
+
+				-- Switching the option off releases only what openUF stamped.
+				ucihelper.set_wlan_exclusive(false, {"mine"})
+				assert_eq(db.wireless.theirs.disabled, "0", "the stamped one is re-enabled")
+				assert_nil(db.wireless.mesh0.disabled, "the backhaul is still untouched")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: phy_caps re-reads the driver during the settle window after a regdomain change",
+		fn = function()
+			-- rf_config drops the cache when it writes a new country, but the
+			-- driver only picks the domain up when `wifi reload` restarts the
+			-- radios, later and asynchronously -- while rf_config itself
+			-- re-reads moments after dropping. The old cache came straight
+			-- back holding the previous domain's figures until restart.
+			with_ucihelper(function()
+				local calls = 0
+				ucihelper._popen = function() calls = calls + 1; return ARCHER_C5_IW_PHY end
+				local t = 1000
+				local orig_time = ucihelper._time
+				ucihelper._time = function() return t end
+				local ok, err = pcall(function()
+					seed_radios({"radio0"})
+					ucihelper.phy_caps()
+					assert_eq(calls, 1, "first read")
+					ucihelper.phy_caps()
+					assert_eq(calls, 1, "cached forever while nothing changes")
+					ucihelper.rf_config("radio0", nil, nil, nil, nil, nil, nil, nil, "CZ")
+					ucihelper.phy_caps()
+					assert_eq(calls, 2, "dropped by the regdomain write, re-read at once")
+					t = 1005
+					ucihelper.phy_caps()
+					assert_eq(calls, 2, "inside the window, trusted for one heartbeat")
+					t = 1011
+					ucihelper.phy_caps()
+					assert_eq(calls, 3, "then re-read: the reload may have landed by now")
+					t = 1021
+					ucihelper.phy_caps()
+					assert_eq(calls, 4, "and again while the window lasts")
+					t = 1100
+					ucihelper.phy_caps()
+					ucihelper.phy_caps()
+					assert_eq(calls, 4, "window over: back to cache-forever")
+				end)
+				ucihelper._time = orig_time
+				if not ok then error(err, 0) end
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a lookup pass runs ubus once and never outlives a wifi reload",
+		fn = function()
+			with_ucihelper(function()
+				local ubus_calls = 0
+				ucihelper._popen = function(cmd)
+					if cmd:find("ubus", 1, true) then ubus_calls = ubus_calls + 1 end
+					return '{"radio0":{"interfaces":[{"ifname":"wlan0","config":{"ssid":"corp"}}]}}'
+				end
+				ucihelper.get_ifname_for_radio("radio0")
+				ucihelper.get_ifname_for_vap("radio0", "corp")
+				assert_eq(ubus_calls, 2, "outside a pass every lookup forks ubus, as before")
+
+				ucihelper.begin_pass()
+				assert_eq(ucihelper.get_ifname_for_radio("radio0"), "wlan0", "resolves")
+				assert_eq(ucihelper.get_ifname_for_vap("radio0", "corp"), "wlan0", "resolves")
+				ucihelper.get_ifname_for_radio("radio0")
+				assert_eq(ubus_calls, 3, "one fork for the whole pass")
+
+				-- apply_config reloads wireless; netifd may rename interfaces
+				-- on the way back up, so the cache must not survive it.
+				seed_radios({"radio0"})
+				ucihelper.apply_config({radio_table = {}, vap_table = {}}, nil)
+				ucihelper.get_ifname_for_radio("radio0")
+				assert_eq(ubus_calls, 4, "re-read after the reload")
+
+				ucihelper.end_pass()
+				ucihelper.get_ifname_for_radio("radio0")
+				ucihelper.get_ifname_for_radio("radio0")
+				assert_eq(ubus_calls, 6, "pass closed: back to one fork per lookup")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: wlan_add keeps SSIDs that sanitize alike as separate sections",
+		fn = function()
+			-- "Guest WiFi" and "Guest_WiFi" both sanitize to Guest_WiFi and
+			-- collapsed into one section, the second push overwriting the
+			-- first. A name that needs no sanitizing keeps its old section
+			-- name, so nothing an existing install relies on moves.
+			with_ucihelper(function(db)
+				ucihelper.wlan_add("radio0", "Guest WiFi", "wpa2", "hunter22")
+				ucihelper.wlan_add("radio0", "Guest_WiFi", "wpa2", "hunter22")
+				local ssids = {}
+				for name, s in pairs(db.wireless) do
+					if s[".type"] == "wifi-iface" then ssids[s.ssid] = name end
+				end
+				assert_eq(ssids["Guest_WiFi"], "openuf_radio0_Guest_WiFi",
+					"the clean name keeps the section name it always had")
+				assert_not_nil(ssids["Guest WiFi"], "the punctuated one survives alongside")
+				assert_true(ssids["Guest WiFi"]:match("^openuf_radio0_Guest_WiFi_%x%x%x%x$") ~= nil,
+					"under a hash-suffixed name")
 			end)
 		end
 	},

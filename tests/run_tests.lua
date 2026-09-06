@@ -174,5 +174,25 @@ for _, filepath in ipairs(test_files) do
 	end
 end
 
+-- Every tests/test_*.lua on disk has to be in the list above: a file that is
+-- not registered never runs, and until now nothing said so. `ls` rather than
+-- a filesystem library -- the runner has no external dependencies, and
+-- io.popen is standard Lua.
+do
+	local registered = {}
+	for _, f in ipairs(test_files) do registered[f] = true end
+	local h = io.popen("ls tests 2>/dev/null")
+	if h then
+		for name in h:lines() do
+			if name:match("^test_.*%.lua$") and not registered["tests/" .. name] then
+				print("ERROR tests/" .. name .. " exists but is not registered in "
+					.. "tests/run_tests.lua -- its tests did not run")
+				failed = failed + 1
+			end
+		end
+		h:close()
+	end
+end
+
 print(string.format("\nResults: %d passed, %d failed", passed, failed))
 os.exit(failed == 0 and 0 or 1)

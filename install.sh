@@ -5,7 +5,9 @@
 # Run from the project root after transferring files to the device.
 #
 # Usage:
-#   ./install.sh install    — copy files, enable service
+#   ./install.sh install [--bootstrap-adopt] [--replace-conf]
+#                           — copy files, enable service. An existing
+#                             /opt/openuf/conf.lua is KEPT unless --replace-conf
 #   ./install.sh uninstall  — remove files, disable service
 
 INSTALL_DIR=/opt/openuf
@@ -40,7 +42,23 @@ else
 	pkg_add()       { return 1; }
 fi
 
-case "$1" in
+# ── Options ─────────────────────────────────────────────────────────────────
+# The action comes first; anything after it is a flag. An unknown flag is an
+# error rather than ignored -- a mistyped --bootstrap-adopt used to install
+# silently without the account it was asked for.
+ACTION=${1:-}
+[ $# -gt 0 ] && shift
+BOOTSTRAP_ADOPT=0
+REPLACE_CONF=0
+for _opt in "$@"; do
+	case "$_opt" in
+		--bootstrap-adopt) BOOTSTRAP_ADOPT=1 ;;
+		--replace-conf)    REPLACE_CONF=1 ;;
+		*) echo "ERROR: unknown option: $_opt" >&2; exit 1 ;;
+	esac
+done
+
+case "$ACTION" in
 
 	# ────────────────────────────────────────────────────────────────────────
 	install)
@@ -83,6 +101,22 @@ case "$1" in
 		# of Lua and the install "succeeded" with no /opt/openuf on disk.
 		# Product first means a space shortage costs a feature, never openUF.
 
+		# An existing conf.lua IS the device's configuration -- above all the
+		# modelmap it was adopted under. Overwriting it on a reinstall, which
+		# is the natural way to upgrade, reset the modelmap to the generic
+		# one; on a DSA board that moves lan_cpueth and with it the identity
+		# MAC, and every inform afterwards is rejected with HTTP 400 while the
+		# old record goes Offline (CLAUDE.md: "lan_cpueth decides IDENTITY").
+		# Keep it, and ship the new default alongside as conf.lua.dist.
+		# setup.sh passes --replace-conf: it rewrites conf.lua from its own
+		# interview on purpose, and a re-run is meant to reproduce the whole
+		# configuration.
+		KEEP_CONF=""
+		if [ "$REPLACE_CONF" = 0 ] && [ -f "$INSTALL_DIR/conf.lua" ]; then
+			KEEP_CONF="$INSTALL_DIR/conf.lua.keep.$$"
+			cp "$INSTALL_DIR/conf.lua" "$KEEP_CONF" || KEEP_CONF=""
+		fi
+
 		# Copy Lua source. etc/ is excluded deliberately: the init script
 		# belongs in /etc/init.d (installed further down) and a second copy
 		# under $INSTALL_DIR would never be executed.
@@ -91,9 +125,23 @@ case "$1" in
 			echo "ERROR: failed to copy openUF into $INSTALL_DIR"
 			echo "  Free space: $(overlay_free_kb "$INSTALL_DIR")KB. openUF needs ~130KB"
 			echo "  (comment-stripped) plus room for state and logs."
+			[ -n "$KEEP_CONF" ] && mv "$KEEP_CONF" "$INSTALL_DIR/conf.lua" 2>/dev/null
 			exit 1
 		}
 		rm -rf "$INSTALL_DIR/etc"
+
+		if [ -n "$KEEP_CONF" ]; then
+			mv "$INSTALL_DIR/conf.lua" "$INSTALL_DIR/conf.lua.dist"
+			mv "$KEEP_CONF" "$INSTALL_DIR/conf.lua"
+			echo "Kept the existing $INSTALL_DIR/conf.lua (shipped default: conf.lua.dist)."
+			echo "  Pass --replace-conf to overwrite it instead."
+			# The kept file may select a modelmap this release no longer ships.
+			_mm=$(sed -n 's/^dev = dofile("modelmap\/\(.*\)")$/\1/p' "$INSTALL_DIR/conf.lua" | head -1)
+			if [ -n "$_mm" ] && [ ! -f "$INSTALL_DIR/modelmap/$_mm" ]; then
+				echo "WARNING: conf.lua selects modelmap/$_mm, which this release does not ship."
+				echo "  openUF will not start until conf.lua names a profile that exists."
+			fi
+		fi
 
 		# Release tarballs arrive already comment-stripped (tools/dist.sh).
 		# When installing from a git clone, strip on the way in using the same
@@ -238,7 +286,7 @@ case "$1" in
 		# able to write $STATE_DIR -- no other privilege. Self-locks once the
 		# device is adopted and re-enables on factory reset (see
 		# inform.lua's M._sync_bootstrap_account). See USAGE.md.
-		if [ "$2" = "--bootstrap-adopt" ]; then
+		if [ "$BOOTSTRAP_ADOPT" = 1 ]; then
 			echo "Setting up SSH bootstrap adoption account (ubnt/ubnt) ..."
 
 			ALREADY_ADOPTED=0
@@ -344,10 +392,15 @@ case "$1" in
 	# ────────────────────────────────────────────────────────────────────────
 	*)
 		echo ""
-		echo "Usage: $0 <install|uninstall> [--bootstrap-adopt]"
+		echo "Usage: $0 <install|uninstall> [--bootstrap-adopt] [--replace-conf]"
 		echo ""
 		echo "  install    Copy files to $INSTALL_DIR, create init.d service,"
-		echo "             symlink syswrapper.sh to $BIN_LINK"
+		echo "             symlink syswrapper.sh to $BIN_LINK. An existing"
+		echo "             conf.lua is kept (the shipped one lands as conf.lua.dist)"
+		echo "             so a reinstall never changes the device's modelmap."
+		echo ""
+		echo "  install --replace-conf"
+		echo "             Overwrite conf.lua with the shipped default instead."
 		echo ""
 		echo "  install --bootstrap-adopt"
 		echo "             Also create a temporary, non-root SSH account"

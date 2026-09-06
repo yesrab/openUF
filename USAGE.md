@@ -161,26 +161,22 @@ Broadcast Blocker keep working with the firewall service off.
 
 ### By hand
 
-Download the latest release directly on the device over SSH — no git client or scp required:
+Download the source tree directly on the device over SSH — no git client or scp required.
+`install.sh` comment-strips the Lua on the way in (`tools/strip.lua`), so the device gets
+the same lean tree a release would ship:
 
 ```sh
 # On the OpenWrt device
-mkdir openuf-install && cd openuf-install
-wget https://github.com/jonasevcik/openUF/releases/latest/download/openuf.tar.gz
-tar xzf openuf.tar.gz
+wget -O openuf-src.tar.gz https://codeload.github.com/yesrab/openUF/tar.gz/main
+tar xzf openuf-src.tar.gz && cd openUF-main
 sh install.sh install
 ```
 
-Optionally verify the download before installing:
-
-```sh
-wget https://github.com/jonasevcik/openUF/releases/latest/download/openuf.tar.gz.sha256
-sha256sum -c openuf.tar.gz.sha256
-```
-
-Releases are tagged `vX.Y.Z`; each tag push builds and publishes a new `openuf.tar.gz` via
-GitHub Actions. If you're working from a git checkout instead (e.g. for development), the old
-transfer-then-install flow still works:
+Releases are tagged `vX.Y.Z`; each tag push builds and publishes a pre-stripped
+`openuf.tar.gz` plus its `.sha256` via GitHub Actions under
+`https://github.com/yesrab/openUF/releases`, and those install the same way. If you're
+working from a git checkout instead (e.g. for development), the old transfer-then-install
+flow still works:
 
 ```sh
 # From your development machine
@@ -195,7 +191,14 @@ still a router unless you convert it yourself. It works on both package managers
 on OpenWrt 25.12+ and `opkg` on 24.10 and earlier.
 
 What `install.sh install` does:
-- Copies `openuf/` to `/opt/openuf/`
+- Copies `openuf/` to `/opt/openuf/` — **keeping an existing `conf.lua`** (the shipped
+  default lands next to it as `conf.lua.dist`). That is what makes a re-run the upgrade
+  path: `conf.lua` holds the modelmap the device was adopted under, and on a DSA board
+  resetting it to the generic profile moves `lan_cpueth` and with it the identity MAC,
+  after which the controller rejects every inform with HTTP 400. `--replace-conf`
+  overwrites it deliberately; `setup.sh` passes that, since it has just rewritten
+  `conf.lua` from its interview. Modelmaps are always replaced, so a board profile you
+  edited on the device should be copied out first.
 - Creates `/etc/openuf/` (state directory)
 - Symlinks `/opt/openuf/hook/syswrapper.sh` → `/usr/bin/syswrapper.sh`
 - Creates `/etc/init.d/openuf` with two procd service instances (announce + inform)
@@ -432,13 +435,26 @@ uap = {
 ```lua
 config = {
     use_only_unifi_wlan = true,  -- disable non-openuf_ SSIDs during provisioning
+    keep_wlan_sections  = {},    -- AP sections that option must leave alone (see below)
     inform_url  = "http://unifi:8080/inform",   -- default URL (overwritten at adoption)
-    state_file  = "/etc/openuf/state.json",
+    state_file  = "/etc/openuf/state.json",     -- honoured by inform, announce and syswrapper
     l2_announce = true,          -- see below
     debug_dump_file = nil,       -- see below
+    debug_dump_requests = false, -- with debug_dump_file: record requests and HTTP errors too
+    debug_caps = nil,            -- RESEARCH ONLY: override the claimed capability bits
+    debug_payload_extra = nil,   -- RESEARCH ONLY: extra top-level payload fields
+    neighbour_scan_interval = 0, -- seconds between background neighbour scans, 0 = never
+    country_override = nil,      -- see below
     bootstrap_adopt_user = nil,  -- see below
 }
 ```
+
+`keep_wlan_sections` — `wifi-iface` section names that `use_only_unifi_wlan` must never
+switch off, e.g. `{"guest_legacy"}`. Sections whose `mode` is not `ap` (a mesh point, a
+station interface) are exempt without being listed: a link is not a competing SSID, and it
+may be this AP's own uplink. A listed section openUF had already switched off on an
+earlier pass is switched back on. Non-AP sections are also left out of the reported
+`vap_table` — they have no SSID and are not a BSS the controller can provision.
 
 `country_override` — an ISO 3166-1 alpha-2 code programmed into the driver **instead of**
 the one the controller pushes. `nil` (default) means the controller's own value is used.
@@ -492,6 +508,29 @@ the controller starts sending something openUF has *never* seen, which is how
 two whole features sat unnoticed in every capture for months. Key names and
 counts only: these blobs carry passphrases and the adoption key, so no value is
 ever logged.
+
+`debug_dump_requests` — with `debug_dump_file` set, also append what openUF *sends*
+(one line tagged `TX` per inform, every 10 s) and any transport failure (`ERR HTTP 400`,
+`ERR connect failed: …`). Response lines keep their untagged shape, so the recipes in
+REVERSE-ENGINEERING.md still work; `grep ' TX '` / `grep -v ' TX '` separates the two.
+
+`debug_caps` and `debug_payload_extra` — **research switches; leave them `nil`.** The
+rule everywhere else is that openUF never claims a capability bit it cannot honour,
+because a claimed bit makes the controller push config and show UI for a feature that
+then silently does nothing. These are the deliberate exception, for protocol
+experiments (REVERSE-ENGINEERING.md's mesh plan): `debug_caps = {fw_caps = …,
+wifi_caps = …, wifi_caps2 = …}` replaces the masks the payload claims (a mask left out
+keeps its shipped value; `wifi_caps` is not sent at all unless overridden), and
+`debug_payload_extra = {uplink = {…}}` merges extra top-level fields into every
+payload verbatim. The daemon shouts at startup while either is set.
+
+`neighbour_scan_interval` — seconds between `iw dev <if> scan` on each radio; `0`
+(default) never scans. The Environment view is fed from the kernel's cached BSS list,
+which forgets a network about 30 s after it was last seen, and the controller drops
+anything with `age >= 30` on top — and nothing else in openUF scans, so after the
+boot-time ACS sweep the list drains to empty. A scan takes the radio off-channel for a
+moment (clients see a brief stall), which is why it is off unless you turn it on; `300`
+is a sane value. The first scan happens one interval after start, never at boot.
 
 `bootstrap_adopt_user` — set by `install.sh install --bootstrap-adopt`, not by
 hand. Names the temporary SSH bootstrap account (see § SSH prerequisite below)
@@ -627,8 +666,17 @@ Persistent state is stored at `/etc/openuf/state.json`:
 | `inform_url` | URL for the 10-second inform heartbeat |
 | `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
 | `blocked_stas` | MACs blocked from the controller's Clients view; re-applied to nftables on startup so blocks survive restarts |
+| `mac` | The identity MAC the previous run informed under (read off `lan_cpueth` at startup). Compared against the live one on the next start: a difference on an adopted device is the HTTP-400-forever condition, and is shouted about |
+| `locating`, `led_enabled` | The controller's Locate and Manage → LED state, so a restart does not forget them |
 | `swvlan_backup` | Original `ports` strings of the stock `switch_vlan` sections, snapshotted before per-port VLAN assignment first modifies them; used to restore them (see § 6) |
 | `ip_mode`, `static_ip`, `static_netmask`, `static_gateway`, `static_dns` | The last "IP Settings" push. `ip_mode` is `"static"` or `"dhcp"`; the `static_*` fields are set only in static mode and cleared on a revert to DHCP. `static_dns` is an array in the controller's primary/secondary order, written to `/etc/resolv.conf`. On DHCP, DNS is left to the lease and openUF does not touch `resolv.conf` |
+
+Every field `state.save` writes is read back by `state.load` (the eight in the JSON
+above are type-checked and fall back to a default; anything else round-trips as-is). The
+file is written through a sibling temp file and renamed into place, so a power cut
+mid-write leaves the old file rather than a truncated one — and a truncated file would
+be read as "defaults", which un-adopts the device. A non-empty file that does not parse
+is reported on stderr for the same reason.
 
 To reset to factory defaults:
 ```sh
@@ -649,7 +697,7 @@ When the controller pushes a config, `ucihelper.lua` applies it via OpenWrt UCI.
 > name starts with `openuf_`, and there is no way to ask it to.  What *is* configurable is
 > whether your hand-made SSIDs keep broadcasting, which is `use_only_unifi_wlan` below.
 
-`use_only_unifi_wlan` (default `true`) additionally sets `disabled=1` on every *other* `wifi-iface`, so the radios carry only what the controller provisioned.  openUF stamps each SSID it turns off with `openuf_autodisabled=1`; setting the option back to `false` re-enables exactly those and leaves everything else as-is, so an SSID you had disabled yourself is never switched back on.  Set it to `false` from the start to keep hand-configured SSIDs broadcasting alongside the controller's.
+`use_only_unifi_wlan` (default `true`) additionally sets `disabled=1` on every *other* AP-mode `wifi-iface`, so the radios carry only what the controller provisioned.  openUF stamps each SSID it turns off with `openuf_autodisabled=1`; setting the option back to `false` re-enables exactly those and leaves everything else as-is, so an SSID you had disabled yourself is never switched back on.  Set it to `false` from the start to keep hand-configured SSIDs broadcasting alongside the controller's, or list the ones to keep in `keep_wlan_sections` (§ 3).  Sections whose `mode` is not `ap` — a mesh point or a station interface, i.e. a wireless backhaul — are never touched either way, and are not reported as VAPs.
 
 Settings carried through from the controller:
 
@@ -903,8 +951,11 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Controller channel width is ignored; radio runs 802.11n | UniFi's `ieee_mode` token keeps the vestigial `ht` PHY marker and moves only the width, so 80 MHz arrives as `11naht80`. openUF used to take that literally as `HT80` — which does not exist — and `clamp_htmode` knocked it back to `HT40`, silently discarding the setting. Fixed: a width above 40 MHz promotes the token to `VHT`, the narrowest PHY that can express it. If the radio still runs below its capability, set a `dev.conf.radio.<band>.htmode_floor` |
 | Radios provisioned but a **5 GHz** SSID never comes up | hostapd's ACS picked a **DFS** channel and the driver's CAC failed — `logread \| grep DFS` shows `start_dfs_cac() failed` then `AP-DISABLED`. Common on mt7915/mt7986 (filogic). Fix it in the modelmap with `dev.conf.radio.na.acs_exclude_dfs = true`, which restricts ACS to non-DFS channels (see **Radio policy**); pinning a non-DFS channel in the controller also works |
 | `lldp_table` empty | `lldpd` not running — run `/etc/init.d/lldpd start` |
-| Bootstrap account (`ubnt`) doesn't lock after adoption, or doesn't re-enable after a factory reset | `inform.lua` must be running for this — it's what detects the state change and runs `passwd -l`/`-u` (see § SSH prerequisite). Check `/var/log/openuf.log`. |
+| Bootstrap account (`ubnt`) doesn't lock after adoption, or doesn't re-enable after a factory reset | `inform.lua` must be running for this — it's what detects the state change and runs `passwd -l`/`-u` (see § SSH prerequisite). Check `logread -e openuf`. |
+| Adopted, but every inform is answered `HTTP 400` and the controller shows the device Offline | The identity MAC changed underneath the adoption: `dev.conf.net.lan_cpueth` now names a different interface than the device was adopted under (a modelmap switch, or a reinstall that reset `conf.lua`). openUF says so at startup (it compares against the MAC the previous run persisted) and again on the first 400 of a streak. Forget the device in the controller and re-adopt, or point `lan_cpueth` back |
+| Insights → Environment shows nothing, or only right after boot | Nothing rescans: the kernel's BSS cache forgets neighbours after ~30 s and the controller drops entries with `age >= 30`. Set `neighbour_scan_interval` in `conf.lua` (§ 3), accepting the brief client stall each scan costs |
+| `logread` says `cannot read a MAC from dev.conf.net.lan_cpueth` | The modelmap names an interface this board does not have (a generic profile on a DSA board, say). The daemon keeps informing under the identity `state.json` persisted; fix `conf.lua` |
 
-Log file: `/var/log/openuf.log`
+Logs go to the system log via procd: `logread -e openuf` (follow with `logread -f`).
 
 For development testing without hardware, see `tools/test_controller.py`.

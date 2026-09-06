@@ -1145,7 +1145,10 @@ head1 "Installing openUF"
 BOOTSTRAP_ARG=""
 [ "$OPT_BOOTSTRAP" = 1 ] && BOOTSTRAP_ARG="--bootstrap-adopt"
 # install.sh reads openuf/, tools/strip.lua and install.sh by relative path.
-( cd "$SRC" && sh install.sh install $BOOTSTRAP_ARG ) \
+# --replace-conf: on its own, install.sh keeps a device's existing conf.lua
+# (a bare reinstall must not move an adopted device's modelmap); this script
+# has just written conf.lua from the interview and means for it to land.
+( cd "$SRC" && sh install.sh install $BOOTSTRAP_ARG --replace-conf ) \
 	|| die "install.sh failed. Nothing about the network has been touched yet,
        so this device is still a working router. Some files may have been
        copied into $INSTALL_DIR -- 'sh install.sh uninstall' clears them."

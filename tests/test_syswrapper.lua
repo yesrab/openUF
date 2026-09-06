@@ -135,4 +135,25 @@ return {
 			assert_eq(st.authkey, state.DEFAULT_KEY,        "authkey reset to default")
 		end
 	},
+	{
+		name = "syswrapper: reads conf.lua's state_file as text, ignoring comments",
+		fn = function()
+			-- conf.lua cannot be dofile()d from the hook (its modelmap path is
+			-- relative to /opt/openuf and the SSH session's cwd is anything),
+			-- so the one assignment is read out of the file's text.
+			local dir = "/tmp/openuf_test_sw_conf/"
+			os.execute("mkdir -p " .. dir)
+			local f = io.open(dir .. "conf.lua", "w")
+			f:write('config = {\n'
+				.. '\t-- state_file = "/etc/openuf/commented-out.json",\n'
+				.. '\tinform_url = "http://unifi:8080/inform",\n'
+				.. '\tstate_file = "/mnt/data/state.json",\n'
+				.. '}\n')
+			f:close()
+			local got = sw._conf_state_file(dir)
+			os.remove(dir .. "conf.lua")
+			assert_eq(got, "/mnt/data/state.json", "the live assignment, not the comment")
+			assert_nil(sw._conf_state_file("/tmp/openuf_test_sw_nowhere/"), "nil without a conf.lua")
+		end
+	},
 }

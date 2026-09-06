@@ -15,6 +15,9 @@ end
 local function with_fixtures(file_map, cmd_map, fn)
 	local orig_rf  = sysinfo._read_file
 	local orig_cmd = sysinfo._run_cmd
+	-- `iw phy` output is cached per phy for minutes; a fixture fed to one
+	-- test must not answer the next test's different fixture for the same phy.
+	sysinfo._phy_info_cache = {}
 	sysinfo._read_file = function(path)
 		for k, v in pairs(file_map) do
 			if path == k or path:find(k, 1, true) then return v end
@@ -871,6 +874,58 @@ return {
 				local caps = sysinfo.radio_caps("wlan0")
 				assert_eq(next(caps), nil, "empty table -- no 'wiphy N' line to resolve")
 			end)
+		end
+	},
+	{
+		name = "sysinfo: _phy_info() caches `iw phy` per phy and re-reads after the TTL",
+		fn = function()
+			-- Tens of kilobytes parsed per radio per heartbeat, for data that
+			-- changes only with the regdomain. `iw dev info` (live channel,
+			-- TX power) is deliberately NOT cached and stays per call.
+			local calls = {}
+			local orig_cmd, orig_time = sysinfo._run_cmd, sysinfo._time
+			sysinfo._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "Wiphy " .. cmd end
+			local t = 5000
+			sysinfo._time = function() return t end
+			sysinfo._phy_info_cache = {}
+			local ok, err = pcall(function()
+				assert_eq(sysinfo._phy_info("1"), "Wiphy iw phy phy1 info", "read")
+				sysinfo._phy_info("1")
+				sysinfo._phy_info("1")
+				assert_eq(#calls, 1, "served from the cache within the TTL")
+				sysinfo._phy_info("0")
+				assert_eq(#calls, 2, "a different phy is its own entry")
+				t = 5000 + sysinfo.PHY_INFO_TTL
+				sysinfo._phy_info("1")
+				assert_eq(#calls, 3, "re-read once the TTL has passed")
+				-- An empty answer (iw missing, phy gone) is not cached: the
+				-- next heartbeat should try again rather than report nothing
+				-- for five minutes.
+				sysinfo._run_cmd = function(cmd) calls[#calls + 1] = cmd; return "" end
+				sysinfo._phy_info("2")
+				sysinfo._phy_info("2")
+				assert_eq(#calls, 5, "a failed read is retried")
+			end)
+			sysinfo._run_cmd, sysinfo._time = orig_cmd, orig_time
+			sysinfo._phy_info_cache = {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "sysinfo: _note_seen() forgets hosts unseen for an hour, and only those",
+		fn = function()
+			-- The first-seen table was keyed by every MAC that ever crossed
+			-- the bridge and never shrank.
+			sysinfo._mac_first_seen, sysinfo._mac_last_seen = {}, {}
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:01", 1000), 1000, "first sighting")
+			sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:02", 1000)
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:01", 4700), 1000,
+				"a host still present keeps its first-seen time")
+			assert_nil(sysinfo._mac_first_seen["eth1 aa:bb:cc:dd:ee:02"],
+				"one unseen for over an hour is forgotten")
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:02", 4701), 4701,
+				"and starts a fresh uptime when it returns")
+			sysinfo._mac_first_seen, sysinfo._mac_last_seen = {}, {}
 		end
 	},
 }

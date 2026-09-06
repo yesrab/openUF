@@ -152,4 +152,32 @@ return {
 			end)
 		end
 	},
+	{
+		name = "netconfig: apply_static refuses a malformed address or gateway without running anything",
+		fn = function()
+			-- ip and gateway are spliced into command lines. Refused whole,
+			-- not half-applied: an address with no route is not what was asked.
+			with_capture(function(cmds)
+				assert_false(netconfig.apply_static("eth0", "10.0.0.5; reboot", "255.255.255.0"),
+					"shell metacharacters in the address")
+				assert_false(netconfig.apply_static("eth0", "10.0.0.5", "255.255.255.0", "$(reboot)"),
+					"shell metacharacters in the gateway")
+				assert_false(netconfig.apply_static("eth0", "300.1.1.1", "255.255.255.0"),
+					"an octet out of range")
+				assert_eq(#cmds, 0, "nothing was run")
+				assert_true(netconfig.apply_static("eth0", "10.0.0.5", "255.255.255.0", "10.0.0.1"),
+					"a well-formed push still applies")
+				assert_eq(#cmds, 3, "flush, add, route")
+			end)
+		end
+	},
+	{
+		name = "netconfig: is_ipv4 is exported for the parser's own refusal",
+		fn = function()
+			assert_true(netconfig.is_ipv4("10.0.0.1"), "dotted quad")
+			assert_false(netconfig.is_ipv4("10.0.0"), "three octets")
+			assert_false(netconfig.is_ipv4("10.0.0.1 "), "trailing space")
+			assert_false(netconfig.is_ipv4(nil), "nil")
+		end
+	},
 }

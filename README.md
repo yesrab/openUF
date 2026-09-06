@@ -1,6 +1,6 @@
 # openUF
 
-[![Tests](https://github.com/jonasevcik/openUF/actions/workflows/test.yml/badge.svg)](https://github.com/jonasevcik/openUF/actions/workflows/test.yml)
+[![Tests](https://github.com/yesrab/openUF/actions/workflows/test.yml/badge.svg)](https://github.com/yesrab/openUF/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Lua 5.1+](https://img.shields.io/badge/Lua-5.1%2B-blue.svg)](https://www.lua.org/)
 
@@ -31,7 +31,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | Feature | Status |
 |---|---|
 | Controller-pushed SSID provisioning | ✅ Working (UCI); only `openuf_`-prefixed sections are created or deleted |
-| Exclusive-WLAN mode (`use_only_unifi_wlan`) | ✅ Working — default `true` disables hand-configured SSIDs so the radios carry only what the controller pushed; reversible (openUF stamps what it disabled) |
+| Exclusive-WLAN mode (`use_only_unifi_wlan`) | ✅ Working — default `true` disables hand-configured SSIDs so the radios carry only what the controller pushed; reversible (openUF stamps what it disabled). Non-AP interfaces (mesh point, station — a wireless backhaul) are never touched, and `keep_wlan_sections` exempts named AP sections |
 | WPA2 / WPA3 / WPA2-WPA3 mixed security | ✅ Working — derived from the pushed AKM set plus `wpa3.support`/`wpa3.transition`. Requires `radio_caps2` bit `0x1` on each radio, which openUF sends when hostapd can really do SAE — without it the controller silently downgrades every WPA3 WLAN to WPA2. **WPA-Enterprise (802.1X) is not supported**: the wire protocol carries no RADIUS server, port or secret, so such a WLAN is skipped with a log line rather than mis-provisioned as a keyless WPA2 SSID |
 | PMF / 802.11w (`ieee80211w`) | ✅ Working — from `aaa.<n>.pmf.status`/`pmf.mode`. PMF is just PMF: the WPA3-transition signal is `wpa3.support`/`wpa3.transition`, not these keys |
 | Fast Roaming (802.11r) | ✅ Working — both the WLAN-level `ft.status` and the SAE-only `wpa3.ft.status` are read; FT is enabled if either asks for it, since OpenWrt cannot enable 802.11r for one AKM alone |
@@ -212,11 +212,14 @@ point it at a different fork, branch, or a checkout already on the device.
 apk update
 apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
 
-# 2. Download and install the latest release (no git client or scp needed)
-mkdir openuf-install && cd openuf-install
-wget https://github.com/jonasevcik/openUF/releases/latest/download/openuf.tar.gz
-tar xzf openuf.tar.gz
+# 2. Download and install (no git client or scp needed). This is the source
+#    tree; install.sh comment-strips it on the way in. A tagged release
+#    (vX.Y.Z) publishes a pre-stripped openuf.tar.gz under Releases instead.
+wget -O openuf-src.tar.gz https://codeload.github.com/yesrab/openUF/tar.gz/main
+tar xzf openuf-src.tar.gz && cd openUF-main
 sh install.sh install
+#    Re-running this later upgrades in place and KEEPS the device's conf.lua
+#    (its modelmap above all); add --replace-conf to start from the default.
 
 # 3a. L2 adoption (device and controller on same subnet)
 #     — The device will appear in UniFi Discover automatically.

@@ -128,7 +128,13 @@ return {
 				local f = io.open(TMP, "w")
 				f:write("this is not json {{{")
 				f:close()
-				local st = state.load()
+				-- The warning this emits is tested on its own below; keep
+				-- the suite's output clean here.
+				local real = io.stderr
+				io.stderr = {write = function() end}
+				local ok, st = pcall(state.load)
+				io.stderr = real
+				assert_true(ok, "load survives garbage")
 				assert_eq(st.authkey, DEFKEY, "defaults on bad JSON")
 				assert_eq(st.adopted, false,  "defaults on bad JSON")
 			end)
@@ -160,6 +166,100 @@ return {
 				assert_eq(type(bad.blocked_stas), "table", "wrong-typed block list -> default table")
 				assert_eq(#bad.blocked_stas, 0, "default block list is empty")
 				assert_eq(bad.upgrade_requested_version, "", "wrong-typed version -> default")
+			end)
+		end
+	},
+	{
+		name = "state: every field save() writes comes back from load()",
+		fn = function()
+			-- save() has always serialized the whole table while load() read
+			-- back eight named fields, so everything else was written on
+			-- every heartbeat and dropped on every start. The identity MAC
+			-- (the previous-run comparison the HTTP 400 warning needs), the
+			-- switch reversibility ledger, the IP Settings mode and the
+			-- Locate/LED state all live here -- and USAGE.md has documented
+			-- swvlan_backup and ip_mode as persisted all along.
+			with_tmp(function()
+				local st = state.load()
+				st.adopted       = true
+				st.mac           = "e8:de:27:5f:62:7a"
+				st.ip_mode       = "static"
+				st.static_ip     = "10.0.0.20"
+				st.static_dns    = {"10.0.0.1", "10.0.0.2"}
+				st.swvlan_backup = {["1"] = "0t 1 2 3 4"}
+				st.locating      = true
+				st.led_enabled   = false
+				state.save(st)
+				local loaded = state.load()
+				assert_eq(loaded.mac, "e8:de:27:5f:62:7a", "identity MAC round-trips")
+				assert_eq(loaded.ip_mode, "static", "ip_mode round-trips")
+				assert_eq(loaded.static_ip, "10.0.0.20", "static_ip round-trips")
+				assert_eq(loaded.static_dns[2], "10.0.0.2", "static_dns list round-trips")
+				assert_eq(loaded.swvlan_backup["1"], "0t 1 2 3 4", "switch ledger round-trips")
+				assert_eq(loaded.locating, true, "locating round-trips")
+				assert_eq(loaded.led_enabled, false, "an explicit false round-trips")
+			end)
+		end
+	},
+	{
+		name = "state: a JSON null on disk is dropped rather than carried as a userdata",
+		fn = function()
+			with_tmp(function()
+				local f = io.open(TMP, "w")
+				f:write('{"adopted":true,"authkey":"aabbccddeeff00112233445566778899",'
+					.. '"ip_mode":null,"static_ip":"10.0.0.20"}')
+				f:close()
+				local st = state.load()
+				assert_nil(st.ip_mode, "null -> absent, not cjson.null")
+				assert_eq(st.static_ip, "10.0.0.20", "the string next to it survives")
+			end)
+		end
+	},
+	{
+		name = "state: save writes through a temp file and leaves none behind",
+		fn = function()
+			-- A truncated state.json is read as "defaults", i.e. unadopted with
+			-- the well-known key -- so the write must be all-or-nothing. The
+			-- temp file is a sibling (same filesystem, so rename is atomic)
+			-- and must be gone once save() returns.
+			with_tmp(function()
+				state.save({adopted = true, authkey = "aabbccddeeff00112233445566778899",
+					cfgversion = "", inform_url = "http://x/inform"})
+				assert_nil(io.open(TMP .. ".tmp", "r"), "no temp file left behind")
+				local f = io.open(TMP, "r")
+				assert_not_nil(f, "state file written")
+				local raw = f:read("*a"); f:close()
+				assert_contains(raw, '"adopted":true', "with the new contents")
+				-- and a second save replaces, not appends
+				state.save({adopted = false, authkey = "x", cfgversion = "", inform_url = "u"})
+				f = io.open(TMP, "r"); raw = f:read("*a"); f:close()
+				assert_eq(select(2, raw:gsub("adopted", "")), 1, "exactly one document in the file")
+			end)
+		end
+	},
+	{
+		name = "state: an unreadable non-empty file warns; an empty one is silent",
+		fn = function()
+			-- Defaults are still the right answer, but from the controller's
+			-- side a device that lost its state looks factory-reset, so the
+			-- log has to say why. An empty file is the normal pre-adoption
+			-- state install.sh --bootstrap-adopt leaves behind and must not
+			-- warn on every start.
+			local function capture(fn)
+				local buf, real = {}, io.stderr
+				io.stderr = {write = function(_, s) buf[#buf + 1] = s end}
+				local ok, err = pcall(fn)
+				io.stderr = real
+				if not ok then error(err, 0) end
+				return table.concat(buf)
+			end
+			with_tmp(function()
+				local f = io.open(TMP, "w"); f:write("garbage {{"); f:close()
+				local out = capture(function() state.load() end)
+				assert_contains(out, "not valid JSON", "corrupt file is named")
+				assert_contains(out, "unadopted", "and the consequence spelled out")
+				f = io.open(TMP, "w"); f:write(""); f:close()
+				assert_eq(capture(function() state.load() end), "", "empty file: no warning")
 			end)
 		end
 	},

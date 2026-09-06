@@ -367,4 +367,70 @@ return {
 			assert_nil(bridged, "bridge exists but has no address -> nil")
 		end
 	},
+	{
+		name = "announce: _refresh re-reads ip, hostname, uptime and the adopted flag each tick",
+		fn = function()
+			-- The packet was built from startup values for the life of the
+			-- process: IsDefault said "unadopted" forever, the IP was the
+			-- boot-time one, uptime counted from daemon start.
+			local o_popen, o_read, o_state = announce._popen, announce._read_file, announce._state
+			announce._popen = function(cmd)
+				if cmd:find("ip -4 addr show dev br-lan", 1, true) then
+					return "    inet 10.1.2.3/24 brd 10.1.2.255 scope global br-lan\n"
+				end
+				return ""
+			end
+			announce._read_file = function(path)
+				if path == "/proc/uptime" then return "4242.55 8000.10\n" end
+				if path == "/proc/sys/kernel/hostname" then return "ap-two\n" end
+				return nil
+			end
+			announce._state = {load = function() return {adopted = true} end}
+			local ok, err = pcall(function()
+				local cfg = {iface = "br-lan", state_file = "/x/state.json",
+					ip = {192, 168, 1, 1}, hostname = "openUF", uptime = 7, adopted = false}
+				announce._refresh(cfg)
+				assert_eq(table.concat(cfg.ip, "."), "10.1.2.3", "IP re-read from the interface")
+				assert_eq(cfg.hostname, "ap-two", "hostname re-read")
+				assert_eq(cfg.uptime, 4242, "uptime is the system's, from /proc/uptime")
+				assert_eq(cfg.adopted, true, "adopted follows state.json")
+				assert_eq(announce._state._state_file, "/x/state.json", "conf.lua's state path is used")
+				local pkt = announce.build_packet(sample_cfg(cfg))
+				assert_eq(string.byte(find_tlv(pkt, 0x17), 1), 0x00, "and the packet says adopted")
+			end)
+			announce._popen, announce._read_file, announce._state = o_popen, o_read, o_state
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "announce: _refresh keeps the previous values when a source cannot be read",
+		fn = function()
+			local o_popen, o_read, o_state = announce._popen, announce._read_file, announce._state
+			announce._popen = function() return "" end
+			announce._read_file = function() return nil end
+			announce._state = {load = function() error("unreadable") end}
+			local ok, err = pcall(function()
+				local cfg = {iface = "br-lan", ip = {10, 0, 0, 9}, hostname = "kept",
+					uptime = 77, adopted = true}
+				announce._refresh(cfg)
+				assert_eq(table.concat(cfg.ip, "."), "10.0.0.9", "ip kept")
+				assert_eq(cfg.hostname, "kept", "hostname kept")
+				assert_eq(cfg.uptime, 77, "uptime kept")
+				assert_eq(cfg.adopted, true, "adopted kept when state is unreadable")
+				assert_nil(announce.adopted(), "adopted() answers nil rather than guessing")
+			end)
+			announce._popen, announce._read_file, announce._state = o_popen, o_read, o_state
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "announce: the version suffix has one definition",
+		fn = function()
+			local cfg = sample_cfg()
+			cfg.version_suffix = nil
+			local short = find_tlv(announce.build_packet(cfg), 0x16)
+			assert_eq(short, cfg.fw_ver .. announce.VERSION_SUFFIX, "default suffix is M.VERSION_SUFFIX")
+			assert_eq(announce.VERSION_SUFFIX, "-openUF-0.2", "the shipped value")
+		end
+	},
 }

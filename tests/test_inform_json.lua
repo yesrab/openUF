@@ -1808,4 +1808,68 @@ return {
 			assert_true(wired_macs["aa:bb:cc:dd:ee:02"], "the other bridge-learned host is still reported")
 		end
 	},
+	{
+		name = "inform json: debug_caps overrides the claimed capability masks, and only then",
+		fn = function()
+			-- The rule is "never claim a bit openUF cannot honour"; debug_caps
+			-- is the deliberate, logged exception the mesh go/no-go experiment
+			-- needs (REVERSE-ENGINEERING.md). wifi_caps is never on the wire
+			-- unless overridden, and a mask left nil keeps its shipped value.
+			inject_sysinfo()
+			local st = {authkey = state.DEFAULT_KEY, adopted = true, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap"}
+			local d = cjson.decode(inform.build_json(st, {config = {}}, ufhw))
+			assert_eq(d.fw_caps, 0x110, "shipped fw_caps without an override")
+			assert_eq(d.wifi_caps2, 0x40, "shipped wifi_caps2 without an override")
+			assert_nil(d.wifi_caps, "wifi_caps is not on the wire by default")
+			d = cjson.decode(inform.build_json(st,
+				{config = {debug_caps = {wifi_caps = 0x2, wifi_caps2 = 0x41}}}, ufhw))
+			assert_eq(d.fw_caps, 0x110, "an unlisted mask keeps its shipped value")
+			assert_eq(d.wifi_caps, 0x2, "wifi_caps appears only when overridden")
+			assert_eq(d.wifi_caps2, 0x41, "wifi_caps2 override applied")
+		end
+	},
+	{
+		name = "inform json: debug_payload_extra merges top-level fields into the payload verbatim",
+		fn = function()
+			inject_sysinfo()
+			local st = {authkey = state.DEFAULT_KEY, adopted = true, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap"}
+			local d = cjson.decode(inform.build_json(st, {config = {debug_payload_extra = {
+				uplink = {type = "wireless", rssi = -40}, model = "U6M",
+			}}}, ufhw))
+			assert_eq(d.uplink.type, "wireless", "a new nested object rides along")
+			assert_eq(d.uplink.rssi, -40, "with its values intact")
+			assert_eq(d.model, "U6M", "an existing field can be overridden for the experiment")
+			assert_eq(d.mac, "aa:bb:cc:dd:ee:ff", "everything else is untouched")
+		end
+	},
+	{
+		name = "inform json: build_json brackets every ucihelper lookup in one pass",
+		fn = function()
+			-- One `ubus call network.wireless status` per payload instead of
+			-- one per lookup: the pass is opened before the first lookup and
+			-- closed after the last.
+			inject_sysinfo()
+			local orig = inform._ucihelper
+			local log = {}
+			inform._ucihelper = {
+				begin_pass      = function() log[#log + 1] = "begin" end,
+				end_pass        = function() log[#log + 1] = "end" end,
+				get_vap_table   = function() log[#log + 1] = "vaps"; return {} end,
+				get_radio_table = function() log[#log + 1] = "radios"; return {} end,
+			}
+			local ok, err = pcall(function()
+				local st = {authkey = state.DEFAULT_KEY, adopted = true, cfgversion = "",
+					inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+					ip = "192.168.1.100", hostname = "testap"}
+				inform.build_json(st, nil, ufhw)
+			end)
+			inform._ucihelper = orig
+			if not ok then error(err, 0) end
+			assert_eq(table.concat(log, ","), "begin,vaps,radios,end", "pass brackets every lookup")
+		end
+	},
 }
