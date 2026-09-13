@@ -35,12 +35,19 @@ M.DEFAULT_KEY = "ba86f2bbe107c7c57eb5f2690775c712"
 -- Override this in tests to point at a temp file
 M._state_file = "/etc/openuf/state.json"
 
+-- The inform URL a device uses until a controller (or `syswrapper.sh
+-- set-inform`) gives it one. inform.lua's entry point sets this from
+-- conf.lua's inform_url; it only ever fills a state.json that has no URL of
+-- its own, so an adopted device keeps whatever it was assigned and a factory
+-- reset goes back to conf.lua.
+M.DEFAULT_INFORM_URL = "http://unifi:8080/inform"
+
 local function defaults()
 	return {
 		authkey                  = M.DEFAULT_KEY,
 		adopted                  = false,
 		cfgversion               = "",
-		inform_url               = "http://unifi:8080/inform",
+		inform_url               = M.DEFAULT_INFORM_URL,
 		use_gcm                  = false,
 		upgrade_requested_version = "",
 		upgrade_requested_url     = "",

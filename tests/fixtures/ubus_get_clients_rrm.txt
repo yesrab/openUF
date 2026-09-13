@@ -1,28 +1,28 @@
 {
 	"freq": 5180,
 	"clients": {
-		"2a:1a:ec:4a:c0:df": {
+		"00:00:5e:00:53:10": {
 			"auth": true,
 			"assoc": true,
 			"rrm": [ 115, 0, 0, 0, 0 ],
 			"extended_capabilities": [ 1, 0, 72, 4, 0, 0, 0, 64 ],
 			"aid": 1
 		},
-		"82:e0:6b:a2:f6:84": {
+		"00:00:5e:00:53:22": {
 			"auth": true,
 			"assoc": true,
 			"rrm": [ 75, 0, 0, 0, 0 ],
 			"extended_capabilities": [ 1, 0, 72, 4, 0, 0, 0, 64 ],
 			"aid": 2
 		},
-		"94:27:70:79:aa:18": {
+		"00:00:5e:00:53:1b": {
 			"auth": true,
 			"assoc": true,
 			"rrm": [ 50, 0, 0, 0, 0 ],
 			"extended_capabilities": [ 1, 0, 72, 4, 0, 0, 0, 64 ],
 			"aid": 3
 		},
-		"2a:85:dc:4f:87:e4": {
+		"00:00:5e:00:53:18": {
 			"auth": true,
 			"assoc": true,
 			"rrm": [ 0, 0, 0, 0, 0 ],

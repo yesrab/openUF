@@ -55,6 +55,23 @@ local function get_uci()
 	return require("uci")
 end
 
+-- General memo for the lookup pass M.begin_pass/end_pass open (see the
+-- wireless_status cache further down, which was the first thing to need one).
+-- Anything in here answers the SAME question for the length of one inform
+-- payload; outside a pass every call recomputes, which is what keeps the test
+-- suite's per-test stubs independent of one another.
+M._pass_cache = nil
+local function pass_memo(key, fn)
+	local cache = M._ws_pass and M._pass_cache
+	if cache then
+		local hit = cache[key]
+		if hit ~= nil then return hit[1] end
+	end
+	local value = fn()
+	if cache then cache[key] = {value} end
+	return value
+end
+
 -- Load an enforcement sibling by path, mirroring inform.lua's _require_sibling:
 -- openUF's modules are not on package.path, and the working directory differs
 -- between running from openuf/ and from an install root. Returns nil rather
@@ -680,6 +697,7 @@ function M.ensure_vlan_network(cpueth, vlan_id)
 	local ifname = cpueth .. "." .. tostring(vlan_id)
 	local br_section = OPENUF_PREFIX .. "brdev" .. tostring(vlan_id)
 	local br_name = "br-" .. OPENUF_PREFIX:gsub("_$", "") .. tostring(vlan_id)
+	local port_section = OPENUF_PREFIX .. "brport" .. tostring(vlan_id)
 
 	local changed = false
 	if netifd_uses_device_sections(cursor) then
@@ -712,6 +730,35 @@ function M.ensure_vlan_network(cpueth, vlan_id)
 				changed = true
 			end
 		end
+		-- Turn MAC learning OFF on the tagged uplink port. On a DSA board the
+		-- untagged uplink (in br-lan) and its `<uplink>.<vid>` sub-device are
+		-- the SAME physical port on the SAME hardware switch, and that switch
+		-- has ONE FDB. With learning on, it learns the upstream router's MAC
+		-- against the tagged sub-device and files it in the VLAN bridge's
+		-- domain:
+		--     5a:d6:..:f6 dev wan.10 offload master br-openuf10
+		-- Wired clients sit in that hardware FDB too (`dev lan4 self`), so
+		-- their frames to the router get hardware-forwarded into the VLAN
+		-- domain and blackholed -- LAN peers reachable, gateway and internet
+		-- dead. WiFi clients ride the CPU/software path, hit the correct
+		-- `dev wan master br-lan` entry, and work: the giveaway signature is
+		-- WiFi fine, wired broken, on the same AP. Upstream confirmed this
+		-- live on an AX3000T (2026-09-03) and fixed it with exactly this,
+		-- after which the hardware entry binds correctly as `dev wan self`.
+		-- Deleting the bad entry does not help -- it re-learns in seconds.
+		--
+		-- Cost is nil in practice: the VLAN bridge is the uplink plus the
+		-- VAP(s), so unlearned unicast floods to the one other port it would
+		-- have been forwarded to anyway. Only the uplink port is set -- every
+		-- other member still learns normally. Harmless on swconfig, where the
+		-- sub-device is a software 8021q device with no hardware FDB behind it.
+		if cursor:get("network", port_section, "name") ~= ifname
+			or tostring(cursor:get("network", port_section, "learning") or "") ~= "0" then
+			cursor:set("network", port_section, "device")
+			cursor:set("network", port_section, "name", ifname)
+			cursor:set("network", port_section, "learning", "0")
+			changed = true
+		end
 		if cursor:get("network", section_name, "device") ~= br_name then
 			cursor:set("network", section_name, "interface")
 			cursor:set("network", section_name, "device", br_name)
@@ -742,6 +789,94 @@ function M.ensure_vlan_network(cpueth, vlan_id)
 	return section_name
 end
 
+-- ─── Bridge identity ─────────────────────────────────────────────────────────
+
+-- One netdev's MAC from sysfs, lowercased, or nil.
+local function mac_of(ifname)
+	local raw = ifname and M._read_file("/sys/class/net/" .. ifname .. "/address")
+	local mac = type(raw) == "string" and raw:match("(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+	return mac and mac:lower() or nil
+end
+
+-- The bridge a netdev is enslaved to, or nil when it carries its own address.
+local function master_of(ifname)
+	local m = M._popen("readlink /sys/class/net/" .. tostring(ifname) .. "/master")
+	m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
+	if m and m ~= "" and m ~= ifname then return m end
+	return nil
+end
+
+-- Give the management bridge the MAC openUF identifies as.
+--
+-- openUF takes its IDENTITY from `dev.conf.net.lan_cpueth` -- that netdev's MAC
+-- is what the controller keys the adopted device on, what lldpd advertises as
+-- the chassis id, and what every inform arrives under. It takes its reported
+-- IP from the same name, but `announce.get_ip` deliberately hops to the BRIDGE
+-- that port is enslaved to, because a bridge member carries no address.
+--
+-- MAC from the port, address from the bridge: fine as long as the two share a
+-- MAC, which on every swconfig board they do (`eth1` and `br-lan` read the
+-- same address, so the divergence never existed to be noticed). It is NOT
+-- true on a DSA board whose modelmap names a SOCKET as lan_cpueth -- upstream's
+-- AX3000T map names `wan`, whose MAC is board.json's `label_macaddr`, while
+-- `br-lan` inherits the DSA conduit's (`eth0`). The AP then announces itself
+-- under one MAC while every frame it sources, and the ARP entry for the very
+-- address it reports, carries another. The gateway sees one device claiming
+-- the IP and a different one using it, and raises an IP conflict against a
+-- network that is in fact correctly configured (upstream confirmed on the
+-- wire, 2026-09-12).
+--
+-- Pinning the bridge's `macaddr` closes it, and is what a real UniFi AP looks
+-- like: one MAC for identity, LLDP and management traffic. Adoption is keyed
+-- on `lan_cpueth`'s MAC, which this does not touch, so the device record
+-- survives -- see inform's _warn_identity_change for what changing THAT costs.
+--
+-- Only ever acts when the two genuinely differ, so a board where they already
+-- agree is untouched and no reload is issued. This fork's JioRouter maps name
+-- `br-lan` itself as lan_cpueth (CLAUDE.md: "lan_cpueth: bridge on DSA"), so
+-- the bridge has no master and this is a no-op there; it protects any DSA map
+-- that names a socket instead. On a DHCP-addressed board the new L2 identity
+-- means a new lease and possibly a new address; openUF reports the change on
+-- the next inform and the adoption is unaffected, but that is why this is
+-- loud rather than silent.
+function M.ensure_bridge_identity(cfg)
+	local cpueth = cfg and cfg.net and cfg.net.lan_cpueth
+	local want = mac_of(cpueth)
+	if not want then return false end
+
+	local br = master_of(cpueth)
+	-- No bridge means the port holds the address itself: nothing diverges.
+	if not br then return false end
+	local have = mac_of(br)
+	if not have or have == want then return false end
+
+	local cursor = get_uci().cursor()
+	-- Found by the bridge's NAME, not a section name: it is the board's own
+	-- anonymous `network.@device[0]`, and openUF must not assume where it sits.
+	local sec
+	cursor:foreach("network", "device", function(s)
+		if s.name == br and s.type == "bridge" then sec = s[".name"] end
+	end)
+	if not sec then
+		io.stderr:write(("ucihelper: %s has MAC %s but openUF identifies as %s, and "
+			.. "there is no `config device` section for %s to pin it on -- the "
+			.. "controller will see an IP conflict against itself\n")
+			:format(br, have, want, br))
+		return false
+	end
+
+	if tostring(cursor:get("network", sec, "macaddr") or ""):lower() == want then
+		return false
+	end
+	cursor:set("network", sec, "macaddr", want)
+	cursor:commit("network")
+	io.stderr:write(("ucihelper: pinning %s to the identity MAC %s (was %s, from %s) "
+		.. "-- MAC and reported IP must belong to the same netdev or the gateway "
+		.. "reports an IP conflict\n"):format(br, want, have, cpueth))
+	M._network_dirty = true
+	return true
+end
+
 -- Delete the interface and bridge sections of every VLAN not in `wanted`
 -- (a set keyed by VLAN id). Only openUF's own sections are ever touched --
 -- same discipline as wlan_clear()'s openuf_ prefix rule.
@@ -765,6 +900,15 @@ function M.prune_vlan_networks(wanted)
 	end
 	sweep("interface", "^" .. OPENUF_PREFIX .. "vlan(%d+)$")
 	sweep("device",    "^" .. OPENUF_PREFIX .. "brdev(%d+)$")
+	-- The uplink port's learning override goes with the bridge it qualified;
+	-- left behind it would keep learning off on a port no openUF bridge owns.
+	sweep("device",    "^" .. OPENUF_PREFIX .. "brport(%d+)$")
+	-- ...and switchvlan's per-SOCKET overrides on the same bridge
+	-- (`openuf_brport<vid>_<socket>`), which the anchored pattern above
+	-- deliberately does not match. A VLAN going away takes its moved sockets
+	-- back to br-lan, and an override left behind would keep learning off on a
+	-- port no openUF bridge owns -- silently costing that port its host list.
+	sweep("device",    "^" .. OPENUF_PREFIX .. "brport(%d+)_")
 
 	if #doomed == 0 then return false end
 	for _, name in ipairs(doomed) do
@@ -1146,6 +1290,45 @@ end
 
 -- ─── Config apply ────────────────────────────────────────────────────────────
 
+-- Drive the two kernel-resident features from one normalized list of
+-- {ifname, bcfilt_enabled, bcfilt_macs, down_kbps, up_kbps} entries, so the
+-- setparam path (apply_config) and the startup reapply (reapply_runtime_rules)
+-- cannot drift apart.
+--
+-- Both are reconciled unconditionally, even with an empty list: each rebuilds
+-- from scratch rather than diffing, so turning a control off in the controller
+-- tears the previous ruleset down instead of leaving it in place -- the same
+-- contract firewall.lua keeps. That is also why EVERY managed VAP is passed to
+-- the shaper and not just the capped ones: shaper.reconcile clears each
+-- interface it is handed before reshaping it, so a VAP whose limit was just
+-- removed has to appear here, with both rates nil, to get its old qdisc torn
+-- down.
+local function reconcile_runtime(entries)
+	local bcfilter = get_bcfilter()
+	if bcfilter then
+		local rules = {}
+		for _, e in ipairs(entries) do
+			if e.bcfilt_enabled then
+				rules[#rules + 1] = {ifname = e.ifname, macs = e.bcfilt_macs or {}}
+			end
+		end
+		bcfilter.reconcile(rules)
+	end
+
+	local shaper = get_shaper()
+	if shaper then
+		local rules = {}
+		for _, e in ipairs(entries) do
+			rules[#rules + 1] = {
+				ifname    = e.ifname,
+				down_kbps = e.down_kbps,
+				up_kbps   = e.up_kbps,
+			}
+		end
+		shaper.reconcile(rules)
+	end
+end
+
 -- Apply a full config payload from the controller.
 -- resp: decoded JSON table from the controller's inform response.
 -- cfg:  device configuration (from conf.lua); used for dev.conf.net.lan_cpueth
@@ -1463,23 +1646,18 @@ function M.apply_config(resp, cfg, opts)
 				extra.wps_device_name = (opts and opts.device_name) or "openUF"
 				extra.ap_setup_locked = "1"
 			end
-			if vap.sae_anti_clogging then
-				-- hostapd's own option name for this exact WPA3-SAE tuning
-				-- value (default 5, confirmed via hostapd upstream docs).
-				-- Renamed to "anti_clogging_threshold" in newer hostapd
-				-- (to also cover PASN, not just SAE) -- using the older
-				-- name here since it's the one broadly supported across
-				-- the OpenWrt/wpad versions this project targets; revisit
-				-- if a target build's hostapd has dropped the old alias.
-				extra.sae_anti_clogging_threshold = vap.sae_anti_clogging
-			end
-			if vap.sae_sync then
-				-- hostapd's own option name, unchanged/stable across
-				-- versions (confirmed via hostapd upstream docs) -- max
-				-- SAE sync errors (dot11RSNASAESync) before disconnecting
-				-- the offending peer.
-				extra.sae_sync = vap.sae_sync
-			end
+			-- NOT written: SAE anti-clogging / sync time. Both are real
+			-- hostapd config keys, but OpenWrt exposes neither as a
+			-- wifi-iface UCI option -- upstream verified this 2026-09-10 on
+			-- an Archer C5 (ath79) and an AX3000T (filogic), both OpenWrt
+			-- 25.12.5, against all three places an option can be declared:
+			-- the wifi-iface schema, /usr/share/ucode/wifi/ and hostapd.sh's
+			-- config_add_* lists. Neither name appears in any of them, so a
+			-- write here was stored in UCI and dropped in silence. The wire
+			-- keys (aaa.<n>.sae.anti_clogging / sae.sync) are no longer
+			-- parsed either -- a producer with no consumer is the same defect
+			-- one level up. See PROTOCOL-VALIDATION.md for what is known
+			-- about them on the wire.
 			-- VLAN comes off the vap itself: the controller derives it from
 			-- aaa.<n>.br.devname ("br0.20"), not from a linked network object.
 			local vlan_enabled = vap.vlan_enabled
@@ -1541,76 +1719,103 @@ function M.apply_config(resp, cfg, opts)
 
 	-- Reload wireless
 	M._run_cmd("wifi reload")
-	-- netifd may hand the interfaces new netdev names on the way back up, so
-	-- the lookups below must not reuse anything read before the reload.
-	M._ws_cache = nil
+	-- netifd may hand the interfaces new netdev names on the way back up, and
+	-- the wireless config this reload just wrote is the very thing the radio
+	-- rows were read from, so the lookups below must not reuse anything read
+	-- before it.
+	M._ws_cache   = nil
+	M._pass_cache = nil
 
-	-- "Multicast and Broadcast Blocker" enforcement. Deliberately after the
-	-- reload: the rules key off each VAP's live netdev name, which only exists
-	-- (and can change) once netifd has brought the interfaces back up. Always
-	-- reconciled, even with no filtered VAPs, so turning the control off in the
-	-- controller tears the previous ruleset down rather than leaving it in
-	-- place -- the same reason firewall.lua rebuilds from scratch every time.
-	local bcfilter = get_bcfilter()
-	if bcfilter then
-		local rules = {}
-		for _, vap in ipairs(vap_table) do
-			if vap.bcfilt_enabled and vap.ssid and vap.radio then
-				local ifname = M.get_ifname_for_vap(vap.radio, vap.ssid)
-				if ifname then
-					rules[#rules + 1] = {ifname = ifname, macs = vap.bcfilt_macs or {}}
-				end
+	-- "Multicast and Broadcast Blocker" (nftables) and "WiFi Speed Limit" (tc)
+	-- enforcement. Deliberately after the reload: the rules key off each VAP's
+	-- live netdev name, which only exists (and can change) once netifd has
+	-- brought the interfaces back up.
+	local entries = {}
+	for _, vap in ipairs(vap_table) do
+		if vap.ssid and vap.radio then
+			-- Resolved once per VAP and shared by both features -- this used to
+			-- be two lookups per VAP through the same ubus status call.
+			local ifname = M.get_ifname_for_vap(vap.radio, vap.ssid)
+			if ifname then
+				entries[#entries + 1] = {
+					ifname         = ifname,
+					bcfilt_enabled = vap.bcfilt_enabled,
+					bcfilt_macs    = vap.bcfilt_macs,
+					down_kbps      = vap.ratelimit_down_kbps,
+					up_kbps        = vap.ratelimit_up_kbps,
+				}
 			end
 		end
-		bcfilter.reconcile(rules)
 	end
+	reconcile_runtime(entries)
+end
 
-	-- "WiFi Speed Limit" enforcement, after the reload for the same reason.
-	-- EVERY managed VAP is passed, not just the capped ones: shaper.reconcile
-	-- clears each interface it is handed before reshaping it, so a VAP whose
-	-- limit was just removed has to appear here (with both rates nil) to get
-	-- its old qdisc torn down.
-	local shaper = get_shaper()
-	if shaper then
-		local rules = {}
-		for _, vap in ipairs(vap_table) do
-			if vap.ssid and vap.radio then
-				local ifname = M.get_ifname_for_vap(vap.radio, vap.ssid)
-				if ifname then
-					rules[#rules + 1] = {
-						ifname    = ifname,
-						down_kbps = vap.ratelimit_down_kbps,
-						up_kbps   = vap.ratelimit_up_kbps,
-					}
-				end
-			end
+-- Reapply both kernel-resident WiFi features from UCI.
+--
+-- The blocker is an nftables ruleset and the speed limit is a tc qdisc: both
+-- are LIVE KERNEL STATE that a reboot discards, and neither has a UCI option
+-- OpenWrt itself understands. apply_config() only ever runs on a setparam, and
+-- after a reboot there is no setparam to run it -- cfgversion is persisted, so
+-- it matches on the first inform and the controller replies noop with no
+-- system_cfg at all. Both features therefore stayed switched off indefinitely
+-- while the controller UI went on showing them as on.
+--
+-- The four openuf_bcfilt/openuf_ratelimit_* options wlan_add stamps onto each
+-- managed section are the record this reads back; before this they were
+-- written and never read by anything.
+--
+-- Called at startup by inform.M.run, alongside the blocked-client and LED
+-- reconciliation, and for the same reason. Returns the number of managed VAPs
+-- it found, for the caller's log line.
+function M.reapply_runtime_rules()
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	local entries = {}
+	cursor:foreach("wireless", "wifi-iface", function(s)
+		local name = s[".name"]
+		if not name or name:sub(1, #OPENUF_PREFIX) ~= OPENUF_PREFIX then return end
+		-- A disabled VAP has no netdev to attach a rule to. It also needs no
+		-- teardown: the reload that disabled it took its interface, and with it
+		-- every qdisc and every nft rule that named it.
+		if s.disabled == "1" then return end
+		local ok_if, ifname = pcall(M.get_ifname_for_vap, s.device, s.ssid)
+		if not (ok_if and ifname) then return end
+		local macs = {}
+		for mac in (s.openuf_bcfilt_macs or ""):gmatch("%S+") do
+			macs[#macs + 1] = mac
 		end
-		shaper.reconcile(rules)
-	end
+		entries[#entries + 1] = {
+			ifname         = ifname,
+			bcfilt_enabled = (s.openuf_bcfilt == "1"),
+			bcfilt_macs    = macs,
+			down_kbps      = tonumber(s.openuf_ratelimit_down),
+			up_kbps        = tonumber(s.openuf_ratelimit_up),
+		}
+	end)
+	reconcile_runtime(entries)
+	return #entries
 end
 
 -- ─── Read helpers (for inform payload builder) ───────────────────────────────
 
--- Return a table of radio info for the inform payload.
--- hwassign: the modelmap's dev.openuf.uap.hwassign -- the radio names to
--- report. Documented since the first release as controlling exactly this, but
--- read by nothing until now, so every wifi-device in UCI was reported no matter
--- what the modelmap said. That matters on a board with a radio openUF should
--- not present as part of the emulated model (a third radio, a mesh-only or
--- monitor phy): the controller would show and try to configure a radio the
--- emulated model does not have. nil/empty keeps the report-everything
--- behavior, which is what a modelmap without hwassign means.
-function M.get_radio_table(hwassign)
+-- Every wifi-device in UCI, unfiltered, read once per pass.
+--
+-- get_radio_table was called TWICE per heartbeat -- once by build_json with
+-- the modelmap's hwassign, and once by get_vap_table with none, to build its
+-- band lookup -- so /etc/config/wireless was loaded through a fresh
+-- uci.cursor() twice for one answer, on config that changes only when the
+-- controller pushes one.
+--
+-- The rows are held UNFILTERED and hwassign is applied per call: the two
+-- callers want different filtering of the same rows, and a memo that held the
+-- filtered result would change which radios vap_table can resolve
+-- radio/channel/tx_power against.
+local function radio_rows()
+	return pass_memo("radio_rows", function()
 	local uci = get_uci()
 	local cursor = uci.cursor()
-	local allowed = nil
-	if type(hwassign) == "table" and #hwassign > 0 then
-		allowed = {}
-		for _, name in ipairs(hwassign) do allowed[name] = true end
-	end
 	local radios = {}
 	cursor:foreach("wireless", "wifi-device", function(s)
-		if allowed and not allowed[s[".name"]] then return end
 		radios[#radios + 1] = {
 			name             = s[".name"],
 			radio            = band_for_device(s),
@@ -1649,6 +1854,38 @@ function M.get_radio_table(hwassign)
 		}
 	end)
 	return radios
+	end)
+end
+
+-- Return a table of radio info for the inform payload.
+-- hwassign: the modelmap's dev.openuf.uap.hwassign -- the radio names to
+-- report. Documented since the first release as controlling exactly this, but
+-- read by nothing until now, so every wifi-device in UCI was reported no matter
+-- what the modelmap said. That matters on a board with a radio openUF should
+-- not present as part of the emulated model (a third radio, a mesh-only or
+-- monitor phy): the controller would show and try to configure a radio the
+-- emulated model does not have. nil/empty keeps the report-everything
+-- behavior, which is what a modelmap without hwassign means.
+function M.get_radio_table(hwassign)
+	local allowed = nil
+	if type(hwassign) == "table" and #hwassign > 0 then
+		allowed = {}
+		for _, name in ipairs(hwassign) do allowed[name] = true end
+	end
+	local radios = {}
+	for _, row in ipairs(radio_rows()) do
+		if not allowed or allowed[row.name] then
+			-- A COPY per call. build_json writes the hardware caps, the
+			-- re-derived band and the payload's own fields onto the rows it
+			-- gets back and strips the internal ones; sharing the memoized
+			-- tables would let that reach the copy get_vap_table is reading
+			-- from -- and the next heartbeat's.
+			local copy = {}
+			for k, v in pairs(row) do copy[k] = v end
+			radios[#radios + 1] = copy
+		end
+	end
+	return radios
 end
 
 -- The cjson binding used to parse `ubus call network.wireless status` for
@@ -1686,8 +1923,8 @@ end
 -- four-SSID box is one.
 M._ws_cache = nil      -- {status = <decoded table> | false} while a pass is open
 M._ws_pass  = false
-function M.begin_pass() M._ws_pass = true;  M._ws_cache = nil end
-function M.end_pass()   M._ws_pass = false; M._ws_cache = nil end
+function M.begin_pass() M._ws_pass = true;  M._ws_cache = nil; M._pass_cache = {} end
+function M.end_pass()   M._ws_pass = false; M._ws_cache = nil; M._pass_cache = nil end
 
 local function wireless_status()
 	if M._ws_pass and M._ws_cache then

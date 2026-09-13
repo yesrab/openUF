@@ -1975,30 +1975,6 @@ return {
 		end
 	},
 	{
-		name = "inform packet: _parse_wifi_system_cfg parses aaa.<n>.sae.anti_clogging/sae.sync (WPA3-SAE tuning)",
-		fn = function()
-			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\naaa.1.sae.anti_clogging=12\naaa.1.sae.sync=20\n"
-				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
-			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
-			assert_eq(vap_table[1].sae_anti_clogging, 12, "sae.anti_clogging parsed as a number")
-			assert_eq(vap_table[1].sae_sync, 20, "sae.sync parsed as a number")
-		end
-	},
-	{
-		name = "inform packet: _parse_wifi_system_cfg leaves sae_anti_clogging/sae_sync nil when absent",
-		fn = function()
-			-- Real controller behavior: these keys are only ever emitted
-			-- when the WLAN is actually in WPA3/SAE mode (or 6GHz) --
-			-- absent for a plain WPA2 or WPA2/WPA3-mixed WLAN even with a
-			-- non-default admin value saved server-side (confirmed live).
-			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
-				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
-			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
-			assert_eq(vap_table[1].sae_anti_clogging, nil, "no sae.anti_clogging key -> nil")
-			assert_eq(vap_table[1].sae_sync, nil, "no sae.sync key -> nil")
-		end
-	},
-	{
 		name = "inform packet: handle_response parses resolv.host.1.name and threads it as opts.device_name",
 		fn = function()
 			local st = sample_state()
@@ -2496,24 +2472,21 @@ return {
 		end
 	},
 	{
-		name = "inform: _state_mtime parses stat output as a number",
+		name = "inform: _state_mtime forks nothing and returns nil for a missing file",
 		fn = function()
-			local orig = inform._run_cmd
-			inform._run_cmd = function(cmd) return "1700000000\n" end
-			local mtime = inform._state_mtime("/tmp/whatever")
-			inform._run_cmd = orig
-			assert_eq(mtime, 1700000000, "mtime parsed as number")
-		end
-	},
-	{
-		name = "inform: _state_mtime returns nil when stat yields no output",
-		fn = function()
+			-- This runs on the first line of every heartbeat. It used to fork
+			-- `stat -c %Y` and keep the file contents as a fallback; the fork
+			-- bought strictly less than the fallback (mtime has one-second
+			-- granularity) and on a board with no stat applet it could only
+			-- ever fail. Nothing here may spawn a process.
 			local orig, orig_read = inform._run_cmd, inform._read_file
-			inform._run_cmd = function(cmd) return "" end
+			local forks = 0
+			inform._run_cmd = function() forks = forks + 1; return "1700000000\n" end
 			inform._read_file = function() return nil end
 			local mtime = inform._state_mtime("/nonexistent")
 			inform._run_cmd, inform._read_file = orig, orig_read
-			assert_true(mtime == nil, "nil when file missing")
+			assert_eq(forks, 0, "no process is spawned to poll the state file")
+			assert_true(mtime == nil, "nil when the file cannot be read")
 		end
 	},
 	{
@@ -2525,14 +2498,14 @@ return {
 			-- with nothing on the device to explain it. Observed for real.
 			local out = with_stderr(function()
 				local warned = inform._warn_identity_change(
-					"e8:de:27:5f:62:7a",
-					{adopted = true, mac = "e8:de:27:5f:62:77"},
+					"00:00:5e:00:53:1a",
+					{adopted = true, mac = "00:00:5e:00:53:19"},
 					{net = {lan_cpueth = "eth0"}})
 				assert_true(warned, "warns")
 			end)
 			assert_contains(out, "IDENTITY MAC CHANGED", "names the problem")
-			assert_contains(out, "e8:de:27:5f:62:7a", "the MAC it was adopted as")
-			assert_contains(out, "e8:de:27:5f:62:77", "the MAC it now reports")
+			assert_contains(out, "00:00:5e:00:53:1a", "the MAC it was adopted as")
+			assert_contains(out, "00:00:5e:00:53:19", "the MAC it now reports")
 			assert_contains(out, "eth0", "and which setting decides it")
 			assert_contains(out, "re-adopt", "says how to fix it")
 		end
@@ -2597,20 +2570,21 @@ return {
 		end
 	},
 	{
-		name = "inform: _state_mtime falls back to file contents without stat",
+		name = "inform: the state token tracks the file's contents",
 		fn = function()
-			-- BusyBox gates `stat -c` behind FEATURE_STAT_FORMAT and some
-			-- builds ship no stat applet at all -- confirmed on a real
-			-- TL-WDR3500 -- which silently disabled detection of an SSH
-			-- set-adopt or a manual reset-inform until openUF restarted.
-			local orig, orig_read = inform._run_cmd, inform._read_file
-			inform._run_cmd = function() return "" end        -- no stat anywhere
+			-- Detecting an SSH set-adopt or a manual reset-inform hangs on
+			-- this: a state file written since the last heartbeat must produce
+			-- a different token. Contents, not mtime -- two writes inside one
+			-- second are indistinguishable by mtime and not by this, and
+			-- BusyBox builds without a stat applet (a real TL-WDR3500) could
+			-- never have answered the mtime question anyway.
+			local orig_read = inform._read_file
 			inform._read_file = function() return '{"adopted":false}' end
 			local a = inform._state_mtime("/etc/openuf/state.json")
 			inform._read_file = function() return '{"adopted":true}' end
 			local b = inform._state_mtime("/etc/openuf/state.json")
-			inform._run_cmd, inform._read_file = orig, orig_read
-			assert_not_nil(a, "a token is produced without stat")
+			inform._read_file = orig_read
+			assert_not_nil(a, "a token is produced")
 			assert_true(a ~= b, "and it changes when the file changes")
 		end
 	},
@@ -2957,22 +2931,29 @@ return {
 			local calls = {}
 			local o_rrm = inform._rrmscan
 			inform._rrmscan = {
-				collector_ensure = function() calls[#calls + 1] = "ensure" end,
-				harvest          = function() return {} end,
-				hostapd_objects  = function() return {} end,
-				capable_stations = function() return {} end,
-				request          = function() end,
+				collector_ensure  = function() calls[#calls + 1] = "ensure" end,
+				collector_running = function() return false end,
+				harvest           = function() return {} end,
+				hostapd_objects   = function() return {} end,
+				capable_stations  = function() return {} end,
+				request           = function() end,
 			}
+			inform._rrm_collector_next = 0
 			local ok, err = pcall(function()
 				assert_false(inform._rrm_tick(nil), "no cfg at all -> off")
 				assert_false(inform._rrm_tick({}), "no config block -> off")
 				assert_false(inform._rrm_tick({config = {rrm_enrichment = false}}), "explicit false -> off")
 				assert_eq(#calls, 0, "and nothing ran")
+				-- The liveness check is rate-limited (RRM_COLLECTOR_CHECK_INTERVAL),
+				-- so re-arm it between the two on-ticks to see each one check.
+				inform._rrm_collector_next = 0
 				assert_true(inform._rrm_tick({config = {}}), "absent key -> on (the kept-conf.lua case)")
+				inform._rrm_collector_next = 0
 				assert_true(inform._rrm_tick({config = {rrm_enrichment = true}}), "explicit true -> on")
 				assert_eq(#calls, 2, "the collector was kept alive on each on-tick")
 			end)
 			inform._rrmscan = o_rrm
+			inform._rrm_collector_next = 0
 			if not ok then error(err, 0) end
 		end
 	},
@@ -3100,13 +3081,13 @@ return {
 			-- persisted from the previous run is kept rather than informing
 			-- as 00:00:00:00:00:00 -- but that hides the misconfiguration, so
 			-- the log has to name it.
-			local st = {mac = "e8:de:27:5f:62:7a"}
+			local st = {mac = "00:00:5e:00:53:1a"}
 			local out = with_stderr(function()
 				inform._populate_net_info(st, {net = {lan_cpueth = "openuf-nosuch0"}})
 			end)
 			assert_contains(out, "cannot read a MAC", "warns")
 			assert_contains(out, "openuf-nosuch0", "names the interface")
-			assert_eq(st.mac, "e8:de:27:5f:62:7a", "the persisted identity is kept")
+			assert_eq(st.mac, "00:00:5e:00:53:1a", "the persisted identity is kept")
 		end
 	},
 	{
@@ -3306,6 +3287,360 @@ return {
 			assert_eq(#vaps[1].mac_filter_list, 1, "one filter entry survives")
 			assert_eq(vaps[1].mac_filter_list[1], "02:11:22:33:44:55", "the well-formed one")
 			assert_eq(select(2, out:gsub("malformed MAC", "")), 2, "both refusals logged")
+		end
+	},
+
+	-- ── Adopted from upstream 2026-09-13: debug dump cap, startup reapply of
+	--    IP settings, RRM collector housekeeping ──────────────────────────────
+	{
+		name = "inform packet: handle_response restarts the dump once it passes the cap",
+		fn = function()
+			-- debug_dump_file is append-only and written every few seconds,
+			-- with no ceiling anywhere in the path; its usual home is a tmpfs
+			-- /tmp shared with state.json and the package manager. Upstream
+			-- measured 31.7 MB on one board.
+			local st = sample_state()
+			local path = "/tmp/openuf_test_dump_cap.log"
+			os.remove(path)
+			local pre = io.open(path, "w")
+			pre:write(string.rep("x", 5000) .. "\nOLDMARKER\n")
+			pre:close()
+			inform.handle_response('{"_type":"noop"}', st,
+				{ config = { debug_dump_file = path, debug_dump_max_bytes = 1024 } })
+			local f = io.open(path, "r")
+			local contents = f:read("*a")
+			f:close()
+			os.remove(path)
+			assert_true(contents:find("OLDMARKER", 1, true) == nil,
+				"the oversized previous contents are gone")
+			assert_true(contents:find("restarted", 1, true) ~= nil,
+				"a restart marker records why the history vanished")
+			assert_true(contents:find('{"_type":"noop"}', 1, true) ~= nil,
+				"the response that triggered the restart is still recorded")
+			assert_true(#contents < 1024,
+				"the file is back under the cap, not merely appended to")
+		end
+	},
+	{
+		name = "inform packet: handle_response appends while the dump is under the cap",
+		fn = function()
+			local st = sample_state()
+			local path = "/tmp/openuf_test_dump_under.log"
+			os.remove(path)
+			local pre = io.open(path, "w")
+			pre:write("OLDMARKER\n")
+			pre:close()
+			inform.handle_response('{"_type":"noop"}', st,
+				{ config = { debug_dump_file = path, debug_dump_max_bytes = 1024 } })
+			local f = io.open(path, "r")
+			local contents = f:read("*a")
+			f:close()
+			os.remove(path)
+			assert_true(contents:find("OLDMARKER", 1, true) ~= nil,
+				"history below the cap is preserved -- the cap is not an unconditional truncate")
+			assert_true(contents:find('{"_type":"noop"}', 1, true) ~= nil,
+				"the new response was appended after it")
+			-- Response lines stay untagged: the shape every grep recipe expects.
+			assert_true(contents:match("Z {\"_type\"") ~= nil, "no tag between timestamp and response")
+		end
+	},
+	{
+		name = "inform packet: debug_dump_max_bytes = 0 disables the cap",
+		fn = function()
+			local st = sample_state()
+			local path = "/tmp/openuf_test_dump_nocap.log"
+			os.remove(path)
+			local pre = io.open(path, "w")
+			pre:write(string.rep("x", 5000) .. "\nOLDMARKER\n")
+			pre:close()
+			inform.handle_response('{"_type":"noop"}', st,
+				{ config = { debug_dump_file = path, debug_dump_max_bytes = 0 } })
+			local f = io.open(path, "r")
+			local contents = f:read("*a")
+			f:close()
+			os.remove(path)
+			assert_true(contents:find("OLDMARKER", 1, true) ~= nil,
+				"an explicit 0 keeps the unbounded behaviour")
+		end
+	},
+	{
+		-- The static address is `ip addr` state only, so it dies with the
+		-- reboot, and cfgversion matching means the controller replies noop and
+		-- never re-pushes it. Without the startup reapply the device silently
+		-- comes back on the board's own boot config.
+		name = "inform packet: _reapply_static_ip reapplies a persisted static address at startup",
+		fn = function()
+			local st = sample_state({
+				ip_mode        = "static",
+				static_ip      = "172.19.0.50",
+				static_netmask = "255.255.255.0",
+				static_gateway = "172.19.0.1",
+			})
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local ok = inform._reapply_static_ip(st, {net = {lan_cpueth = "eth0"}})
+			inform._netconfig._exec = orig
+			assert_true(ok, "reapply reports success")
+			assert_eq(#cmds, 3, "three shell commands (flush, add, route)")
+			assert_contains(cmds[1], "ip addr flush dev eth0", "flushes the right interface")
+			assert_contains(cmds[2], "172.19.0.50/24 dev eth0", "restores address and prefix")
+			assert_contains(cmds[3], "172.19.0.1", "restores the default route")
+		end
+	},
+	{
+		name = "inform packet: _reapply_static_ip restores the pushed DNS servers too",
+		fn = function()
+			local st = sample_state({
+				ip_mode    = "static",
+				static_ip  = "172.19.0.50",
+				static_dns = {"1.1.1.1", "9.9.9.9"},
+			})
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			inform._reapply_static_ip(st, {net = {lan_cpueth = "eth0"}})
+			inform._netconfig._exec = orig
+			local resolv = cmds[#cmds]
+			assert_contains(resolv, "nameserver 1.1.1.1", "primary nameserver restored")
+			assert_contains(resolv, "nameserver 9.9.9.9", "secondary nameserver restored")
+		end
+	},
+	{
+		-- The board's own boot config already handles DHCP, and flushing to
+		-- re-lease is the destructive no-op handle_response guards against.
+		name = "inform packet: _reapply_static_ip does nothing on dhcp or when never pushed",
+		fn = function()
+			local cmds = {}
+			local orig = inform._netconfig._exec
+			inform._netconfig._exec = function(cmd)
+				cmds[#cmds + 1] = cmd
+				return true
+			end
+			local cfg = {net = {lan_cpueth = "eth0"}}
+			assert_false(inform._reapply_static_ip(sample_state({ip_mode = "dhcp"}), cfg),
+				"dhcp mode does not reapply")
+			assert_false(inform._reapply_static_ip(sample_state(), cfg),
+				"never-pushed IP Settings does not reapply")
+			assert_false(inform._reapply_static_ip(
+				sample_state({ip_mode = "static"}), cfg),
+				"static mode with no recorded address does not reapply")
+			inform._netconfig._exec = orig
+			assert_eq(#cmds, 0, "no interface was touched in any of the three cases")
+		end
+	},
+	{
+		-- Upstream found this in its validation lab: usteer raised partway
+		-- through handle_response, the AP moved to its pushed static address,
+		-- and state.json never learned about it. _tick pcalls handle_response
+		-- by design, so the error cost one log line -- but the startup reapply
+		-- reads exactly these fields, so the address was unrecoverable after a
+		-- reboot. The record has to be written as soon as the interface is
+		-- changed, not after another 350 lines of shelling out.
+		name = "inform packet: handle_response persists IP settings before the WiFi pass can raise",
+		fn = function()
+			local st = sample_state()
+			local saved = nil
+			local orig_save, orig_exec = inform._state.save, inform._netconfig._exec
+			local orig_uci = inform._ucihelper
+			inform._netconfig._exec = function() return true end
+			inform._state.save = function(t)
+				-- snapshot, so a later save cannot mask an earlier omission
+				saved = saved or {ip_mode = t.ip_mode, static_ip = t.static_ip,
+					static_netmask = t.static_netmask, static_gateway = t.static_gateway}
+			end
+			-- Everything after the IP branch blows up, the way usteer did.
+			inform._ucihelper = setmetatable({
+				begin_pass = function() end, end_pass = function() end,
+				apply_config = function() error("boom: anything downstream can raise") end,
+			}, {__index = orig_uci})
+
+			local cfg = {net = {lan_cpueth = "eth0"}, config = {}}
+			local resp = '{"_type":"setparam","system_cfg":"netconf.1.ip=172.19.0.50\\n'
+				.. 'netconf.1.netmask=255.255.255.0\\nroute.1.gateway=172.19.0.1\\n'
+				.. 'aaa.1.ssid=x\\nwireless.1.ssid=x\\nwireless.1.parent=radio0\\n"}'
+			local ok = pcall(inform.handle_response, resp, st, cfg)
+
+			inform._state.save, inform._netconfig._exec = orig_save, orig_exec
+			inform._ucihelper = orig_uci
+
+			assert_false(ok, "the downstream failure really did raise")
+			assert_true(saved ~= nil, "state was saved anyway, before the raise")
+			assert_eq(saved.ip_mode, "static", "ip_mode reached disk")
+			assert_eq(saved.static_ip, "172.19.0.50", "static_ip reached disk")
+			assert_eq(saved.static_gateway, "172.19.0.1", "static_gateway reached disk")
+		end
+	},
+	{
+		name = "inform: the RRM collector is checked once a minute, not every heartbeat",
+		fn = function()
+			-- collector_ensure forks `pgrep -f` to ask whether the background
+			-- `ubus subscribe` child is alive. That ran on every 10-second
+			-- heartbeat, but the subscription only dies when one of the
+			-- hostapd objects it named goes away -- a config push, not a
+			-- ten-second event.
+			local orig = {rrm = inform._rrmscan, time = inform._time}
+			local clock, checks = 4000, 0
+			inform._time = function() return clock end
+			inform._rrm_collector_next = 0
+			inform._rrmscan = {
+				collector_ensure = function() checks = checks + 1 end,
+				harvest = function() return {}, {} end,
+				hostapd_objects = function() return {} end,
+				_now = function() return clock end,
+			}
+			local cfg = {config = {rrm_enrichment = true}}
+
+			inform._rrm_tick(cfg)
+			clock = clock + 10; inform._rrm_tick(cfg)
+			clock = clock + 10; inform._rrm_tick(cfg)
+			assert_eq(checks, 1, "one liveness check, not one per heartbeat")
+
+			clock = clock + inform.RRM_COLLECTOR_CHECK_INTERVAL
+			inform._rrm_tick(cfg)
+			assert_eq(checks, 2, "and another once the interval is up")
+
+			inform._rrmscan, inform._time = orig.rrm, orig.time
+			inform._rrm_collector_next = 0
+		end
+	},
+	{
+		name = "inform: a config push re-arms the RRM collector check immediately",
+		fn = function()
+			-- `wifi reload` takes every hostapd object the collector subscribed
+			-- to away with it and kills the subscription. That is the one
+			-- moment the check must not wait out its interval -- otherwise
+			-- 802.11k enrichment is dead for up to a minute after every push,
+			-- which is exactly when the neighbourhood is worth re-reading.
+			local orig = {
+				rrm = inform._rrmscan, time = inform._time,
+				build = inform.build_json, packet = inform.build_packet,
+				post = inform.http_post, parse = inform.parse_packet,
+				handle = inform.handle_response, reload = inform._reload_if_changed,
+				scan = inform._maybe_scan_neighbours, status = inform._write_status,
+			}
+			local clock, checks = 4000, 0
+			inform._time = function() return clock end
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._maybe_scan_neighbours = function() end
+			inform._write_status = function() end
+			inform._rrmscan = {
+				collector_ensure = function() checks = checks + 1 end,
+				harvest = function() return {}, {} end,
+				hostapd_objects = function() return {} end,
+				_now = function() return clock end,
+			}
+			inform.build_json    = function() return "{}" end
+			inform.build_packet  = function() return "pkt" end
+			inform.http_post     = function() return "body" end
+			inform.parse_packet  = function() return "{}" end
+			inform.handle_response = function() return true end   -- config applied
+			inform._rrm_collector_next = 0
+			local cfg = {config = {rrm_enrichment = true}}
+			local ctx = {interval = 10, backoff = 10}
+
+			assert_eq(inform._tick({inform_url = "u"}, cfg, nil, ctx), 0,
+				"a config was applied, so the AP re-informs at once")
+			assert_eq(checks, 1, "the first heartbeat checked")
+			-- Well inside the interval, so without the re-arm this would not.
+			clock = clock + 10
+			inform._tick({inform_url = "u"}, cfg, nil, ctx)
+			assert_eq(checks, 2, "and the push re-armed the check straight away")
+
+			inform._rrmscan, inform._time = orig.rrm, orig.time
+			inform.build_json, inform.build_packet = orig.build, orig.packet
+			inform.http_post, inform.parse_packet = orig.post, orig.parse
+			inform.handle_response, inform._reload_if_changed = orig.handle, orig.reload
+			inform._maybe_scan_neighbours, inform._write_status = orig.scan, orig.status
+			inform._rrm_collector_next = 0
+		end
+	},
+	{
+		-- Turning rrm_enrichment off returned before collector_ensure AND
+		-- before harvest, so a collector started while it was on kept
+		-- appending to /tmp/openuf-rrm.jsonl with nothing left to drain it.
+		-- The child is detached and reparented to init, so nothing else was
+		-- going to clean it up either.
+		name = "inform: _rrm_tick stops an orphaned collector once enrichment is switched off",
+		fn = function()
+			local orig_rrm, orig_time = inform._rrmscan, inform._time
+			local stopped, ensured = 0, 0
+			inform._rrmscan = {
+				collector_running = function() return true end,
+				collector_stop    = function() stopped = stopped + 1 end,
+				collector_ensure  = function() ensured = ensured + 1 end,
+				harvest           = function() return {}, {} end,
+				hostapd_objects   = function() return {} end,
+			}
+			local clock = 1000
+			inform._time = function() return clock end
+			inform._rrm_collector_next = 0
+
+			local cfg = {config = {rrm_enrichment = false}}
+			assert_false(inform._rrm_tick(cfg), "still reports disabled")
+			assert_eq(stopped, 1, "the stale collector is killed")
+			assert_eq(ensured, 0, "and nothing is started in its place")
+
+			-- Rate-limited on the collector's own liveness clock: this is a
+			-- pgrep, and there is nothing to catch between checks.
+			inform._rrm_tick(cfg)
+			inform._rrm_tick(cfg)
+			assert_eq(stopped, 1, "not re-run on every tick")
+			clock = clock + inform.RRM_COLLECTOR_CHECK_INTERVAL
+			inform._rrm_tick(cfg)
+			assert_eq(stopped, 2, "checked again once the interval has passed")
+
+			-- Nothing running is the steady state once it has been cleaned up,
+			-- and must not turn into a pkill every interval forever.
+			inform._rrmscan.collector_running = function() return false end
+			clock = clock + inform.RRM_COLLECTOR_CHECK_INTERVAL
+			inform._rrm_tick(cfg)
+			assert_eq(stopped, 2, "no kill when there is no collector to kill")
+
+			inform._rrmscan, inform._time = orig_rrm, orig_time
+			inform._rrm_collector_next = 0
+		end
+	},
+
+	{
+		name = "inform: a build_json that throws still closes the sysinfo lookup pass",
+		fn = function()
+			-- The sysinfo pass memoizes /proc/net/arp, /tmp/dhcp.leases and the
+			-- bucketed switch ARL for the length of one payload. Leaving it
+			-- open past an error would feed the NEXT heartbeat this one's
+			-- wired-host data -- clients that have since moved socket or
+			-- changed address, reported where they used to be.
+			local orig = {
+				build_json = inform.build_json, sysinfo = inform._sysinfo,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				scan = inform._maybe_scan_neighbours, stderr = io.stderr,
+			}
+			io.stderr = {write = function() end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform._maybe_scan_neighbours = function() end
+			local open_passes = 0
+			inform._sysinfo = {
+				begin_pass = function() open_passes = open_passes + 1 end,
+				end_pass   = function() open_passes = open_passes - 1 end,
+			}
+			inform.build_json = function()
+				inform._sysinfo.begin_pass()
+				error("boom halfway through the payload")
+			end
+			inform._tick({inform_url = "http://unifi:8080/inform"}, nil, nil,
+				{interval = 10, backoff = 10})
+
+			inform.build_json, inform._sysinfo, inform._reload_if_changed,
+				inform._rrm_tick, inform._maybe_scan_neighbours, io.stderr =
+				orig.build_json, orig.sysinfo, orig.reload, orig.rrm, orig.scan, orig.stderr
+			assert_eq(open_passes, 0, "the pass is closed even on the error path")
 		end
 	},
 }

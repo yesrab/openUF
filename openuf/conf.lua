@@ -55,7 +55,9 @@ config = {
 
 	-- URL the inform loop posts to.  Overwritten at runtime when the controller
 	-- sends a new URL or when syswrapper.sh set-inform is called.
-	-- The value here is only used on first boot (before state.json exists).
+	-- The value here is only used while state.json carries no URL of its own
+	-- (first boot, or after a factory reset). An https:// URL here also makes
+	-- install.sh pull in luasec.
 	inform_url = "http://unifi:8080/inform",
 
 	-- Path for persistent state (authkey, adopted flag, cfgversion, inform_url,
@@ -90,6 +92,13 @@ config = {
 	-- grep ' TX ' / grep -v ' TX '. Off by default because it multiplies the
 	-- file's growth and the payload carries no secrets the responses do not.
 	debug_dump_requests = false,
+
+	-- Ceiling on debug_dump_file, in bytes. The file lives on /tmp, a RAM
+	-- disk shared with state.json and the package manager; unbounded, it
+	-- reached 31.7 MB on one board. Past the cap the file restarts with a
+	-- marker line rather than rotating (a second generation would double the
+	-- peak footprint). 0 disables the cap; nil means the 4 MiB default.
+	debug_dump_max_bytes = 4 * 1024 * 1024,
 
 	-- RESEARCH ONLY. Override the capability bitmasks the payload claims:
 	--   debug_caps = {fw_caps = 0x110, wifi_caps = 0x0, wifi_caps2 = 0x40},

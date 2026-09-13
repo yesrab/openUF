@@ -92,15 +92,15 @@ return {
 				local set = {}
 				for _, m in ipairs(stas) do set[m] = true end
 				-- rrm=115 (passive+active+table) and rrm=50 (passive+active).
-				assert_true(set["2a:1a:ec:4a:c0:df"], "full RRM client asked")
-				assert_true(set["94:27:70:79:aa:18"], "passive+active client asked")
+				assert_true(set["00:00:5e:00:53:10"], "full RRM client asked")
+				assert_true(set["00:00:5e:00:53:1b"], "passive+active client asked")
 				-- rrm=75 is beacon-TABLE only: acked every real request and
 				-- answered none, and hostapd refuses a passive request for it
 				-- outright. Asking it is pure airtime for no data.
-				assert_false(set["82:e0:6b:a2:f6:84"],
+				assert_false(set["00:00:5e:00:53:22"],
 					"beacon-table-only client is NOT asked")
 				-- rrm=0 -- most clients on a real network.
-				assert_false(set["2a:85:dc:4f:87:e4"], "non-802.11k client is not asked")
+				assert_false(set["00:00:5e:00:53:18"], "non-802.11k client is not asked")
 				assert_eq(#stas, 2, "exactly the two capable ones")
 			end)
 		end
@@ -111,20 +111,20 @@ return {
 			with_events(read_fixture("ubus_beacon_report.txt"), function()
 				local n = rrmscan.harvest()
 				local m = by_bssid(n)
-				assert_eq(m["84:78:48:a4:fb:21"].channel, 1, "2.4 GHz neighbour")
-				assert_eq(m["84:78:48:a4:fb:21"].band, "ng", "banded from the channel")
-				assert_eq(m["84:78:48:a4:fb:21"].signal, -73, "rcpi 74 -> -73 dBm")
-				assert_eq(m["30:b5:c2:d7:b6:59"].band, "na", "5 GHz neighbour")
+				assert_eq(m["00:00:5e:00:53:11"].channel, 1, "2.4 GHz neighbour")
+				assert_eq(m["00:00:5e:00:53:11"].band, "ng", "banded from the channel")
+				assert_eq(m["00:00:5e:00:53:11"].signal, -73, "rcpi 74 -> -73 dBm")
+				assert_eq(m["00:00:5e:00:53:15"].band, "na", "5 GHz neighbour")
 				-- The captured rep-mode 4 report ("refused / incapable")
 				-- carries an all-zero BSSID on channel 0. Both the BSSID
 				-- guard and the rep-mode guard reject it, so this assertion
 				-- alone does not prove the rep-mode one works -- see the next
 				-- test for that.
 				assert_nil(m["00:00:00:00:00:00"], "refused measurement dropped")
-				-- Two clients both reported 30:b5:c2:d7:b6:59.
+				-- Two clients both reported 00:00:5e:00:53:15.
 				local count = 0
 				for _, e in ipairs(n) do
-					if e.bssid == "30:b5:c2:d7:b6:59" then count = count + 1 end
+					if e.bssid == "00:00:5e:00:53:15" then count = count + 1 end
 				end
 				assert_eq(count, 1, "a BSS seen by two clients is carried once")
 				-- `probe` and `link-measurement-report` share the stream and
@@ -167,8 +167,8 @@ return {
 			-- this capture) is a station declining too and does not count.
 			with_events(read_fixture("ubus_beacon_report.txt"), function()
 				local _, reporters = rrmscan.harvest()
-				assert_true(reporters["2a:1a:ec:4a:c0:df"], "the client with real reports answered")
-				assert_true(reporters["94:27:70:79:aa:18"], "so did the second one")
+				assert_true(reporters["00:00:5e:00:53:10"], "the client with real reports answered")
+				assert_true(reporters["00:00:5e:00:53:1b"], "so did the second one")
 				local n = 0
 				for _ in pairs(reporters) do n = n + 1 end
 				assert_eq(n, 2, "and nobody else")
@@ -191,7 +191,7 @@ return {
 			-- directly, so the report still lands.
 			with_events(read_fixture("ubus_beacon_report.txt"), function()
 				local m = by_bssid(rrmscan.harvest())
-				assert_not_nil(m["30:b5:c2:d7:b6:59"],
+				assert_not_nil(m["00:00:5e:00:53:15"],
 					"report with an out-of-range start-time still parsed")
 			end)
 		end
@@ -209,26 +209,26 @@ return {
 		name = "rrmscan: merge only adds new BSSIDs, on the matching band",
 		fn = function()
 			local passive = {
-				{bssid = "30:b5:c2:d7:b6:5a", essid = "Home LAN",
+				{bssid = "00:00:5e:00:53:14", essid = "Home LAN",
 				 security = "wpa2", channel = 6, bw = 40},
 			}
 			local neigh = {
 				-- already known passively, with a richer record
-				{bssid = "30:b5:c2:d7:b6:5a", channel = 6, band = "ng", signal = -48, seen_at = 100},
+				{bssid = "00:00:5e:00:53:14", channel = 6, band = "ng", signal = -48, seen_at = 100},
 				-- new, same band
-				{bssid = "84:78:48:a4:fb:21", channel = 1, band = "ng", signal = -73, seen_at = 100},
+				{bssid = "00:00:5e:00:53:11", channel = 1, band = "ng", signal = -73, seen_at = 100},
 				-- new, WRONG band for this radio
-				{bssid = "54:af:97:55:14:78", channel = 48, band = "na", signal = -80, seen_at = 100},
+				{bssid = "00:00:5e:00:53:17", channel = 48, band = "na", signal = -80, seen_at = 100},
 			}
 			local out = rrmscan.merge_into(passive, neigh,
 				{band = "ng", radio = "ng", radio_name = "radio0", now = 105})
 			local m = by_bssid(out)
 			assert_eq(#out, 2, "one appended, nothing duplicated or cross-banded")
-			assert_eq(m["30:b5:c2:d7:b6:5a"].essid, "Home LAN",
+			assert_eq(m["00:00:5e:00:53:14"].essid, "Home LAN",
 				"the passive cache's richer record wins")
-			assert_eq(m["30:b5:c2:d7:b6:5a"].bw, 40, "and keeps its real width")
-			assert_nil(m["54:af:97:55:14:78"], "other band not merged into this radio")
-			local added = m["84:78:48:a4:fb:21"]
+			assert_eq(m["00:00:5e:00:53:14"].bw, 40, "and keeps its real width")
+			assert_nil(m["00:00:5e:00:53:17"], "other band not merged into this radio")
+			local added = m["00:00:5e:00:53:11"]
 			assert_eq(added.channel, 1, "channel carried")
 			assert_eq(added.freq, 2412, "frequency derived")
 			assert_eq(added.signal, -73, "signal carried")
@@ -253,7 +253,7 @@ return {
 			-- The controller's rogue-AP ingestion silently drops any entry
 			-- with age >= 30. Carrying one past that is payload nobody reads.
 			local neigh = {
-				{bssid = "84:78:48:a4:fb:21", channel = 1, band = "ng", signal = -73, seen_at = 100},
+				{bssid = "00:00:5e:00:53:11", channel = 1, band = "ng", signal = -73, seen_at = 100},
 			}
 			local fresh = rrmscan.merge_into({}, neigh,
 				{band = "ng", now = 129, max_age = 30})
@@ -302,11 +302,11 @@ return {
 		name = "rrmscan: a request asks for an ACTIVE all-channel measurement",
 		fn = function()
 			with_exec(function(cmds)
-				rrmscan.request("phy1-ap0", "2a:1a:ec:4a:c0:df")
+				rrmscan.request("phy1-ap0", "00:00:5e:00:53:10")
 				local c = table.concat(cmds, "\n")
 				assert_true(c:find("hostapd.phy1%-ap0 rrm_beacon_req") ~= nil,
 					"goes to the right BSS object")
-				assert_true(c:find('"addr":"2a:1a:ec:4a:c0:df"', 1, true) ~= nil,
+				assert_true(c:find('"addr":"00:00:5e:00:53:10"', 1, true) ~= nil,
 					"names the station")
 				-- mode 1 is active measurement: the client probes rather than
 				-- only listening, which is what makes it report BSSes on
@@ -316,6 +316,26 @@ return {
 				-- 255 means every channel in the operating class; a single
 				-- channel would report only what the radio already knows.
 				assert_true(c:find('"channel":255', 1, true) ~= nil, "sweeps all channels")
+			end)
+		end
+	},
+
+	{
+		-- The collector is a detached `ubus subscribe` child reparented to
+		-- init, so it outlives the daemon. It has to be killed explicitly, and
+		-- the notification file has to go with it: harvest() is the only thing
+		-- that truncates it, so a file left behind with no reader grows without
+		-- bound on a RAM-disk /tmp. Called from inform's _rrm_tick when
+		-- enrichment is off, and from the init script's stop_service().
+		name = "rrmscan: collector_stop kills the subscriber and removes the event file",
+		fn = function()
+			with_exec(function(cmds)
+				rrmscan.collector_stop()
+				local all = table.concat(cmds, "\n")
+				assert_true(all:find("pkill -f 'ubus subscribe hostapd'", 1, true) ~= nil,
+					"kills the subscriber by the pattern collector_ensure spawns")
+				assert_true(all:find("rm -f " .. rrmscan.EVENT_FILE, 1, true) ~= nil,
+					"removes the notification file it was appending to")
 			end)
 		end
 	},

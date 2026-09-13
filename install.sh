@@ -169,6 +169,39 @@ case "$ACTION" in
 		# Create state directory
 		mkdir -p "$STATE_DIR"
 
+		# Keep the device's identity across a firmware upgrade.
+		# sysupgrade preserves /etc/config and a short built-in list; it knows
+		# nothing about $STATE_DIR or conf.lua, so a stock `sysupgrade` drops
+		# state.json -- mac, authkey, cfgversion, swvlan_backup -- and the
+		# board's modelmap selection along with it. The device comes back up
+		# unadopted, as a generic dualband AP, and the controller no longer
+		# recognises it. Upstream verified it on a live Archer C5:
+		# `sysupgrade -b` produced 29 entries and neither file was among them.
+		# The Lua itself is deliberately NOT preserved -- it is reinstalled
+		# from this script anyway, and carrying an old tree onto a new OpenWrt
+		# is how you get a silent version mismatch.
+		#
+		# Idempotent (grep -qxF), which matters here specifically: update.sh
+		# and setup.sh both re-run `install.sh install`.
+		SYSUPGRADE_CONF=/etc/sysupgrade.conf
+		for keep in "$STATE_DIR/" "$INSTALL_DIR/conf.lua"; do
+			if ! grep -qxF "$keep" "$SYSUPGRADE_CONF" 2>/dev/null; then
+				# A hand-edited file need not end in a newline, and
+				# appending straight onto one that does not splices our
+				# path onto the user's last line: their entry is
+				# destroyed and ours is never registered.  `tail -c1` is
+				# empty exactly when the file already ends in a newline
+				# (command substitution strips it), so this terminates
+				# the last line only when it needs it.
+				if [ -s "$SYSUPGRADE_CONF" ] \
+					&& [ -n "$(tail -c1 "$SYSUPGRADE_CONF" 2>/dev/null)" ]; then
+					echo >> "$SYSUPGRADE_CONF"
+				fi
+				echo "$keep" >> "$SYSUPGRADE_CONF"
+				echo "Registered $keep with sysupgrade (survives a firmware upgrade)."
+			fi
+		done
+
 		# Symlink syswrapper.sh into PATH
 		ln -sf "$INSTALL_DIR/hook/syswrapper.sh" "$BIN_LINK"
 		chmod +x "$BIN_LINK"
@@ -259,14 +292,11 @@ case "$ACTION" in
 		# "Failed to load TC action module", so the download cap applies and the
 		# upload cap silently does not. Half a feature reporting success.
 		try_optional kmod-sched-act-police "WiFi Speed Limit, upload half (tc police)"
-		# inform.lua detects an out-of-process state.json write (syswrapper's
-		# SSH set-adopt, a manual reset-inform) with `stat -c %Y`. Some builds
-		# ship no stat applet at all -- confirmed on a real WDR3500 -- and
-		# without it those changes go unnoticed until openUF is restarted.
-		# Cheaper than this package: enable busybox's own stat applet.
-		if ! command -v stat >/dev/null 2>&1; then
-			try_optional coreutils-stat "state-file change detection (stat)"
-		fi
+		# No coreutils-stat any more: inform.lua used to fork `stat -c %Y` to
+		# notice an out-of-process state.json write and fell back to the file's
+		# contents when the applet was missing (a real WDR3500 has none). The
+		# contents are the stronger token and cost no fork, so they are the
+		# only token now, and the 40 KB package bought nothing.
 
 		# luasec, but only when it is actually needed: inform.lua TLS-wraps the
 		# socket for an https:// inform URL and fails with a clear error
@@ -425,6 +455,44 @@ case "$ACTION" in
 			sed -i '/^openuf:/d' /etc/group
 		fi
 
+		# Drop the sysupgrade keep-list entry for conf.lua: that file goes
+		# with $INSTALL_DIR (below), and a line pointing at nothing is just
+		# litter in a file the user may also hand-edit.
+		# $STATE_DIR/ deliberately stays registered. The directory outlives
+		# this uninstall by design -- see the message at the end -- so that a
+		# later reinstall still finds the authkey, and un-registering it would
+		# hand the next sysupgrade precisely the deletion the entry exists to
+		# prevent. It is also not necessarily ours: an admin may have added
+		# that line by hand before openUF was ever installed. Should the user
+		# later remove the directory themselves, the stale line costs nothing
+		# -- add_conffiles swallows find's error and returns 0.
+		# Fixed-string, whole-line matching -- the mirror of the grep -qxF
+		# the install branch adds them with. Not sed: the entry contains the
+		# delimiter, and busybox sed's -i is not the same animal as GNU's.
+		if [ -f /etc/sysupgrade.conf ]; then
+			SU_TMP=$(mktemp 2>/dev/null)
+			if [ ! -f "$SU_TMP" ]; then
+				echo "Warning: mktemp failed, leaving /etc/sysupgrade.conf alone."
+			else
+				grep -vxF -e "$INSTALL_DIR/conf.lua" \
+					/etc/sysupgrade.conf > "$SU_TMP"
+				su_rc=$?
+				# 0 is matches; 1 is an empty result, legitimate here (the
+				# file held nothing else). 2 is an error, and the temp file
+				# is then whatever got written before it -- on these boards
+				# a full /tmp tmpfs is the likely cause. Copying that back
+				# would silently drop the user's own keep entries, and they
+				# would find out at the next firmware upgrade.
+				if [ "$su_rc" -le 1 ]; then
+					cat "$SU_TMP" > /etc/sysupgrade.conf
+				else
+					echo "Warning: could not rewrite /etc/sysupgrade.conf," \
+						"leaving it alone."
+				fi
+				rm -f "$SU_TMP"
+			fi
+		fi
+
 		# Remove installed files (leave state dir so authkey is preserved)
 		rm -rf "$INSTALL_DIR"
 
@@ -440,6 +508,8 @@ case "$ACTION" in
 		echo "             symlink syswrapper.sh to $BIN_LINK. An existing"
 		echo "             conf.lua is kept (the shipped one lands as conf.lua.dist)"
 		echo "             so a reinstall never changes the device's modelmap."
+		echo "             Registers $STATE_DIR/ and conf.lua in /etc/sysupgrade.conf"
+		echo "             so the adoption survives a firmware upgrade."
 		echo ""
 		echo "  install --replace-conf"
 		echo "             Overwrite conf.lua with the shipped default instead."

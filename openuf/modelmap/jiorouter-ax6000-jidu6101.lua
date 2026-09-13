@@ -62,9 +62,7 @@ dev.conf.net = {
 	lan_name	= "lan",
 	lan_cpueth	= "br-lan",
 	lan_vlanid	= 1,
-	wan_name	= "wan",
 	wan_cpueth	= "wan",
-	wan_vlanid	= 4090,
 
 	-- UniFi port_idx -> netdev, for the inform payload's port_table.
 	--

@@ -262,8 +262,16 @@ return {
 				assert_eq(joined(u, "brlan"), "lan2,lan4,wan", "lan3 left br-lan")
 				assert_eq(joined(u, "openuf_brdev10"), "wan.10,lan3",
 					"and joined the VLAN 10 bridge, behind its tagged uplink")
-				assert_eq(cmds[#cmds], "/etc/init.d/network reload 2>/dev/null",
-					"network reloaded once")
+				-- Searched for rather than taken as the last command: the tap
+				-- reconcile runs after the reload, so position is not the
+				-- claim being made here -- "exactly once" is.
+				local reloads = 0
+				for _, c in ipairs(cmds) do
+					if c == "/etc/init.d/network reload 2>/dev/null" then
+						reloads = reloads + 1
+					end
+				end
+				assert_eq(reloads, 1, "network reloaded once")
 				assert_eq(table.concat(st.dsa_brlan_ports, ","), "lan2,lan3,lan4,wan",
 					"br-lan's original ports are in the ledger, pristine")
 			end)
@@ -967,6 +975,289 @@ return {
 				switchvlan._popen = orig
 				assert_not_nil(u.db.network.openuf_swvlan8, "VLAN 8 fits in 16 entries")
 				assert_eq(u.db.network.openuf_swvlan8.vlan, "8", "written as the id")
+			end)
+		end
+	},
+
+	-- ── Adopted from upstream 2026-09-13: learning '0' on moved sockets and the
+	--    nft MAC tap that reports their hosts ────────────────────────────────────
+	{
+		name = "switchvlan/dsa: a moved socket gets MAC learning turned off",
+		fn = function()
+			-- The ASIC has one address table shared with br-lan's uplink. Let
+			-- it learn the attached device against the moved socket and a
+			-- reply arriving tagged on the uplink resolves in hardware to a
+			-- port that is no longer in the uplink's bridge, so the switch
+			-- drops it instead of punting it to the CPU. Outbound stays
+			-- perfect throughout, which is why nothing else catches this.
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, {}, {}, nil, "wan")
+				local sec = u.db.network["openuf_brport10_lan3"]
+				assert_true(sec ~= nil, "the socket has a bridge-port section")
+				assert_eq(sec.name, "lan3", "naming the socket")
+				assert_eq(sec.learning, "0", "with MAC learning off")
+				assert_true(u.db.network["openuf_brport10"] == nil,
+					"and it does not collide with ucihelper's uplink override")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: the learning override does not re-dirty a steady push",
+		fn = function()
+			-- Same reasoning as the bridge lists above: a write that looks
+			-- like a change on every inform reloads the network every ~10 s.
+			local u = dsa_board()
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan")
+				local n = #cmds
+				assert_false(switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan"),
+					"second identical push is a no-op")
+				assert_eq(#cmds, n, "and issues no reload")
+				assert_eq(u.db.network["openuf_brport10_lan3"].learning, "0",
+					"the override is still there, just not rewritten")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: a socket sent home loses its learning override",
+		fn = function()
+			-- An override that outlives the assignment leaves a port back in
+			-- br-lan with learning off, which silently costs that port its
+			-- host list in port_table -- a regression with no symptom.
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan")
+				assert_true(u.db.network["openuf_brport10_lan3"] ~= nil, "applied")
+				switchvlan.apply({enabled = true, vlans = {}, ports = {}},
+					DSA_CFG, st, {}, nil, "wan")
+				assert_eq(joined(u, "brlan"), "lan2,lan4,wan,lan3", "lan3 came home")
+				assert_true(u.db.network["openuf_brport10_lan3"] == nil,
+					"and its learning override went with it")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: restore leaves no learning override behind",
+		fn = function()
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				local st = {}
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, st, {}, nil, "wan")
+				assert_true(u.db.network["openuf_brport10_lan3"] ~= nil, "applied")
+				switchvlan.restore(st, DSA_CFG)
+				assert_true(u.db.network["openuf_brport10_lan3"] == nil,
+					"teardown removed it")
+				assert_eq(joined(u, "brlan"), "lan2,lan3,lan4,wan",
+					"and br-lan is back as the board shipped it")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: a moved socket gets an nft tap to report its hosts from",
+		fn = function()
+			-- The other half of `learning '0'`. With the FDB emptied for this
+			-- socket there is nothing left for port_table to read, so the
+			-- assignment also installs the bridge-family tap sysinfo reads
+			-- instead -- otherwise the port silently reports no clients and
+			-- the controller credits them to the gateway.
+			local u = dsa_board()
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, {}, {}, nil, "wan")
+				local nft = {}
+				for _, c in ipairs(cmds) do
+					if c:find("^nft ") then nft[#nft + 1] = c end
+				end
+				assert_eq(#nft, 8, "delete, table, two sets, chain, three rules")
+				assert_eq(nft[1], "nft delete table bridge openuf_learn 2>/dev/null",
+					"rebuilt from scratch, like firewall.reconcile")
+				assert_eq(nft[2], "nft add table bridge openuf_learn", "the table")
+				assert_eq(nft[3], "nft add set bridge openuf_learn portmacs "
+					.. "'{ type ifname . ether_addr; flags dynamic,timeout; timeout 5m; }'",
+					"who is behind the socket")
+				assert_eq(nft[4], "nft add set bridge openuf_learn portips "
+					.. "'{ type ifname . ether_addr . ipv4_addr; flags dynamic,timeout; timeout 5m; }'",
+					"and which address they hold -- what the network label needs")
+				assert_eq(nft[5], "nft add chain bridge openuf_learn learn "
+					.. "'{ type filter hook prerouting priority -300; policy accept; }'",
+					"observing, never deciding")
+				assert_eq(nft[6], "nft add rule bridge openuf_learn learn "
+					.. "'iifname { \"lan3\" } update @portmacs "
+					.. "{ iifname . ether saddr }'",
+					"and only the socket that actually lost its learning")
+				assert_eq(nft[7], "nft add rule bridge openuf_learn learn "
+					.. "'iifname { \"lan3\" } arp saddr ip != 0.0.0.0 "
+					.. "update @portips { iifname . ether saddr . arp saddr ip }'",
+					"addresses from ARP, excluding the 0.0.0.0 of a probe")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: addresses are harvested from IPv4 as well as ARP",
+		fn = function()
+			-- A host that has finished DHCP may never ARP again inside the set
+			-- timeout, and would then be reported with no address at all.
+			local u = dsa_board()
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, {}, {}, nil, "wan")
+				local last
+				for _, c in ipairs(cmds) do
+					if c:find("^nft add rule") then last = c end
+				end
+				assert_eq(last, "nft add rule bridge openuf_learn learn "
+					.. "'iifname { \"lan3\" } ip saddr != 0.0.0.0 "
+					.. "update @portips { iifname . ether saddr . ip saddr }'",
+					"the IPv4 source rule, excluding a DHCP DISCOVER's 0.0.0.0")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: every tapped socket shares one set and one rule",
+		fn = function()
+			local u = dsa_board()
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				local push = dsa_push(3, 10)
+				push.ports[2] = {pvid = 10, vlans = {[1] = "exclude", [10] = "untagged"}}
+				switchvlan.apply(push, DSA_CFG, {}, {}, nil, "wan")
+				local rule
+				for _, c in ipairs(cmds) do
+					if c:find("add rule", 1, true) then rule = c end
+				end
+				assert_not_nil(rule, "a rule was written")
+				assert_true(rule:find('{ "lan2", "lan3" }', 1, true) ~= nil,
+					"both sockets in one iifname set, sorted -- not a rule each")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: restore takes the tap down with the assignment",
+		fn = function()
+			-- A tap left standing would keep filing MACs for a socket that is
+			-- back in br-lan and learning again, and mac_table prefers the FDB
+			-- -- so it would leak rather than mislead. Tear it down anyway:
+			-- an observer nothing reads is a per-frame cost for nothing.
+			local u = dsa_board()
+			with_capture(function()
+				switchvlan._uci = u.mock
+				switchvlan.apply(dsa_push(3, 10), DSA_CFG, {dsa_brlan_ports = nil}, {}, nil, "wan")
+			end)
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				switchvlan.restore({dsa_brlan_ports = {"lan2", "lan3", "lan4", "wan"}}, DSA_CFG)
+				local nft = {}
+				for _, c in ipairs(cmds) do
+					if c:find("^nft ") then nft[#nft + 1] = c end
+				end
+				assert_eq(#nft, 1, "only the teardown")
+				assert_eq(nft[1], "nft delete table bridge openuf_learn 2>/dev/null",
+					"the table goes and nothing replaces it")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: the tap is rebuilt from UCI alone, for startup",
+		fn = function()
+			-- nftables state does not survive a reboot. inform.run calls this
+			-- with no push and no state, so the sections dsa_apply left behind
+			-- have to be the whole record of what to reinstall.
+			local u = dsa_board()
+			u.cursor:set("network", "openuf_brport10_lan3", "device")
+			u.cursor:set("network", "openuf_brport10_lan3", "name", "lan3")
+			u.cursor:set("network", "openuf_brport10_lan3", "learning", "0")
+			-- ucihelper's tagged-uplink section is the same prefix without the
+			-- socket suffix, and is NOT a tapped socket.
+			u.cursor:set("network", "openuf_brport10", "device")
+			u.cursor:set("network", "openuf_brport10", "name", "wan.10")
+			u.cursor:set("network", "openuf_brport10", "learning", "0")
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				assert_true(switchvlan.reconcile_mac_taps(u.cursor), "a tap was installed")
+				local rule
+				for _, c in ipairs(cmds) do
+					if c:find("add rule", 1, true) then rule = c end
+				end
+				assert_not_nil(rule, "a rule was written")
+				assert_true(rule:find('{ "lan3" }', 1, true) ~= nil,
+					"the moved socket is tapped")
+				assert_true(rule:find("wan.10", 1, true) == nil,
+					"the tagged uplink sub-device is not a socket and is not tapped")
+			end)
+		end
+	},
+	{
+		name = "switchvlan/dsa: a tap that already matches is left alone",
+		fn = function()
+			-- Rebuilding empties both sets, and everything in them was learned
+			-- from traffic that has already happened -- so the socket reports
+			-- NO clients until each host next speaks, and a host reported
+			-- before its address is known is filed under the wrong network.
+			-- openUF restarts far more often than an assignment changes.
+			local u = dsa_board()
+			u.cursor:set("network", "openuf_brport10_lan3", "device")
+			u.cursor:set("network", "openuf_brport10_lan3", "name", "lan3")
+			u.cursor:set("network", "openuf_brport10_lan3", "learning", "0")
+			local orig = switchvlan._popen
+			switchvlan._popen = function()
+				return "table bridge openuf_learn {\n\tchain learn {\n"
+					.. "\t\ttype filter hook prerouting priority dstnat; policy accept;\n"
+					.. "\t\tiifname \"lan3\" update @portmacs { iifname . ether saddr }\n"
+					.. "\t\tiifname \"lan3\" arp saddr ip != 0.0.0.0 update @portips "
+					.. "{ iifname . ether saddr . arp saddr ip }\n\t}\n}\n"
+			end
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				assert_true(switchvlan.reconcile_mac_taps(u.cursor), "the tap stands")
+				assert_eq(#cmds, 0, "and not one nft command was run")
+			end)
+			switchvlan._popen = orig
+		end
+	},
+	{
+		name = "switchvlan/dsa: a tap covering the wrong sockets is rebuilt",
+		fn = function()
+			-- The converse, and the reason the check compares the socket list
+			-- rather than merely noticing that a table exists.
+			local u = dsa_board()
+			u.cursor:set("network", "openuf_brport10_lan3", "device")
+			u.cursor:set("network", "openuf_brport10_lan3", "name", "lan3")
+			u.cursor:set("network", "openuf_brport10_lan3", "learning", "0")
+			local orig = switchvlan._popen
+			switchvlan._popen = function()
+				return "table bridge openuf_learn {\n\tchain learn {\n"
+					.. "\t\tiifname \"lan4\" update @portmacs { iifname . ether saddr }\n"
+					.. "\t\tiifname \"lan4\" arp saddr ip != 0.0.0.0 update @portips "
+					.. "{ iifname . ether saddr . arp saddr ip }\n\t}\n}\n"
+			end
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				switchvlan.reconcile_mac_taps(u.cursor)
+				assert_true(#cmds > 0, "a stale tap is replaced")
+				assert_eq(cmds[1], "nft delete table bridge openuf_learn 2>/dev/null",
+					"starting with the teardown")
+			end)
+			switchvlan._popen = orig
+		end
+	},
+	{
+		name = "switchvlan/dsa: nothing to tap tears the table down and adds nothing",
+		fn = function()
+			local u = dsa_board()
+			with_capture(function(cmds)
+				switchvlan._uci = u.mock
+				assert_true(switchvlan.reconcile_mac_taps(u.cursor) == false,
+					"no sockets, no tap")
+				assert_eq(#cmds, 1, "one command")
+				assert_eq(cmds[1], "nft delete table bridge openuf_learn 2>/dev/null",
+					"and it is the teardown")
 			end)
 		end
 	},

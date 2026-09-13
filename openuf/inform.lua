@@ -89,6 +89,18 @@ M._rrm_neighbours   = {}
 M._rrm_next_request = 0
 M._rrm_rr           = 0
 
+-- How often to ask whether the background beacon-report collector is still
+-- alive. collector_ensure forks `pgrep -f` to find out, and that used to run
+-- on every 10-second heartbeat -- but the subscription only dies when one of
+-- the hostapd objects it named goes away, which is a config push, not a
+-- ten-second event. _tick re-arms the check (sets _rrm_collector_next = 0)
+-- the moment handle_response reports a config WAS applied, because that push
+-- ran `wifi reload` and took those objects with it; waiting out the interval
+-- there would leave 802.11k enrichment dead for up to a minute after every
+-- push -- exactly when the neighbourhood is worth re-reading.
+M.RRM_COLLECTOR_CHECK_INTERVAL = 60
+M._rrm_collector_next = 0
+
 -- Stations asked for a beacon report that have not answered, keyed by MAC:
 -- {n = unanswered requests so far, at = when the last one went out}. A
 -- station's RRM capability bits are not a promise. AP2's one "capable"
@@ -125,6 +137,9 @@ M._spectrum_cache = {}
 -- cpu_percent() delta-samples /proc/stat between calls (first sample for a
 -- given MAC has no prior delta, so throughput is reported as 0 that time).
 M._sta_stats_cache = {}
+-- Forget a station's previous sample once it has been gone this long (see the
+-- sweep in build_json). Exported so a test can drive the window.
+M.STA_STATS_FORGET_AFTER = 600
 
 -- Injectable: override in tests to control elapsed time deterministically
 -- (used by the sta_table throughput delta-sample below).
@@ -187,26 +202,22 @@ function M._link_up(ifname)
 	return nil
 end
 
--- Returns the mtime (seconds since epoch, as a number) of path, or nil if
--- it can't be stat'd (missing, permission denied, stat unavailable, ...).
--- A token that changes whenever the state file changes. Compared for equality
--- only -- callers never interpret it -- so its type is free to vary.
+-- A token that changes whenever the state file changes, so the loop can
+-- notice an out-of-band `set-adopt` or `reset-inform`. Compared for equality
+-- only -- callers never interpret it -- so its type is free to vary. The name
+-- is historical: it IS the file's contents now, not its mtime.
 --
--- `stat -c %Y` first, since it costs no file read. But it cannot be relied on:
--- BusyBox gates `-c` behind FEATURE_STAT_FORMAT and some builds omit the stat
--- applet entirely (confirmed on a real TL-WDR3500 with no stat at all), and
--- coreutils-stat is 40 KB on boards that are already out of flash. When it is
--- unavailable, fall back to the file's own CONTENTS as the token: state.json
--- is a few hundred bytes, so re-reading it once per poll costs nothing, and it
--- needs no package, no applet and no busybox config.
---
--- The fallback is in fact the stronger test: mtime has one-second granularity,
--- so two writes inside the same second are indistinguishable by it, while the
--- contents are not.
+-- It used to fork `stat -c %Y` first and keep the contents as a fallback. The
+-- fork bought strictly less than the fallback it fell back to: BusyBox gates
+-- `-c` behind FEATURE_STAT_FORMAT and some builds ship no stat applet at all
+-- (confirmed on a real TL-WDR3500), so on those boards it could only ever
+-- fail and the read ran regardless, every ten seconds, forever; mtime has
+-- one-second granularity, so two writes inside one second are
+-- indistinguishable by it and not by the contents; and state.json is a few
+-- hundred bytes that _state.load() is about to read anyway. So the contents
+-- are the token outright, and the first line of every heartbeat spawns
+-- nothing. nil when the file cannot be read.
 function M._state_mtime(path)
-	local out = M._run_cmd("stat -c %Y '" .. path .. "'")
-	local n = tonumber((out:gsub("%s+$", "")))
-	if n then return n end
 	return M._read_file(path)
 end
 
@@ -298,7 +309,6 @@ end
 local function is_mac(s)
 	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
 end
-M._is_mac = is_mac
 
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 
@@ -500,11 +510,29 @@ end
 -- that are never wired clients of this AP -- its own netdev MACs, and the
 -- stations currently associated to its radios (a wireless client bridged into
 -- br-lan genuinely shows up in the bridge FDB and the switch ARL too).
--- `source` is sysinfo.mac_table(ifname) or sysinfo.switch_mac_table(phys, arl);
--- a failing source yields no hosts rather than aborting the payload.
-local function _filter_hosts(source, a, b, self_macs, station_macs)
+-- `source` is sysinfo.mac_table(ifname, bridge, allow_tap) or
+-- sysinfo.switch_mac_table(phys, arl); a failing source yields no hosts rather
+-- than aborting the payload.
+--
+-- `vlan` is the VLAN the reporting socket carries, and it decides which
+-- NETWORK the controller files each host under. Its wired-client processor
+-- walks the site's layer-2 networks and keeps a reported host only where
+--
+--     if (network.getVlan() != host.getInt("vlan", 1)) continue;
+--
+-- (upstream read this out of the 10.6 controller's wired-client processor).
+-- Omitted, every host defaults to 1 and lands in the untagged network no
+-- matter which socket reported it -- so a client on a socket openUF assigned
+-- to a VLAN was filed under the management LAN while its port, IP and the
+-- Ports view's own Native VLAN column all said otherwise. It is also half of
+-- the controller's dedup key for these rows (`mac` .. `vlan`), so one host
+-- reachable on two VLANs stays two rows rather than collapsing into one.
+--
+-- Left nil for the management VLAN: the controller drops a `vlan` of 1 on
+-- arrival, so sending it says nothing and costs bytes on every heartbeat.
+local function _filter_hosts(source, a, b, c, vlan, self_macs, station_macs)
 	local hosts = {}
-	local ok, found = pcall(source, a, b)
+	local ok, found = pcall(source, a, b, c)
 	if not ok or type(found) ~= "table" then return hosts end
 	for _, host in ipairs(found) do
 		if not self_macs[host.mac] and not station_macs[host.mac] then
@@ -514,6 +542,7 @@ local function _filter_hosts(source, a, b, self_macs, station_macs)
 				hostname = host.hostname,
 				age      = host.age,
 				uptime   = host.uptime,
+				vlan     = vlan,
 			}
 		end
 	end
@@ -549,6 +578,13 @@ end
 -- ufhw: ufmodel table
 function M.build_json(st, cfg, ufhw)
 	local uap = ufhw and ufhw.uap or {}
+
+	-- Opened before the first sysinfo call, not partway down: this payload's
+	-- very first question -- the uptime -- is one scan_table asks again per
+	-- radio, and upstream measured a real heartbeat still reading it twice
+	-- because the pass started below it. Nothing in here may outlive the
+	-- payload; _tick closes it again even if this function throws.
+	if M._sysinfo.begin_pass then M._sysinfo.begin_pass() end
 
 	-- Collect sysinfo
 	local uptime     = M._sysinfo.uptime()
@@ -1276,7 +1312,7 @@ function M.build_json(st, cfg, ufhw)
 		-- association, and a 0-throughput first sample is the honest figure
 		-- for it anyway. Assigning nil during pairs() is defined behaviour.
 		for mac, s in pairs(M._sta_stats_cache) do
-			if now - s.time > 600 then M._sta_stats_cache[mac] = nil end
+			if now - s.time > M.STA_STATS_FORGET_AFTER then M._sta_stats_cache[mac] = nil end
 		end
 	end
 
@@ -1327,6 +1363,18 @@ function M.build_json(st, cfg, ufhw)
 	-- that to "hosts plugged into this AP" is a far worse payload than an
 	-- empty mac_table.
 	local uplink_dev, uplink_unknown = nil, false
+	-- Kept in scope for the port loop: the FDB dump uplink_netdev takes of
+	-- this bridge carries the hosts of every socket ENSLAVED TO IT too, so
+	-- those sockets are served from it (mac_table's `bridge` argument) rather
+	-- than forking a `bridge fdb show dev <socket>` of their own.
+	--
+	-- "Enslaved to it" is the load-bearing half. A socket the controller
+	-- assigns to a port VLAN is moved out of the management bridge into
+	-- br-openuf<vid> (switchvlan.dsa_apply), and asking the UPLINK bridge's
+	-- FDB about it finds nothing, because it is not a port of that bridge any
+	-- more. Each socket is therefore asked about its OWN bridge in the port
+	-- loop below, and this one is also what tells a moved socket apart.
+	local uplink_bridge = nil
 	if cfg and cfg.net and cfg.net.uplink_detect == "fdb" then
 		-- Asked of the LAN bridge alone. sysinfo.lan_bridge resolves
 		-- lan_cpueth whether the map names the bridge itself (the JioRouter
@@ -1334,6 +1382,7 @@ function M.build_json(st, cfg, ufhw)
 		-- sysinfo.bridge_fdb_ports for why reading the whole FDB was wrong.
 		local ok_br, br = pcall(M._sysinfo.lan_bridge, cfg.net.lan_cpueth)
 		if ok_br and br then
+			uplink_bridge = br
 			local ok_ud, dev = pcall(M._sysinfo.uplink_netdev, br)
 			if ok_ud then uplink_dev = dev end
 		end
@@ -1397,7 +1446,8 @@ function M.build_json(st, cfg, ufhw)
 			-- host there is not reachable on the LAN it would be listed in.
 			if not is_uplink and (link.pvid == nil or link.pvid == mgmt_vlan) then
 				entry.mac_table = arr(_filter_hosts(
-					M._sysinfo.switch_mac_table, phys, sw.arl, self_macs, station_macs))
+					M._sysinfo.switch_mac_table, phys, sw.arl, nil, nil,
+					self_macs, station_macs))
 			end
 		else
 			-- Netdev-only: no switch, no swconfig, or no identifiable uplink.
@@ -1441,9 +1491,60 @@ function M.build_json(st, cfg, ufhw)
 			-- flagged is_uplink, since that port faces the controller's own
 			-- network, not an end host. And on nothing at all when the map
 			-- asked which socket that is and detection could not say.
+			--
+			-- Do NOT be tempted to report just the gateway on the uplink,
+			-- however reasonable "the device on the other end of this cable"
+			-- sounds, and however visibly a real UniFi gateway does it on its
+			-- own uplink port. openUF knows which MAC that is -- finding it is
+			-- how the uplink socket was identified in the first place -- and
+			-- reporting it would populate the Ports view's Connection column.
+			-- It would also invert the topology. The controller matches every
+			-- MAC on a port against its adopted devices, and a port carrying
+			-- exactly one known device files that device in this one's
+			-- `downlink_table`; the guard that would stop it is
+			--     bl9 = !is_uplink && isUplinkMac(neighbour)
+			-- which disables itself on precisely the port where it is needed.
+			-- The gateway would hang beneath every AP that reported it. A
+			-- real gateway gets away with it because its upstream is the
+			-- ISP's router, which is not an adopted device and so never
+			-- reaches that branch; openUF cannot tell the two cases apart
+			-- from the device, so it reports nothing on the uplink at all
+			-- (upstream read this out of the controller, 2026-09-12).
 			if not entry.is_uplink and not uplink_unknown then
+				-- This socket's bridge, which is the uplink's for every socket
+				-- openUF has not moved. bridge_of is TTL-cached and
+				-- bridge_fdb_ports is memoized per bridge NAME for the pass,
+				-- so the common case resolves to the same string and reuses
+				-- the dump already taken -- no extra fork. A socket in
+				-- br-openuf<vid> costs one dump of that bridge instead.
+				--
+				-- nil (not a bridge port at all, or a stubbed sysfs) is passed
+				-- through rather than papered over with the uplink's:
+				-- mac_table then forks `bridge fdb show dev <socket>`, which
+				-- is the right answer for an unbridged socket and an empty one
+				-- for a bridged socket looked up in the wrong bridge.
+				local ok_sb, sock_bridge = pcall(M._sysinfo.bridge_of, p.ifname)
+				if not ok_sb then sock_bridge = nil end
+				-- A socket in a bridge that is not the uplink's is one openUF
+				-- moved, which is the only case where MAC learning is off and
+				-- the FDB has nothing to say -- so it is the only case allowed
+				-- to fall back to switchvlan's nft tap. Every other board never
+				-- forks `nft` at all.
+				local allow_tap = (uplink_bridge ~= nil and sock_bridge ~= nil
+					and sock_bridge ~= uplink_bridge)
+				-- Which VLAN this socket carries, read off the bridge openUF
+				-- moved it into rather than plumbed down from the push: that
+				-- bridge IS the VLAN (ucihelper names it br-openuf<vid>), so
+				-- the socket's own enslavement is the most direct statement of
+				-- it available, and it cannot disagree with where the frames
+				-- actually go. nil for a socket still in the management
+				-- bridge, which is the same thing as VLAN 1.
+				local port_vlan = sock_bridge
+					and tonumber(sock_bridge:match("^br%-openuf(%d+)$")) or nil
+				if port_vlan == mgmt_vlan then port_vlan = nil end
 				entry.mac_table = arr(_filter_hosts(
-					M._sysinfo.mac_table, p.ifname, nil, self_macs, station_macs))
+					M._sysinfo.mac_table, p.ifname, sock_bridge, allow_tap,
+					port_vlan, self_macs, station_macs))
 			end
 		end
 		port_table[#port_table + 1] = entry
@@ -1604,6 +1705,7 @@ function M.build_json(st, cfg, ufhw)
 	end
 
 	if ufuci and ufuci.end_pass then ufuci.end_pass() end
+	if M._sysinfo.end_pass then M._sysinfo.end_pass() end
 	return M._fix_empty_arrays(cjson.encode(payload))
 end
 
@@ -2164,31 +2266,14 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- derivation). "enabled"/"disabled" string, same
 				-- convention as bss_transition/no2ghz_oui.
 				advertise_ap_name     = _wire_bool(w.advertise_ap_name),
-				-- aaa.<n>.sae.anti_clogging / aaa.<n>.sae.sync: "SAE
-				-- Anti-clogging"/"SAE Sync Time" (WPA3-SAE tuning).
-				-- CONFIRMED via decompiling the controller's WLAN-config-
-				-- generator (a small SAE-specific helper class): both are
-				-- plain integers, only emitted when > 0 (the controller's
-				-- own admin-side default is 5 for each), and -- unlike
-				-- every other field on this vap -- gated on the WLAN
-				-- actually being in real WPA3/SAE mode (Wlan.isWpa3() --
-				-- an admin-facing "wpa3_support" flag, NOT the same thing
-				-- as the "WPA2/WPA3" mixed Security Protocol dropdown
-				-- option -- or a 6GHz radio, not a device capability like
-				-- advertise_ap_name above). Live-tested: a WPA2/WPA3
-				-- mixed-mode WLAN never emits either key even with a
-				-- non-default admin value saved server-side, confirming
-				-- the gate. Could not live-confirm the emitting (pure
-				-- WPA3) case end-to-end -- switching this validation
-				-- environment's test WLAN to pure WPA3 tripped an
-				-- unrelated, already-documented config-sync flakiness
-				-- (see PROTOCOL-VALIDATION.md) where the controller
-				-- stopped pushing the WLAN's aaa./wireless. blocks
-				-- entirely, even across an inform.lua restart. High
-				-- confidence from the decompiled method body alone
-				-- (a simple getInt(key, -1) > 0 check, no ambiguity).
-				sae_anti_clogging     = tonumber(a["sae.anti_clogging"]),
-				sae_sync              = tonumber(a["sae.sync"]),
+				-- NOT parsed: aaa.<n>.sae.anti_clogging / aaa.<n>.sae.sync
+				-- ("SAE Anti-clogging" / "SAE Sync Time"). They are real
+				-- wire keys (decompiled: plain integers, emitted only when
+				-- > 0 and only for a genuine WPA3/SAE WLAN, never for the
+				-- mixed WPA2/WPA3 option), but OpenWrt has no wifi-iface UCI
+				-- option for either, so ucihelper stopped writing them and
+				-- a parsed field with no consumer would be the same defect
+				-- one level up. PROTOCOL-VALIDATION.md keeps what is known.
 					-- aaa.<n>.proxy_arp: "Proxy ARP". CONFIRMED live
 					-- 2026-07-18 by REST-toggling wlanconf.proxy_arp and
 					-- diffing system_cfg -- exactly aaa.<n>.proxy_arp flipped
@@ -2480,13 +2565,8 @@ function M.handle_response(json_str, st, cfg)
 	-- debug_dump_file stops getting dropped-key reports too.
 	M._debug_dropped_keys = not not (cfg and cfg.config and cfg.config.debug_dump_file)
 
-	if cfg and cfg.config and cfg.config.debug_dump_file then
-		local f = io.open(cfg.config.debug_dump_file, "a")
-		if f then
-			f:write(os.date("!%Y-%m-%dT%H:%M:%SZ") .. " " .. json_str .. "\n")
-			f:close()
-		end
-	end
+	-- Untagged: the line shape every documented grep recipe expects.
+	M._debug_append(cfg, nil, json_str)
 
 	local ok, resp = pcall(cjson.decode, json_str)
 	if not ok or type(resp) ~= "table" then
@@ -2660,6 +2740,19 @@ function M.handle_response(json_str, st, cfg)
 						st.ip = ip  -- known directly, no need to re-read the interface
 					end
 				end
+				-- Save NOW, not at the end of the function with everything
+				-- else. Between here and that tail-end save sit the WiFi pass,
+				-- switchvlan, usteer, bcfilter and shaper -- every one of which
+				-- shells out or reaches into UCI and can raise. _tick pcalls
+				-- this whole function by design, so a raise there costs one
+				-- stderr line and the next cycle carries on -- but it also
+				-- meant the kernel had been reconfigured and the only record
+				-- of it was lost, which is exactly the state _reapply_static_ip
+				-- cannot recover from after a reboot. Upstream watched it
+				-- happen in the validation lab: the AP moved to its pushed
+				-- address, usteer raised immediately afterwards, and
+				-- state.json never learned about it.
+				M._state.save(st)
 			end
 
 			-- Parsed once, out here: the switch pass below needs the vap_table
@@ -2794,6 +2887,10 @@ function M.handle_response(json_str, st, cfg)
 						M._switchvlan.apply(sw, cfg, st, wireless_vlans,
 							uplink_phys, uplink_ifname)
 					end
+					-- Either branch may have moved a socket into or out of a
+					-- VLAN bridge, which is the one thing bridge_of's 300 s TTL
+					-- cannot notice on its own.
+					if M._sysinfo.forget_uplink_cache then M._sysinfo.forget_uplink_cache() end
 				end)
 			end
 		end
@@ -3285,20 +3382,70 @@ function M._warn_debug_overrides(cfg)
 	return true
 end
 
--- Appends one line -- UTC timestamp, a direction tag, the text -- to
+-- Ceiling on the debug dump, in bytes; conf.lua's debug_dump_max_bytes
+-- overrides it (0 disables the cap). The file is append-only and the inform
+-- loop writes to it every few seconds, and its usual home is /tmp, which on
+-- these boards is tmpfs: upstream found an Archer C5 that had been dumping
+-- since 2026-07-28 with the file at 31.7 MB -- 55% of a 59 MB filesystem
+-- that also has to hold state.json writes and the package manager's working
+-- set. Past the cap the file RESTARTS rather than rotating, leaving a marker
+-- line: a second generation would double the peak footprint on exactly the
+-- boards least able to afford it, and a capture is read from its tail.
+M.DEBUG_DUMP_MAX_BYTES = 4 * 1024 * 1024
+
+-- Appends one line -- UTC timestamp, an optional direction tag, the text -- to
 -- cfg.config.debug_dump_file. Responses are written by handle_response with
--- NO tag, which is the line shape every documented grep recipe expects and
--- must stay; requests ("TX") and transport failures ("ERR") are tagged so they
--- can be filtered in or out, and only appear at all with debug_dump_requests
--- set. Returns true when a line was written.
+-- NO tag (nil), which is the line shape every documented grep recipe expects
+-- and must stay; requests ("TX") and transport failures ("ERR") are tagged so
+-- they can be filtered in or out, and only appear at all with
+-- debug_dump_requests set. Returns true when a line was written.
+--
+-- The size comes from seek("end") on the append handle rather than a stat
+-- binding: busybox's stat applet is missing on some builds, the same reason
+-- _state_mtime stopped forking it.
 function M._debug_append(cfg, tag, text)
 	local path = cfg and cfg.config and cfg.config.debug_dump_file
 	if not path then return false end
+	local cap = cfg.config.debug_dump_max_bytes
+	if cap == nil then cap = M.DEBUG_DUMP_MAX_BYTES end
 	local f = io.open(path, "a")
 	if not f then return false end
-	f:write(os.date("!%Y-%m-%dT%H:%M:%SZ") .. " " .. tag .. " " .. text .. "\n")
+	local size = f:seek("end") or 0
+	if cap and cap > 0 and size >= cap then
+		f:close()
+		f = io.open(path, "w")
+		if not f then return false end
+		f:write(("%s # openuf: dump passed %d bytes, restarted\n")
+			:format(os.date("!%Y-%m-%dT%H:%M:%SZ"), cap))
+	end
+	f:write(os.date("!%Y-%m-%dT%H:%M:%SZ") .. (tag and (" " .. tag) or "")
+		.. " " .. text .. "\n")
 	f:close()
 	return true
+end
+
+-- Reapply a controller-pushed static address from state.json at startup.
+--
+-- netconfig.apply_static() is `ip addr flush` + `ip addr add` + `ip route
+-- replace` -- pure kernel state, no UCI -- so the address dies with a reboot
+-- and netifd brings the interface back up on the board's own boot config.
+-- The controller does not re-push it either: cfgversion is persisted, so it
+-- matches on the first inform and the reply is a noop carrying no system_cfg
+-- at all. The device silently returned to DHCP (or to no address) while the
+-- controller's IP Settings page went on showing the static one it assigned.
+-- state.json has carried the static_* fields since IP Settings landed, and
+-- until this nothing ever read them back.
+--
+-- Only ip_mode == "static" with a recorded address acts. On "dhcp", and when
+-- IP Settings was never pushed, the boot config is already correct and
+-- flushing to re-lease would be the destructive no-op handle_response already
+-- guards against. Extracted from M.run so it is testable -- run() blocks
+-- forever. Returns true when an address was reapplied.
+function M._reapply_static_ip(st, cfg)
+	if not st or st.ip_mode ~= "static" or not st.static_ip then return false end
+	local iface = cfg and cfg.net and cfg.net.lan_cpueth
+	return M._netconfig.apply_static(iface, st.static_ip, st.static_netmask,
+		st.static_gateway, st.static_dns) and true or false
 end
 
 -- An adopted device whose informs are answered 400 is, in every case seen so
@@ -3374,9 +3521,27 @@ function M._rrm_tick(cfg)
 	-- default (on): install.sh keeps a device's existing conf.lua across
 	-- upgrades, so every device installed before this option existed has no
 	-- such key -- AP2 was exactly that, and the collector never started.
-	if cfg.config.rrm_enrichment == false then return false end
+	local now = M._time()
+	if cfg.config.rrm_enrichment == false then
+		-- Off -- but a collector started while it was ON is a detached `ubus
+		-- subscribe` child, reparented to init, appending to a file on a RAM
+		-- disk that harvest() -- the only thing that ever truncates it -- no
+		-- longer drains. rrmscan.collector_stop() existed and had no caller;
+		-- this is where it belongs. Rate-limited on the collector's own
+		-- liveness clock, since finding out is a pgrep.
+		if now >= M._rrm_collector_next then
+			M._rrm_collector_next = now + M.RRM_COLLECTOR_CHECK_INTERVAL
+			local ok_r, running = pcall(rrm.collector_running)
+			if ok_r and running then pcall(rrm.collector_stop) end
+		end
+		return false
+	end
 
-	pcall(rrm.collector_ensure)
+	-- Once a minute, not every heartbeat -- see RRM_COLLECTOR_CHECK_INTERVAL.
+	if now >= M._rrm_collector_next then
+		M._rrm_collector_next = now + M.RRM_COLLECTOR_CHECK_INTERVAL
+		pcall(rrm.collector_ensure)
+	end
 
 	local ok, fresh, reporters = pcall(rrm.harvest)
 	if ok then
@@ -3394,7 +3559,8 @@ function M._rrm_tick(cfg)
 		end
 	end
 
-	local now  = M._time()
+	-- n.seen_at comes from rrmscan's own _now, so a test stubbing one clock
+	-- must stub the other.
 	local live = {}
 	for bssid, n in pairs(M._rrm_cache) do
 		if now - n.seen_at < RRM_MAX_AGE then
@@ -3539,6 +3705,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- return; an error skips the close, and a stale pass would then feed
 	-- handle_response's own lookups pre-reload interface names.
 	if M._ucihelper and M._ucihelper.end_pass then pcall(M._ucihelper.end_pass) end
+	if M._sysinfo and M._sysinfo.end_pass then pcall(M._sysinfo.end_pass) end
 	if not ok_b then
 		io.stderr:write("inform: build_json failed: " .. tostring(json_str) .. "\n")
 		return ctx.interval
@@ -3576,7 +3743,13 @@ function M._tick(st, cfg, ufhw, ctx)
 		return ctx.interval
 	end
 	pcall(M._write_status, st, {last_ok = M._time(), last_type = rtype})
-	if applied then return 0 end
+	if applied then
+		-- The push ran `wifi reload`, which killed the RRM collector's
+		-- subscription; check it again on the very next heartbeat rather
+		-- than waiting out RRM_COLLECTOR_CHECK_INTERVAL.
+		M._rrm_collector_next = 0
+		return 0
+	end
 	return ctx.interval
 end
 
@@ -3588,15 +3761,65 @@ function M.run(cfg, ufhw)
 	-- table and state.load now reads it all back), before _populate_net_info
 	-- overwrites it with the live one read off dev.conf.net.lan_cpueth.
 	local prev_mac = st.mac
+	-- A controller-pushed static address is kernel state and died with the
+	-- reboot; put it back BEFORE the identity fields are read off the
+	-- interface, so the very first inform reports where the device actually
+	-- is. pcall'd: a malformed record must not stop the daemon.
+	local ok_ip, err_ip = pcall(M._reapply_static_ip, st, cfg)
+	if not ok_ip then
+		io.stderr:write("inform: could not reapply static IP: " .. tostring(err_ip) .. "\n")
+	end
 	M._populate_net_info(st, cfg)
 	M._warn_identity_change(prev_mac, st, cfg)
 	M._warn_missing_uci()
+	-- Identity and reported address must come off the same netdev. openUF
+	-- takes the MAC from lan_cpueth and the IP from the bridge that port is
+	-- enslaved to, which only agree when the two share a MAC -- true on every
+	-- swconfig board, false on a DSA board whose map names a socket, where the
+	-- gateway then flags an IP conflict between the AP and itself. Reconciled
+	-- once, here, before the first inform carries the mismatch. pcall'd for
+	-- the same reason reapply_runtime_rules is: this reaches UCI and sysfs, and
+	-- a board where either is missing must still start and report statistics.
+	if M._ucihelper and M._ucihelper.ensure_bridge_identity then
+		local ok_id, err_id = pcall(M._ucihelper.ensure_bridge_identity, cfg)
+		if not ok_id then
+			io.stderr:write("inform: could not reconcile bridge identity: "
+				.. tostring(err_id) .. "\n")
+		elseif err_id then
+			-- It changed UCI; netifd has to be told, and nothing else at
+			-- startup consumes _network_dirty (apply_config's reload only runs
+			-- on a setparam, which may be many minutes away or never).
+			M._ucihelper._network_dirty = false
+			M._sysinfo._run_cmd("/etc/init.d/network reload 2>/dev/null")
+			M._populate_net_info(st, cfg)  -- the address may have moved with it
+		end
+	end
 	M._warn_debug_overrides(cfg)
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 	-- Blocked-client nft rules are live kernel state, not persisted UCI --
 	-- reapply from state.json on every fresh start (mirrors the bootstrap
 	-- account reconciliation just above).
 	M._firewall.reconcile(st.blocked_stas)
+	-- Same category, one level out: the "Multicast and Broadcast Blocker" is an
+	-- nftables ruleset and the "WiFi Speed Limit" is a tc qdisc, so both die
+	-- with the reboot, and neither has a UCI option OpenWrt itself applies.
+	-- They are only ever built inside apply_config, which runs on a setparam --
+	-- and after a reboot there is no setparam: cfgversion matches on the first
+	-- inform and the controller replies noop, carrying no system_cfg at all.
+	-- Both controls therefore stayed off indefinitely while the UI showed them
+	-- on. Rebuilt here from the openuf_bcfilt/openuf_ratelimit_* options
+	-- wlan_add stamps onto each managed section.
+	--
+	-- pcall'd because it reaches ubus for each VAP's live netdev name: no
+	-- radios, no wifi up yet, no ubus at all are ordinary outcomes on a board
+	-- openUF has never provisioned, and none of them may stop the daemon.
+	if M._ucihelper and M._ucihelper.reapply_runtime_rules then
+		local ok_rt, err_rt = pcall(M._ucihelper.reapply_runtime_rules)
+		if not ok_rt then
+			io.stderr:write("inform: could not reapply blocker/speed-limit rules: "
+				.. tostring(err_rt) .. "\n")
+		end
+	end
 	-- A Locate does NOT survive a restart, and must not: it is a transient
 	-- "which box is it" blink, nobody is still standing in front of the AP,
 	-- and unset-locate only ever arrives while someone is watching the
@@ -3631,6 +3854,14 @@ function M.run(cfg, ufhw)
 	-- Per-port byte counters are a switch-driver setting that some boards ship
 	-- switched off; without it every socket reports 0 B in the Ports view.
 	if M._switchvlan then pcall(M._switchvlan.enable_mib_polling, cfg) end
+	-- nftables state does not survive a reboot, so the per-socket MAC tap is
+	-- reinstalled here from the UCI sections that record which sockets have
+	-- learning off -- the same discipline _firewall.reconcile uses for the
+	-- blocklist. A tap that is not reinstalled fails silently, as an empty
+	-- mac_table, which is the bug it exists to fix.
+	if M._switchvlan and M._switchvlan.reconcile_mac_taps then
+		pcall(M._switchvlan.reconcile_mac_taps)
+	end
 
 	local socket = require("socket")
 	local ctx = {
@@ -3659,6 +3890,17 @@ if not OPENUF_TEST_MODE then
 		-- way, so the three processes that touch the file agree on where it is.
 		if config and type(config.state_file) == "string" and config.state_file ~= "" then
 			state._state_file = config.state_file
+		end
+		-- Its sibling key, with the same history: conf.lua's inform_url was
+		-- documented as "only used on first boot" and read by nothing --
+		-- state.lua's defaults() carried its own hardcoded copy, so editing
+		-- conf.lua moved no traffic, while install.sh parsed that very key to
+		-- decide whether an https:// controller needed luasec. Applied as the
+		-- default rather than written onto the loaded state, so it takes
+		-- effect exactly where the doc says: only when state.json has no URL
+		-- of its own. An adopted device keeps what the controller assigned.
+		if config and type(config.inform_url) == "string" and config.inform_url ~= "" then
+			state.DEFAULT_INFORM_URL = config.inform_url
 		end
 		local ufhw = {uap = dofile("ufmodel/" .. dev.openuf.uap.ufmodel .. ".lua")}
 		-- config (debug_dump_file, state_file, ...) is a separate global set by

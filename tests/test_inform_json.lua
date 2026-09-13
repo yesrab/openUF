@@ -27,9 +27,15 @@ end
 -- info` sources return a real 5GHz (VHT+HE+DFS+160MHz) fixture instead of
 -- empty.
 local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_caps)
+	-- Caches whose whole point is to outlive a heartbeat: swapping the
+	-- fixtures underneath them is exactly what they are not built for, so each
+	-- payload starts from a clean one. (with_fixtures in test_sysinfo.lua does
+	-- the same, on the way in and out.)
+	inform._sysinfo._phy_info_cache = {}
+	inform._sysinfo._uplink_cache   = {}
+	inform._sysinfo.end_pass()
 	inform._sysinfo._read_file = function(path)
 		if path:find("uptime")  then return fixture("proc_uptime.txt")  end
-		if path:find("loadavg") then return fixture("proc_loadavg.txt") end
 		if path:find("meminfo") then return fixture("proc_meminfo.txt") end
 		if path:find("net/dev") then return fixture("proc_net_dev.txt") end
 		if with_wired and path:find("net/arp")     then return fixture("proc_net_arp.txt") end
@@ -63,8 +69,12 @@ local function inject_sysinfo(with_clients, with_wired, with_scan, with_radio_ca
 		end
 		return ""
 	end
-	-- Return empty neighbor list (no lldpd on dev machine)
+	-- Return empty neighbor list (no lldpd on dev machine). The neighbour list
+	-- is TTL-cached for a minute, so a test that fed it a real lldpctl reply
+	-- would otherwise keep answering for the tests after it.
 	inform._lldp._run_cmd = function() return "" end
+	inform._lldp._neighbours_cache = nil
+	inform._lldp._port_idx_cache   = {}
 end
 
 -- Inject a mock ucihelper so build_json's radio/vap/stats wiring can be
@@ -288,31 +298,61 @@ local AX_CFG = {
 	},
 }
 
+-- opts.master maps an ifname to the bridge it is enslaved to, for the one case
+-- where they are not all in br-lan: a socket openUF has moved into a VLAN
+-- bridge. opts.fdb_by_br gives that bridge its own FDB dump.
+-- Commands the last build_ax3000t() run forked, by kind. Lets a test assert on
+-- the COST of a payload, not only its content -- which is the only way to pin
+-- that build_json actually threads the shared FDB dump down to the port loop.
+local dsa_forks = {}
+
 local function build_ax3000t(opts)
 	opts = opts or {}
+	dsa_forks = {fdb_br = 0, fdb_dev = 0, uptime = 0, fdb_br_names = {}}
 	inject_sysinfo(false, false, false, false)
 	local base_read = inform._sysinfo._read_file
 	local base_cmd  = inform._sysinfo._run_cmd
 	inform._sysinfo._read_file = function(path)
 		if path:find("net/arp") then return fixture("proc_net_arp_dsa.txt") end
 		if path:find("/bridge/bridge_id") then return nil end   -- a socket is not a bridge
+		if path == "/proc/uptime" then dsa_forks.uptime = dsa_forks.uptime + 1 end
 		return base_read(path)
 	end
 	inform._sysinfo._run_cmd = function(cmd)
 		if cmd:find("swconfig") then return "" end   -- no such binary on DSA
 		if cmd:find("ip route") then
-			return "default via 192.168.200.1 dev br-lan \n"
+			return "default via 192.0.2.1 dev br-lan \n"
+		end
+		local rl = cmd:match("readlink /sys/class/net/(%S+)/master")
+		if rl then
+			local br = (opts.master or {})[rl] or "br-lan"
+			return "../../../../../../../../virtual/net/" .. br .. "\n"
 		end
 		if cmd:find("readlink") then
 			return "../../../../../../../../virtual/net/br-lan\n"
 		end
-		if cmd:find("bridge fdb show br", 1, true) then
-			return opts.fdb or fixture("bridge_fdb_br_dsa.txt")
+		local fdb = opts.fdb or fixture("bridge_fdb_br_dsa.txt")
+		local br = cmd:match("bridge fdb show br (%S+)")
+		if br then
+			dsa_forks.fdb_br = dsa_forks.fdb_br + 1
+			dsa_forks.fdb_br_names[br] = (dsa_forks.fdb_br_names[br] or 0) + 1
+			if br ~= "br-lan" then return (opts.fdb_by_br or {})[br] or "" end
+			return fdb
 		end
-		if cmd:find("bridge fdb show dev lan3", 1, true) then
-			return "aa:bb:cc:dd:ee:01 master br-lan\n"
+		-- `bridge fdb show dev <socket>`: on DSA each socket is its own
+		-- bridge port, so the per-port FDB is the per-socket host list. Derived
+		-- from the SAME dump rather than canned separately -- they are one
+		-- kernel table, and a stub that let them disagree would hide exactly
+		-- the substitution build_json now makes between them.
+		local dev = cmd:match("bridge fdb show dev (%S+)")
+		if dev then
+			dsa_forks.fdb_dev = dsa_forks.fdb_dev + 1
+			local lines = {}
+			for line in fdb:gmatch("[^\n]+") do
+				if line:match("dev%s+(%S+)") == dev then lines[#lines + 1] = line end
+			end
+			return table.concat(lines, "\n") .. "\n"
 		end
-		if cmd:find("bridge fdb show dev", 1, true) then return "" end
 		return base_cmd(cmd)
 	end
 	local orig_rf = inform._read_file
@@ -330,8 +370,8 @@ local function build_ax3000t(opts)
 	end
 	local st = {
 		authkey = state.DEFAULT_KEY, adopted = true, cfgversion = "",
-		inform_url = "http://192.168.200.1:8080/inform",
-		mac = "d4:53:2a:38:80:cf", ip = "192.168.200.4", hostname = "testap",
+		inform_url = "http://192.0.2.1:8080/inform",
+		mac = "00:00:5e:00:53:16", ip = "192.0.2.4", hostname = "testap",
 	}
 	local ok, out = pcall(function()
 		return cjson.decode(inform.build_json(st, opts.cfg or AX_CFG, ufhw))
@@ -1891,9 +1931,9 @@ return {
 			inform._rrm_neighbours = {
 				{bssid = "aa:bb:cc:dd:ee:01", channel = 6, band = "ng",
 				 signal = -70, seen_at = os.time()},          -- already scanned: not duplicated
-				{bssid = "84:78:48:a4:fb:21", channel = 1, band = "ng",
+				{bssid = "00:00:5e:00:53:11", channel = 1, band = "ng",
 				 signal = -73, seen_at = os.time()},          -- only the client could see it
-				{bssid = "54:af:97:55:14:78", channel = 48, band = "na",
+				{bssid = "00:00:5e:00:53:17", channel = 48, band = "na",
 				 signal = -80, seen_at = os.time()},          -- other band: not this radio's
 			}
 			local ok, d = pcall(build, {with_uci = true, with_scan = true})
@@ -1910,12 +1950,12 @@ return {
 			assert_eq(seen["aa:bb:cc:dd:ee:01"].essid, "NeighborNet",
 				"the scanned record wins over the beacon report")
 			assert_eq(seen["aa:bb:cc:dd:ee:01"].signal, -55, "and keeps its own signal")
-			local added = seen["84:78:48:a4:fb:21"]
+			local added = seen["00:00:5e:00:53:11"]
 			assert_not_nil(added, "the client-only neighbour reached the payload")
 			assert_eq(added.channel, 1, "on the channel the client reported")
 			assert_eq(added.signal, -73, "with the RCPI-derived signal")
 			assert_eq(added.band, "ng", "band set or the row silently vanishes")
-			assert_nil(seen["54:af:97:55:14:78"], "a 5 GHz sighting is not filed under 2.4 GHz")
+			assert_nil(seen["00:00:5e:00:53:17"], "a 5 GHz sighting is not filed under 2.4 GHz")
 		end
 	},
 	{
@@ -1923,7 +1963,7 @@ return {
 		fn = function()
 			local prev = inform._rrm_neighbours
 			inform._rrm_neighbours = {
-				{bssid = "84:78:48:a4:fb:21", channel = 1, band = "ng",
+				{bssid = "00:00:5e:00:53:11", channel = 1, band = "ng",
 				 signal = -73, seen_at = os.time() - 120},
 			}
 			local ok, d = pcall(build, {with_uci = true, with_scan = true})
@@ -1938,7 +1978,11 @@ return {
 		fn = function()
 			-- Upstream's AX3000T shape: lan_cpueth is the wan SOCKET, and the
 			-- bridge is found through its master. No swconfig, no ARL.
-			local d = build_ax3000t()
+			-- The captured dump has nothing on lan3 (that board had one cable
+			-- in it), so a host is added explicitly rather than fabricated
+			-- into the capture.
+			local d = build_ax3000t({fdb = fixture("bridge_fdb_br_dsa.txt")
+				.. "aa:bb:cc:dd:ee:01 dev lan3 master br-lan \n"})
 			assert_eq(#d.port_table, 4, "one entry per socket")
 			local p = by_idx(d.port_table)
 			assert_true(p[1].up, "the cabled socket is up")
@@ -1959,7 +2003,7 @@ return {
 		fn = function()
 			local moved = build_ax3000t({
 				live = "lan3",
-				fdb  = "5a:d6:1f:40:e2:f6 dev lan3 master br-lan \n"
+				fdb  = "00:00:5e:00:53:12 dev lan3 master br-lan \n"
 					.. "aa:bb:cc:dd:ee:01 dev lan3 master br-lan \n",
 			})
 			local q = by_idx(moved.port_table)
@@ -1979,7 +2023,7 @@ return {
 				{idx = 1, ifname = "wan", uplink = true},
 				{idx = 2, ifname = "lan2"},
 			}}}
-			local d = build_ax3000t({cfg = cfg, fdb = "5a:d6:1f:40:e2:f6 dev tap0 master br-lan \n"})
+			local d = build_ax3000t({cfg = cfg, fdb = "00:00:5e:00:53:12 dev tap0 master br-lan \n"})
 			local p = by_idx(d.port_table)
 			assert_true(p[1].is_uplink, "fell back to the modelmap's own flag")
 			assert_false(p[2].is_uplink, "and only that one")
@@ -2053,6 +2097,117 @@ return {
 			inform._ucihelper = orig
 			if not ok then error(err, 0) end
 			assert_eq(table.concat(log, ","), "begin,vaps,radios,end", "pass brackets every lookup")
+		end
+	},
+
+	{
+		name = "inform json: the throughput cache forgets a station that left",
+		fn = function()
+			-- _sta_stats_cache is keyed by CLIENT MAC and was never emptied,
+			-- so on a daemon that runs for months in a place with transient
+			-- clients it only ever grew. A station back after the window is a
+			-- fresh association, and its 0-throughput first sample is honest.
+			inform._sta_stats_cache = {}
+			local orig_time = inform._time
+			inform._time = function() return 1000 end
+			build({with_uci = true, with_clients = true})   -- seeds the stations
+			local seeded = 0
+			for _ in pairs(inform._sta_stats_cache) do seeded = seeded + 1 end
+			assert_eq(seeded, 2, "both connected stations are cached")
+
+			-- A later payload on which that station no longer appears.
+			inform._time = function() return 1000 + inform.STA_STATS_FORGET_AFTER + 1 end
+			build({with_uci = true})                        -- no clients this time
+			local left = 0
+			for _ in pairs(inform._sta_stats_cache) do left = left + 1 end
+			assert_eq(left, 0, "and dropped once it has been gone for the whole window")
+
+			inform._time = orig_time
+			inform._sta_stats_cache = {}
+		end
+	},
+
+	-- ── Adopted from upstream 2026-09-13: per-socket bridge, VLAN label, one FDB
+	--    dump per payload (AX3000T-shaped harness) ─────────────────────────────
+	{
+		name = "inform json: a socket moved to a VLAN bridge still reports its hosts",
+		fn = function()
+			-- The socket the controller assigned to a port VLAN is not a port
+			-- of the management bridge any more -- switchvlan.dsa_apply moved
+			-- it into br-openuf<vid>. Asking the uplink bridge about it (which
+			-- is what the port loop used to do for EVERY socket) finds nothing,
+			-- the port publishes an empty mac_table, and the controller credits
+			-- the client to the gateway instead of to this AP's port 2.
+			local d = build_ax3000t({
+				master   = {lan2 = "br-openuf10"},
+				fdb_by_br = {["br-openuf10"] =
+					"00:00:5e:00:53:07 dev lan2 master br-openuf10 \n"},
+				fdb = fixture("bridge_fdb_br_dsa.txt")
+					.. "00:00:5e:00:53:08 dev lan3 master br-lan \n",
+			})
+			local p = by_idx(d.port_table)
+			assert_eq(#p[2].mac_table, 1, "the host behind the moved socket")
+			assert_eq(p[2].mac_table[1].mac, "00:00:5e:00:53:07", "its mac")
+			-- The sockets still in the management bridge are unchanged, and
+			-- the uplink question is still answered from that bridge's dump.
+			assert_eq(#p[3].mac_table, 1, "a socket still in br-lan reports as before")
+			assert_eq(p[3].mac_table[1].mac, "00:00:5e:00:53:08", "its mac")
+			assert_true(p[1].is_uplink, "and the uplink is still detected")
+			-- One dump per BRIDGE, not one per socket: three sockets live in
+			-- br-lan and share its dump, the fourth costs one dump of its own.
+			assert_eq(dsa_forks.fdb_br, 2, "one FDB dump per distinct bridge")
+			assert_eq(dsa_forks.fdb_br_names["br-lan"], 1, "br-lan dumped once")
+			assert_eq(dsa_forks.fdb_br_names["br-openuf10"], 1, "the VLAN bridge once")
+			assert_eq(dsa_forks.fdb_dev, 0, "and still no per-socket fork")
+		end
+	},
+	{
+		name = "inform json: a host behind a VLAN-assigned socket is labelled with that VLAN",
+		fn = function()
+			-- The field that decides which NETWORK the controller files the
+			-- client under. It walks the site's layer-2 networks and keeps a
+			-- reported host only where the network's VLAN equals the row's
+			-- `vlan`, defaulting to 1 -- so without this every host landed in
+			-- the untagged network no matter which socket reported it, and the
+			-- IoT device on an assigned socket was listed under the management
+			-- LAN while its port, its IP and the controller's own Native VLAN
+			-- column all said otherwise.
+			local d = build_ax3000t({
+				master   = {lan2 = "br-openuf10"},
+				fdb_by_br = {["br-openuf10"] =
+					"00:00:5e:00:53:07 dev lan2 master br-openuf10 \n"},
+				fdb = fixture("bridge_fdb_br_dsa.txt")
+					.. "00:00:5e:00:53:08 dev lan3 master br-lan \n",
+			})
+			local p = by_idx(d.port_table)
+			assert_eq(p[2].mac_table[1].vlan, 10,
+				"the VLAN read off the bridge openUF moved the socket into")
+			-- A socket still in the management bridge carries no vlan at all:
+			-- the controller drops a vlan of 1 on arrival, so sending it says
+			-- nothing and costs bytes every heartbeat.
+			assert_true(p[3].mac_table[1].vlan == nil,
+				"a socket on the management VLAN is left unlabelled")
+		end
+	},
+	{
+		name = "inform json: a DSA payload dumps the bridge FDB once, not once per socket",
+		fn = function()
+			-- build_json already dumps the whole bridge FDB to find the uplink
+			-- socket, and that dump carries every socket's hosts. Each socket
+			-- forked `bridge fdb show dev <socket>` for a subset of it anyway.
+			-- Asserting the host lists alone cannot catch a regression here:
+			-- both sources are the same kernel table and give the same answer,
+			-- so only the fork count says which one was asked.
+			build_ax3000t({fdb = fixture("bridge_fdb_br_dsa.txt")
+				.. "aa:bb:cc:dd:ee:01 dev lan3 master br-lan \n"})
+			assert_eq(dsa_forks.fdb_br, 1, "one dump of the kernel FDB per payload")
+			assert_eq(dsa_forks.fdb_dev, 0, "and no per-socket fork at all")
+			-- The payload's very first question is the uptime, and scan_table
+			-- asks it again per radio as its CLOCK_BOOTTIME reference. The pass
+			-- has to be open before that first call, not partway down the
+			-- function -- measuring a real heartbeat on hardware is what caught
+			-- it still being read twice.
+			assert_eq(dsa_forks.uptime, 1, "and /proc/uptime is read once for the payload")
 		end
 	},
 }

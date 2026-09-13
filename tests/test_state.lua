@@ -182,7 +182,7 @@ return {
 			with_tmp(function()
 				local st = state.load()
 				st.adopted       = true
-				st.mac           = "e8:de:27:5f:62:7a"
+				st.mac           = "00:00:5e:00:53:1a"
 				st.ip_mode       = "static"
 				st.static_ip     = "10.0.0.20"
 				st.static_dns    = {"10.0.0.1", "10.0.0.2"}
@@ -191,7 +191,7 @@ return {
 				st.led_enabled   = false
 				state.save(st)
 				local loaded = state.load()
-				assert_eq(loaded.mac, "e8:de:27:5f:62:7a", "identity MAC round-trips")
+				assert_eq(loaded.mac, "00:00:5e:00:53:1a", "identity MAC round-trips")
 				assert_eq(loaded.ip_mode, "static", "ip_mode round-trips")
 				assert_eq(loaded.static_ip, "10.0.0.20", "static_ip round-trips")
 				assert_eq(loaded.static_dns[2], "10.0.0.2", "static_dns list round-trips")
@@ -283,6 +283,46 @@ return {
 				f = io.open(TMP, "w"); f:write(""); f:close()
 				assert_eq(capture(function() state.load() end), "", "empty file: no warning")
 			end)
+		end
+	},
+
+	{
+		-- conf.lua's inform_url was documented as the first-boot URL and read
+		-- by nothing -- defaults() carried its own hardcoded copy, so editing
+		-- conf.lua moved no traffic, while install.sh parsed that key to
+		-- decide whether an https:// controller needed luasec.
+		name = "state: DEFAULT_INFORM_URL supplies the first-boot URL and yields to state.json",
+		fn = function()
+			local orig_default = state.DEFAULT_INFORM_URL
+			with_tmp(function()
+				local path = TMP
+				state.DEFAULT_INFORM_URL = "https://unifi.example.com:8443/inform"
+
+				-- No file at all: the conf.lua-supplied default is what a fresh
+				-- device informs to.
+				os.remove(path)
+				assert_eq(state.load().inform_url,
+					"https://unifi.example.com:8443/inform",
+					"first boot uses the configured URL")
+
+				-- A file with no inform_url is the same case.
+				local f = io.open(path, "w")
+				f:write('{"adopted":false}')
+				f:close()
+				assert_eq(state.load().inform_url,
+					"https://unifi.example.com:8443/inform",
+					"a state file without a URL still falls back to it")
+
+				-- An adopted device keeps whatever the controller assigned:
+				-- the default must never override a stored URL.
+				f = io.open(path, "w")
+				f:write('{"adopted":true,"authkey":"'
+					.. string.rep("a", 32) .. '","inform_url":"http://10.0.0.5:8080/inform"}')
+				f:close()
+				assert_eq(state.load().inform_url, "http://10.0.0.5:8080/inform",
+					"a controller-assigned URL wins over the default")
+			end)
+			state.DEFAULT_INFORM_URL = orig_default
 		end
 	},
 }

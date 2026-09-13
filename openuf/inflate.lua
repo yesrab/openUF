@@ -28,9 +28,21 @@ local function bitstream(data)
 	local bitcnt = 0
 	local bs = {}
 
+	-- Past the end of the input this RAISES rather than supplying zero bits.
+	-- `byte(data, pos) or 0` looked harmless and hung the daemon: fed to
+	-- M.inflate, an endless run of zeros decodes as bfinal=0, btype=0
+	-- (stored), LEN=0 -- a zero-length block that emits nothing and never
+	-- sets bfinal -- and the `repeat ... until bfinal == 1` loop spins on it
+	-- forever. No error, no heartbeat, no log line, and procd cannot respawn
+	-- a process that never exits. Any truncated or corrupted compressed
+	-- response from the controller reached this, and on OpenWrt 25.12 (no
+	-- Lua zlib binding) this pure-Lua path decompresses EVERY compressed
+	-- response. Raising lands in _tick's pcall around parse_packet: one
+	-- heartbeat lost, one line logged, next cycle tries again.
 	function bs.getbit()
 		if bitcnt == 0 then
-			bitbuf = byte(data, pos) or 0
+			bitbuf = byte(data, pos)
+			if not bitbuf then error("inflate: truncated stream") end
 			pos    = pos + 1
 			bitcnt = 8
 		end
@@ -51,7 +63,8 @@ local function bitstream(data)
 
 	function bs.align()  bitcnt = 0 end          -- discard to byte boundary
 	function bs.getbyte()
-		local b = byte(data, pos) or 0
+		local b = byte(data, pos)
+		if not b then error("inflate: truncated stream") end
 		pos = pos + 1
 		return b
 	end

@@ -25,24 +25,96 @@ M._run_cmd = function(cmd)
 	return s or ""
 end
 
--- Returns uptime in seconds (as a number) by parsing /proc/uptime.
-function M.uptime()
-	local s = M._read_file("/proc/uptime")
-	if not s then return 0 end
-	local secs = tonumber(s:match("^(%S+)"))
-	return secs and math.floor(secs) or 0
+
+-- ─── Lookup pass ────────────────────────────────────────────────────────────
+--
+-- The same seam ucihelper.begin_pass/end_pass provides, for the same reason:
+-- build_json asks several of the functions below the SAME question once per
+-- socket, and the answer cannot change inside one payload. `/proc/net/arp` was
+-- read five times per heartbeat and `/tmp/dhcp.leases` four (once per
+-- downstream socket, from both mac_table and switch_mac_table, plus one more
+-- for the default gateway), and the switch's whole ARL table was walked once
+-- per socket to keep the handful of entries on it.
+--
+-- Scoped to a pass rather than given a TTL: both files are genuinely live
+-- between heartbeats, and none of this may outlast the payload it was read
+-- for. It also makes that payload internally CONSISTENT -- without it two
+-- sockets in one inform can disagree about a host's IP.
+--
+-- Outside a pass every function below behaves exactly as it did before, which
+-- is what keeps the test suite's per-test _read_file/_run_cmd stubs
+-- independent of one another. inform.build_json opens the pass and closes it
+-- on return; inform._tick closes it again even when build_json throws.
+M._pass       = false
+M._pass_cache = nil
+function M.begin_pass() M._pass = true;  M._pass_cache = {} end
+function M.end_pass()   M._pass = false; M._pass_cache = nil end
+
+-- Run fn() once per pass, keyed by `key`. Outside a pass fn() runs every time.
+-- A false/nil result is memoized as such (wrapped, so "computed and empty" is
+-- distinguishable from "not computed"): a missing /tmp/dhcp.leases must not be
+-- re-opened once per socket either.
+local function pass_memo(key, fn)
+	local cache = M._pass and M._pass_cache
+	if cache then
+		local hit = cache[key]
+		if hit ~= nil then return hit[1] end
+	end
+	local value = fn()
+	if cache then cache[key] = {value} end
+	return value
 end
 
--- Returns load averages as {one, five, fifteen} by parsing /proc/loadavg.
-function M.loadavg()
-	local s = M._read_file("/proc/loadavg")
-	if not s then return {one = 0, five = 0, fifteen = 0} end
-	local one, five, fifteen = s:match("^(%S+)%s+(%S+)%s+(%S+)")
-	return {
-		one     = tonumber(one)     or 0,
-		five    = tonumber(five)    or 0,
-		fifteen = tonumber(fifteen) or 0,
-	}
+-- One read of the kernel's ARP cache per pass. Both readers of it below --
+-- _ip_by_mac for the wired-host join, _default_gateway_mac for the uplink
+-- question -- go through this, so the file is opened once per payload rather
+-- than once per socket plus one.
+local function arp_text()
+	return pass_memo("arp_text", function() return M._read_file("/proc/net/arp") end)
+end
+
+-- A {[mac] = port} map inverted into {[port] = {macs}}, multicast/broadcast
+-- dropped on the address's own bit and each bucket sorted (pairs() order is
+-- undefined; the payload must be stable).
+--
+-- Both wired-host sources hand us that exact shape -- the switch's ARL table
+-- and the bridge's FDB -- and both were scanned WHOLE once per socket to keep
+-- the entries on that one, O(sockets x hosts) on a switch that may have
+-- learned a couple of hundred. One inversion answers every socket.
+--
+-- Memoized on the map TABLE, not on a name: build_json fetches one dump per
+-- heartbeat and hands the same table to every socket, so a pass given a fresh
+-- dump buckets it afresh rather than serving the previous one.
+local function hosts_by_port(map)
+	return pass_memo(map, function()
+		local by_port = {}
+		for mac, port in pairs(map) do
+			local first_octet = tonumber(mac:sub(1, 2), 16)
+			if first_octet and first_octet % 2 == 0 then
+				local bucket = by_port[port]
+				if not bucket then bucket = {}; by_port[port] = bucket end
+				bucket[#bucket + 1] = mac
+			end
+		end
+		for _, bucket in pairs(by_port) do table.sort(bucket) end
+		return by_port
+	end)
+end
+
+-- Returns uptime in seconds (as a number) by parsing /proc/uptime.
+--
+-- Read once per pass: build_json reports it once and scan_table reads it again
+-- per radio, as the CLOCK_BOOTTIME reference for each BSS's "last seen" -- so
+-- it was three opens a heartbeat on a two-radio box. It is a monotonic counter
+-- whose drift across one payload is under a second, and reading it twice
+-- inside one payload was the less consistent of the two anyway.
+function M.uptime()
+	return pass_memo("uptime", function()
+		local s = M._read_file("/proc/uptime")
+		if not s then return 0 end
+		local secs = tonumber(s:match("^(%S+)"))
+		return secs and math.floor(secs) or 0
+	end)
 end
 
 -- Returns {total_kb, free_kb} by parsing /proc/meminfo.
@@ -63,9 +135,9 @@ M._prev_cpu = nil
 
 -- Returns CPU usage percent (0-100) since the previous call, by delta-
 -- sampling the aggregate "cpu" line in /proc/stat (matches the real
--- inform payload's system-stats.cpu, which is a live percentage -- not to
--- be confused with M.loadavg(), a different metric real devices don't
--- report under this field). Returns 0 on the first call, since there's no
+-- inform payload's system-stats.cpu, which is a live percentage -- not a
+-- load average, a different metric real devices don't report under this
+-- field). Returns 0 on the first call, since there's no
 -- prior sample to diff against yet.
 function M.cpu_percent()
 	local s = M._read_file("/proc/stat")
@@ -464,52 +536,26 @@ function M.sae_supported()
 	return found
 end
 
--- `iw phy phyN info` is tens of kilobytes and was fetched and parsed for
--- every radio on every heartbeat, although it describes the hardware plus
--- the regulatory domain and changes only with the latter. Cached per phy with
--- a TTL: long enough to take the parse off the 10-second path, short enough
--- that a regdomain change is reflected within minutes. (ucihelper keeps its
--- own, separately invalidated cache of `iw phy` for its clamping decisions.)
--- `iw dev <if> info` is NOT cached -- it carries the live channel and TX
--- power, which is the point of reading it every time.
+-- `iw phy phyN info` is tens of kilobytes and was fetched and parsed for every
+-- radio on every heartbeat, although it describes the HARDWARE plus the
+-- regulatory domain and changes only with the latter. Cached per phy with a
+-- TTL: long enough to take the fetch AND the parse off the 10-second path,
+-- short enough that a regdomain change is reflected within minutes.
+-- (ucihelper keeps its own, separately invalidated cache of `iw phy` for its
+-- clamping decisions.) `iw dev <if> info` is NOT cached -- it carries the live
+-- channel and TX power, which is the point of reading it every time.
 M.PHY_INFO_TTL = 300
 M._phy_info_cache = {}
-function M._phy_info(phy)
-	local now = M._time()
-	local c = M._phy_info_cache[phy]
-	if c and (now - c.at) < M.PHY_INFO_TTL then return c.text end
-	local text = M._run_cmd("iw phy phy" .. phy .. " info")
-	if text and text ~= "" then
-		M._phy_info_cache[phy] = {text = text, at = now}
-	end
-	return text
-end
 
-function M.radio_caps(ifname)
-	if not ifname then return {} end
-	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")
-	local phy = dev_info:match("wiphy%s+(%d+)")
-	if not phy then return {} end
-	local phy_info = M._phy_info(phy)
-	if not phy_info or phy_info == "" then return {} end
-
+-- Everything M.radio_caps() reports that comes from the phy dump rather than
+-- from the live interface. Split out and cached alongside the text it is
+-- derived from, because caching the TEXT alone still left ~8 scans and a
+-- gmatch over 40-odd kilobytes running per radio per heartbeat -- on a 560 MHz
+-- MIPS SoC that parse was the largest thing left on the path, and it produces
+-- the same answer for exactly as long as the text does.
+local function parse_phy_info(phy_info)
 	local has_dfs = phy_info:find("radar detection") ~= nil
-	-- The live negotiated channel ("channel 6 (2437 MHz), width: ...") is
-	-- more authoritative than UCI's own config value, which is frequently
-	-- "auto" (a config *intent*, not a number) -- the controller has no use
-	-- for the literal string "auto" here and was left showing channel 0.
-	local channel = dev_info:match("channel%s+(%d+)")
-	-- The live TX power ("txpower 23.00 dBm"), for exactly the same reason as
-	-- the channel above: UCI carries no `txpower` option at all while the
-	-- controller's Transmit Power is set to Auto (absent = driver default),
-	-- so the payload's tx_power was nil and the Radios view reported every
-	-- radio as transmitting at 0 dBm -- confirmed against a real controller,
-	-- with the hardware actually at 23 dBm (5GHz) and 17 dBm (2.4GHz).
-	-- Floored to whole dBm, which is the unit the field is in.
-	local txpower = tonumber(dev_info:match("txpower%s+([%d%.]+)"))
 	local caps = {
-		channel    = channel and tonumber(channel) or nil,
-		tx_power   = txpower and math.floor(txpower) or nil,
 		is_11ac    = phy_info:find("VHT Capabilities") ~= nil,
 		is_11ax    = (phy_info:find("HE PHY Capabilities") ~= nil) or (phy_info:find("HE MAC Capabilities") ~= nil),
 		is_11be    = phy_info:find("EHT PHY Capabilities") ~= nil,
@@ -563,6 +609,51 @@ function M.radio_caps(ifname)
 	return caps
 end
 
+-- Returns the phy dump's text and the hardware capabilities parsed out of it.
+function M._phy_info(phy)
+	local now = M._time()
+	local c = M._phy_info_cache[phy]
+	if c and (now - c.at) < M.PHY_INFO_TTL then return c.text, c.caps end
+	local text = M._run_cmd("iw phy phy" .. phy .. " info")
+	if not text or text == "" then return text, nil end
+	local caps = parse_phy_info(text)
+	M._phy_info_cache[phy] = {text = text, caps = caps, at = now}
+	return text, caps
+end
+
+function M.radio_caps(ifname)
+	if not ifname then return {} end
+	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")
+	local phy = dev_info:match("wiphy%s+(%d+)")
+	if not phy then return {} end
+	local phy_info, static = M._phy_info(phy)
+	if not phy_info or phy_info == "" or not static then return {} end
+
+	-- The hardware half comes off the cached phy dump; copied rather than
+	-- returned directly, since callers merge their own fields into what they
+	-- get back (build_json writes radio_caps/wpa3_supported onto it).
+	local caps = {}
+	for k, v in pairs(static) do caps[k] = v end
+
+	-- The live negotiated channel ("channel 6 (2437 MHz), width: ...") is
+	-- more authoritative than UCI's own config value, which is frequently
+	-- "auto" (a config *intent*, not a number) -- the controller has no use
+	-- for the literal string "auto" here and was left showing channel 0.
+	local channel = dev_info:match("channel%s+(%d+)")
+	-- The live TX power ("txpower 23.00 dBm"), for exactly the same reason as
+	-- the channel above: UCI carries no `txpower` option at all while the
+	-- controller's Transmit Power is set to Auto (absent = driver default),
+	-- so the payload's tx_power was nil and the Radios view reported every
+	-- radio as transmitting at 0 dBm -- confirmed against a real controller,
+	-- with the hardware actually at 23 dBm (5GHz) and 17 dBm (2.4GHz).
+	-- Floored to whole dBm, which is the unit the field is in.
+	local txpower = tonumber(dev_info:match("txpower%s+([%d%.]+)"))
+	caps.channel  = channel and tonumber(channel) or nil
+	caps.tx_power = txpower and math.floor(txpower) or nil
+
+	return caps
+end
+
 -- First-seen timestamps for wired hosts, keyed by "<source> mac" -- used to
 -- derive `uptime` in M.mac_table()/M.switch_mac_table() the same way
 -- sta_table's connected_sec comes from iw (which has no equivalent concept
@@ -572,57 +663,200 @@ M._mac_first_seen = {}
 M._mac_last_seen  = {}
 M._time = os.time
 
--- Record that key was seen now; returns when it was first seen. Also the only
+-- How long a host stays remembered after it was last seen. See M._note_seen.
+M.MAC_FORGET_AFTER = 3600
+
+-- Record that key was seen now; returns when it was FIRST seen. Also the only
 -- place the two tables ever shrink: a host not seen for an hour is forgotten,
 -- so a daemon that runs for months does not keep every MAC that ever crossed
--- the bridge. A host back after that long gets a fresh uptime, which is what
--- a real switch would report for it as well.
-local MAC_FORGET_AFTER = 3600
+-- the bridge.
+--
+-- The sweep runs BEFORE this sighting is recorded, so it applies to `key`
+-- itself as well: a host back after an hour away starts a fresh uptime instead
+-- of reporting the wall-clock time since it was first seen, which for a host
+-- that was gone for most of it is not an uptime at all. That is also what a
+-- real switch reports for a re-learned MAC.
 function M._note_seen(key, now)
+	for k, last in pairs(M._mac_last_seen) do
+		if now - last > M.MAC_FORGET_AFTER then
+			M._mac_last_seen[k]  = nil
+			M._mac_first_seen[k] = nil
+		end
+	end
 	local first = M._mac_first_seen[key]
 	if not first then
 		first = now
 		M._mac_first_seen[key] = now
 	end
 	M._mac_last_seen[key] = now
-	for k, last in pairs(M._mac_last_seen) do
-		if now - last > MAC_FORGET_AFTER then
-			M._mac_last_seen[k]  = nil
-			M._mac_first_seen[k] = nil
-		end
-	end
 	return first
 end
 
 -- MAC -> IP from /proc/net/arp (the header line has no MAC and is skipped by
 -- the pattern itself). Shared by both wired-host sources below.
 function M._ip_by_mac()
-	local by_mac = {}
-	local arp_out = M._read_file("/proc/net/arp")
-	if arp_out then
-		for line in arp_out:gmatch("[^\n]+") do
-			local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-			if ip and mac then by_mac[mac:lower()] = ip end
+	return pass_memo("ip_by_mac", function()
+		local by_mac = {}
+		local arp_out = arp_text()
+		if arp_out then
+			for line in arp_out:gmatch("[^\n]+") do
+				local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+				if ip and mac then by_mac[mac:lower()] = ip end
+			end
 		end
-	end
-	return by_mac
+		return by_mac
+	end)
 end
 
 -- MAC -> hostname from dnsmasq's lease file, when this device runs the DHCP
 -- server (format: "<expiry> <mac> <ip> <hostname> <client-id>"). An AP usually
 -- is not, so this is empty far more often than not.
 function M._hostname_by_mac()
-	local by_mac = {}
-	local leases_out = M._read_file("/tmp/dhcp.leases")
-	if leases_out then
-		for line in leases_out:gmatch("[^\n]+") do
-			local mac, hostname = line:match("^%d+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+%S+%s+(%S+)")
-			if mac and hostname and hostname ~= "*" then
-				by_mac[mac:lower()] = hostname
+	return pass_memo("hostname_by_mac", function()
+		local by_mac = {}
+		local leases_out = M._read_file("/tmp/dhcp.leases")
+		if leases_out then
+			for line in leases_out:gmatch("[^\n]+") do
+				local mac, hostname = line:match("^%d+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s+%S+%s+(%S+)")
+				if mac and hostname and hostname ~= "*" then
+					by_mac[mac:lower()] = hostname
+				end
 			end
 		end
+		return by_mac
+	end)
+end
+
+-- The MACs an nftables tap has seen ingressing each socket, as
+-- {[ifname] = {mac, ...}}, from one `nft list set`.
+--
+-- This exists because of a hardware fact, not a software preference. A socket
+-- openUF moves into a VLAN bridge must have MAC learning turned OFF or the
+-- switch ASIC hardware-drops the replies coming back to it (switchvlan.lua's
+-- dsa_apply documents the measurement). Learning off empties the bridge FDB for
+-- that socket, and the FDB is where every other wired-host answer comes from --
+-- so for exactly those sockets there is no kernel table left to read, and the
+-- hosts behind them stopped being reported at all.
+--
+-- The tap is the observation point that survives: switchvlan installs bridge
+-- prerouting rules that file each frame's source address into dynamic sets with
+-- timeouts matching the bridge's own FDB ageing, so an unplugged client expires
+-- the way it used to. Two sets, read from one dump of the table:
+--
+--     set portmacs {
+--         elements = { "lan2" . 00:00:5e:00:53:07 expires 4m59s990ms }
+--     }
+--     set portips {
+--         elements = { "lan2" . 00:00:5e:00:53:07 . 192.0.2.20 expires 5m }
+--     }
+--
+-- Captured verbatim from nftables v1.1.6 on the real board, not guessed. The
+-- quoted ifname is what makes the pattern unambiguous against the `type ifname
+-- . ether_addr` lines and the `iifname { "lan2" }` rules in the same dump, and
+-- the presence of a third `. <dotted quad>` component is what tells the two
+-- sets' elements apart without tracking which set block we are inside.
+--
+-- The address half is what keeps the controller's network label right: it
+-- classifies a wired client by the IP its reporter supplies, and an assigned
+-- socket is on a VLAN this AP holds no address on, so /proc/net/arp will never
+-- answer for it.
+--
+-- One dump per pass, and only asked for at all when a caller knows it has a
+-- socket in this position -- see mac_table's `allow_tap`.
+M.NFT_LEARN_TABLE = "bridge openuf_learn"
+
+-- Seconds left on a dynamic element, from the `expires 4m59s980ms` suffix nft
+-- prints. Every element carries the same timeout, so what is left is a direct
+-- proxy for how recently the tap last saw that host -- which is how a MAC that
+-- has held two addresses inside one timeout window resolves to the current one.
+-- Note `ms` must be tested before `m`/`s`, or 980ms reads as 980 minutes.
+local function nft_expires_secs(rest)
+	local t = rest:match("expires%s+(%S+)")
+	if not t then return nil end
+	local secs = 0
+	for n, unit in t:gmatch("(%d+)(%a+)") do
+		local mult = (unit == "ms" and 0.001) or (unit == "s" and 1)
+			or (unit == "m" and 60) or (unit == "h" and 3600)
+			or (unit == "d" and 86400) or 0
+		secs = secs + tonumber(n) * mult
 	end
-	return by_mac
+	return secs
+end
+
+-- {macs = {[ifname] = {mac, ...}}, ips = {[ifname] = {[mac] = ip}}} from one
+-- `nft list table`. One table rather than two return values on purpose:
+-- pass_memo caches a single value, so a second result would be silently lost
+-- on every call after the first of a pass.
+function M.nft_tap()
+	return pass_memo("nft_tap", function()
+		local macs, ips, fresh = {}, {}, {}
+		local out = M._run_cmd("nft list table " .. M.NFT_LEARN_TABLE)
+		if not out or out == "" then return {macs = macs, ips = ips} end
+		for ifname, mac, rest in
+			out:gmatch('"([^"]+)"%s*%.%s*(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)([^,\n]*)') do
+			-- Same multicast-bit filter the FDB and ARL sources apply. A
+			-- source address can never be multicast, so this only ever
+			-- rejects a malformed dump -- kept for the same reason it is
+			-- kept there.
+			local first_octet = tonumber(mac:sub(1, 2), 16)
+			if first_octet and first_octet % 2 == 0 then
+				mac = mac:lower()
+				local ip = rest:match("^%s*%.%s*(%d+%.%d+%.%d+%.%d+)")
+				if ip then
+					local seen = ips[ifname]
+					if not seen then
+						seen = {}; ips[ifname] = seen; fresh[ifname] = {}
+					end
+					local age = nft_expires_secs(rest) or 0
+					local best = fresh[ifname][mac]
+					-- Freshest wins, and on a tie the lower address, so the
+					-- payload cannot flip between two live answers from one
+					-- heartbeat to the next.
+					if best == nil or age > best
+						or (age == best and ip < seen[mac]) then
+						seen[mac], fresh[ifname][mac] = ip, age
+					end
+				else
+					local bucket = macs[ifname]
+					if not bucket then bucket = {}; macs[ifname] = bucket end
+					bucket[#bucket + 1] = mac
+				end
+			end
+		end
+		for _, bucket in pairs(macs) do table.sort(bucket) end
+		return {macs = macs, ips = ips}
+	end)
+end
+
+-- MACs -> the {mac, ip, hostname, age, uptime} rows port_table publishes.
+-- Shared by both of mac_table's sources so the tap's rows are indistinguishable
+-- from the FDB's: same ARP/lease join, same _note_seen-derived uptime.
+-- `tap_ips` is {[mac] = ip} for this socket, used only where the ARP cache has
+-- nothing: /proc/net/arp is the AP's own L3 view and is authoritative wherever
+-- it can answer, but it can never answer for a socket on a VLAN the AP holds no
+-- address on -- which is exactly the socket the tap exists for.
+local function hosts_from_macs(ifname, macs, tap_ips)
+	local ip_by_mac       = M._ip_by_mac()
+	local hostname_by_mac = M._hostname_by_mac()
+
+	local now = M._time()
+	local hosts = {}
+	for _, mac in ipairs(macs) do
+		local first_seen = M._note_seen(ifname .. " " .. mac, now)
+		hosts[#hosts + 1] = {
+			mac      = mac,
+			ip       = ip_by_mac[mac:lower()]
+				or (tap_ips and tap_ips[mac:lower()]) or nil,
+			hostname = hostname_by_mac[mac:lower()],
+			-- age: seconds since last observed on this fdb -- 0 since this
+			-- call just observed it fresh (matches TtZhv's use of `age` to
+			-- pick the more-recently-seen of two ports reporting the same
+			-- client, favoring whichever port's dump is being processed).
+			age      = 0,
+			uptime   = math.floor(now - first_seen),
+		}
+	end
+	return hosts
 end
 
 -- Returns a table of wired hosts learned on ifname's bridge port, by
@@ -640,43 +874,86 @@ end
 -- reports multicast/broadcast group addresses) -- neither is a real client.
 -- A multicast-bit check on the MAC's first octet is kept as a second filter
 -- in case a caller's mocked/real bridge output ever omits those markers.
-function M.mac_table(ifname)
+--
+-- `bridge` is optional and names the bridge ifname is enslaved to. Given one,
+-- the hosts come from the single `bridge fdb show br <bridge>` that
+-- M.bridge_fdb_ports already ran for the uplink question -- one dump of the
+-- kernel FDB carries every port's hosts, and it applies the identical
+-- master/self/permanent filter, so `bridge fdb show dev <socket>` per socket
+-- was re-dumping a strict subset of it. On the AX3000T's four sockets that was
+-- four forks per heartbeat for data already in hand. Without a bridge (every
+-- direct caller, and the tests) it forks per socket exactly as before.
+--
+-- `allow_tap` opts this socket into the nft fallback above, and is the caller's
+-- job because only the caller knows a socket is in the position that needs it
+-- (its bridge is not the uplink's -- i.e. openUF moved it). Left off, a board
+-- with no assigned socket never forks `nft` at all. The FDB always wins: the
+-- tap is consulted only when the kernel had nothing to say.
+function M.mac_table(ifname, bridge, allow_tap)
 	if not ifname then return {} end
-	local fdb_out = M._run_cmd("bridge fdb show dev " .. ifname)
-	local macs = {}
-	for line in fdb_out:gmatch("[^\n]+") do
-		if not line:find("self") and not line:find("permanent") and line:find("master") then
-			local mac = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
-			if mac then
-				local first_octet = tonumber(mac:sub(1, 2), 16)
-				if first_octet and first_octet % 2 == 0 then
-					macs[#macs + 1] = mac
+	local macs
+	if bridge then
+		macs = hosts_by_port(M.bridge_fdb_ports(bridge))[ifname]
+	else
+		local fdb_out = M._run_cmd("bridge fdb show dev " .. ifname)
+		macs = {}
+		for line in fdb_out:gmatch("[^\n]+") do
+			if not line:find("self") and not line:find("permanent") and line:find("master") then
+				local mac = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+				if mac then
+					local first_octet = tonumber(mac:sub(1, 2), 16)
+					if first_octet and first_octet % 2 == 0 then
+						macs[#macs + 1] = mac
+					end
 				end
 			end
 		end
 	end
-	if #macs == 0 then return {} end
-
-	local ip_by_mac       = M._ip_by_mac()
-	local hostname_by_mac = M._hostname_by_mac()
-
-	local now = M._time()
-	local hosts = {}
-	for _, mac in ipairs(macs) do
-		local first_seen = M._note_seen(ifname .. " " .. mac, now)
-		hosts[#hosts + 1] = {
-			mac      = mac,
-			ip       = ip_by_mac[mac:lower()],
-			hostname = hostname_by_mac[mac:lower()],
-			-- age: seconds since last observed on this fdb -- 0 since this
-			-- call just observed it fresh (matches TtZhv's use of `age` to
-			-- pick the more-recently-seen of two ports reporting the same
-			-- client, favoring whichever port's dump is being processed).
-			age      = 0,
-			uptime   = math.floor(now - first_seen),
-		}
+	local tap
+	if allow_tap then
+		tap = M.nft_tap()
+		if not macs or #macs == 0 then macs = tap.macs[ifname] end
 	end
-	return hosts
+	if not macs or #macs == 0 then return {} end
+	return hosts_from_macs(ifname, macs, tap and tap.ips[ifname] or nil)
+end
+
+-- === The uplink question's near-static half, cached ========================
+--
+-- Uplink detection must stay MEASURED rather than declared -- a modelmap
+-- constant is wrong the moment someone moves the cable. But two of its three
+-- inputs are not measurements of the cable at all, and were re-asked every ten
+-- seconds anyway: which bridge a netdev is enslaved to (`readlink
+-- /sys/class/net/<if>/master`, changes only on a network reload) and the
+-- gateway's IP (`ip route show default`, which on an AP changes essentially
+-- never). Both are cached for five minutes -- the PHY_INFO_TTL discipline.
+-- What stays live is the half that actually follows the cable: the gateway's
+-- MAC is looked up in the ARP cache every heartbeat and resolved against the
+-- ARL/FDB every heartbeat, so a moved cable still lands on the next one.
+--
+-- A nil answer is NOT cached. "No default route yet" and "not a bridge port
+-- yet" are both ordinary states during boot, before DHCP has settled or netifd
+-- has finished; caching them would leave the device unable to find its uplink
+-- for the next five minutes.
+M.UPLINK_TTL = 300
+M._uplink_cache = {}
+local function uplink_memo(key, fn)
+	local now = M._time()
+	local c = M._uplink_cache[key]
+	if c and (now - c.at) < M.UPLINK_TTL then return c.value end
+	local value = fn()
+	if value ~= nil then M._uplink_cache[key] = {value = value, at = now} end
+	return value
+end
+
+-- Drop everything the TTL cache holds, for the one event the TTL cannot cover:
+-- openUF itself moving a socket between bridges. The 300 s here is tuned for
+-- "a human moved a cable", which nobody does twice a minute -- but a controller
+-- push that reassigns a port VLAN rewrites the answer to bridge_of() in the
+-- same second, and a port reporting against the bridge it was in five minutes
+-- ago reports no hosts at all. Called on the config path, not the heartbeat.
+function M.forget_uplink_cache()
+	M._uplink_cache = {}
 end
 
 -- Which netdev the uplink cable is in, on a board whose sockets ARE netdevs --
@@ -697,10 +974,12 @@ end
 -- /sys/class/net/<if>/master symlinks to the enslaving device.
 function M.bridge_of(ifname)
 	if not ifname then return nil end
-	local m = M._run_cmd("readlink /sys/class/net/" .. ifname .. "/master")
-	m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
-	if m and m ~= "" and m ~= ifname then return m end
-	return nil
+	return uplink_memo("bridge_of:" .. ifname, function()
+		local m = M._run_cmd("readlink /sys/class/net/" .. ifname .. "/master")
+		m = type(m) == "string" and m:match("([^/%s]+)%s*$") or nil
+		if m and m ~= "" and m ~= ifname then return m end
+		return nil
+	end)
 end
 
 -- The bridge whose FDB answers "which socket is the gateway behind", given
@@ -734,8 +1013,13 @@ end
 -- separable only by that word, and counting it would put the AP's own socket
 -- MAC in its own client list.
 function M.bridge_fdb_ports(bridge)
+	if not bridge then return {} end
+	-- Memoized for the length of a pass: this one dump answers the uplink
+	-- question AND every socket's own host list (see M.mac_table), which
+	-- otherwise forked `bridge fdb show dev <socket>` once per socket for a
+	-- strict subset of what is already here.
+	return pass_memo("fdb_br:" .. bridge, function()
 	local ports = {}
-	if not bridge then return ports end
 	local out = M._run_cmd("bridge fdb show br " .. bridge)
 	if not out or out == "" then return ports end
 	for line in out:gmatch("[^\n]+") do
@@ -747,6 +1031,7 @@ function M.bridge_fdb_ports(bridge)
 		end
 	end
 	return ports
+	end)
 end
 
 -- Which bridge port -- i.e. which socket -- the uplink cable is in, as an
@@ -857,10 +1142,12 @@ end
 -- detectors are only different ways of asking the switch where that MAC
 -- lives: swconfig's ARL table on ath79, the bridge FDB on DSA.
 function M._default_gateway_mac()
-	local gw_ip = tostring(M._run_cmd("ip route show default") or "")
-		:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
+	local gw_ip = uplink_memo("default_gw_ip", function()
+		return tostring(M._run_cmd("ip route show default") or "")
+			:match("default%s+via%s+(%d+%.%d+%.%d+%.%d+)")
+	end)
 	if not gw_ip then return nil end
-	local arp_out = M._read_file("/proc/net/arp")
+	local arp_out = arp_text()
 	if not arp_out then return nil end
 	for line in arp_out:gmatch("[^\n]+") do
 		local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
@@ -879,17 +1166,8 @@ end
 -- caller, which is where both sets are already known.
 function M.switch_mac_table(phys, arl)
 	if phys == nil or type(arl) ~= "table" then return {} end
-	local macs = {}
-	for mac, port in pairs(arl) do
-		if port == phys then
-			local first_octet = tonumber(mac:sub(1, 2), 16)
-			if first_octet and first_octet % 2 == 0 then
-				macs[#macs + 1] = mac
-			end
-		end
-	end
-	if #macs == 0 then return {} end
-	table.sort(macs)   -- pairs() order is undefined; keep the payload stable
+	local macs = hosts_by_port(arl)[phys]
+	if not macs or #macs == 0 then return {} end
 
 	local ip_by_mac       = M._ip_by_mac()
 	local hostname_by_mac = M._hostname_by_mac()

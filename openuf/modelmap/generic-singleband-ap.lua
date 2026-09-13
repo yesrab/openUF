@@ -26,9 +26,7 @@ dev.conf.net = {
 	lan_name	= "lan",
 	lan_cpueth	= "eth1",
 	lan_vlanid	= 1,
-	wan_name	= "wan",
 	wan_cpueth	= "eth0",
-	wan_vlanid	= 4090,
 	-- UniFi port_idx -> netdev mapping for the inform payload's port_table.
 	-- The netdev-based shape, for the same reason the dual-band generic uses
 	-- it: a generic profile cannot know a board's socket layout. See
@@ -53,6 +51,11 @@ dev.conf.led = nil
 -- reads it. TP-Link boards commonly put the WAN socket on physical 1 with the
 -- LAN sockets at 2-5, as the Archer C5 turned out to.
 dev.conf.vlan = {
+	-- swconfig device name, as `swconfig list` reports it. Every reader used
+	-- to fall through to a hardcoded "switch0" because no map set this; on a
+	-- board whose switch is switch1 every swconfig call then silently
+	-- addressed a device that does not exist.
+	device	= "switch0",
 	cpu_lan	= 0,
 	cpu_wan	= 6,
 	ports	= {

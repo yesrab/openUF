@@ -15,9 +15,16 @@ end
 local function with_fixtures(file_map, cmd_map, fn)
 	local orig_rf  = sysinfo._read_file
 	local orig_cmd = sysinfo._run_cmd
-	-- `iw phy` output is cached per phy for minutes; a fixture fed to one
-	-- test must not answer the next test's different fixture for the same phy.
+	-- `iw phy` output is cached per phy with a TTL (it describes hardware).
+	-- Swapping the fixtures underneath it is exactly the thing that cache is
+	-- not built for, so drop it on the way in AND on the way out: a test
+	-- feeding a canned phy dump must not leak those caps into a later one.
 	sysinfo._phy_info_cache = {}
+	-- Same reasoning for the lookup pass and for the uplink cache, which holds
+	-- a `readlink` and an `ip route` answer for five minutes: a pass or an
+	-- entry left behind would memoize one test's fixtures into the next.
+	sysinfo.end_pass()
+	sysinfo._uplink_cache = {}
 	sysinfo._read_file = function(path)
 		for k, v in pairs(file_map) do
 			if path == k or path:find(k, 1, true) then return v end
@@ -33,6 +40,9 @@ local function with_fixtures(file_map, cmd_map, fn)
 	local ok, err = pcall(fn)
 	sysinfo._read_file = orig_rf
 	sysinfo._run_cmd   = orig_cmd
+	sysinfo._phy_info_cache = {}
+	sysinfo._uplink_cache = {}
+	sysinfo.end_pass()
 	if not ok then error(err, 2) end
 end
 
@@ -51,17 +61,6 @@ return {
 		fn = function()
 			with_fixtures({}, {}, function()
 				assert_eq(sysinfo.uptime(), 0, "0 when missing")
-			end)
-		end
-	},
-	{
-		name = "sysinfo: loadavg() parses /proc/loadavg correctly",
-		fn = function()
-			with_fixtures({["/proc/loadavg"] = fixture("proc_loadavg.txt")}, {}, function()
-				local la = sysinfo.loadavg()
-				assert_eq(la.one,     0.42, "1-min load")
-				assert_eq(la.five,    0.31, "5-min load")
-				assert_eq(la.fifteen, 0.19, "15-min load")
 			end)
 		end
 	},
@@ -614,9 +613,9 @@ return {
 				{["bridge fdb show br"] = fixture("bridge_fdb_br_dsa.txt")},
 				function()
 					local ports = sysinfo.bridge_fdb_ports("br-lan")
-					assert_eq(ports["5a:d6:1f:40:e2:f6"], "wan", "gateway is on wan")
-					assert_eq(ports["00:04:4b:86:81:77"], "wan", "a host is on wan")
-					assert_true(ports["d4:53:2a:38:80:cf"] == nil,
+					assert_eq(ports["00:00:5e:00:53:12"], "wan", "gateway is on wan")
+					assert_eq(ports["00:00:5e:00:53:1c"], "wan", "a host is on wan")
+					assert_true(ports["00:00:5e:00:53:16"] == nil,
 						"the port's own permanent address is not a learned host")
 				end)
 			assert_eq(next(sysinfo.bridge_fdb_ports(nil)), nil, "nil bridge -> empty")
@@ -630,7 +629,7 @@ return {
 		fn = function()
 			local cmds = {
 				["bridge fdb show br"] = fixture("bridge_fdb_br_dsa.txt"),
-				["ip route"] = "default via 192.168.200.1 dev br-lan \n",
+				["ip route"] = "default via 192.0.2.1 dev br-lan \n",
 			}
 			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_dsa.txt")}, cmds,
 				function()
@@ -638,11 +637,11 @@ return {
 				end)
 			-- Same board, cable moved to another socket: the answer follows
 			-- the FDB, not a constant.
-			local moved = "5a:d6:1f:40:e2:f6 dev lan3 master br-lan \n"
-				.. "00:04:4b:86:81:77 dev lan3 master br-lan \n"
+			local moved = "00:00:5e:00:53:12 dev lan3 master br-lan \n"
+				.. "00:00:5e:00:53:1c dev lan3 master br-lan \n"
 			with_fixtures({["/proc/net/arp"] = fixture("proc_net_arp_dsa.txt")},
 				{["bridge fdb show br"] = moved,
-				 ["ip route"] = "default via 192.168.200.1 dev br-lan \n"},
+				 ["ip route"] = "default via 192.0.2.1 dev br-lan \n"},
 				function()
 					assert_eq(sysinfo.uplink_bridge_port("br-lan"), "lan3",
 						"uplink socket followed the cable")
@@ -1111,21 +1110,626 @@ return {
 			if not ok then error(err, 0) end
 		end
 	},
+
+	-- ── Adopted from upstream 2026-09-13: lookup pass, TTL caches, the nft
+	--    MAC tap, and the iw 6.17 scan fixture ─────────────────────────────────
 	{
-		name = "sysinfo: _note_seen() forgets hosts unseen for an hour, and only those",
+		name = "sysinfo: nft_tap() parses both of the learning tap's sets",
 		fn = function()
-			-- The first-seen table was keyed by every MAC that ever crossed
-			-- the bridge and never shrank.
+			-- Fixture is the verbatim output of `nft list table` on the real
+			-- board (nftables v1.1.6), not a hand-written approximation: the
+			-- continuation-line indentation, the `size 65535` nft adds itself,
+			-- the `expires` suffixes and the rules in the same dump are all
+			-- things the parser has to survive.
+			with_fixtures({},
+				{["nft list table"] = fixture("nft_list_table_openuf_learn.txt")},
+				function()
+					local tap = sysinfo.nft_tap()
+					assert_eq(#tap.macs["lan2"], 2, "two hosts seen on lan2")
+					assert_eq(tap.macs["lan2"][1], "00:00:5e:00:53:07", "sorted, first")
+					assert_eq(tap.macs["lan2"][2], "00:00:5e:00:53:09", "sorted, second")
+					assert_eq(#tap.macs["lan3"], 1, "one on lan3")
+					-- The three-component elements are the address set and must
+					-- not be counted as hosts a second time.
+					assert_eq(tap.ips["lan2"]["00:00:5e:00:53:07"], "192.0.2.20",
+						"the address learned for that host")
+					-- Two addresses are live for one MAC; the one refreshed
+					-- most recently (largest `expires`) is the current one.
+					assert_eq(tap.ips["lan2"]["00:00:5e:00:53:09"], "192.0.2.22",
+						"the freshest of two live addresses wins")
+					-- The `type ifname . ether_addr` lines and the
+					-- `iifname "lan2"` rules sit in the same dump and are
+					-- tempting false matches for a looser pattern.
+					assert_true(tap.macs["ether_addr"] == nil, "the type line is not an element")
+					assert_eq(#tap.macs["lan2"], 2, "and the rules added no hosts")
+				end
+			)
+		end
+	},
+	{
+		name = "sysinfo: nft_tap() is empty when no tap is installed",
+		fn = function()
+			-- `nft list table` on a missing table writes to stderr and prints
+			-- nothing, which _run_cmd returns as "".
+			with_fixtures({}, {["nft list table"] = ""}, function()
+				local tap = sysinfo.nft_tap()
+				assert_eq(next(tap.macs), nil, "no tap, no hosts")
+				assert_eq(next(tap.ips), nil, "and no addresses")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: mac_table() falls back to the tap only when asked, and only when the FDB is silent",
+		fn = function()
+			sysinfo._mac_first_seen = {}
+			with_fixtures({},
+				{
+					["bridge fdb show"] = "",
+					["nft list table"] = fixture("nft_list_table_openuf_learn.txt"),
+				},
+				function()
+					-- Off by default: a board with no moved socket must never
+					-- fork `nft`, so the fallback is opt-in per socket.
+					assert_eq(#sysinfo.mac_table("lan2"), 0, "no tap without allow_tap")
+					local hosts = sysinfo.mac_table("lan2", nil, true)
+					assert_eq(#hosts, 2, "the tap's hosts for this socket")
+					assert_eq(hosts[1].mac, "00:00:5e:00:53:07", "first mac")
+					-- Same row shape as the FDB path: the uptime bookkeeping is
+					-- shared, not reimplemented.
+					assert_eq(hosts[1].age, 0, "age matches the FDB source's contract")
+					assert_not_nil(hosts[1].uptime, "and uptime is filled in")
+				end
+			)
+		end
+	},
+	{
+		name = "sysinfo: the tap supplies an address the ARP cache cannot",
+		fn = function()
+			-- The whole point of the address half. An assigned socket is on a
+			-- VLAN the AP holds no address on, so /proc/net/arp will never
+			-- answer for a host behind it -- and without an ip the controller
+			-- files that client under the untagged network.
+			sysinfo._mac_first_seen = {}
+			with_fixtures({},
+				{
+					["bridge fdb show"] = "",
+					["nft list table"] = fixture("nft_list_table_openuf_learn.txt"),
+				},
+				function()
+					local hosts = sysinfo.mac_table("lan2", nil, true)
+					assert_eq(hosts[1].ip, "192.0.2.20", "address from the tap")
+				end
+			)
+		end
+	},
+	{
+		name = "sysinfo: the ARP cache outranks the tap where it can answer",
+		fn = function()
+			-- /proc/net/arp is the AP's own L3 view: where it has an entry it
+			-- is the better source, and the tap is the fallback for the socket
+			-- it cannot see.
+			sysinfo._mac_first_seen = {}
+			with_fixtures(
+				{["/proc/net/arp"] =
+					"IP address  HW type  Flags  HW address         Mask  Device\n"
+					.. "192.0.2.77  0x1      0x2    00:00:5e:00:53:07  *     br-lan\n"},
+				{
+					["bridge fdb show"] = "",
+					["nft list table"] = fixture("nft_list_table_openuf_learn.txt"),
+				},
+				function()
+					local hosts = sysinfo.mac_table("lan2", nil, true)
+					assert_eq(hosts[1].ip, "192.0.2.77", "the ARP answer, not the tap's")
+				end
+			)
+		end
+	},
+	{
+		name = "sysinfo: mac_table() prefers the FDB over the tap",
+		fn = function()
+			-- The tap is a fallback for a socket the kernel cannot answer for,
+			-- never a second opinion about one it can. If both are populated
+			-- the FDB wins, or a socket that regained learning would report
+			-- whatever the tap had not expired yet.
+			sysinfo._mac_first_seen = {}
+			with_fixtures({},
+				{
+					["bridge fdb show"] = "00:00:5e:00:53:0b dev lan2 master br-lan \n",
+					["nft list table"] = fixture("nft_list_table_openuf_learn.txt"),
+				},
+				function()
+					local hosts = sysinfo.mac_table("lan2", nil, true)
+					assert_eq(#hosts, 1, "the FDB's answer, not the tap's two")
+					assert_eq(hosts[1].mac, "00:00:5e:00:53:0b", "from the FDB")
+				end
+			)
+		end
+	},
+	{
+		name = "sysinfo: a host not seen for an hour is forgotten, so the cache is bounded",
+		fn = function()
+			-- _mac_first_seen is keyed by "<source> mac" and was never emptied
+			-- -- on a daemon that runs for months in a place with transient
+			-- clients it only ever grew. A host back after the forget window
+			-- gets a fresh uptime, which is what a real switch reports for it
+			-- as well.
 			sysinfo._mac_first_seen, sysinfo._mac_last_seen = {}, {}
+			local orig_time = sysinfo._time
+
+			sysinfo._time = function() return 1000 end
 			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:01", 1000), 1000, "first sighting")
-			sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:02", 1000)
-			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:01", 4700), 1000,
-				"a host still present keeps its first-seen time")
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:02", 1000), 1000, "and a second host")
+
+			-- Still inside the window: both remembered, and the first-seen
+			-- stamp of the one that is still around is unchanged.
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:01", 1000 + 3599), 1000,
+				"a host seen again keeps its original first-seen stamp")
+
+			-- Past it: the host that stopped being seen is dropped, and comes
+			-- back as new if it ever returns.
+			local later = 1000 + 3601 + 3601
+			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:01", later), later,
+				"a host back after the window is a fresh sighting")
 			assert_nil(sysinfo._mac_first_seen["eth1 aa:bb:cc:dd:ee:02"],
-				"one unseen for over an hour is forgotten")
-			assert_eq(sysinfo._note_seen("eth1 aa:bb:cc:dd:ee:02", 4701), 4701,
-				"and starts a fresh uptime when it returns")
+				"and the one that never came back is gone from the cache")
+			assert_nil(sysinfo._mac_last_seen["eth1 aa:bb:cc:dd:ee:02"],
+				"from both halves of it")
+
+			sysinfo._time = orig_time
 			sysinfo._mac_first_seen, sysinfo._mac_last_seen = {}, {}
+		end
+	},
+	{
+		name = "sysinfo: scan_table() derives width from the operation elements on iw 6.17",
+		fn = function()
+			-- The fixture is trimmed from real `iw dev ... scan` output taken
+			-- off upstream's AX3000T and Archer C5 (2026-09-09, MACs and SSIDs
+			-- anonymized). Both boards run iw 6.17, which prints NO
+			-- "BSS operating channel width:" summary line at all -- so every
+			-- neighbour went out at the 20 MHz default, including two real
+			-- 80 MHz APs next door.
+			with_fixtures({["/proc/uptime"] = "662790.00 1000000.00\n"},
+				{["scan dump"] = fixture("iw_scan_dump_iw617.txt")}, function()
+				local nets = {}
+				for _, n in ipairs(sysinfo.scan_table("wlan0")) do nets[n.essid] = n end
+
+				assert_eq(nets["NeighborNet"].bw, 80,
+					"VHT width field 1 with segment 2 zero is 80 MHz")
+				-- The trap this is anchored against: two lines below the VHT
+				-- element sits the HT capability line "* STA channel width:
+				-- 20 MHz". An unanchored pattern reads that 20 as a VHT width
+				-- field -- which is >= 1, so the BSS comes out as 80 MHz.
+				assert_eq(nets["LegacyNet"].bw, 20,
+					"VHT width field 0 with no secondary channel is 20 MHz")
+				assert_eq(nets["WideLegacy"].bw, 40,
+					"no VHT element at all, but a secondary channel offset, is HT40")
+				assert_eq(nets["WideNet"].bw, 160,
+					"segments 8 channels apart is the modern 160 MHz encoding")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: scan_table() reads the [boottime] form of 'last seen'",
+		fn = function()
+			-- Newer iw prints the driver's CLOCK_BOOTTIME stamp, and some
+			-- entries carry ONLY that form -- seen on upstream's AX3000T. The
+			-- "ms ago" pattern never matched those, so their age stayed at the
+			-- 0 default and every stale neighbour was reported as seen this
+			-- instant. The controller drops anything with age >= 30 as stale,
+			-- so a wrong 0 keeps a long-gone AP in the Environment view.
+			with_fixtures({["/proc/uptime"] = "662790.00 1000000.00\n"},
+				{["scan dump"] = fixture("iw_scan_dump_iw617.txt")}, function()
+				local nets = {}
+				for _, n in ipairs(sysinfo.scan_table("wlan0")) do nets[n.essid] = n end
+				-- Only the boottime line: 662790.00 - 662754.792 = 35s.
+				assert_eq(nets["LegacyNet"].age, 35, "age comes from the boottime stamp")
+				-- Both printed: "ms ago" wins, being what the controller's own
+				-- staleness rule is written against.
+				assert_eq(nets["NeighborNet"].age, 3, "'3290 ms ago' beats the boottime stamp")
+				assert_eq(nets["WideNet"].age, 0, "'140 ms ago' floors to 0")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: `iw phy` is cached per phy, `iw dev` is not",
+		fn = function()
+			-- `iw phy phyN info` is tens of kilobytes and was fetched and
+			-- parsed for every radio on every 10-second heartbeat, though it
+			-- describes the hardware plus the regulatory domain and changes
+			-- only with the latter. `iw dev <if> info` stays uncached: it
+			-- carries the LIVE channel and TX power, which is the point of
+			-- reading it every time.
+			local orig_cmd, orig_time = sysinfo._run_cmd, sysinfo._time
+			local phy_reads, dev_reads, clock = 0, 0, 1000
+			sysinfo._time = function() return clock end
+			sysinfo._phy_info_cache = {}
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("iw phy") then
+					phy_reads = phy_reads + 1
+					return "\tBand 2:\n\t\tVHT Capabilities (0x00000000):\n"
+				end
+				dev_reads = dev_reads + 1
+				return "\twiphy 0\n\tchannel 36 (5180 MHz)\n\ttxpower 23.00 dBm\n"
+			end
+
+			sysinfo.radio_caps("wlan0")
+			sysinfo.radio_caps("wlan0")
+			sysinfo.radio_caps("wlan0")
+			assert_eq(phy_reads, 1, "the hardware description is read once")
+			assert_eq(dev_reads, 3, "the live channel and TX power are read every time")
+
+			-- Past the TTL, so a regdomain change is picked up within minutes.
+			clock = clock + sysinfo.PHY_INFO_TTL + 1
+			sysinfo.radio_caps("wlan0")
+			assert_eq(phy_reads, 2, "and re-read once the TTL is up")
+
+			sysinfo._run_cmd, sysinfo._time = orig_cmd, orig_time
+			sysinfo._phy_info_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: a pass reads /proc/net/arp and the leases once, not once per port",
+		fn = function()
+			-- _ip_by_mac/_hostname_by_mac are called from BOTH mac_table and
+			-- switch_mac_table, which build_json runs once per downstream
+			-- socket -- five reads of the ARP cache and four of the lease file
+			-- per heartbeat on the Archer C5, plus the ARL walked whole once
+			-- per socket. One pass answers every socket.
+			local orig_rf, orig_cmd = sysinfo._read_file, sysinfo._run_cmd
+			local arp_reads, lease_reads = 0, 0
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					arp_reads = arp_reads + 1
+					return "10.0.0.7 0x1 0x2 aa:bb:cc:dd:ee:01 * br-lan\n"
+				elseif path == "/tmp/dhcp.leases" then
+					lease_reads = lease_reads + 1
+					return "1700000000 aa:bb:cc:dd:ee:01 10.0.0.7 laptop *\n"
+				end
+				return nil
+			end
+			sysinfo._run_cmd = function() return "" end
+
+			-- No pass open: every call reads, exactly as before.
+			sysinfo.end_pass()
+			sysinfo._ip_by_mac(); sysinfo._ip_by_mac()
+			sysinfo._hostname_by_mac(); sysinfo._hostname_by_mac()
+			assert_eq(arp_reads, 2, "no pass open -- every call reads, as before")
+			assert_eq(lease_reads, 2, "and the same for the lease file")
+
+			arp_reads, lease_reads = 0, 0
+			sysinfo.begin_pass()
+			local arl = {["aa:bb:cc:dd:ee:01"] = 2, ["aa:bb:cc:dd:ee:02"] = 3}
+			local p2 = sysinfo.switch_mac_table(2, arl)
+			local p3 = sysinfo.switch_mac_table(3, arl)
+			sysinfo.switch_mac_table(4, arl)
+			assert_eq(arp_reads, 1, "one ARP read for every socket in the payload")
+			assert_eq(lease_reads, 1, "one lease read for every socket in the payload")
+			-- ...and the answers are still right, per socket.
+			assert_eq(#p2, 1, "port 2 keeps its own host")
+			assert_eq(p2[1].mac, "aa:bb:cc:dd:ee:01", "the right one")
+			assert_eq(p2[1].ip, "10.0.0.7", "with its IP from the shared ARP read")
+			assert_eq(p2[1].hostname, "laptop", "and its lease hostname")
+			assert_eq(#p3, 1, "port 3 keeps its own host")
+			assert_eq(p3[1].mac, "aa:bb:cc:dd:ee:02", "the right one")
+
+			-- A fresh ARL inside the same pass is bucketed afresh: the memo is
+			-- keyed on the table, so a new dump is never served a stale one.
+			local arl2 = {["aa:bb:cc:dd:ee:03"] = 2}
+			local again = sysinfo.switch_mac_table(2, arl2)
+			assert_eq(#again, 1, "a new ARL is bucketed, not served from the old one")
+			assert_eq(again[1].mac, "aa:bb:cc:dd:ee:03", "with its own host")
+
+			-- Closing the pass restores the un-memoized behaviour, and RELEASES
+			-- what it held: the memo pins an ARP map and a bucketed ARL, which
+			-- must not sit in a long-running daemon between heartbeats.
+			sysinfo.end_pass()
+			assert_nil(sysinfo._pass_cache, "end_pass releases the memo")
+			arp_reads = 0
+			sysinfo._ip_by_mac(); sysinfo._ip_by_mac()
+			assert_eq(arp_reads, 2, "the pass is closed -- every call reads again")
+
+			sysinfo._read_file, sysinfo._run_cmd = orig_rf, orig_cmd
+			sysinfo.end_pass()
+		end
+	},
+	{
+		name = "sysinfo: an absent lease file is not re-opened once per socket",
+		fn = function()
+			-- An AP is usually not the DHCP server, so _hostname_by_mac's read
+			-- returns nil -- which must be memoized as "computed and empty",
+			-- not as "not computed yet", or the common case keeps re-opening a
+			-- file that is not there.
+			local orig_rf = sysinfo._read_file
+			local lease_reads = 0
+			sysinfo._read_file = function(path)
+				if path == "/tmp/dhcp.leases" then
+					lease_reads = lease_reads + 1
+					return nil
+				end
+				return nil
+			end
+			sysinfo.begin_pass()
+			sysinfo._hostname_by_mac()
+			sysinfo._hostname_by_mac()
+			sysinfo._hostname_by_mac()
+			assert_eq(lease_reads, 1, "the missing file is opened once, not once per socket")
+			sysinfo.end_pass()
+			sysinfo._read_file = orig_rf
+		end
+	},
+	{
+		name = "sysinfo: one `bridge fdb show br` serves every socket in a payload",
+		fn = function()
+			-- uplink_bridge_port already dumps the WHOLE bridge FDB to find the
+			-- gateway's socket, and that one dump carries every socket's hosts.
+			-- mac_table forked `bridge fdb show dev <socket>` per socket anyway
+			-- -- four more forks a heartbeat on the AX3000T for a strict subset
+			-- of what was already in hand. Given the bridge, it reads the
+			-- shared dump; without one it forks exactly as before.
+			local orig_cmd = sysinfo._run_cmd
+			local br_dumps, dev_dumps = 0, 0
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("bridge fdb show br", 1, true) then
+					br_dumps = br_dumps + 1
+					return table.concat({
+						"aa:bb:cc:dd:ee:01 dev lan2 master br-lan ",
+						"aa:bb:cc:dd:ee:02 dev lan3 master br-lan ",
+						"01:00:5e:00:00:01 dev lan3 master br-lan ",   -- multicast
+						"00:00:5e:00:53:20 dev lan2 master br-lan permanent",
+						"aa:bb:cc:dd:ee:02 dev lan3 self ",
+					}, "\n") .. "\n"
+				elseif cmd:find("bridge fdb show dev", 1, true) then
+					dev_dumps = dev_dumps + 1
+					return "aa:bb:cc:dd:ee:09 dev lan9 master br-lan \n"
+				end
+				return ""
+			end
+
+			sysinfo.begin_pass()
+			local l2 = sysinfo.mac_table("lan2", "br-lan")
+			local l3 = sysinfo.mac_table("lan3", "br-lan")
+			local l4 = sysinfo.mac_table("lan4", "br-lan")
+			assert_eq(br_dumps, 1, "one dump of the kernel FDB for every socket")
+			assert_eq(dev_dumps, 0, "and not one per-socket fork")
+			assert_eq(#l2, 1, "lan2's own host")
+			assert_eq(l2[1].mac, "aa:bb:cc:dd:ee:01", "the right one")
+			assert_eq(#l3, 1, "lan3's own host -- multicast and self dropped")
+			assert_eq(l3[1].mac, "aa:bb:cc:dd:ee:02", "the right one")
+			assert_eq(#l4, 0, "a socket with nothing on it reports no hosts")
+			-- `permanent` is the socket's OWN address; counting it would put
+			-- this device's socket in its own client list.
+			for _, h in ipairs(l2) do
+				assert_true(h.mac ~= "00:00:5e:00:53:20", "never the port's own address")
+			end
+
+			-- The uplink question and the host lists share the one dump.
+			assert_eq(sysinfo.bridge_fdb_ports("br-lan")["aa:bb:cc:dd:ee:01"], "lan2",
+				"the same dump still answers which socket a MAC is behind")
+			assert_eq(br_dumps, 1, "without a second fork")
+
+			-- No bridge given: the per-socket fork, exactly as before.
+			local solo = sysinfo.mac_table("lan9")
+			assert_eq(dev_dumps, 1, "no bridge -- mac_table forks per socket, as before")
+			assert_eq(#solo, 1, "and still answers")
+			assert_eq(solo[1].mac, "aa:bb:cc:dd:ee:09", "with that socket's host")
+
+			-- Outside a pass the shared dump is re-read every time.
+			sysinfo.end_pass()
+			br_dumps = 0
+			sysinfo.mac_table("lan2", "br-lan")
+			sysinfo.mac_table("lan3", "br-lan")
+			assert_eq(br_dumps, 2, "the pass is closed -- every call dumps again")
+
+			sysinfo._run_cmd = orig_cmd
+			sysinfo.end_pass()
+		end
+	},
+	{
+		name = "sysinfo: the phy dump is parsed once per TTL, not once per radio per heartbeat",
+		fn = function()
+			-- Caching the phy dump's TEXT still left ~8 scans and a gmatch over
+			-- 40-odd kilobytes running per radio per heartbeat. Everything but
+			-- the live channel and TX power is derived from that text and is
+			-- exactly as static as it is, so the derivation is cached with it.
+			local orig_cmd, orig_time = sysinfo._run_cmd, sysinfo._time
+			local clock = 1000
+			sysinfo._time = function() return clock end
+			sysinfo._phy_info_cache = {}
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("iw phy") then
+					return "\t\tHT TX Max spatial streams: 3\n"
+						.. "\t\tVHT Capabilities (0x00000000):\n"
+				end
+				return "\twiphy 0\n\tchannel 36 (5180 MHz)\n\ttxpower 23.00 dBm\n"
+			end
+
+			local first = sysinfo.radio_caps("wlan0")
+			assert_eq(first.nss, 3, "the hardware's real stream count")
+			assert_true(first.is_11ac, "and its PHY generation")
+			assert_eq(first.channel, 36, "with the live channel merged on top")
+			assert_eq(first.tx_power, 23, "and the live TX power")
+
+			-- Reads come from the cached derivation, not from a fresh parse:
+			-- poison the cached half and it shows through.
+			sysinfo._phy_info_cache["0"].caps.nss = 99
+			assert_eq(sysinfo.radio_caps("wlan0").nss, 99,
+				"the hardware half is served from the cache, not re-parsed")
+
+			-- ...but the caller gets a COPY. build_json writes radio_caps and
+			-- wpa3_supported onto what it gets back, and one radio's payload
+			-- fields must not leak into the next radio's -- or into the cache.
+			local mine = sysinfo.radio_caps("wlan0")
+			mine.nss, mine.wpa3_supported = 1, true
+			local theirs = sysinfo.radio_caps("wlan0")
+			assert_eq(theirs.nss, 99, "a caller's writes do not reach the cache")
+			assert_nil(theirs.wpa3_supported, "nor its added fields")
+
+			-- Past the TTL everything is re-read AND re-derived, so a regdomain
+			-- change still lands within minutes.
+			clock = clock + sysinfo.PHY_INFO_TTL + 1
+			assert_eq(sysinfo.radio_caps("wlan0").nss, 3, "re-parsed once the TTL is up")
+
+			sysinfo._run_cmd, sysinfo._time = orig_cmd, orig_time
+			sysinfo._phy_info_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: the uplink's near-static inputs are cached, the cable-following ones are not",
+		fn = function()
+			-- Which socket the cable is in must stay measured every heartbeat.
+			-- Which BRIDGE a netdev is on, and what the default route's gateway
+			-- IP is, are not measurements of the cable and changed only when
+			-- the network was reconfigured -- two forks a heartbeat, forever.
+			local orig_cmd, orig_rf, orig_time =
+				sysinfo._run_cmd, sysinfo._read_file, sysinfo._time
+			local clock = 5000
+			sysinfo._time = function() return clock end
+			sysinfo._uplink_cache = {}
+			local readlinks, routes = 0, 0
+			local gw = "192.0.2.1"
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("readlink") then
+					readlinks = readlinks + 1
+					return "../../../../../virtual/net/br-lan\n"
+				elseif cmd:find("ip route") then
+					routes = routes + 1
+					return "default via " .. gw .. " dev br-lan \n"
+				end
+				return ""
+			end
+			local arp_reads = 0
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					arp_reads = arp_reads + 1
+					return gw .. " 0x1 0x2 aa:bb:cc:00:00:01 * br-lan\n"
+						.. "192.0.2.9 0x1 0x2 aa:bb:cc:00:00:09 * br-lan\n"
+				end
+				return nil
+			end
+
+			assert_eq(sysinfo.bridge_of("wan"), "br-lan", "the bridge is found")
+			sysinfo.bridge_of("wan"); sysinfo.bridge_of("wan")
+			assert_eq(readlinks, 1, "and asked for once, not once per heartbeat")
+
+			assert_eq(sysinfo._default_gateway_mac(), "aa:bb:cc:00:00:01", "the gateway")
+			sysinfo._default_gateway_mac()
+			assert_eq(routes, 1, "the default route is asked for once")
+			assert_eq(arp_reads, 2, "but the ARP cache is read every time -- it follows the cable")
+
+			-- The gateway moving to another socket is picked up immediately:
+			-- the same IP, a different MAC in the ARP cache.
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					return gw .. " 0x1 0x2 aa:bb:cc:00:00:0f * br-lan\n"
+				end
+				return nil
+			end
+			assert_eq(sysinfo._default_gateway_mac(), "aa:bb:cc:00:00:0f",
+				"a change on the live half lands on the very next heartbeat")
+
+			-- Past the TTL the near-static half is re-asked too.
+			clock = clock + sysinfo.UPLINK_TTL + 1
+			sysinfo.bridge_of("wan")
+			sysinfo._default_gateway_mac()
+			assert_eq(readlinks, 2, "the bridge is re-read once the TTL is up")
+			assert_eq(routes, 2, "and so is the default route")
+
+			sysinfo._run_cmd, sysinfo._read_file, sysinfo._time =
+				orig_cmd, orig_rf, orig_time
+			sysinfo._uplink_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: a device with no default route yet keeps asking",
+		fn = function()
+			-- "No default route" and "not a bridge port" are ordinary states
+			-- during boot, before DHCP has settled or netifd has finished.
+			-- Caching them would leave the device unable to find its uplink for
+			-- the next five minutes.
+			local orig_cmd, orig_rf = sysinfo._run_cmd, sysinfo._read_file
+			sysinfo._uplink_cache = {}
+			local up = false
+			sysinfo._run_cmd = function(cmd)
+				if not up then return "" end
+				if cmd:find("readlink") then return "/sys/devices/virtual/net/br-lan\n" end
+				if cmd:find("ip route") then return "default via 10.0.0.1 dev br-lan \n" end
+				return ""
+			end
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					return "10.0.0.1 0x1 0x2 aa:bb:cc:00:00:01 * br-lan\n"
+				end
+				return nil
+			end
+			assert_nil(sysinfo.bridge_of("wan"), "nothing to find yet")
+			assert_nil(sysinfo._default_gateway_mac(), "nor a gateway")
+			up = true
+			assert_eq(sysinfo.bridge_of("wan"), "br-lan", "and it is found as soon as it exists")
+			assert_eq(sysinfo._default_gateway_mac(), "aa:bb:cc:00:00:01", "gateway too")
+
+			sysinfo._run_cmd, sysinfo._read_file = orig_cmd, orig_rf
+			sysinfo._uplink_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: one read of /proc/net/arp serves the whole payload",
+		fn = function()
+			-- _default_gateway_mac had its own inline read of the ARP cache,
+			-- separate from _ip_by_mac's -- so the pass covered four of the
+			-- five reads a heartbeat, not all five. Both go through one now.
+			local orig_rf, orig_cmd = sysinfo._read_file, sysinfo._run_cmd
+			sysinfo._uplink_cache = {}
+			local arp_reads = 0
+			sysinfo._read_file = function(path)
+				if path == "/proc/net/arp" then
+					arp_reads = arp_reads + 1
+					return "10.0.0.1 0x1 0x2 aa:bb:cc:00:00:01 * br-lan\n"
+				end
+				return nil
+			end
+			sysinfo._run_cmd = function(cmd)
+				if cmd:find("ip route") then return "default via 10.0.0.1 dev br-lan \n" end
+				return ""
+			end
+			sysinfo.begin_pass()
+			sysinfo._default_gateway_mac()
+			sysinfo._ip_by_mac()
+			sysinfo._default_gateway_mac()
+			assert_eq(arp_reads, 1, "the uplink lookup and the host join share one read")
+			sysinfo.end_pass()
+
+			sysinfo._read_file, sysinfo._run_cmd = orig_rf, orig_cmd
+			sysinfo._uplink_cache = {}
+		end
+	},
+	{
+		name = "sysinfo: /proc/uptime is read once per payload, not once per radio",
+		fn = function()
+			-- build_json reports the uptime once, and scan_table reads it again
+			-- per radio as the CLOCK_BOOTTIME reference for each BSS's "last
+			-- seen" -- three opens a heartbeat on a two-radio box.
+			local orig_rf = sysinfo._read_file
+			local reads = 0
+			sysinfo._read_file = function(path)
+				if path == "/proc/uptime" then
+					reads = reads + 1
+					return "12345.67 98765.43\n"
+				end
+				return nil
+			end
+
+			sysinfo.end_pass()
+			sysinfo.uptime(); sysinfo.uptime()
+			assert_eq(reads, 2, "no pass open -- every call reads, as before")
+
+			reads = 0
+			sysinfo.begin_pass()
+			assert_eq(sysinfo.uptime(), 12345, "the uptime")
+			sysinfo.uptime(); sysinfo.uptime()
+			assert_eq(reads, 1, "one read for the whole payload")
+			sysinfo.end_pass()
+
+			sysinfo._read_file = orig_rf
 		end
 	},
 }

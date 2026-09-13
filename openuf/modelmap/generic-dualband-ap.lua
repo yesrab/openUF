@@ -22,9 +22,7 @@ dev.conf.net = {
 	lan_name	= "lan",
 	lan_cpueth	= "eth1",
 	lan_vlanid	= 1,
-	wan_name	= "wan",
 	wan_cpueth	= "eth0",
-	wan_vlanid	= 4090,
 	-- UniFi port_idx -> netdev mapping for the inform payload's port_table
 	-- (separate numbering space from dev.conf.vlan.ports below, which is
 	-- swconfig physical-switch-port numbering, not UniFi's port_idx).
@@ -59,6 +57,11 @@ dev.conf.led = nil
 
 -- Switch layout (common for both target devices)
 dev.conf.vlan = {
+	-- swconfig device name, as `swconfig list` reports it. Every reader used
+	-- to fall through to a hardcoded "switch0" because no map set this; on a
+	-- board whose switch is switch1 every swconfig call then silently
+	-- addressed a device that does not exist.
+	device	= "switch0",
 	cpu_lan	= 0,
 	cpu_wan	= 6,
 	ports	= {

@@ -1612,42 +1612,6 @@ return {
 		end
 	},
 	{
-		name = "ucihelper: apply_config writes sae_anti_clogging_threshold/sae_sync from vap fields",
-		fn = function()
-			with_ucihelper(function(db)
-				local resp = {
-					radio_table = {},
-					vap_table = {
-						{ssid = "corp", radio = "radio0", security = "wpa3",
-						 x_passphrase = "hunter22", sae_anti_clogging = 12, sae_sync = 20},
-					},
-				}
-				ucihelper.apply_config(resp, nil)
-				local s = db.wireless.openuf_radio0_corp
-				assert_eq(s.sae_anti_clogging_threshold, "12", "sae_anti_clogging_threshold written")
-				assert_eq(s.sae_sync, "20", "sae_sync written")
-			end)
-		end
-	},
-	{
-		name = "ucihelper: apply_config omits sae_anti_clogging_threshold/sae_sync when absent",
-		fn = function()
-			with_ucihelper(function(db)
-				local resp = {
-					radio_table = {},
-					vap_table = {
-						{ssid = "corp", radio = "radio0", security = "wpa2",
-						 x_passphrase = "hunter22"},
-					},
-				}
-				ucihelper.apply_config(resp, nil)
-				local s = db.wireless.openuf_radio0_corp
-				assert_eq(s.sae_anti_clogging_threshold, nil, "no sae_anti_clogging_threshold written")
-				assert_eq(s.sae_sync, nil, "no sae_sync written")
-			end)
-		end
-	},
-	{
 		name = "ucihelper: get_vap_table omits foreign SSIDs that are switched off",
 		fn = function()
 			-- OpenWrt's stock default_radioN sections, which
@@ -3170,6 +3134,419 @@ return {
 					assert_true(ssids[punct]:match("^openuf_radio0_Guest_WiFi_%x%x%x%x$") ~= nil,
 						punct .. " under a hash-suffixed, libuci-valid name")
 				end
+			end)
+		end
+	},
+
+	-- ── Adopted from upstream 2026-09-13: DSA learning overrides, bridge
+	--    identity, startup reapply of runtime rules, per-pass radio rows ─────
+	{
+		name = "ucihelper: apply_config does not write UCI options OpenWrt has no schema for",
+		fn = function()
+			-- Upstream verified 2026-09-10 on an Archer C5 (ath79) and an
+			-- AX3000T (filogic), both OpenWrt 25.12.5: neither name appears in
+			-- the wifi-iface schema, in /usr/share/ucode/wifi/, or in
+			-- hostapd.sh's config_add_* lists -- the three places a wifi-iface
+			-- option can be declared. openUF wrote both anyway; UCI stored them
+			-- and the generator dropped them without a word. A negative test,
+			-- so the write cannot quietly come back on the strength of the
+			-- names being real hostapd keys -- which they are, just not UCI ones.
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				local resp = {
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa3",
+						 x_passphrase = "hunter22", sae_anti_clogging = 12, sae_sync = 20},
+					},
+				}
+				ucihelper.apply_config(resp, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.sae_anti_clogging_threshold, nil,
+					"sae_anti_clogging_threshold is not a UCI option and is not written")
+				assert_eq(s.sae_sync, nil,
+					"sae_sync is not a UCI option and is not written")
+				-- The WLAN itself must still provision normally.
+				assert_eq(s.ssid, "corp", "the vap is still written")
+				assert_eq(s.encryption, "sae", "and still gets its WPA3 encryption")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: ensure_vlan_network turns learning off on the tagged uplink port",
+		fn = function()
+			-- On a DSA board the untagged uplink and its VLAN sub-device are
+			-- ONE physical port on ONE hardware switch with ONE FDB. Left
+			-- learning, that switch files the upstream router's MAC under the
+			-- VLAN bridge -- `dev wan.10 offload master br-openuf10` -- and
+			-- every WIRED client's traffic to the gateway is hardware-
+			-- forwarded into the VLAN domain and dropped, while WiFi clients
+			-- take the software path and stay fine. Upstream confirmed it live
+			-- on an AX3000T (2026-09-03): LAN peers reachable, gateway and
+			-- internet dead, controller config completely clean.
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "type", "bridge")
+				ucihelper.ensure_vlan_network("wan", 10)
+
+				local port = db.network.openuf_brport10
+				assert_true(port ~= nil, "the uplink port gets its own device section")
+				assert_eq(port[".type"], "device", "as a `config device` section")
+				assert_eq(port.name, "wan.10", "naming the tagged uplink sub-device")
+				assert_eq(port.learning, "0", "with MAC learning off")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the learning override does not re-dirty a steady-state push",
+		fn = function()
+			-- A rewrite every inform would reload the network every inform,
+			-- bouncing the uplink and the inform connection with it.
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "type", "bridge")
+				ucihelper.ensure_vlan_network("wan", 10)
+				ucihelper._network_dirty = false
+				ucihelper.ensure_vlan_network("wan", 10)
+				assert_eq(ucihelper._network_dirty, false,
+					"an unchanged push leaves the learning override alone")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: prune_vlan_networks takes the uplink port override with it",
+		fn = function()
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "type", "bridge")
+				ucihelper.ensure_vlan_network("wan", 10)
+				assert_true(db.network.openuf_brport10 ~= nil, "precondition")
+
+				ucihelper.prune_vlan_networks({})
+				assert_eq(db.network.openuf_brport10, nil,
+					"learning off must not outlive the bridge that needed it")
+				assert_eq(db.network.openuf_brdev10, nil, "bridge gone")
+				assert_eq(db.network.openuf_vlan10, nil, "interface gone")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: prune_vlan_networks also takes switchvlan's per-socket overrides",
+		fn = function()
+			-- switchvlan writes `openuf_brport<vid>_<socket>` for every wired
+			-- socket it moves into the VLAN bridge. Deleting the VLAN sends
+			-- those sockets back to br-lan, and an override left behind would
+			-- keep MAC learning off on a port no openUF bridge owns -- which
+			-- costs that port its host list in port_table and says nothing.
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "type", "bridge")
+				ucihelper.ensure_vlan_network("wan", 10)
+				c:set("network", "openuf_brport10_lan2", "device")
+				c:set("network", "openuf_brport10_lan2", "name", "lan2")
+				c:set("network", "openuf_brport10_lan2", "learning", "0")
+
+				ucihelper.prune_vlan_networks({})
+				assert_eq(db.network.openuf_brport10_lan2, nil,
+					"the socket override went with the bridge")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a surviving VLAN keeps its per-socket overrides",
+		fn = function()
+			-- The sweep is per-VLAN, not a blanket prefix delete: pruning one
+			-- VLAN must not disarm another's sockets.
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "type", "bridge")
+				ucihelper.ensure_vlan_network("wan", 10)
+				c:set("network", "openuf_brport10_lan2", "device")
+				c:set("network", "openuf_brport10_lan2", "name", "lan2")
+				c:set("network", "openuf_brport10_lan2", "learning", "0")
+
+				ucihelper.prune_vlan_networks({[10] = true})
+				assert_true(db.network.openuf_brport10_lan2 ~= nil,
+					"VLAN 10 is still wanted, so its socket override stays")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the management bridge is pinned to the identity MAC",
+		fn = function()
+			-- openUF takes its MAC from lan_cpueth and its reported IP from the
+			-- bridge that port is enslaved to. On a DSA map naming a socket
+			-- those are different netdevs with different MACs, so the AP
+			-- announces one identity and sources every frame from another --
+			-- and the gateway raises an IP conflict between the device and
+			-- itself.
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "type", "bridge")
+				c:set("network", "br_lan", "name", "br-lan")
+				ucihelper._popen = function() return "../../virtual/net/br-lan" end
+				ucihelper._read_file = function(path)
+					if path:match("/wan/address")    then return "00:00:5e:00:53:01\n" end
+					if path:match("/br%-lan/address") then return "00:00:5e:00:53:02\n" end
+				end
+				local changed
+				silently_uci(function()
+					changed = ucihelper.ensure_bridge_identity({net = {lan_cpueth = "wan"}})
+				end)
+				assert_true(changed, "reported a change")
+				assert_eq(db.network.br_lan.macaddr, "00:00:5e:00:53:01",
+					"the bridge now carries the MAC openUF identifies as")
+				assert_true(ucihelper._network_dirty, "and netifd must be told")
+				ucihelper._network_dirty = false
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a board whose port and bridge already agree is left alone",
+		fn = function()
+			-- Every swconfig board: eth1 and br-lan read the same address, which
+			-- is why this divergence went unnoticed until the first DSA board.
+			-- Acting there would rewrite UCI and bounce the network for nothing.
+			with_ucihelper(function(db, cmds)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "type", "bridge")
+				c:set("network", "br_lan", "name", "br-lan")
+				ucihelper._popen = function() return "../../virtual/net/br-lan" end
+				ucihelper._read_file = function() return "00:00:5e:00:53:04\n" end
+				assert_false(ucihelper.ensure_bridge_identity({net = {lan_cpueth = "eth1"}}),
+					"nothing to reconcile")
+				assert_eq(db.network.br_lan.macaddr, nil, "no macaddr written")
+				assert_eq(#cmds, 0, "and no reload")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: pinning the bridge identity is idempotent",
+		fn = function()
+			-- Runs on every daemon start. A second pass must not re-dirty the
+			-- network and bounce the uplink the inform connection rides on.
+			with_ucihelper(function(db)
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "type", "bridge")
+				c:set("network", "br_lan", "name", "br-lan")
+				c:set("network", "br_lan", "macaddr", "00:00:5e:00:53:01")
+				ucihelper._popen = function() return "../../virtual/net/br-lan" end
+				ucihelper._read_file = function(path)
+					if path:match("/wan/address")     then return "00:00:5e:00:53:01\n" end
+					if path:match("/br%-lan/address") then return "00:00:5e:00:53:02\n" end
+				end
+				ucihelper._network_dirty = false
+				assert_false(ucihelper.ensure_bridge_identity({net = {lan_cpueth = "wan"}}),
+					"already pinned")
+				assert_false(ucihelper._network_dirty or false, "no reload requested")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a port that carries its own address is never touched",
+		fn = function()
+			-- No bridge means no divergence to reconcile -- and no section to
+			-- write to. Guessing one would pin a MAC onto the wrong device.
+			-- This is also the shape of this fork's JioRouter maps, whose
+			-- lan_cpueth IS br-lan: the bridge has no master, so nothing runs.
+			with_ucihelper(function(db)
+				-- A bridge section and a MAC that DOES differ are both present:
+				-- the only thing stopping this from being written is that the
+				-- port has no master, so the test fails if that check is lost.
+				local c = ucihelper._uci.cursor()
+				c:set("network", "br_lan", "device")
+				c:set("network", "br_lan", "type", "bridge")
+				c:set("network", "br_lan", "name", "br-lan")
+				ucihelper._popen = function() return "" end
+				ucihelper._read_file = function(path)
+					if path:match("/wan/address")     then return "00:00:5e:00:53:01\n" end
+					if path:match("/br%-lan/address") then return "00:00:5e:00:53:02\n" end
+				end
+				assert_false(ucihelper.ensure_bridge_identity({net = {lan_cpueth = "wan"}}),
+					"nothing to do")
+				assert_eq(db.network.br_lan.macaddr, nil, "and nothing was pinned")
+			end)
+		end
+	},
+	{
+		-- Both features are live KERNEL state -- nftables for the blocker,
+		-- tc for the limit -- and neither has a UCI option OpenWrt applies. A
+		-- reboot discards both, and the controller never re-pushes: cfgversion
+		-- matches on the first inform, so the reply is a noop with no
+		-- system_cfg and apply_config never runs again. The openuf_* stamps are
+		-- the only record of what was configured; before this nothing read them.
+		name = "ucihelper: reapply_runtime_rules rebuilds blocker and speed limit from UCI",
+		fn = function()
+			with_ucihelper(function()
+				local c = ucihelper._uci.cursor()
+				c:set("wireless", "openuf_radio0_corp", "wifi-iface")
+				c:set("wireless", "openuf_radio0_corp", "device", "radio0")
+				c:set("wireless", "openuf_radio0_corp", "ssid", "corp")
+				c:set("wireless", "openuf_radio0_corp", "openuf_bcfilt", "1")
+				c:set("wireless", "openuf_radio0_corp", "openuf_bcfilt_macs",
+					"01:00:5e:00:00:fb aa:bb:cc:dd:ee:ff")
+				c:set("wireless", "openuf_radio0_corp", "openuf_ratelimit_down", "33000")
+				c:set("wireless", "openuf_radio0_corp", "openuf_ratelimit_up", "17000")
+				local bc, sh
+				ucihelper._bcfilter = {reconcile = function(r) bc = r end}
+				ucihelper._shaper   = {reconcile = function(r) sh = r end}
+				ucihelper.get_ifname_for_vap = function(radio, ssid)
+					if radio == "radio0" and ssid == "corp" then return "wlan0" end
+				end
+
+				local n = ucihelper.reapply_runtime_rules()
+
+				assert_eq(n, 1, "one managed vap found")
+				assert_eq(#bc, 1, "the blocker ruleset is rebuilt")
+				assert_eq(bc[1].ifname, "wlan0", "on the vap's own netdev")
+				assert_eq(#bc[1].macs, 2, "both allow-listed MACs come back")
+				assert_eq(bc[1].macs[1], "01:00:5e:00:00:fb", "in the order recorded")
+				assert_eq(#sh, 1, "the shaper gets the vap back")
+				assert_eq(sh[1].down_kbps, 33000, "download cap restored as a number")
+				assert_eq(sh[1].up_kbps, 17000, "upload cap restored as a number")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: reapply_runtime_rules leaves unmanaged and disabled sections alone",
+		fn = function()
+			with_ucihelper(function()
+				local c = ucihelper._uci.cursor()
+				-- Hand-configured SSID: openUF never provisioned it and must
+				-- not shape or filter it.
+				c:set("wireless", "homelab", "wifi-iface")
+				c:set("wireless", "homelab", "device", "radio0")
+				c:set("wireless", "homelab", "ssid", "homelab")
+				c:set("wireless", "homelab", "openuf_ratelimit_down", "1000")
+				-- Managed but switched off: the reload that disabled it took
+				-- its netdev, and every qdisc and nft rule naming it went too.
+				c:set("wireless", "openuf_radio0_old", "wifi-iface")
+				c:set("wireless", "openuf_radio0_old", "device", "radio0")
+				c:set("wireless", "openuf_radio0_old", "ssid", "old")
+				c:set("wireless", "openuf_radio0_old", "disabled", "1")
+				c:set("wireless", "openuf_radio0_old", "openuf_bcfilt", "1")
+				local bc, sh
+				ucihelper._bcfilter = {reconcile = function(r) bc = r end}
+				ucihelper._shaper   = {reconcile = function(r) sh = r end}
+				ucihelper.get_ifname_for_vap = function() return "wlan0" end
+
+				assert_eq(ucihelper.reapply_runtime_rules(), 0, "neither section qualifies")
+				-- Still reconciled, with nothing: each rebuilds from scratch, so
+				-- an empty list is what tears a stale ruleset down.
+				assert_true(bc ~= nil and sh ~= nil, "both are still reconciled")
+				assert_eq(#bc, 0, "no blocker rules")
+				assert_eq(#sh, 0, "no shaper rules")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: reapply_runtime_rules skips a vap whose netdev cannot be resolved",
+		fn = function()
+			with_ucihelper(function()
+				local c = ucihelper._uci.cursor()
+				c:set("wireless", "openuf_radio0_corp", "wifi-iface")
+				c:set("wireless", "openuf_radio0_corp", "device", "radio0")
+				c:set("wireless", "openuf_radio0_corp", "ssid", "corp")
+				c:set("wireless", "openuf_radio0_corp", "openuf_bcfilt", "1")
+				local bc
+				ucihelper._bcfilter = {reconcile = function(r) bc = r end}
+				ucihelper._shaper   = {reconcile = function() end}
+				-- Radio down, wifi not up yet, no ubus: all ordinary, and a
+				-- rule with a nil ifname would be worse than no rule.
+				ucihelper.get_ifname_for_vap = function() return nil end
+				assert_eq(ucihelper.reapply_runtime_rules(), 0, "unresolvable vap is skipped")
+				assert_eq(#bc, 0, "no rule is built without a netdev name")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: one wireless read serves a whole payload, and hwassign still filters",
+		fn = function()
+			-- get_radio_table was called twice per heartbeat -- once by
+			-- build_json with the modelmap's hwassign, once by get_vap_table
+			-- with none -- so /etc/config/wireless was loaded through a fresh
+			-- cursor twice for one answer.
+			with_ucihelper(function(db)
+				seed_radios({"radio0", "radio1", "radio2"})
+				local seed = ucihelper._uci.cursor()
+				for _, r in ipairs({"radio0", "radio1", "radio2"}) do
+					seed:set("wireless", r, "country", "CZ")
+				end
+				local reads = 0
+				local real_cursor = ucihelper._uci.cursor
+				ucihelper._uci.cursor = function(...)
+					reads = reads + 1
+					return real_cursor(...)
+				end
+
+				-- No pass open: every call reads, exactly as before.
+				ucihelper.end_pass()
+				ucihelper.get_radio_table()
+				ucihelper.get_radio_table()
+				assert_eq(reads, 2, "no pass open -- every call reads, as before")
+
+				reads = 0
+				ucihelper.begin_pass()
+				local all      = ucihelper.get_radio_table()
+				local assigned = ucihelper.get_radio_table({"radio0", "radio1"})
+				assert_eq(reads, 1, "one wireless read for the whole payload")
+
+				-- The trap: the two callers want DIFFERENT filtering of the
+				-- same rows. A memo holding the filtered result would change
+				-- which radios vap_table can resolve against.
+				assert_eq(#all, 3, "get_vap_table's call still sees every radio")
+				assert_eq(#assigned, 2, "and build_json's still honours hwassign")
+				assert_eq(assigned[1].name, "radio0", "the assigned ones")
+				assert_eq(assigned[2].name, "radio1", "and only those")
+
+				-- Each caller gets its own tables: build_json writes the
+				-- hardware caps onto what it gets and strips the internal
+				-- fields, which must not reach the other caller or the memo.
+				assigned[1].country = nil
+				assigned[1].nss     = 3
+				local again = ucihelper.get_radio_table()
+				assert_eq(again[1].country, "CZ", "a caller's writes do not reach the memo")
+				assert_nil(again[1].nss, "nor its added fields")
+				assert_eq(all[1].country, "CZ", "nor the other caller's copy")
+
+				ucihelper.end_pass()
+				reads = 0
+				ucihelper.get_radio_table()
+				ucihelper.get_radio_table()
+				assert_eq(reads, 2, "the pass is closed -- every call reads again")
+
+				ucihelper._uci.cursor = real_cursor
+			end)
+		end
+	},
+	{
+		name = "ucihelper: nothing read before a `wifi reload` is reused after it",
+		fn = function()
+			-- The radio rows come from the very config apply_config just
+			-- rewrote, so the reload has to drop them along with the netdev
+			-- names -- otherwise the enforcement that runs after the reload
+			-- reads the config as it was before the push.
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				ucihelper.begin_pass()
+				ucihelper.get_radio_table()
+				assert_not_nil(ucihelper._pass_cache, "the pass is holding rows")
+				pcall(ucihelper.apply_config, {}, nil, nil)
+				assert_nil(ucihelper._pass_cache, "and the reload dropped them")
+				ucihelper.end_pass()
 			end)
 		end
 	},

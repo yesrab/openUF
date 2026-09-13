@@ -50,9 +50,7 @@ dev.conf.net = {
 	lan_name	= "lan",
 	lan_cpueth	= "eth0",
 	lan_vlanid	= 1,
-	wan_name	= "wan",
 	wan_cpueth	= "eth1",
-	wan_vlanid	= 2,
 	-- The board's four LAN sockets, one port_idx each -- not the CPU netdev
 	-- they share. eth0's link is the internal SoC<->switch one (always
 	-- 1000/full) while the socket the cable is in had negotiated 100baseT, and
@@ -91,6 +89,11 @@ dev.conf.led = "green:system"
 -- Stock config puts LAN sockets 1-4 on VLAN 1 with the CPU port tagged
 -- ("1 2 3 4 0t"), which is what dev.conf.net above assumes.
 dev.conf.vlan = {
+	-- swconfig device name, as `swconfig list` reports it. Every reader used
+	-- to fall through to a hardcoded "switch0" because no map set this; on a
+	-- board whose switch is switch1 every swconfig call then silently
+	-- addressed a device that does not exist.
+	device	= "switch0",
 	cpu_lan	= 0,
 	cpu_wan	= 0,
 	ports	= {

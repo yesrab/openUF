@@ -123,8 +123,8 @@ on the controller's own subnet and its informs are landing perfectly. On the Ado
 gateway opened three SSH connections to the AP within 20 seconds:
 
 ```
-dropbear[3746]: Child connection from 192.168.200.1:33114
-dropbear[3746]: Login attempt for nonexistent user from 192.168.200.1:33114
+dropbear[3746]: Child connection from 192.0.2.1:33114
+dropbear[3746]: Login attempt for nonexistent user from 192.0.2.1:33114
 ```
 
 and, failing them, parked the device at **Connection Interrupted** while the inform loop kept
@@ -284,7 +284,7 @@ openUF now does that once at startup when the attribute exists and reads 0
 
 ## A tagged SSID's trunk deafened every wired client on the AP — FIXED
 
-2026-08-02, same two APs. The user reported a printer at a static `192.168.200.11`, cabled
+2026-08-02, same two APs. The user reported a printer at a static `192.0.2.11`, cabled
 into the Bedroom AP, that nothing could reach and that never appeared in the controller UI.
 It was an openUF bug, and the printer was only the visible half of it — a second host on
 another socket had been dead the same way, unnoticed.
@@ -677,8 +677,12 @@ wlanconf: `wpa3_support: true`, `wpa3_transition: true`, `pmf_mode: optional`. (
 revision of this document claimed the mixed choice left `wpa3_support` false and that a mixed
 WLAN therefore never emits these keys. Wrong: the WLAN-side gate passes; what suppresses the
 whole SAE block is the *per-device radio* capability check described in the WPA3 section.)
-openUF maps these to hostapd's `sae_anti_clogging_threshold` / `sae_sync`
-(the older name, still the broadly-supported one across the OpenWrt/wpad versions targeted).
+openUF used to map these to hostapd's `sae_anti_clogging_threshold` / `sae_sync`. **It no
+longer does, and no longer parses them**: both are real hostapd keys but neither is a
+wifi-iface UCI option — upstream checked the wifi-iface schema, `/usr/share/ucode/wifi/`
+and `hostapd.sh`'s `config_add_*` lists on an Archer C5 and an AX3000T (both 25.12.5) and
+found neither name anywhere, so the writes were stored in UCI and dropped in silence. See
+feature 27 in the matrix.
 
 ### `wireless.<n>.*` — per-SSID radio binding and behavior
 
@@ -1235,7 +1239,10 @@ why this is the fallback and not the default. Confirmed live: a TL-WDR3500 repor
 an uplink whose socket had negotiated 100baseT, and the gateway's own Ports view said FE for
 the same cable.
 
-**Non-uplink ports additionally carry `mac_table[]`** — `{mac, ip, hostname, age, uptime}`,
+**Non-uplink ports additionally carry `mac_table[]`** — `{mac, ip, hostname, age, uptime,
+vlan}`, where `vlan` is present only for a socket openUF has assigned to a VLAN and is what
+places the client on the right *network* (the controller keeps a host only where
+`network.getVlan() == host.getInt("vlan", 1)`; absent means 1 — see the 2026-09-13 section),
 joined with `/proc/net/arp` for IPs and `/tmp/dhcp.leases` when present for hostnames
 (optional — an AP is usually not the DHCP server; `hostname` stays absent rather than
 invented). The host list itself is per-socket from the ARL table
@@ -1250,6 +1257,33 @@ listed in.
 
 Ports flagged `is_uplink: true` are skipped by the controller for client creation, since that
 port faces the controller's own network.
+
+**An uplink port must carry no `mac_table` at all — not even the gateway.** Reporting just
+the one MAC on the other end of the cable is tempting: openUF knows it (finding it is how the
+uplink socket is identified), a real UniFi gateway visibly does it on its own uplink port, and
+it would fill the Ports view's Connection column, which is otherwise blank or stuck on a
+retained "last seen device". It would also invert the topology map. The controller matches
+every MAC on a port against its adopted devices, and a port carrying exactly one known device
+files that device into this one's `downlink_table` (`wRSpUfdrmMXnppHBKZ`):
+
+```java
+bl9 = !is_uplink && device.isUplinkMac(neighbour);
+if (!bl9) downlink_table.add(neighbour, port);
+```
+
+The `isUplinkMac` guard that would prevent it is ANDed with `!is_uplink`, so it disables
+itself on exactly the port where it is needed — the gateway would hang beneath every AP that
+reported it. A real gateway escapes this because its upstream is the ISP's router, which is
+not an adopted device and never reaches that branch; openUF cannot tell the two cases apart
+from the device. Upstream verified it on their live site: with both APs silent on their
+uplinks, each AP's `downlink_table` is empty and the gateway's holds both APs, which is the
+correct shape.
+
+A blank Connection column on an uplink port is therefore intended. `last_connection` is only
+recomputed when a port reports exactly one MAC (`wefewPevorbc`: `if (list.size() > 1) return
+existing`), and is never touched at all when the port sends no `mac_table` field — which is
+why a stale value there persists until cleared with the Ports view's **Clear Last Seen
+Device**.
 
 Two exclusion filters prevent double-reporting: the device's **own** MACs, and any MAC
 currently associated as a wireless station — a wireless client bridged into `br-lan` genuinely
@@ -1325,7 +1359,7 @@ them for measured values.
 | `model` / `platform` / `version` / `required_version` / `bootrom_version` | The emulated UniFi identity from `ufmodel/*.lua` — deliberately not the host hardware. This is the point of the project, not an accidental approximation |
 | `fw_caps` = `0x110`, `wifi_caps2` = `0x40` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
 | `ucihelper` `wps_device_name` / `ap_setup_locked` | Standards-based rather than Ubiquiti-derived — see the beacon row in the [feature matrix](#feature-matrix) |
-| `usteer.lua`'s `USTEER_DEFAULTS` | Guessed `/etc/config/usteer` option names; verify against the package's own shipped defaults if usteer is ever installed in the validation container |
+| ~~`usteer.lua`'s `USTEER_DEFAULTS`~~ | ✅ **Resolved upstream 2026-09-10.** Verified against the installed package (usteer 2025.10.04) on an Archer C5. `band_steering_threshold` is a real option — it is in the init script's own list of keys fed to `ubus call usteer set_config`. The named `local` section is read too: the loader does `config_foreach uci_usteer usteer`, which visits every section of type `usteer`, named or anonymous. `network` is read from `uci get usteer.@usteer[-1].network`, the last section of that type — openUF's — so both writes are load-bearing and correctly named. |
 
 Everything not listed above is measured from the running system. Several fields
 *used* to belong in this table and no longer do — `max_txpower`, `tx_power`,
@@ -1565,6 +1599,45 @@ Kept as ours where ours was stronger: atomic `state.json` writes and generic fie
 passthrough, the `_tick` error boundaries and debug switches, wire-value validation, the
 per-pass ubus and `iw phy` caches, `--replace-conf`, the `iw` 6.17 parser fixes.
 
+## Adopted from upstream (jonasevcik/openUF), 2026-09-13
+
+Second review, covering upstream's 61 commits of 3–12 September 2026 (`d7d7e21..12b4db0`),
+again re-implemented here rather than merged. As before, the hardware evidence is **theirs**
+— an AX3000T and an Archer C5 against a UCG Ultra on Network 10.6.101 — and nothing below
+has been re-verified on this fork's JioRouter boards. Roughly a third of their commits
+turned out to be fixes this fork had already made on 2026-09-06 (the `_tick` boundary,
+atomic state writes, wire validation, the announce fixes, the per-VAP BSSID, the iw 6.17
+scan parser, the RRM benching, the ubus and `iw phy` caches, the HTTP 400 streak warning);
+those were checked for equivalence and left alone.
+
+| Finding | Evidence | Status here |
+|---|---|---|
+| A DSA socket moved into a VLAN bridge must have MAC learning **off**, or the ASIC's single address table hardware-drops every VLAN-tagged reply to it while outbound stays perfect | Captured at three points at once with a Trådfri hub on port 2: learning on, 4 DISCOVERs out and 0 replies anywhere; learning off, OFFER + ACK in 2 ms. An entry learned before the move cannot be deleted (ENOENT / EOPNOTSUPP) and ages out in ~140 s | Adopted: `switchvlan.dsa_apply` writes `openuf_brport<vid>_<socket>` with `learning '0'`; `ucihelper.ensure_vlan_network` does the same for the tagged uplink sub-device (`openuf_brport<vid>`), which the switch also files against the VLAN bridge; `prune_vlan_networks` and `dsa_restore` sweep both |
+| Learning off empties `bridge fdb` for that socket, and on DSA the FDB is the ONLY wired-host source — so the port reported no clients and the controller credited them to the gateway | The wired IoT device listed under the gateway at GbE instead of under the AP's port 2 at FE. `vlan_filtering` + `bridge-vlan` would fix it at the switch (mt7530 sets `IVL_MAC`) but is blocked on netifd (openwrt#16314, #9089: every member incl. runtime VAPs needs an explicit `bridge-vlan`, and the 8021q sub-device would have to go) | Adopted: `switchvlan.reconcile_mac_taps` installs `table bridge openuf_learn` (sets `portmacs` and `portips`, 5-minute timeouts matching FDB ageing, one rule per set over every tapped socket); `sysinfo.mac_table(ifname, bridge, allow_tap)` reads it only for a socket whose bridge is not the uplink's and only when the FDB is silent. Rebuilt at startup from the UCI sections, left alone when it already matches |
+| The controller files a wired client under a network by `mac_table[].vlan`, defaulting to 1 — not by the port's native VLAN and not by the IP it already holds | `com.ubnt.service.devmgr.isqI`: `if (network.getVlan() != host.getInt("vlan", 1)) continue;`; the dedup key is `mac .. vlan`; the client record copies `vlan` and drops a 1. With `vlan` and the tap's `ip` the live record read network IoT, vlan 10, Office AP port 2, FE | Adopted: `_filter_hosts` stamps each row with the VLAN of the bridge the socket sits in (`br-openuf<vid>`), nil on the management VLAN; the tap's second set harvests addresses from ARP and IPv4 (0.0.0.0 excluded), freshest wins, because the AP holds no address on that VLAN and `/proc/net/arp` can never answer |
+| `port_table` asked the UPLINK's bridge about every socket, so a moved socket answered nothing even with learning on | Seen while tracing the above | Adopted: each socket asks `sysinfo.bridge_of` for its own bridge, memoized per pass; `forget_uplink_cache` after a switch push, since the 300 s TTL cannot see openUF moving a socket itself |
+| An uplink port must carry no `mac_table` at all, gateway included: a port with exactly one known device files it into `downlink_table`, and the `isUplinkMac` guard is ANDed with `!is_uplink` | Both APs silent → each AP's `downlink_table` empty, the gateway's holding both. `last_connection` is never recomputed when the field is absent, so a stale Connection column is expected | Already our behaviour; the rationale recorded (feature 39) |
+| A DSA map whose `lan_cpueth` names a socket announces one MAC and sources every frame from another (`br-lan` inherits the conduit's), and the gateway raises an IP conflict | Capture on `wan`: the reported address sending exclusively from the eth0 MAC | Adopted as `ucihelper.ensure_bridge_identity`, run once from `M.run`; pins `br-lan`'s `macaddr` to `lan_cpueth`'s only when they differ. **A no-op on this fork's maps**, whose `lan_cpueth` is `br-lan` itself |
+| The blocker (nft) and speed limit (tc) are kernel state and were only ever built inside `apply_config`; after a reboot the controller replies `noop` and both stayed off while the UI showed them on | Verified in the validation lab once its UCI mock persisted; the `openuf_bcfilt*`/`openuf_ratelimit_*` stamps had never been read back | Adopted: `ucihelper.reapply_runtime_rules` rebuilds both from the stamps at startup, through the same `reconcile_runtime` `apply_config` uses |
+| A controller-pushed static IP is `ip addr` state, died with the reboot, and the four `static_*` fields in `state.json` had no reader; and a raise between the apply and the tail-end save lost the record | The AP moved to its pushed address, usteer raised, `state.json` never learned about it | Adopted: `_reapply_static_ip` at startup, before `_populate_net_info`; the IP branch saves state the moment the interface changes |
+| `rrmscan.collector_stop` had no caller: the detached `ubus subscribe` child outlived a disabled `rrm_enrichment` and a service stop, appending to a RAM disk forever; the procd reload trigger degraded to a restart on every LuCI wireless edit | Static analysis plus the 31.7 MB debug dump found the same week | Adopted: stopped from `_rrm_tick`'s disabled branch and from a real `stop_service()`; `service_triggers` dropped; the `pgrep` liveness check runs once a minute and is re-armed after a config push |
+| `debug_dump_file` had no ceiling and lives on tmpfs | 31.7 MB after five weeks, 55% of a 59 MB `/tmp` | Adopted: 4 MiB cap, `debug_dump_max_bytes`, restart-with-marker rather than rotate |
+| `conf.lua`'s `inform_url` and `state_file` were read by nothing | — | `state_file` was already honoured here; `inform_url` now seeds `state.DEFAULT_INFORM_URL` |
+| `_state_mtime` forked `stat -c %Y` every heartbeat and fell back to the contents, which are the stronger token anyway | No stat applet on a WDR3500 | Adopted; `coreutils-stat` dropped from both installers |
+| Six per-heartbeat costs: ARP and leases read once per socket, the ARL walked whole per socket, `bridge fdb show dev` forked per socket on DSA, the phy dump re-parsed per radio, `readlink`/`ip route` forked every 10 s, `lldpctl` forked every 10 s, `/proc/uptime` read per radio, `/etc/config/wireless` loaded three times | Measured with the new `tools/heartbeat-probe.lua` on the Archer C5 | Adopted: a `sysinfo` lookup pass mirroring ucihelper's, a 300 s uplink cache that never caches nil, the parsed phy caps cached with the text, a 60 s LLDP cache that never caches an empty answer, one `radio_rows` memo per pass with copies handed to each caller |
+| `inflate` supplied zero bits past EOF and spun forever on a truncated stream | Found by writing the module's first tests | Adopted with `tests/test_inflate.lua` (Lua 5.1-safe `string.char`, not `\xNN`) |
+| `sysupgrade` knows nothing about `/etc/openuf` or `conf.lua`; a firmware upgrade un-adopts the AP | `sysupgrade -b` listed 29 entries, neither among them | Adopted in `install.sh` with the four follow-up fixes (no trailing newline, uninstall keeps the state dir line, grep exit 2 leaves the file alone) |
+| `cfg.vlan.device` had five readers and no producer | Every swconfig call addressed `switch0` regardless | Adopted: declared in all five swconfig maps, pinned by a modelmap test; `wan_name`/`wan_vlanid` and `uap.field` dropped as dead |
+| `sae_anti_clogging_threshold`/`sae_sync` are not wifi-iface options; "Show AP Name in Beacon" never reaches a beacon | Schema, ucode and `hostapd.sh` checked on both boards | Adopted: writes and parser fields removed; features 26/27 re-graded |
+| Test fixtures carried the author's real home-network MACs and addresses | — | Mapped one-for-one onto RFC 7042 / RFC 5737 documentation values here too, since this fork ships the same captures |
+
+Kept as ours: `sysinfo.lan_bridge` (upstream resolves the uplink bridge with `bridge_of`,
+which cannot handle a map whose `lan_cpueth` is the bridge itself), the `not uplink_unknown`
+gate on wired clients, `keep_wlan_sections`, the `--replace-conf` installer flag, the
+`/tmp/openuf-status` health file and `update.sh`, the `coreutils-stat` removal (upstream
+still installs a package nothing reads). Not taken: upstream's README screenshots of their
+own deployment.
+
 ## Feature matrix
 
 Every controller-UI control exercised against a live openUF device. "Confirmed" means driven
@@ -1588,7 +1661,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 14 | IP Settings (DHCP/Static) | `system_cfg` `netconf.*`/`dhcpc.*`/`route.*` | ✅ Confirmed end-to-end: real kernel interface change, real route, informing from the new address, controller Overview reflecting it back |
 | 15 | Power / PoE | `power_source`, `power_source_voltage`, `psu_table`, `power-monitor`, `total_max_power`, `led_state`, `outlet_table` — copied straight off the inform when present | 🔍 Not implemented. The "Power: -" element lives in the **Parent Device** subsection (properties of the upstream LLDP-linked switch), and this environment has no PoE switch. Field names confirmed; values/format not researched, and openUF has no local signal for a real PoE class. |
 | 16 | Set Replacement Device / Load Configuration | **None** — controller-side Mongo document clone (`commonDeviceCloneConfigService`), then an ordinary adopt + `setparam` | ✅ Both confirmed live; zero product code needed. Replacement auto-adopts the target ~50 s after the source goes away. |
-| 17 | Wired clients | `port_table[]` + per-port `mac_table[]` | ✅ Confirmed live: both fake hosts under Connection → Wired, on the correct port; Ports view renders them. Hosts are placed on the physical socket the switch learned them on (ARL table) as of 2026-08-02 — before that, real wired clients behind an AP were reported by nobody and the controller credited them to the gateway's port |
+| 17 | Wired clients | `port_table[]` + per-port `mac_table[]` | ✅ Confirmed live: both fake hosts under Connection → Wired, on the correct port; Ports view renders them. Hosts are placed on the physical socket the switch learned them on (ARL table) as of 2026-08-02 — before that, real wired clients behind an AP were reported by nobody and the controller credited them to the gateway's port. Extended 2026-09-13 (from upstream's 2026-09-12 work): each socket is asked about its OWN bridge, a socket whose MAC learning is off is served by the `bridge openuf_learn` nft tap, and rows carry `vlan` (+ a tap-harvested `ip`) — which is what puts the client on the right **network**, not just the right port. See [Adopted from upstream, 2026-09-13](#adopted-from-upstream-jonasevcikopenuf-2026-09-13) |
 | 18 | Per-port VLAN assignment | `fw_caps` bit `0x100`; controller pushes `switch.*` | ⚠️ Wire format fully mapped live 2026-07-19 (gate, per-VLAN table, per-port `pvid` + tagged/untagged/exclude matrix, teardown). The **controller side** is confirmed — it accepts the assignment and pushes an actionable table. Device-side apply on swconfig is unverifiable here (the validation AP has no switch); on DSA it is a bridge move adopted from upstream, verified there on an mt7530 — see [Adopted from upstream](#adopted-from-upstream-jonasevcikopenuf-2026-09-06). Note it was unreachable on both real boards until 2026-08-02: the only port they reported was the uplink, which is exactly the port that must never be reassigned |
 | 19 | Client block / unblock | `cmd:"block-sta"` / `"unblock-sta"` | ✅ Confirmed live including real nftables enforcement and survival across a simulated reboot. `hostapd_cli` deauth is unit-tested only (no real hostapd here). |
 | 20 | Environment / rogue-AP scan | `scan_radio_table[]` | ✅ openUF's payload and the controller's ingestion both confirmed correct (10/10 direct API polls). The tab's own display bug is [controller-side](#controller-side-ui-quirks). |
@@ -1597,8 +1670,8 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 23 | Minimum RSSI | `system_cfg` `stamgr.<n>.*`; outbound `min_rssi`/`min_rssi_enabled` | ✅ Wire format and field names confirmed; conversion is the fixed `raw - 95` (corrected 2026-09-06 — the live-noise-floor version was wrong on every radio but one). Enforcement (`kick_station`) is unit-tested only — no real radios here. |
 | 24 | Security tab WPA2/WPA3 protocol options | **None** | ℹ️ Not capability-driven from anything openUF sends. No security-capability field exists in the payload; `ucihelper`'s `SECURITY_MAP` (`wpa2`→`psk2`, `wpa3`→`sae`, `wpa2/wpa3`→`sae-mixed`, `wpa-enterprise`→`wpa2+ccmp`) is a one-way map of a choice the controller has already made. The dropdown's options come from the controller's own internal per-model database, keyed on the reported `model`/`platform`. Not fixable here. |
 | 25 | Band Steering / BSS Transition / DTIM | `wireless.<n>.no2ghz_oui` / `aaa.<n>.bss_transition` / `wireless.<n>.dtim_period` | ✅ All three confirmed live by individual before/after `system_cfg` diffs |
-| 26 | Show AP Name in Beacon | `wifi_caps2` bit `0x40` → `wireless.<n>.advertise_ap_name` | ✅ Wire protocol and capability gating confirmed live, both directions. **The OpenWrt/hostapd side is not verified** — implemented via the WPS/WSC Device Name attribute (`wps_device_name` + `ap_setup_locked=1`, the standard mechanism, per hostapd's README-WPS/`beacon.c` and OpenWrt's wifi-iface schema) rather than an unknown Ubiquiti vendor IE. Needs real hardware to confirm hostapd accepts it and the beacon changes. |
-| 27 | SAE Anti-clogging / Sync Time | `aaa.<n>.sae.anti_clogging` / `.sae.sync` | ⚠️ Key names, integer shape, and `isWpa3()` gating confirmed via an unambiguous decompiled method body. The **emitting** (true WPA3) case could not be live-diffed — forcing pure WPA3 tripped the [config-sync issue](#config-sync-can-get-stuck-after-informs-stabilise). |
+| 26 | Show AP Name in Beacon | `wifi_caps2` bit `0x40` → `wireless.<n>.advertise_ap_name` | ⚠️ Wire protocol and capability gating confirmed live, both directions. **The OpenWrt side does not work and is not implemented.** openUF writes `wps_device_name` + `ap_setup_locked` (both valid wifi-iface options — present in the schema and in `/usr/share/ucode/wifi/`), but OpenWrt emits the WPS/WSC block that carries `device_name` only under `if (config.wps_possible && length(config.config_methods))` (`ap.uc:227`), and `config_methods` is populated solely from `wps_pushbutton`/`wps_label`. openUF sets neither, so WPS never activates and no WSC Device Name IE reaches a beacon. Upstream verified 2026-09-10 on an Archer C5 (ath79) and an AX3000T (filogic), both 25.12.5, same gate on both; no live BSS conf carries any WPS key. Turning WPS on to broadcast a name trades a real security surface for a cosmetic feature — deliberately not done. |
+| 27 | SAE Anti-clogging / Sync Time | `aaa.<n>.sae.anti_clogging` / `.sae.sync` | ❌ **Not applicable on OpenWrt.** Key names, integer shape and `isWpa3()` gating are confirmed via an unambiguous decompiled method body, and the emitting (true WPA3) case could not be live-diffed — forcing pure WPA3 tripped the [config-sync issue](#config-sync-can-get-stuck-after-informs-stabilise). It does not matter: `sae_anti_clogging_threshold` and `sae_sync` are real hostapd config keys but are **not** wifi-iface UCI options. Upstream verified 2026-09-10 on an Archer C5 (ath79) and an AX3000T (filogic), both 25.12.5, against all three places an option can be declared — the wifi-iface schema, `/usr/share/ucode/wifi/` and `hostapd.sh`'s `config_add_*` lists. Neither name appears in any of them, on either board, so openUF's writes were stored in UCI and dropped in silence. Both writes removed (2026-09-13 here); the wire keys are no longer parsed either, since nothing could consume them. |
 | 28 | PMF (802.11w) / Multicast Enhancement | `aaa.<n>.pmf.status`/`.pmf.mode`; `wireless.<n>.mcast.enhance` | ✅ Confirmed live by `system_cfg` diff. PMF is what actually carries WPA2/WPA3 transition intent on this model. |
 | 29 | Channel width | `radio.<n>.ieee_mode` → `wifi-device.htmode` | ✅ Confirmed live both directions: `11nght20`↔`11nght40` follows the per-AP 2.4 GHz Channel Width control, and the pushed value reaches UCI (`radio0` `HT20`, `radio1` `HT40`). Previously parsed by nothing, so width never applied. |
 | 30 | IoT Optimization: Lock 2.4 GHz to Channel 6 | `radio.<n>.channel` (no dedicated key) | ✅ Confirmed live end-to-end: the toggle changes the 2.4 GHz radio's `channel` from `auto` to `6`, and UCI `radio0.channel` follows (verified 11 → 6, so it is not a coincidence of the default). |
@@ -1610,6 +1683,7 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 36 | Hide WiFi Name | `wireless.<n>.hide_ssid` (+ duplicate `aaa.<n>.hide_ssid`) | ✅ Confirmed live 2026-07-18 by toggling the control in the UI and diffing `system_cfg`: exactly those two keys flipped `false`→`true`, on both band entries of the WLAN, nothing else moved. Always present, so "off" is explicit and is written back out as `hidden=0`. Note the `true`/`false` vocabulary rather than `enabled`/`disabled`. Previously **documented in USAGE.md as already applied, but no code read or wrote it** — the same doc-vs-code drift as `use_only_unifi_wlan`. |
 | 37 | MAC Address Filter | top-level `macacl.<m>.*`, joined on `wireless.<n>.devname` | ✅ Confirmed live 2026-07-18 by enabling the control with one allow-listed MAC and diffing `system_cfg`: the whole `macacl` section appeared at once, keyed by devname (`ath0`/`ath2`) and numbered independently of `wireless.<n>`, so **the devname join is mandatory**. Two keys already on the wire were **excluded** by the same diff: `wireless.<n>.mac_acl.status`/`.policy` (sit at `enabled`/`deny` with the control off) and `aaa.<n>.radius.macacl.status` (the separate RADIUS MAC Authentication control). → OpenWrt `macfilter` + `maclist`, whose allow/deny vocabulary matches the controller's 1:1. Enforced by hostapd itself, so no openUF-side ruleset is involved. |
 | 38 | WiFi Speed Limit | top-level `qos.vap.<m>.*`, joined on `wireless.<n>.devname` | ✅ Wire format confirmed live 2026-07-18 by creating a speed-limit profile (33/17 Mbps) and assigning it to a WLAN. Values are **kbps**, and the discriminator is the presence of `maxspeed` — an unlimited vap still gets a block, carrying only `minspeed` set to its raw `devspeed`. The cap is a **per-VAP aggregate**, not per-client. Requires a profile to exist before the per-WLAN toggle does anything. ⚠️ Enforcement is openUF's own `tc` ruleset (`shaper.lua`), since no hostapd/OpenWrt option expresses a throughput cap: HTB on egress for downlink, ingress policing for uplink. Every generated command is verified against real tc (iproute2 6.9.0), but the on-air throughput is unverified (no real radios). |
+| 39 | Ports view Connection column on an **uplink** port | `port_table[]` with **no** `mac_table` field on `is_uplink` ports | ✅ Blank (or a retained stale value) is the CORRECT state, verified upstream 2026-09-12. Reporting the one MAC on the other end of the cable is tempting — openUF knows it, since finding it is how the uplink socket is identified, and a real UniFi gateway visibly does it on its own uplink port — but it would invert the topology map: the controller files a known device seen alone on a port into this device's `downlink_table`, and the `isUplinkMac` guard against that is ANDed with `!is_uplink`, so it disables itself on exactly the port where it is needed. The gateway would hang beneath every AP that reported it. A real gateway escapes it only because the ISP's router is not an adopted device. Live proof of the correct shape: both of upstream's APs' `downlink_table` empty, the gateway's holding both APs. The stale text persists because `last_connection` is never recomputed when a port sends no `mac_table` field (and only ever recomputed when a port reports exactly **one** MAC) — clear it with the Ports view's **Clear Last Seen Device**. |
 
 ---
 
@@ -1625,8 +1699,16 @@ through the real UI with the resulting wire payload captured or the effect verif
   live capture from real hardware.
 - **`bootrom_version`** has no counterpart in the device schema. Probably ignored.
 - **The `spectrum-scan` cmd handler** has never received a real controller-issued command.
-- **openUF's `usteer` config option names** are unverified against the real package.
-- **hostapd's acceptance of `wps_device_name`/`ap_setup_locked`** needs real hardware.
+- ~~**openUF's `usteer` config option names**~~ — ✅ resolved upstream 2026-09-10, verified
+  against the installed package; the option names and the named `local` section are both
+  correct.
+- ~~**hostapd's acceptance of `wps_device_name`/`ap_setup_locked`**~~ — ✅ resolved upstream
+  2026-09-10: the option names are valid, but OpenWrt never emits the WPS block that would
+  carry them (see feature 26). The feature is now documented as not implemented.
+- **SAE anti-clogging / sync time** cannot be applied on OpenWrt at all:
+  `sae_anti_clogging_threshold` and `sae_sync` are real hostapd keys but are declared in no
+  wifi-iface schema, no ucode generator and no `hostapd.sh` `config_add_*` list, on either
+  of upstream's boards. openUF no longer writes them (see feature 27).
 - **PoE self-reporting** could be reopened if the validation environment ever gains a real
   switch container, or if a non-Parent-Device UI surface for those fields is found.
 

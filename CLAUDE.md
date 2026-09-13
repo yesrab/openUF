@@ -429,6 +429,29 @@ factory reset.
   after a regdomain write, because the driver applies the new domain only when the
   radios come back up. Tests that stub `_popen`/`_run_cmd` must reset these (the harnesses
   do).
+- **sysinfo has the same lookup pass, and two TTL caches.** `sysinfo.begin_pass` is opened
+  at the very TOP of `build_json` (before the uptime read) and closed on return and in
+  `_tick`; inside it `/proc/net/arp`, `/tmp/dhcp.leases`, `/proc/uptime`, each `bridge fdb
+  show br` dump and the bucketed ARL/FDB (`hosts_by_port`) are read once per payload.
+  `bridge_of` and the default gateway's IP are cached for `UPLINK_TTL` (300 s) -- **a nil
+  answer is never cached**, boot is full of them -- and `forget_uplink_cache` runs after a
+  switch push because openUF moving a socket is the one change the TTL cannot see. The
+  parsed phy caps live in the same cache entry as the dump's text. `lldp.neighbors` is
+  cached 60 s, empty answers never. `ucihelper.get_radio_table` reads the wifi-device rows
+  once per pass and hands each caller a COPY. Outside a pass everything reads every time,
+  which is what keeps per-test stubs independent; harnesses reset `_uplink_cache`,
+  `_phy_info_cache`, the lldp caches and call `end_pass()` on the way in and out.
+- **Kernel state is rebuilt at startup, because the controller never re-pushes it.** After
+  a reboot `cfgversion` matches and the reply is `noop` with no `system_cfg`, so anything
+  applied only from `apply_config`/`handle_response` is gone for good. `M.run` therefore
+  reapplies, in order: the pushed static IP (`_reapply_static_ip`, before
+  `_populate_net_info`), the bridge identity (`ensure_bridge_identity`), the blocked-client
+  rules, the blocker and speed limit from the `openuf_bcfilt*`/`openuf_ratelimit_*` stamps
+  (`reapply_runtime_rules`), the LED state, and the nft MAC tap
+  (`switchvlan.reconcile_mac_taps`, from the `openuf_brport<vid>_<socket>` sections). Every
+  one is pcall'd. A new kernel-resident feature belongs in that list or it is a reboot bug.
+  The IP branch of `handle_response` saves state the moment the interface changes, not at
+  the tail: anything after it can raise, and the startup reapply reads what was saved.
 - **AES-GCM is mandatory for adoption.** UniFi 10.4.57 will not finish provisioning a
   device that has never sent a genuine GCM inform; a CBC-only device sticks at "Adopting"
   forever. Needs a GCM-capable `lua-openssl`; the `openssl` CLI fallback is CBC-only.
@@ -525,6 +548,36 @@ factory reset.
   member and never evicts anyone else; `apply_config`'s `keep_vlans` keeps a wired-only
   VLAN's bridge alive. The ledger is `st.dsa_brlan_ports`, and a push with no `switch.*`
   keys counts as "off" only while a ledger exists.
+- **A moved DSA socket, and the tagged uplink sub-device, run with MAC learning OFF, and
+  that is not optional.** The VLAN bridge is software but the socket is a port on the same
+  ASIC as the uplink, and the ASIC has ONE address table: with learning on it files the
+  attached device against the socket and hardware-drops every VLAN-tagged reply to it,
+  while outbound stays perfect and every counter says the move worked (upstream: 4 DHCP
+  DISCOVERs out, nothing back; 2 ms OFFER with learning off). `dsa_apply` writes
+  `openuf_brport<vid>_<socket>` (`learning '0'`), `ensure_vlan_network` writes
+  `openuf_brport<vid>` for `<uplink>.<vid>`; both are swept by `prune_vlan_networks` and
+  `dsa_restore`. The bill: that socket's hosts vanish from `bridge fdb`, the only
+  wired-host source on DSA. `switchvlan.reconcile_mac_taps` pays it with an nft
+  bridge-family tap (`table bridge openuf_learn`, sets `portmacs` and `portips`, 5-minute
+  timeouts), read by `sysinfo.mac_table(ifname, bridge, allow_tap)` only when the FDB is
+  silent and only for a socket whose bridge is not the uplink's. Rows carry `vlan` (from
+  the `br-openuf<vid>` name) and the tap's `ip`, because the controller files a wired
+  client under a network by `host.vlan` (default 1) and the AP has no ARP entry for a host
+  on a VLAN it holds no address on. **None of this has run on a JioRouter yet.** The
+  uplink socket stays silent, gateway included: one known MAC alone on a port lands in
+  `downlink_table` and inverts the topology (feature 39 in PROTOCOL-VALIDATION.md).
+- **`_state_mtime` is the file's CONTENTS, not an mtime**, and nothing forks `stat` any more
+  (BusyBox may have no applet; contents beat one-second mtime granularity anyway).
+  `coreutils-stat` is no longer installed. `conf.lua`'s `inform_url` seeds
+  `state.DEFAULT_INFORM_URL` and only fills a `state.json` with no URL of its own.
+  `debug_dump_file` is capped at `debug_dump_max_bytes` (4 MiB, restart with a marker line,
+  never rotate). `inflate` RAISES on a truncated stream -- it used to feed zero bits and
+  spin forever inside a pcall nothing could interrupt.
+- **`install.sh` registers `/etc/openuf/` and `conf.lua` in `/etc/sysupgrade.conf`**, or a
+  firmware upgrade un-adopts the device. Append only when absent (`grep -qxF`), terminate a
+  last line that lacks a newline first, and on uninstall drop only the `conf.lua` line --
+  the state dir line stays because the directory does. Rewrite the file only on grep exit
+  0 or 1; exit 2 with a full `/tmp` would otherwise truncate the user's own keep list.
 - **A station's RRM capability bits are not a promise.** AP2's one "capable" client
   advertises passive, active and table beacon measurement and answers every request with
   mode 0x02 "incapable" -- and hostapd never notifies a bodiless refusal over ubus, so the
@@ -547,13 +600,15 @@ openuf/
   announce.lua      L2 UDP discovery broadcasts (port 10001)
   crypto.lua        AES-128-CBC/GCM            inflate.lua  pure-Lua zlib inflate
   ucihelper.lua     all wireless UCI writes (VAPs, radios, VLAN networks)
-  sysinfo.lua       /proc, iw, swconfig and bridge-fdb parsing
-  switchvlan.lua    per-port VLAN assignment (swconfig only; refuses DSA)
+  sysinfo.lua       /proc, iw, swconfig and bridge-fdb parsing; the per-payload lookup
+                    pass and the 300 s uplink cache; the nft MAC-tap reader
+  switchvlan.lua    per-port VLAN assignment: switch_vlan sections on swconfig, a bridge
+                    move + learning off + nft tap (`bridge openuf_learn`) on DSA
   netconfig.lua     controller-pushed IP settings   led.lua  Locate / LED toggle
   firewall.lua      client block/unblock (nft `bridge openuf`)
   bcfilter.lua      multicast/broadcast blocker (nft `bridge openuf_bcfilt`)
   shaper.lua        WiFi speed limit (tc)       usteer.lua  band steering
-  lldp.lua          neighbour table via lldpctl
+  lldp.lua          neighbour table via lldpctl (cached 60 s; an empty answer never is)
   rrmscan.lua       802.11k beacon-report neighbour enrichment (from upstream)
   state.lua         /etc/openuf/state.json (authkey, adopted, cfgversion, inform_url)
   lib/lib.lua       globals every script expects; wraps `bit` so the same source runs
@@ -569,6 +624,7 @@ update.sh           on-device updater (installed as openuf-update): backup, inst
                     conf.lua, restart, wait for /tmp/openuf-status, roll back on failure
 tools/              dist.sh (package), check.sh (preflight), simulate.sh (e2e),
                     deploy.sh (push a build to adopted APs and run update.sh on each),
+                    heartbeat-probe.lua (what one inform costs a board: forks and reads),
                     strip.lua, test_controller.py, validation/ (docker controller)
 PROTOCOL-VALIDATION.md   evidence for every protocol claim — read before disputing one
 REVERSE-ENGINEERING.md   the open questions: unimplemented surfaces + experiment plans

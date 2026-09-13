@@ -14,20 +14,28 @@
 
 	=== SCOPE AND LIMITS -- read before extending ===
 
-	**swconfig boards only.** All three boards this project targets (TP-Link
-	WDR3500, Archer C5 v1, WR1043ND v2) are ath79/swconfig, and both modelmaps
-	already carry the swconfig physical-port map this needs. Modern OpenWrt
-	(21.02+) is DSA, where per-port VLAN is `config bridge-vlan` instead --
-	detect_backend() recognizes DSA and refuses, rather than emitting
-	unverifiable config. There is no DSA board here to verify against.
+	**Two backends, and they are not equally proven.** The ath79/swconfig boards
+	(TP-Link WDR3500, Archer C5 v1, WR1043ND v2) get `switch_vlan` sections and
+	need a modelmap physical-port map. Modern OpenWrt (21.02+) is DSA, where
+	there is no switch table to write: M.dsa_apply moves the assigned socket out
+	of br-lan and into that VLAN's bridge instead. `config bridge-vlan` is
+	deliberately NOT used -- see PROTOCOL-VALIDATION.md for the netifd reasons.
 
-	**Not verified against real switch hardware.** The validation container has
-	no switch, no swconfig binary, and only a mock UCI. What is verified: the
-	wire format (live, against a real controller), the parse layer, and the
-	UCI state this module produces (unit tests with a mock cursor). What is
-	NOT: that the generated `switch_vlan` sections actually program a switch
-	ASIC, that traffic lands on the right VLAN, or that the reload command
-	behaves on real ath79. Same honesty as bcfilter.lua's nftables caveat.
+	**swconfig is not verified against real switch hardware.** The validation
+	container has no switch, no swconfig binary, and only a mock UCI. What is
+	verified there: the wire format (live, against a real controller), the parse
+	layer, and the UCI state this module produces (unit tests with a mock
+	cursor). What is NOT: that the generated `switch_vlan` sections actually
+	program a switch ASIC, that traffic lands on the right VLAN, or that the
+	reload command behaves on real ath79. Same honesty as bcfilter.lua's
+	nftables caveat.
+
+	**DSA is verified on real hardware upstream** -- a Xiaomi AX3000T (mt7530)
+	against a real UCG Ultra, including the one-address-table hazard that makes
+	`learning '0'` mandatory and the nft tap that gives the reporting back. The
+	JioRouter boards' mt7531 is the same driver family, but NONE of the DSA path
+	has been exercised on them yet: the drop, the ~140 s convergence and the
+	tap are upstream's measurements, not this fork's.
 
 	**Reversibility.** Assigning a port to a VLAN requires removing it from the
 	stock VLAN's port list, so unlike the wireless side this module cannot stay
@@ -576,6 +584,7 @@ end
 -- the socket members. Neither touches the other's.
 
 local OPENUF_BRDEV_PREFIX = "openuf_brdev"
+local OPENUF_BRPORT_PREFIX = "openuf_brport"
 
 -- Which netdev a UniFi port_idx is on a DSA board, or nil plus a reason.
 --
@@ -659,6 +668,22 @@ end
 -- The bridge device section a VLAN's L2 lives in, matching the names
 -- ucihelper.ensure_vlan_network writes.
 local function brdev_section(vid) return OPENUF_BRDEV_PREFIX .. tostring(vid) end
+
+-- The `config device` section carrying one moved SOCKET's bridge-port options.
+--
+-- Deliberately a different shape from ucihelper's `openuf_brport<vid>`, which
+-- names the tagged UPLINK sub-device: that one is per-VLAN and there is exactly
+-- one of it, this one is per-socket and there may be several in the same VLAN.
+-- The `_` keeps the two apart under ucihelper's `^openuf_brport(%d+)$` sweep.
+--
+-- UCI section names accept only [A-Za-z0-9_], and libuci discards a section
+-- with an invalid name while reporting success on both set() and commit() --
+-- silently, which is how an SSID with a hyphen once provisioned nothing at all.
+-- Socket netdevs here are `lan2`/`wan`-shaped, but sanitise rather than trust.
+local function brport_section(vid, ifname)
+	return OPENUF_BRPORT_PREFIX .. tostring(vid) .. "_"
+		.. tostring(ifname):gsub("[^%w_]", "_")
+end
 
 -- Read a UCI list option that may come back as a bare string.
 local function as_list(v)
@@ -781,9 +806,229 @@ function M.dsa_apply(sw, cfg, st, uplink_ifname)
 		end
 	end
 
+	-- MAC learning OFF on every socket openUF moves into a VLAN bridge.
+	--
+	-- Same hardware fact as the tagged uplink's override in
+	-- ucihelper.ensure_vlan_network, reached from the other side. On a DSA
+	-- board br-openuf<vid> is a SOFTWARE bridge: `wan.10` is an 8021q device
+	-- the switch knows nothing about, so the VLAN bridge exists only above the
+	-- CPU port. The moved socket, though, is still a real port on the same
+	-- ASIC as the uplink, and that ASIC has ONE address table. With learning
+	-- on it files the attached device against `lan2`:
+	--     00:00:5e:00:53:03 dev lan2 self
+	-- A reply arriving VLAN-tagged on the physical uplink port then HITS that
+	-- entry, and `lan2` is not in the uplink's bridge port matrix any more --
+	-- so the switch resolves the frame in hardware and drops it instead of
+	-- punting it to the CPU, where the software bridge would have delivered
+	-- it. With no entry the same frame is unknown unicast, floods to the CPU,
+	-- and arrives.
+	--
+	-- Measured on an AX3000T (2026-09-12) with an IKEA Trådfri hub on port 2,
+	-- captured at all three points at once. Learning ON: four DHCP DISCOVERs
+	-- leave `lan2`, reach `wan.10`, leave the uplink correctly tagged, and
+	-- NOTHING comes back -- not even on the physical port, because a
+	-- hardware-dropped frame never reaches the CPU to be captured. Learning
+	-- OFF: DISCOVER -> OFFER -> REQUEST -> ACK in 2 ms. Outbound is perfect in
+	-- both, which is what makes this so hard to see: every counter and every
+	-- log line says the port move worked.
+	--
+	-- Cost: the socket's hosts stop appearing in `bridge fdb show dev <sock>`.
+	-- That was priced here as "an attribution row" and it is not -- the bridge
+	-- FDB is the ONLY wired-host source on a DSA board, so the port reports no
+	-- clients at all and the controller credits them to the gateway. Paid for
+	-- by M.reconcile_mac_taps below, which observes the socket where the FDB
+	-- no longer can. Only assigned sockets need it.
+	--
+	-- NOTE a live reassignment still converges slowly: an entry learned while
+	-- the socket was in br-lan is already in the ASIC, cannot be deleted
+	-- (`bridge fdb del ... self` answers ENOENT, `bridge fdb flush` EOPNOTSUPP)
+	-- and does not clear on a link bounce. It ages out on its own -- measured
+	-- at ~140 s -- and the port works from that moment. Nothing to do but wait.
+	for vid in pairs(vids) do
+		for _, p in ipairs((cfg and cfg.net and cfg.net.ports) or {}) do
+			local ifname = p.ifname
+			if ifname and managed[ifname] then
+				local sec = brport_section(vid, ifname)
+				if assigned[ifname] == vid then
+					if cursor:get("network", sec, "name") ~= ifname
+						or tostring(cursor:get("network", sec, "learning") or "") ~= "0" then
+						cursor:set("network", sec, "device")
+						cursor:set("network", sec, "name", ifname)
+						cursor:set("network", sec, "learning", "0")
+						changed = true
+					end
+				elseif cursor:get("network", sec, "name") then
+					-- Going home to br-lan, or to a different VLAN: the
+					-- override must not outlive the assignment that needed
+					-- it, or the socket returns with learning still off and
+					-- silently stops reporting its hosts.
+					cursor:delete("network", sec)
+					changed = true
+				end
+			end
+		end
+	end
+
 	if not changed then return false end
 	cursor:commit("network")
 	M._exec("/etc/init.d/network reload 2>/dev/null")
+	-- After the commit, so tapped_sockets reads what was just written.
+	M.reconcile_mac_taps(cursor)
+	return true
+end
+
+-- === Getting the hosts back that `learning '0'` took away ==================
+--
+-- dsa_apply has to turn MAC learning off on every socket it moves into a VLAN
+-- bridge, or the ASIC hardware-drops the replies (the measurement is in the
+-- comment above). The bill for that arrives in the inform payload: the socket's
+-- hosts vanish from `bridge fdb`, port_table publishes an empty mac_table, and
+-- the controller credits the client to whoever else saw the MAC -- the gateway,
+-- which sees everything. Seen in production: a wired IoT device on an assigned
+-- socket listed under the gateway at the gateway's link speed.
+--
+-- There is no way to keep the software half of learning and drop the hardware
+-- half. One BR_LEARNING flag per bridge port, mirrored into the driver by DSA;
+-- the ASIC entry cannot be deleted (ENOENT) or flushed (EOPNOTSUPP) and is
+-- re-learned on the client's next frame anyway. The switch-level fix is to make
+-- the switch VLAN-aware (`vlan_filtering` + `config bridge-vlan`), which would
+-- restore learning AND hardware offload -- PROTOCOL-VALIDATION.md records why
+-- that is not what this does.
+--
+-- So openUF observes the socket somewhere the FDB is not: a bridge-family
+-- prerouting rule that files each frame's source address into a dynamic set.
+-- The socket is in a bridge whose other member is a software device, so it
+-- cannot be hardware-offloaded and every one of its frames reaches the CPU --
+-- which is the same fact that makes this tap see everything the FDB used to.
+--
+-- Two sets, one rule each, covering every tapped socket at once; a flat element
+-- list beats one set per socket to parse, and sysinfo reads both in a single
+-- `nft list table`. The 5m timeouts mirror the bridge's own FDB ageing so an
+-- unplugged client expires the way it used to.
+--
+--   portmacs  ifname . ether_addr                WHO is behind the socket.
+--   portips   ifname . ether_addr . ipv4_addr    and WHICH ADDRESS they have.
+--
+-- portips is not a nicety. The controller classifies a wired client into a
+-- network by the IP the reporting device puts in `mac_table[].ip`, NOT by the
+-- port's native VLAN -- verified against a live UCG Ultra, where every wired
+-- client carrying a reported IP landed in that IP's subnet and the one without
+-- fell back to the reporting AP's own network. An assigned socket is on a VLAN
+-- the AP holds no address on, so /proc/net/arp can never answer for it and the
+-- IP would be absent: the port would be right and the network label wrong.
+--
+-- Sources are ARP and IPv4 alike, because either one identifies the sender and
+-- a device that only ever ARPs still has to be reported. 0.0.0.0 is excluded on
+-- both: a DHCP DISCOVER and an ARP probe both carry it, and neither is an
+-- address the host actually holds.
+local NFT_LEARN_TABLE = "bridge openuf_learn"
+local NFT_LEARN_CHAIN = "learn"
+local NFT_LEARN_SET   = "portmacs"
+local NFT_LEARN_IPSET = "portips"
+local NFT_LEARN_TTL   = "5m"
+
+-- Which sockets currently have learning off, read back from the `config device`
+-- sections dsa_apply writes rather than from a second record of openUF's own.
+-- Those sections ARE the record: they exist exactly while the override does, so
+-- this is safe to call at startup with no state to consult.
+function M.tapped_sockets(cursor)
+	local out = {}
+	cursor:foreach("network", "device", function(s)
+		local sec = s[".name"]
+		if sec and sec:match("^" .. OPENUF_BRPORT_PREFIX .. "%d+_")
+			and tostring(s.learning or "") == "0"
+			and type(s.name) == "string" and s.name ~= "" then
+			out[#out + 1] = s.name
+		end
+	end)
+	table.sort(out)
+	return out
+end
+
+-- Rebuild the tap to exactly match the sockets that have learning off.
+--
+-- Same delete-and-recreate shape as firewall.reconcile: idempotent, and the
+-- teardown path is this function with nothing to tap (the table goes and
+-- nothing replaces it). Called after every dsa_apply/dsa_restore and once at
+-- startup, because nftables state does not survive a reboot and a tap that is
+-- not reinstalled fails silently -- as an empty mac_table, which is precisely
+-- the bug it exists to fix.
+--
+-- Returns true when a tap is now installed.
+function M.reconcile_mac_taps(cursor)
+	local c = cursor or get_uci().cursor()
+	local sockets = M.tapped_sockets(c)
+
+	-- Leave a tap that already covers exactly these sockets alone. Everything
+	-- the sets hold was learned from traffic that has already happened, so
+	-- rebuilding empties them and the socket reports NO clients until each host
+	-- next speaks -- and a host reported before its address is known is a host
+	-- the controller files under the wrong network. openUF restarts far more
+	-- often than an assignment changes, and the startup reconcile exists for
+	-- the reboot case, where there is nothing to preserve anyway.
+	local live = tostring(M._popen("nft list chain " .. NFT_LEARN_TABLE
+		.. " " .. NFT_LEARN_CHAIN) or "")
+	if #sockets > 0 and live:find("@" .. NFT_LEARN_SET, 1, true)
+		and live:find("@" .. NFT_LEARN_IPSET, 1, true) then
+		local have, n = {}, 0
+		for line in live:gmatch("[^\n]+") do
+			-- Each rule reads `iifname <selector> ... update @<set> {...}`, and
+			-- nft prints the selector as a bare "lan2" for one socket or as
+			-- { "lan2", "lan3" } for several. Taking the text before the first
+			-- `update` covers both without caring which.
+			local sel = line:match("^%s*iifname%s+(.-)%s+update")
+			if sel then
+				for ifn in sel:gmatch('"([^"]+)"') do
+					if not have[ifn] then have[ifn] = true; n = n + 1 end
+				end
+			end
+		end
+		if n == #sockets then
+			local same = true
+			for _, ifn in ipairs(sockets) do
+				if not have[ifn] then same = false break end
+			end
+			if same then return true end
+		end
+	end
+
+	M._exec("nft delete table " .. NFT_LEARN_TABLE .. " 2>/dev/null")
+	if #sockets == 0 then return false end
+
+	-- Socket names reach here from the modelmap by way of UCI. They are
+	-- `lan2`/`wan`-shaped and always have been, but they are interpolated into
+	-- a shell command, so sanitise rather than trust -- the same discipline
+	-- brport_section applies for libuci's sake.
+	local quoted = {}
+	for _, ifname in ipairs(sockets) do
+		quoted[#quoted + 1] = '"' .. ifname:gsub("[^%w._-]", "_") .. '"'
+	end
+
+	local socket_set = "iifname { " .. table.concat(quoted, ", ") .. " }"
+
+	M._exec("nft add table " .. NFT_LEARN_TABLE)
+	M._exec("nft add set " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_SET
+		.. " '{ type ifname . ether_addr; flags dynamic,timeout; timeout "
+		.. NFT_LEARN_TTL .. "; }'")
+	M._exec("nft add set " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_IPSET
+		.. " '{ type ifname . ether_addr . ipv4_addr; flags dynamic,timeout;"
+		.. " timeout " .. NFT_LEARN_TTL .. "; }'")
+	-- priority -300 (dstnat) puts this ahead of anything else openUF hooks in
+	-- the bridge family; policy accept and rules with no verdict mean it
+	-- observes and never decides.
+	M._exec("nft add chain " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_CHAIN
+		.. " '{ type filter hook prerouting priority -300; policy accept; }'")
+	M._exec("nft add rule " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_CHAIN
+		.. " '" .. socket_set
+		.. " update @" .. NFT_LEARN_SET .. " { iifname . ether saddr }'")
+	M._exec("nft add rule " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_CHAIN
+		.. " '" .. socket_set .. " arp saddr ip != 0.0.0.0"
+		.. " update @" .. NFT_LEARN_IPSET
+		.. " { iifname . ether saddr . arp saddr ip }'")
+	M._exec("nft add rule " .. NFT_LEARN_TABLE .. " " .. NFT_LEARN_CHAIN
+		.. " '" .. socket_set .. " ip saddr != 0.0.0.0"
+		.. " update @" .. NFT_LEARN_IPSET
+		.. " { iifname . ether saddr . ip saddr }'")
 	return true
 end
 
@@ -812,6 +1057,21 @@ function M.dsa_restore(st, cfg)
 		if diff then cursor:set("network", s[".name"], "ports", out); changed = true end
 	end)
 
+	-- The per-socket learning overrides go with the assignment that needed
+	-- them. Collected first and deleted after the walk: deleting inside
+	-- cursor:foreach mutates the list being iterated.
+	local doomed = {}
+	cursor:foreach("network", "device", function(s)
+		local name = s[".name"]
+		if name and name:match("^" .. OPENUF_BRPORT_PREFIX .. "%d+_") then
+			doomed[#doomed + 1] = name
+		end
+	end)
+	for _, name in ipairs(doomed) do
+		cursor:delete("network", name)
+		changed = true
+	end
+
 	-- Derived, not hardcoded: dsa_apply names this bridge from the modelmap,
 	-- and a restore that looked for a different one would silently put nothing
 	-- back while reporting success. Falls back to "lan" only when cfg is
@@ -827,6 +1087,9 @@ function M.dsa_restore(st, cfg)
 	if changed then
 		cursor:commit("network")
 		M._exec("/etc/init.d/network reload 2>/dev/null")
+		-- The overrides are gone, so the tap has nothing left to watch and
+		-- this tears the table down.
+		M.reconcile_mac_taps(cursor)
 	end
 	return changed
 end

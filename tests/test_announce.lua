@@ -284,14 +284,14 @@ return {
 			announce._popen = function(cmd)
 				seen[#seen + 1] = cmd
 				if cmd:match("addr show dev eth1") then
-					return "    inet 192.168.200.3/24 brd 192.168.200.255 scope global eth1\n"
+					return "    inet 192.0.2.3/24 brd 192.0.2.255 scope global eth1\n"
 				end
 				return ""
 			end
 			local ip = announce.get_ip("eth1")
 			announce._popen = orig
 			assert_not_nil(ip, "address found")
-			assert_eq(table.concat(ip, "."), "192.168.200.3", "octets parsed")
+			assert_eq(table.concat(ip, "."), "192.0.2.3", "octets parsed")
 			assert_eq(#seen, 1, "no bridge lookup when the port has its own address")
 		end
 	},
@@ -308,14 +308,14 @@ return {
 					return "../../../../../virtual/net/br-lan\n"
 				end
 				if cmd:match("addr show dev br%-lan") then
-					return "    inet 192.168.200.3/24 brd 192.168.200.255 scope global br-lan\n"
+					return "    inet 192.0.2.3/24 brd 192.0.2.255 scope global br-lan\n"
 				end
 				return ""
 			end
 			local ip = announce.get_ip("eth1")
 			announce._popen = orig
 			assert_not_nil(ip, "bridge address found via master symlink")
-			assert_eq(table.concat(ip, "."), "192.168.200.3", "bridge octets parsed")
+			assert_eq(table.concat(ip, "."), "192.0.2.3", "bridge octets parsed")
 		end
 	},
 	{
@@ -339,14 +339,14 @@ return {
 					return "../../../../../virtual/net/br-lan\n"
 				end
 				if cmd:match("addr show dev br%-lan") then
-					return "    inet 192.168.200.2/24 brd 192.168.200.255 scope global br-lan\n"
+					return "    inet 192.0.2.2/24 brd 192.0.2.255 scope global br-lan\n"
 				end
 				return ""
 			end
 			local ip = announce.get_ip("eth0")
 			announce._popen = orig
 			assert_not_nil(ip, "address found two hops away")
-			assert_eq(table.concat(ip, "."), "192.168.200.2", "trunk -> tagged child -> bridge")
+			assert_eq(table.concat(ip, "."), "192.0.2.2", "trunk -> tagged child -> bridge")
 		end
 	},
 	{

@@ -1,0 +1,28 @@
+table bridge openuf_learn {
+	set portmacs {
+		type ifname . ether_addr
+		size 65535
+		flags dynamic,timeout
+		timeout 5m
+		elements = { "lan2" . 00:00:5e:00:53:07 expires 4m43s880ms,
+			     "lan3" . 00:00:5e:00:53:08 expires 4m59s990ms,
+			     "lan2" . 00:00:5e:00:53:09 expires 1m2s }
+	}
+
+	set portips {
+		type ifname . ether_addr . ipv4_addr
+		size 65535
+		flags dynamic,timeout
+		timeout 5m
+		elements = { "lan2" . 00:00:5e:00:53:07 . 192.0.2.20 expires 4m43s880ms,
+			     "lan2" . 00:00:5e:00:53:09 . 192.0.2.99 expires 44s990ms,
+			     "lan2" . 00:00:5e:00:53:09 . 192.0.2.22 expires 1m2s }
+	}
+
+	chain learn {
+		type filter hook prerouting priority dstnat; policy accept;
+		iifname "lan2" update @portmacs { iifname . ether saddr }
+		iifname "lan2" arp saddr ip != 0.0.0.0 update @portips { iifname . ether saddr . arp saddr ip }
+		iifname "lan2" ip saddr != 0.0.0.0 update @portips { iifname . ether saddr . ip saddr }
+	}
+}

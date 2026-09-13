@@ -28,7 +28,6 @@ apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftable
 | `kmod-leds-gpio` | Only on a board whose device tree declares GPIO LEDs the image has no driver for (an AX3000T registers nothing but its radio LEDs, which are wired to nothing). `install.sh` adds it when it sees that situation |
 | `hostapd-utils` | `hostapd_cli` — immediate deauth of a just-blocked wireless client, client kick (Roaming Assistance) and Minimum RSSI enforcement |
 | `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced |
-| `coreutils-stat` | `stat` — only if your build has no `stat` applet (some do not). `inform.lua` uses `stat -c %Y` to notice an out-of-process `state.json` write, i.e. an SSH `set-adopt` or a manual `reset-inform`; without it those are ignored until restart. Enabling busybox's own `stat` applet is smaller |
 | `usteer` | Band Steering (Behavior Controls) — ubus-based client-steering daemon, driven by `openuf/usteer.lua` |
 | `wpad-wolfssl` (or `wpad-openssl`, `wpad-mbedtls`, `wpad`) | Full hostapd build with 802.11k/v support — required for BSS Transition and Band Steering. Any of the full builds will do; `wpad-basic-*` lacks `bss_transition` entirely and errors with "unknown configuration item 'bss_transition'" |
 
@@ -203,6 +202,15 @@ What `install.sh install` does:
   `conf.lua` from its interview. Modelmaps are always replaced, so a board profile you
   edited on the device should be copied out first.
 - Creates `/etc/openuf/` (state directory)
+- Adds `/etc/openuf/` and `/opt/openuf/conf.lua` to `/etc/sysupgrade.conf`, so that a
+  firmware upgrade keeps them. `sysupgrade` preserves `/etc/config` and a short built-in
+  list and knows nothing about either path; without this a stock upgrade takes
+  `state.json` — mac, authkey, cfgversion, `swvlan_backup` — and the modelmap selection
+  with it, and the AP comes back unadopted, posing as a generic dualband AP the
+  controller no longer recognises. Each line is appended only if it is not already there
+  and nothing else in the file is touched, so a keep list you maintain yourself is safe.
+  The Lua tree is deliberately *not* preserved: the installer reinstalls it, and carrying
+  an old copy onto a new OpenWrt is a silent version mismatch
 - Symlinks `/opt/openuf/hook/syswrapper.sh` → `/usr/bin/syswrapper.sh`
 - Creates `/etc/init.d/openuf` with two procd service instances (announce + inform)
 - Enables and starts the service
@@ -212,6 +220,12 @@ To uninstall:
 ```sh
 sh install.sh uninstall
 ```
+
+Uninstall removes the `/opt/openuf/conf.lua` line from `/etc/sysupgrade.conf` — the file
+is gone with `/opt/openuf/` — but **keeps the `/etc/openuf/` line**. The state directory
+itself is left intact so that the authkey survives, and un-registering it would let the
+next firmware upgrade delete exactly what it is being kept for. Remove that line by hand
+if you also delete `/etc/openuf/`; leaving it costs nothing either way.
 
 ### Upgrading an installed AP
 
@@ -438,8 +452,41 @@ the LAN to a guessed socket. Two more DSA differences:
   identity MAC, which must not depend on which of four equally-valid sockets the installer
   used; it is where the management address lives; and a tagged SSID's sub-device has to
   hang off the bridge (`br-lan.20`) — one on a bridge *port* never sees a frame.
-- Per-port VLAN assignment is unavailable. `switchvlan.lua` detects DSA and refuses rather
-  than guessing at a swconfig port map.
+- Per-port VLAN assignment is a **bridge move**, never `bridge-vlan`: `switchvlan.dsa_apply`
+  takes the assigned socket out of `br-lan` and puts it into that VLAN's `br-openuf<id>`
+  bridge — the same L2 a tagged SSID on that VLAN already uses. `br-lan` keeps the uplink
+  and the management address and nothing ever runs with `vlan_filtering`, so a wrong answer
+  cannot strand the AP. Native VLAN only; a tagged-only port is refused out loud.
+
+  **openUF turns MAC learning off on every socket it moves**, with a `config device`
+  section named `openuf_brport<vid>_<socket>`, and on the tagged uplink sub-device with
+  `openuf_brport<vid>`. This is not a tuning knob. `br-openuf<vid>` is a *software* bridge,
+  but the moved socket is still a real port on the same ASIC as the uplink, and that ASIC
+  has **one** address table: let it learn the attached device against the socket and a
+  reply arriving VLAN-tagged on the uplink port hits that entry, the switch resolves the
+  frame in hardware to a port that is no longer in the uplink's bridge, and drops it.
+  Outbound is perfect throughout, which is what makes it so hard to see. Upstream measured
+  this on an AX3000T (mt7530): learning on, four DHCP DISCOVERs leave, nothing comes back;
+  learning off, DISCOVER → OFFER → REQUEST → ACK in 2 ms. A live reassignment still
+  converges slowly — an entry the ASIC learned before the move cannot be deleted and ages
+  out on its own in ~140 s, so give a freshly moved port three minutes before suspecting
+  anything else.
+
+  With learning off the socket's hosts vanish from `bridge fdb`, which on a DSA board is the
+  only wired-host source — so openUF installs a bridge-family nftables tap
+  (`nft list table bridge openuf_learn`: two dynamic sets, `portmacs` and `portips`, with
+  5-minute timeouts matching the bridge's own FDB ageing) and `port_table` reads that for a
+  socket whose bridge is not the uplink's. The FDB always wins where it has an answer; a
+  board with no assigned socket never forks `nft`. The tap also collects each host's
+  address, because the AP holds no address on that VLAN and `/proc/net/arp` can never
+  answer for it — and the row carries `vlan`, which is what the controller uses to file a
+  wired client under the right **network** (it keeps a host only where the network's VLAN
+  equals the row's `vlan`, defaulting to 1). Both are rebuilt from UCI at startup, since
+  nftables keeps nothing across a reboot.
+
+  ⚠️ All of the above is upstream's work, verified on a Xiaomi AX3000T against a UCG Ultra.
+  The JioRouter boards' mt7531 is the same driver family, but this fork has not exercised
+  per-port VLAN on them yet.
 
 The modelmap sets:
 - `dev.openwrt_boards`      — the OpenWrt board names this profile is for, e.g.
@@ -471,8 +518,13 @@ The modelmap sets:
   own MAC/PHY instead of the switch (the TL-WDR3500's WAN socket, `eth1`) is listed with an
   `ifname` and no `swport`, and sysfs then describes that socket correctly. Count the RJ45
   sockets on the case — the list should have one entry each
-- `dev.conf.net.wan_iface`  — WAN interface (e.g. `eth0`)
-- `dev.conf.switch`         — Switch device name (e.g. `switch0`)
+- `dev.conf.net.wan_cpueth` — WAN-side CPU netdev (e.g. `eth0`). Only used as the uplink
+  entry of a fallback `port_table` for a board that declares no `dev.conf.net.ports`
+- `dev.conf.vlan.device`    — swconfig device name (e.g. `switch0`), as `swconfig list`
+  reports it. Boards that name it something else — `switch1` is common on ath79 and
+  ramips — must set this, or every `swconfig` call silently addresses the wrong device
+  and per-socket port reporting falls back to the CPU-port netdev. Not used on a DSA
+  board, which has no swconfig at all
 - `dev.conf.led`            — status LED, driven by the controller's Locate action and its
   **Manage → LED** toggle. Accepts a full sysfs path (`/sys/class/leds/tp-link:green:wlan`)
   or a bare LED name (`tp-link:green:wlan`). `nil` by default, since a generic profile can't
@@ -513,11 +565,12 @@ uap = {
 config = {
     use_only_unifi_wlan = true,  -- disable non-openuf_ SSIDs during provisioning
     keep_wlan_sections  = {},    -- AP sections that option must leave alone (see below)
-    inform_url  = "http://unifi:8080/inform",   -- default URL (overwritten at adoption)
+    inform_url  = "http://unifi:8080/inform",   -- first-boot URL; state.json's wins once set
     state_file  = "/etc/openuf/state.json",     -- honoured by inform, announce and syswrapper
     l2_announce = true,          -- see below
     debug_dump_file = nil,       -- see below
     debug_dump_requests = false, -- with debug_dump_file: record requests and HTTP errors too
+    debug_dump_max_bytes = 4194304, -- ceiling for that file; 0 = unbounded (see below)
     debug_caps = nil,            -- RESEARCH ONLY: override the claimed capability bits
     debug_payload_extra = nil,   -- RESEARCH ONLY: extra top-level payload fields
     neighbour_scan_interval = 0, -- seconds between background neighbour scans, 0 = never
@@ -593,6 +646,15 @@ ever logged.
 `ERR connect failed: …`). Response lines keep their untagged shape, so the recipes in
 REVERSE-ENGINEERING.md still work; `grep ' TX '` / `grep -v ' TX '` separates the two.
 
+`debug_dump_max_bytes` — ceiling for that dump, default 4 MiB, `0` for none. The dump is
+append-only and the inform loop writes to it every few seconds, so left unattended it
+grows without bound — and its usual home is `/tmp`, which on these boards is a RAM disk
+shared with `state.json` and the package manager (upstream found one left on for five
+weeks at 31.7 MB, 55% of a 59 MB tmpfs). Past the cap the file **restarts** rather than
+rotating, leaving a marker line saying so: a second generation would double the peak
+footprint on exactly the boards least able to afford it, and a capture is read from its
+tail anyway.
+
 `debug_caps` and `debug_payload_extra` — **research switches; leave them `nil`.** The
 rule everywhere else is that openUF never claims a capability bit it cannot honour,
 because a claimed bit makes the controller push config and show UI for a feature that
@@ -627,9 +689,15 @@ and a client that advertises the capability but never produces a report is bench
 two unanswered requests for six hours, with one log line saying so, instead of being asked
 forever. Rows sourced this way show a blank WiFi Name and
 Security, because a beacon report carries neither — openUF will not invent a security mode
-it did not measure. See § 6 for how to watch it work. `false` never sends a request; an
-*absent* key means on, so a `conf.lua` kept across an upgrade (see § 2) picks the feature up
-without an edit. The other new options default to off when absent.
+it did not measure. See § 6 for how to watch it work. `false` never sends a request, and
+also tears down the background collector (a detached `ubus subscribe hostapd.*` child that
+spools reports into `/tmp/openuf-rrm.jsonl`) on the next cycle — as does
+`/etc/init.d/openuf stop`. That matters because the child is reparented to init and outlives
+the daemon, and `harvest()` is the only thing that ever truncates its spool on a RAM-disk
+`/tmp`; if you ever find it running with openUF stopped (`pgrep -f 'ubus subscribe
+hostapd'`), `pkill -f 'ubus subscribe hostapd'` and delete the file. An *absent* key means
+on, so a `conf.lua` kept across an upgrade (see § 2) picks the feature up without an edit.
+The other new options default to off when absent.
 
 `bootstrap_adopt_user` — set by `install.sh install --bootstrap-adopt`, not by
 hand. Names the temporary SSH bootstrap account (see § SSH prerequisite below)
@@ -762,13 +830,13 @@ Persistent state is stored at `/etc/openuf/state.json`:
 | `authkey` | 32 hex chars (16-byte AES-128 key); default = pre-adoption key |
 | `cfgversion` | Opaque string the controller uses to push config updates |
 | `upgrade_requested_version` / `upgrade_requested_url` | Set when the controller sends an `upgrade` command; stored for visibility only — openUF never downloads or flashes firmware (see below) |
-| `inform_url` | URL for the 10-second inform heartbeat |
+| `inform_url` | URL for the 10-second inform heartbeat. Seeded from `conf.lua` on a first boot (or after a factory reset) and overwritten by the controller or by `syswrapper.sh set-inform`; once present here it always wins over `conf.lua` |
 | `use_gcm` | `true` when the controller has requested AES-128-GCM encryption (`use_aes_gcm=true` in mgmt_cfg) |
 | `blocked_stas` | MACs blocked from the controller's Clients view; re-applied to nftables on startup so blocks survive restarts |
 | `mac` | The identity MAC the previous run informed under (read off `lan_cpueth` at startup). Compared against the live one on the next start: a difference on an adopted device is the HTTP-400-forever condition, and is shouted about |
 | `locating`, `led_enabled` | The controller's Locate and Manage → LED state, so a restart does not forget them |
 | `swvlan_backup` | Original `ports` strings of the stock `switch_vlan` sections, snapshotted before per-port VLAN assignment first modifies them; used to restore them (see § 6) |
-| `ip_mode`, `static_ip`, `static_netmask`, `static_gateway`, `static_dns` | The last "IP Settings" push. `ip_mode` is `"static"` or `"dhcp"`; the `static_*` fields are set only in static mode and cleared on a revert to DHCP. `static_dns` is an array in the controller's primary/secondary order, written to `/etc/resolv.conf`. On DHCP, DNS is left to the lease and openUF does not touch `resolv.conf` |
+| `ip_mode`, `static_ip`, `static_netmask`, `static_gateway`, `static_dns` | The last "IP Settings" push. `ip_mode` is `"static"` or `"dhcp"`; the `static_*` fields are set only in static mode and cleared on a revert to DHCP. `static_dns` is an array in the controller's primary/secondary order, written to `/etc/resolv.conf`. On DHCP, DNS is left to the lease and openUF does not touch `resolv.conf`. In static mode these are **re-applied on every start**, because the address is `ip addr` state that a reboot discards and the controller does not re-push it (a matching `cfgversion` gets a `noop` back, carrying no `system_cfg` at all) — the same reason `blocked_stas` and `led_enabled` are reconciled at startup |
 
 Every field `state.save` writes is read back by `state.load` (the eight in the JSON
 above are type-checked and fall back to a default; anything else round-trips as-is). The
@@ -805,7 +873,7 @@ Settings carried through from the controller:
 | SSID, passphrase, security | `wifi-iface` ssid/key/encryption |
 | Hide WiFi Name | `hidden` (hostapd `ignore_broadcast_ssid`) |
 | MAC Address Filter | `macfilter` (`disable`/`allow`/`deny`) + `maclist` |
-| WiFi Speed Limit | `tc` shaping per VAP, not a hostapd option (plus `openuf_ratelimit_down`/`openuf_ratelimit_up` on the section for visibility) |
+| WiFi Speed Limit | `tc` shaping per VAP, not a hostapd option. `openuf_ratelimit_down`/`openuf_ratelimit_up` on the section are the persisted record: `tc` state dies with a reboot, so openUF rebuilds the qdiscs from those two options on every start |
 | WPA2 / WPA3 / WPA2-WPA3 mixed | `encryption=psk2`/`sae`/`sae-mixed`, from the pushed AKM set **plus** `wpa3.transition` — SAE replaces WPA-PSK on the wire, so the AKM alone cannot tell mixed from WPA3-only. Depends on openUF advertising `radio_caps2` bit `0x1` |
 | WPA-Enterprise (802.1X) | **not supported** — the WLAN is skipped and logged. The wire protocol carries no RADIUS server/port/secret to write, so there is nothing openUF could provision |
 | PMF (802.11w) | `ieee80211w` (0 disabled / 1 optional / 2 required) |
@@ -815,7 +883,7 @@ Settings carried through from the controller:
 | Auto/Custom DTIM Period | `dtim_period` |
 | Multicast Enhancement | `multicast_to_unicast` |
 | Minimum Data Rate | per-**radio** `basic_rate` / `supported_rates` / `legacy_rates` / `beacon_rate` |
-| Multicast and Broadcast Blocker | nftables rules, not a hostapd option (plus `openuf_bcfilt`/`openuf_bcfilt_macs` on the section for visibility) |
+| Multicast and Broadcast Blocker | nftables rules, not a hostapd option. `openuf_bcfilt`/`openuf_bcfilt_macs` on the section are the persisted record: the ruleset dies with a reboot, so openUF rebuilds it from those two options on every start |
 | Proxy ARP | `proxy_arp` — **needs a full `wpad` build** |
 | Client Isolation | `isolate` (hostapd `ap_isolate`) |
 | Network / VLAN assignment | a per-VLAN bridge (`br-openuf<id>`) holding the tagged uplink sub-device (`eth1.<id>`), which the VAP joins — plus a `switch_vlan` trunk on swconfig boards. See below |
@@ -1077,6 +1145,14 @@ lldpctl -f json  # JSON output (what openUF reads)
 
 If `lldpd` is absent or returns no neighbors, `lldp.lua` returns an empty table — non-fatal.
 
+The neighbour table is included in every inform, but `lldpctl` is only re-run
+once a minute rather than on every 10-second heartbeat: `lldpd` advertises on a
+30-second interval, so polling it faster only cost a process spawn and a JSON
+decode. A topology change — a new neighbour, or a moved cable — can therefore
+take up to a minute to show up on the controller's map. An *empty* answer is
+never cached, so a device that starts before `lldpd` picks its neighbours up on
+the very next heartbeat.
+
 ### Point lldpd's chassis ID at the same interface as `lan_cpueth`
 
 ```sh
@@ -1106,6 +1182,26 @@ openUF reports, and the controller resolves the uplink immediately — confirmed
 live: an Archer C5 went from no `uplink_mac` at all to
 `Cloud Gateway Ultra, port 4` on the next LLDP advertisement.
 
+**openUF closes the other half of this itself.** The same two-MAC split has a second
+symptom that LLDP does not cover: openUF reports its IP from the *bridge* `lan_cpueth` is
+enslaved to (a bridge member carries no address of its own), so a DSA map that names a
+socket announces the device under the socket's MAC while every frame it sends, and the ARP
+entry for the address it reports, carry `br-lan`'s. The gateway sees one device claiming
+the IP and another using it, and raises **"IP Address Conflict — multiple devices are using
+the same address"** against a network that is perfectly configured (upstream saw this on
+the AX3000T, whose map names `wan`).
+
+`ucihelper.ensure_bridge_identity` runs once at daemon start and pins the bridge's
+`macaddr` to `lan_cpueth`'s MAC when — and only when — the two differ, so identity, LLDP
+and management traffic all agree, the way they do on a real UniFi AP. Boards where they
+already match are untouched and no reload is issued — that includes this fork's JioRouter
+maps, whose `lan_cpueth` *is* `br-lan`. It logs what it pinned; adoption is keyed on
+`lan_cpueth`'s MAC, which it never changes.
+
+> If the board takes its management address by **DHCP**, the new L2 identity means a new
+> lease and possibly a new address. The adoption survives and openUF reports the new
+> address on the next inform, but expect the change.
+
 Verify the two agree:
 ```sh
 lldpcli show chassis | grep ChassisID          # lldpd's identity
@@ -1127,6 +1223,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
 | Locate/LED does nothing | `dev.conf.led` is `nil` in your modelmap — set it to a path from `ls /sys/class/leds` |
 | JSON decode error in controller logs | AES key mismatch — try `syswrapper.sh reset-inform` |
+| `inform: parse error: ... inflate: truncated stream` | A compressed controller response arrived incomplete. One heartbeat is lost and the next retries, so an occasional line is harmless; a steady stream of them points at the link to the controller (an MTU or proxy problem), not at the device. Before this the pure-Lua inflater spun forever on such a stream and the daemon went silent |
 | **Adopted and healthy, but no pushed SSID is ever created** | **`libuci-lua` is missing** — the most likely cause by far, and it looks like nothing is wrong. Check with `lua -e 'print(pcall(require,"uci"))'`; fix with `apk add libuci-lua` and restart. Every wireless read/write is `pcall`-wrapped, so without it the device adopts, reports ports and statistics, and sends an **empty `radio_table`** — the controller has no radio to put a WLAN on, accepts the push, and creates nothing. openUF warns about this at startup (`logread \| grep openuf`) and `tools/check.sh` tests for it |
 | SSID not appearing after adoption | Confirm the controller actually pushed it: set `debug_dump_file` in `conf.lua`, restart, and look for `wireless.*`/`aaa.*` keys in the `setparam` `system_cfg`. If the controller only ever sends `noop`, it believes the device is already configured — clear `cfgversion` in `state.json` and restart to force a full re-push. Then check `uci show wireless \| grep openuf` |
 | Controller channel width is ignored; radio runs 802.11n | UniFi's `ieee_mode` token keeps the vestigial `ht` PHY marker and moves only the width, so 80 MHz arrives as `11naht80`. openUF used to take that literally as `HT80` — which does not exist — and `clamp_htmode` knocked it back to `HT40`, silently discarding the setting. Fixed: a width above 40 MHz promotes the token to `VHT`, the narrowest PHY that can express it. If the radio still runs below its capability, set a `dev.conf.radio.<band>.htmode_floor` |
@@ -1140,3 +1237,36 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 Logs go to the system log via procd: `logread -e openuf` (follow with `logread -f`).
 
 For development testing without hardware, see `tools/test_controller.py`.
+
+### Measuring what a heartbeat costs on the device
+
+`tools/heartbeat-probe.lua` builds one real inform payload and reports every
+process it spawns and every file it opens, broken down by command and path. It
+builds its own payload in a throwaway process, so it is safe to run on a live,
+adopted AP alongside `openuf`.
+
+```sh
+ssh root@<ap> 'cat > /tmp/heartbeat-probe.lua' < tools/heartbeat-probe.lua
+ssh root@<ap> 'cd /opt/openuf && lua /tmp/heartbeat-probe.lua'
+```
+
+Read the **steady** figure, not the cold one: the first payload of a process
+warms everything TTL-cached across heartbeats (the phy dump, the uplink lookup,
+the LLDP neighbour list), so it overstates what openUF pays every ten seconds.
+Add `payload` as an argument to also print the payload on stdout, which is how
+you show a change is behaviour-neutral — build one before and after, and diff
+them with the live counters (`time`, `uptime`, byte/packet counts, `signal`,
+`tx_mcs`, `capacity`, `throughput`, `satisfaction_now`, `idletime`) scrubbed.
+
+The probe measures the *build* half only. To confirm the daemon is still
+informing, count outbound TCP connections — an AP originates almost nothing
+else, so this rises once per heartbeat:
+
+```sh
+grep -A1 '^Tcp:' /proc/net/snmp | sed -n 2p | cut -d' ' -f6
+```
+
+Polling `netstat` for a connection to the controller does **not** work: a POST
+is sub-second, and once-a-second sampling misses it on a perfectly healthy AP.
+openUF logs nothing on success, so silence in `logread` is not evidence either
+(`/tmp/openuf-status`, which `_tick` rewrites every cycle, is).

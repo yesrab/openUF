@@ -827,7 +827,6 @@ REQUIRED="lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw"
 # half of WiFi Speed Limit; a stock filogic image ships sch_htb but no
 # act_police, so only the download cap applied. Both found by upstream.
 OPTIONAL="lldpd hostapd-utils usteer ip-bridge nftables kmod-nft-bridge tc-tiny kmod-sched-act-police"
-command -v stat >/dev/null 2>&1 || OPTIONAL="$OPTIONAL coreutils-stat"
 # A board whose device tree declares gpio LEDs the running kernel cannot drive
 # registers only its radio LEDs (which may be wired to nothing); the gpio
 # driver is 9 KB and pointless where the LEDs already registered.
@@ -1024,9 +1023,7 @@ dev.conf.net = {
 	-- never sees a frame.
 	lan_cpueth	= "$GEN_CPUETH",
 	lan_vlanid	= 1,
-	wan_name	= "wan",
 	wan_cpueth	= "${GEN_WAN:-wan}",
-	wan_vlanid	= 4090,
 
 	-- One entry per physical socket, from this board's UCI bridge membership.
 	-- No 'uplink' flag: the cable's socket is measured at runtime, below.
