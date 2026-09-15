@@ -3643,4 +3643,309 @@ return {
 			assert_eq(open_passes, 0, "the pass is closed even on the error path")
 		end
 	},
+
+	-- ── The controller's interval, and the unhandled-surface ledger ──────────
+
+	{
+		name = "inform: _tick adopts the interval a noop names, clamped, and reverts when the next noop has none",
+		fn = function()
+			with_tick_env(function()
+				local st, ctx = sample_state(), fresh_ctx()
+				local o_ci = inform._controller_interval
+				inform._controller_interval = nil
+				inform._http_post = function() return response('{"_type":"noop","interval":30}', st) end
+				assert_eq(inform._tick(st, nil, nil, ctx), 30, "the controller's 30 s is adopted")
+				inform._http_post = function() return response('{"_type":"noop","interval":1}', st) end
+				assert_eq(inform._tick(st, nil, nil, ctx), 5, "1 s is clamped up to INTERVAL_MIN")
+				inform._http_post = function() return response('{"_type":"noop","interval":100000}', st) end
+				assert_eq(inform._tick(st, nil, nil, ctx), 300, "an hour is clamped down to INTERVAL_MAX")
+				inform._http_post = function() return response('{"_type":"noop","interval":"soon"}', st) end
+				assert_eq(inform._tick(st, nil, nil, ctx), 10, "a non-number falls back to the device's own cadence")
+				inform._http_post = function() return response('{"_type":"noop","interval":20}', st) end
+				assert_eq(inform._tick(st, nil, nil, ctx), 20, "and a later value moves it again")
+				inform._http_post = function() return response('{"_type":"noop"}', st) end
+				assert_eq(inform._tick(st, nil, nil, ctx), 10, "a noop with no interval means the default again")
+				-- The backoff starts over from the CURRENT interval.
+				inform._http_post = function() return response('{"_type":"noop","interval":30}', st) end
+				inform._tick(st, nil, nil, ctx)
+				inform._http_post = function() return nil, "connect failed" end
+				local w
+				with_stderr(function() w = inform._tick(st, nil, nil, ctx) end)
+				assert_eq(w, 60, "first failure after a 30 s cadence backs off to 60")
+				inform._controller_interval = o_ci
+			end)
+		end
+	},
+	{
+		name = "inform: an unknown cmd lands in the ledger with its whole body",
+		fn = function()
+			local led = inform._unhandled
+			led._reset("/tmp/openuf_test_unhandled_inform.json")
+			local st = sample_state()
+			local out = with_stderr(function()
+				inform.handle_response('{"_type":"cmd","cmd":"mesh-halt","mac":"00:00:5e:00:53:01","device_id":"abc","psk":"secret"}', st)
+			end)
+			assert_contains(out, "cmd: mesh-halt", "still logged")
+			local e = led.entry("cmd", "mesh-halt")
+			assert_not_nil(e, "recorded")
+			assert_eq(e.count, 1, "once")
+			assert_eq(e.payload.cmd, "mesh-halt", "body kept")
+			assert_eq(e.payload.mac, "00:00:5e:00:53:01", "with its fields")
+			assert_eq(e.payload.psk, "<redacted>", "secret-named fields redacted")
+			-- A handled cmd is NOT a ledger entry.
+			with_stderr(function()
+				inform.handle_response('{"_type":"cmd","cmd":"unblock-sta","mac":"00:00:5e:00:53:02"}', st)
+			end)
+			assert_nil(led.entry("cmd", "unblock-sta"), "handled commands are not recorded")
+			led._reset()
+		end
+	},
+	{
+		name = "inform: an unknown response _type lands in the ledger; known ones do not",
+		fn = function()
+			local led = inform._unhandled
+			led._reset("/tmp/openuf_test_unhandled_inform.json")
+			local st = sample_state()
+			inform.handle_response('{"_type":"stun-ping","target":"x"}', st)
+			local e = led.entry("response", "stun-ping")
+			assert_not_nil(e, "recorded")
+			assert_eq(e.payload.target, "x", "body kept")
+			inform.handle_response('{"_type":"noop","interval":10,"include_blocks":[]}', st)
+			assert_eq(led.count(), 1, "a noop with only known fields adds nothing")
+			led._reset()
+		end
+	},
+	{
+		name = "inform: a top-level field no handler reads is recorded under its own name",
+		fn = function()
+			local led = inform._unhandled
+			led._reset("/tmp/openuf_test_unhandled_inform.json")
+			local st = sample_state()
+			inform.handle_response('{"_type":"noop","interval":10,"guest_token":"abc","new_thing":{"a":1}}', st)
+			local e = led.entry("field", "noop.new_thing")
+			assert_not_nil(e, "recorded")
+			assert_eq(e.payload.new_thing.a, 1, "value kept under the field's own name")
+			assert_eq(led.entry("field", "noop.guest_token").payload.guest_token, "<redacted>",
+				"a secret-named field is redacted because it is keyed by its own name")
+			assert_nil(led.entry("field", "noop.interval"), "known fields are not recorded")
+			led._reset()
+		end
+	},
+	{
+		name = "inform: unknown mgmt_cfg keys reach the ledger with their value; recognized ones do not",
+		fn = function()
+			local led = inform._unhandled
+			led._reset("/tmp/openuf_test_unhandled_inform.json")
+			local st = sample_state({adopted = true})
+			local resp = '{"_type":"setparam","mgmt_cfg":"cfgversion=abc\nstun_url=stun://192.0.2.4:3478/\n'
+				.. 'capability=notif,notif-assoc-stat\nradius_secret=hunter2\nauthkey=00112233445566778899aabbccddeeff\nuse_aes_gcm=true\n"}'
+			inform.handle_response(resp, st)
+			local e = led.entry("mgmt_cfg", "stun_url")
+			assert_not_nil(e, "stun_url recorded")
+			assert_eq(e.payload.sample, "stun_url", "example key")
+			assert_eq(e.payload.value, "stun://192.0.2.4:3478/", "value kept -- it is the research target")
+			assert_eq(e.payload.occurrences, 1, "occurrences in that blob")
+			assert_eq(led.entry("mgmt_cfg", "capability").payload.value, "notif,notif-assoc-stat", "capability too")
+			assert_eq(led.entry("mgmt_cfg", "radius_secret").payload.value, "<redacted>",
+				"an unknown key with a secret-looking name keeps its name and loses its value")
+			assert_nil(led.entry("mgmt_cfg", "authkey"), "authkey is recognized, never recorded")
+			assert_nil(led.entry("mgmt_cfg", "cfgversion"), "cfgversion is recognized")
+			assert_nil(led.entry("mgmt_cfg", "use_aes_gcm"), "use_aes_gcm is recognized")
+			led._reset()
+		end
+	},
+	{
+		name = "inform: unknown system_cfg key shapes reach the ledger collapsed to <n> with one example",
+		fn = function()
+			local led = inform._unhandled
+			led._reset("/tmp/openuf_test_unhandled_inform.json")
+			local st = sample_state()
+			local resp = '{"_type":"setparam","system_cfg":"guest.1.status=enabled\nguest.2.status=enabled\n'
+				.. 'guest.1.token=zzz\nredirector.url=http://192.0.2.4/guest/s/default/\n'
+				.. 'aaa.1.wpa.psk=hunter2\nradio.1.channel=6\n"}'
+			with_stderr(function() inform.handle_response(resp, st, {net = {lan_cpueth = "eth0"}}) end)
+			local e = led.entry("system_cfg", "guest.<n>.status")
+			assert_not_nil(e, "recorded once per key shape")
+			assert_eq(e.payload.occurrences, 2, "both indices counted")
+			assert_eq(e.payload.sample, "guest.1.status", "first full key kept")
+			assert_eq(e.payload.value, "enabled", "with its value")
+			assert_eq(led.entry("system_cfg", "guest.<n>.token").payload.value, "<redacted>", "token redacted")
+			assert_eq(led.entry("system_cfg", "redirector.url").payload.value,
+				"http://192.0.2.4/guest/s/default/", "a plain unknown key keeps its value")
+			assert_nil(led.entry("system_cfg", "aaa.<n>.wpa.psk"), "recognized prefixes are never recorded")
+			assert_nil(led.entry("system_cfg", "radio.<n>.channel"), "nor radio.*")
+			led._reset()
+		end
+	},
+	{
+		name = "inform: _tick flushes the ledger, so a new entry is on disk after the heartbeat that saw it",
+		fn = function()
+			with_tick_env(function()
+				local led = inform._unhandled
+				local FILE = "/tmp/openuf_test_unhandled_tick.json"
+				os.remove(FILE)
+				led._reset(FILE)
+				led.load()
+				local st, ctx = sample_state(), fresh_ctx()
+				inform._http_post = function() return response('{"_type":"cmd","cmd":"mesh-halt"}', st) end
+				with_stderr(function() inform._tick(st, nil, nil, ctx) end)
+				local f = io.open(FILE, "r")
+				assert_not_nil(f, "written by the tick")
+				local raw = f:read("*a"); f:close()
+				local doc = require("cjson").decode(raw)
+				assert_not_nil(doc.entries["cmd/mesh-halt"], "with the entry")
+				assert_eq(doc.entries["cmd/mesh-halt"].payload.cmd, "mesh-halt", "and its body")
+				os.remove(FILE)
+				led._reset()
+			end)
+		end
+	},
+
+	-- ── sysconf, l2guard and the 11k-scan request ─────────────────────────
+
+	{
+		name = "inform: a setparam with timezone/ntp/cron keys hands the parsed blocks to sysconf.apply",
+		fn = function()
+			local real = inform._sysconf
+			local got
+			inform._sysconf = {parse = real.parse, apply = function(p) got = p; return {} end}
+			local st = sample_state()
+			local resp = '{"_type":"setparam","system_cfg":"system.timezone=IST-5:30\nntpclient.status=enabled\n'
+				.. 'ntpclient.1.server=0.ubnt.pool.ntp.org\ncron.status=enabled\ncron.1.status=enabled\n'
+				.. 'cron.1.job.1.schedule=0 4 * * *\ncron.1.job.1.cmd=syswrapper.sh 11k-scan\n"}'
+			with_stderr(function() inform.handle_response(resp, st, {net = {lan_cpueth = "eth0"}}) end)
+			inform._sysconf = real
+			assert_not_nil(got, "apply called")
+			assert_eq(got.timezone, "IST-5:30", "timezone parsed")
+			assert_eq(got.ntp.servers[1], "0.ubnt.pool.ntp.org", "ntp parsed")
+			assert_eq(got.cron.jobs[1].cmd, "syswrapper.sh 11k-scan", "cron parsed")
+			-- A push without the blocks never calls apply.
+			got = nil
+			inform._sysconf = {parse = real.parse, apply = function(p) got = p; return {} end}
+			with_stderr(function()
+				inform.handle_response('{"_type":"setparam","system_cfg":"radio.1.channel=6\n"}', st, {net = {lan_cpueth = "eth0"}})
+			end)
+			inform._sysconf = real
+			assert_nil(got, "no blocks, no apply")
+		end
+	},
+	{
+		name = "inform: a setparam with the ebtables block records the intent in state and reconciles l2guard on the AP VAPs",
+		fn = function()
+			local real_l2, real_uci = inform._l2guard, inform._ucihelper
+			local calls = {}
+			inform._l2guard = {parse = real_l2.parse, spec_from = real_l2.spec_from,
+				reconcile = function(spec, names) calls[#calls + 1] = {spec = spec, names = names}; return 3 end}
+			inform._ucihelper = {ap_ifnames = function() return {"phy0-ap0", "phy1-ap0"} end}
+			local st = sample_state()
+			local resp = '{"_type":"setparam","system_cfg":"ebtables.status=enabled\n'
+				.. 'ebtables.1.cmd=-t nat -A PREROUTING --in-interface ath0 -d BGA -j DROP\n'
+				.. 'ebtables.2.cmd=-t broute -A BROUTING --vlan-id 10 -p 802_1Q -j DROP\n'
+				.. 'ebtables.3.cmd=-t filter -A FORWARD -j ACCEPT\n"}'
+			local out = with_stderr(function() inform.handle_response(resp, st, nil) end)
+			inform._l2guard, inform._ucihelper = real_l2, real_uci
+			assert_eq(#calls, 1, "reconciled once")
+			assert_true(calls[1].spec.bpdu, "bpdu on")
+			assert_true(calls[1].spec.tagdrop, "tagdrop on")
+			assert_eq(table.concat(calls[1].names, ","), "phy0-ap0,phy1-ap0", "on the live AP VAPs")
+			assert_true(st.l2guard.bpdu and st.l2guard.tagdrop, "intent persisted")
+			assert_eq(st.l2guard.ifnames[2], "phy1-ap0", "names persisted for the startup rebuild")
+			assert_contains(out, 'unrecognised ebtables rule shape, not applied: "-t filter -A FORWARD -j ACCEPT"', "unknown shape logged")
+			-- Wireless not answering: the last known names are reused.
+			inform._l2guard = {parse = real_l2.parse, spec_from = real_l2.spec_from,
+				reconcile = function(spec, names) calls[#calls + 1] = {spec = spec, names = names}; return 0 end}
+			inform._ucihelper = {ap_ifnames = function() return {} end}
+			with_stderr(function() inform.handle_response(resp, st, nil) end)
+			inform._l2guard, inform._ucihelper = real_l2, real_uci
+			assert_eq(table.concat(calls[2].names, ","), "phy0-ap0,phy1-ap0", "fell back to the recorded names")
+			-- Gate off: reconcile is still called, with everything false, so the table is torn down.
+			inform._l2guard = {parse = real_l2.parse, spec_from = real_l2.spec_from,
+				reconcile = function(spec, names) calls[#calls + 1] = {spec = spec, names = names}; return 0 end}
+			inform._ucihelper = {ap_ifnames = function() return {"phy0-ap0"} end}
+			with_stderr(function()
+				inform.handle_response('{"_type":"setparam","system_cfg":"ebtables.status=disabled\n"}', st, nil)
+			end)
+			inform._l2guard, inform._ucihelper = real_l2, real_uci
+			assert_false(calls[3].spec.bpdu or calls[3].spec.tagdrop, "torn down")
+		end
+	},
+	{
+		name = "inform: an 11k-scan request file makes the next heartbeat scan every radio and is consumed",
+		fn = function()
+			local FILE = "/tmp/openuf_test_scan_request"
+			local o_file, o_run, o_uci, o_time = inform.SCAN_REQUEST_FILE, inform._run_cmd, inform._ucihelper, inform._time
+			inform.SCAN_REQUEST_FILE = FILE
+			local cmds = {}
+			inform._run_cmd = function(c) cmds[#cmds + 1] = c; return "" end
+			inform._ucihelper = {
+				get_radio_table = function() return {{name = "radio0"}, {name = "radio1"}} end,
+				get_ifname_for_radio = function(r) return r == "radio0" and "phy0-ap0" or "phy1-ap0" end,
+			}
+			inform._time = function() return 1700000000 end
+			local function write_request(t) local f = io.open(FILE, "w"); f:write(tostring(t), "\n"); f:close() end
+			local ok, err = pcall(function()
+				-- Fresh request: scans, even on the first pass and with the interval option off.
+				write_request(1700000000 - 30)
+				local ctx = {}
+				local out = with_stderr(function()
+					assert_true(inform._maybe_scan_neighbours({config = {neighbour_scan_interval = 0}}, ctx), "scanned")
+				end)
+				assert_eq(#cmds, 2, "one scan per radio")
+				assert_contains(cmds[1], "iw dev phy0-ap0 scan", "radio0")
+				assert_contains(cmds[2], "iw dev phy1-ap0 scan", "radio1")
+				assert_nil(io.open(FILE, "r"), "request consumed")
+				assert_contains(out, "11k-scan requested", "logged")
+				-- Stale request: consumed, ignored, nothing issued.
+				write_request(1700000000 - 3600)
+				out = with_stderr(function()
+					assert_false(inform._maybe_scan_neighbours({config = {neighbour_scan_interval = 0}}, ctx), "not scanned")
+				end)
+				assert_eq(#cmds, 2, "no new scan")
+				assert_nil(io.open(FILE, "r"), "stale request removed too")
+				assert_contains(out, "stale 11k-scan request", "logged")
+				-- No request, interval off: nothing.
+				assert_false(inform._maybe_scan_neighbours({config = {neighbour_scan_interval = 0}}, ctx), "quiet")
+			end)
+			inform.SCAN_REQUEST_FILE, inform._run_cmd, inform._ucihelper, inform._time = o_file, o_run, o_uci, o_time
+			os.remove(FILE)
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: _sync_bootstrap_account skips passwd when /etc/shadow already shows the wanted state",
+		fn = function()
+			local o_run, o_read = inform._run_cmd, inform._read_file
+			local calls = {}
+			inform._run_cmd = function(c) calls[#calls + 1] = c; return "" end
+			local shadow
+			inform._read_file = function(path)
+				if path == inform.SHADOW_FILE then return shadow end
+				return o_read(path)
+			end
+			local ok, err = pcall(function()
+				shadow = "root::0:0:99999:7:::\nubnt:!$1$abc$def:19000:0:99999:7:::\n"
+				assert_true(inform._account_locked("ubnt"), "locked hash recognised")
+				inform._sync_bootstrap_account(true, "ubnt")
+				assert_eq(#calls, 0, "already locked: no passwd -l, no log noise")
+				inform._sync_bootstrap_account(false, "ubnt")
+				assert_eq(#calls, 1, "locked but should be open: unlocked")
+				assert_contains(calls[1], "passwd -u", "unlock")
+				shadow = "ubnt:$1$abc$def:19000:0:99999:7:::\n"
+				assert_false(inform._account_locked("ubnt"), "open hash recognised")
+				inform._sync_bootstrap_account(false, "ubnt")
+				assert_eq(#calls, 1, "already open: nothing")
+				inform._sync_bootstrap_account(true, "ubnt")
+				assert_eq(#calls, 2, "open but should be locked: locked")
+				assert_contains(calls[2], "passwd -l", "lock")
+				shadow = nil
+				assert_nil(inform._account_locked("ubnt"), "unknown without the file")
+				inform._sync_bootstrap_account(true, "ubnt")
+				assert_eq(#calls, 3, "unknown state: act as before")
+				shadow = "root::0:0:99999:7:::\n"
+				assert_nil(inform._account_locked("ubnt"), "unknown when the user is missing")
+			end)
+			inform._run_cmd, inform._read_file = o_run, o_read
+			if not ok then error(err, 0) end
+		end
+	},
 }

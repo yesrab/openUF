@@ -397,6 +397,32 @@ factory reset.
 
 ## Landmines
 
+- **Everything the controller sends that openUF does not act on goes to the unhandled
+  ledger, always.** `handle_response` records an unknown `_type` or `cmd` with its whole
+  body, unknown top-level fields, and (through `_report_dropped_keys`) every `mgmt_cfg` key
+  and `system_cfg` key shape no parser reads, into `unhandled.lua` → `/etc/openuf/unhandled.json`.
+  So: implementing a new cmd or key means adding it to the dispatch or to `RECOGNIZED_*`, or
+  it keeps being counted as ignored -- which is the honest state until it IS implemented.
+  The ledger redacts by field NAME (`psk`, `passphrase`, `authkey`, `token`, `*key`...), so
+  never hand it a payload whose secret sits under an innocent name, and never name a
+  payload field of your own `*_key` (the first version did, and redacted its own sample).
+  The `noop`'s `interval` is honoured (clamped 5–300 s); `_tick` re-reads it every cycle.
+- **`syswrapper.sh 11k-scan` does not scan. It leaves a dated request file** (`/tmp/openuf-
+  scan-request`) that the daemon's `_maybe_scan_neighbours` consumes on the next heartbeat,
+  ignoring anything older than ten minutes. The scan code, the radios' netdev names and the
+  cache the result lands in all live in the daemon; a second implementation in the hook
+  would drift. A request older than the cutoff is what a stopped daemon leaves behind, and
+  firing it at the next boot would land in hostapd's ACS sweep.
+- **`l2guard` protects the VAPs only, never a wired socket, by design.** The controller's
+  `--vlan-id <n> -p 802_1Q -j DROP` is bridge-wide on the stock firmware because there the
+  tagged uplink is an 8021q sub-device that takes tagged frames before the bridge sees them.
+  On a DSA board openUF's tagged uplink is `br-lan.<n>`, ON the bridge, so tagged frames
+  from the uplink socket traverse it -- a bridge-wide rule kills the IoT WLAN's uplink. The
+  uplink socket is a runtime detection that is refused when unsure, so the rule stays on
+  the interfaces the controller's other eight rules name: the VAPs.
+- **`sysconf` installs only commands in `CRON_COMMANDS`.** A pushed cron line is a string
+  crond runs as root; the controller's is `syswrapper.sh 11k-scan`, and that maps to the
+  verb this tree ships. Extend the table only alongside a new verb, never to "pass through".
 - **`state.save` writes the whole table and `state.load` reads all of it back.** Eight
   fields are type-checked with defaults; everything else round-trips as-is. That
   symmetry is load-bearing: `swvlan_backup` (the switch reversibility ledger), `ip_mode`
@@ -610,6 +636,14 @@ openuf/
   shaper.lua        WiFi speed limit (tc)       usteer.lua  band steering
   lldp.lua          neighbour table via lldpctl (cached 60 s; an empty answer never is)
   rrmscan.lua       802.11k beacon-report neighbour enrichment (from upstream)
+  unhandled.lua     /etc/openuf/unhandled.json: every _type, cmd, mgmt_cfg key and
+                    system_cfg key shape the controller sent that nothing here acted on,
+                    with counts and a redacted body -- always on, bounded
+  sysconf.lua       controller-managed system settings: system.timezone and ntpclient.*
+                    into UCI (stamped, reversible), cron.* into a marked block of
+                    /etc/crontabs/root (allow-listed commands only: `syswrapper.sh 11k-scan`)
+  l2guard.lua       the ebtables.* block as nft `bridge openuf_l2guard`: BPDU and 802.1Q
+                    drop on the AP VAPs only; intent + names in state.json for the reboot
   state.lua         /etc/openuf/state.json (authkey, adopted, cfgversion, inform_url)
   lib/lib.lua       globals every script expects; wraps `bit` so the same source runs
                     on the device's Lua 5.1 (luabitop) and a 5.3+ dev interpreter

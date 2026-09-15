@@ -144,6 +144,9 @@ local test_files = {
 	"tests/test_switchvlan.lua",
 	"tests/test_modelmap.lua",
 	"tests/test_inflate.lua",
+	"tests/test_unhandled.lua",
+	"tests/test_sysconf.lua",
+	"tests/test_l2guard.lua",
 }
 
 for _, filepath in ipairs(test_files) do

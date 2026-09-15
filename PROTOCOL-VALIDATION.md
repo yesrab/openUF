@@ -579,7 +579,7 @@ The complete set, per `InformServlet`: `noop`, `setparam`, `cmd`, `upgrade`, `re
 
 | `_type` | Shape | Notes |
 |---|---|---|
-| `noop` | `{"_type":"noop","interval":…}` | Steady state. |
+| `noop` | `{"_type":"noop","interval":…,"live_update":false,"include_blocks":[],"server_time_in_utc":"…"}` | Steady state. `interval` is the cadence the controller wants -- `10` normally, but **not constant**: on 2026-09-15 the UCG Ultra answered with 16–19 for two stretches of a minute or two while the RF stats page was open in the UI, then went back to 10. Honoured since that day (clamped to 5–300 s, back to the device's 10 s when absent) -- openUF used to discard it, so its informs would have kept arriving every 10 s against the controller's wish. `live_update` has only ever been observed `false` (row 17 in REVERSE-ENGINEERING.md's backlog); `include_blocks` see block-sta below. |
 | `setparam` | `{"_type":"setparam","mgmt_cfg":"…","system_cfg":"…","server_time_in_utc":"…"}` | Both configs are flat `key=value` blobs. See [system_cfg](#system_cfg-the-real-config-channel). |
 | `cmd` | `{"_type":"cmd","cmd":"…","mac":"…","device_id":"…",…}` | See command table below. |
 | `upgrade` | `{"_type":"upgrade","version":"6.8.2.15592","md5sum":"…","url":"http://fw-download.ubnt.com/…"}` | Fire-and-forget, sent exactly once; no retry, no confirmation expected. |
@@ -909,6 +909,54 @@ swconfig's untagged/tagged/absent port membership.
 the blob returns byte-identical to C1. Teardown is therefore expressible: absence means
 default (untagged on the management VLAN, all others tagged), the same "absent block means
 disabled" convention used everywhere else in this format.
+
+### `cron.*`, `ntpclient.*`, `system.timezone` — controller-managed system settings
+
+Confirmed live 2026-09-15 on AP2 (JIDU6101, UCG Ultra 10.6.101), the first full push after
+the unhandled ledger went in — every one of these had been in every capture and read by
+nothing:
+
+```
+system.timezone=IST-5:30            locale.timezone=IST-5:30       # the same POSIX TZ string twice
+ntpclient.status=enabled
+ntpclient.1.status=enabled          ntpclient.1.server=0.ubnt.pool.ntp.org   # ... .4 = 3.ubnt.pool.ntp.org
+cron.status=enabled
+cron.1.status=enabled
+cron.1.user=<the site's Device SSH Authentication username>
+cron.1.job.1.status=enabled
+cron.1.job.1.schedule=0 4 * * *
+cron.1.job.1.cmd=syswrapper.sh 11k-scan
+```
+
+The cron job is the controller scheduling a **nightly 04:00 (device local time) neighbour
+scan on every AP**, through the AP's own cron and its `syswrapper.sh` — the "automated RRM
+scans" Ubiquiti's Channel AI describes. openUF's `sysconf.lua` writes the jobs into a marked
+block of `/etc/crontabs/root` (only commands this build provides; the pushed user is ignored
+and jobs run as root), and `syswrapper.sh 11k-scan` asks the running daemon to sweep every
+radio on its next heartbeat. The timezone goes to UCI `system.@system[0].timezone` and the
+servers to `system.ntp.server`, each stamping the value it replaced; `ntpclient.status=disabled`
+restores the list. Device-side effect verified on AP2 the same day (see the feature matrix).
+
+### `ebtables.*` — L2 hardening rules
+
+Same push, ten literal ebtables fragments the stock firmware replays:
+
+```
+ebtables.status=enabled             ebtables.add_vlan.status=disabled
+ebtables.1.cmd=-t nat -A PREROUTING  --in-interface  ath0 -d BGA -j DROP    # and ath1, ath2
+ebtables.2.cmd=-t nat -A POSTROUTING --out-interface ath0 -d BGA -j DROP    # and ath1, ath2
+ebtables.7.cmd=-t broute -A BROUTING -i ath1 -p 802_1Q -j DROP              # the VLAN-tagged SSID's VAP
+ebtables.8.cmd=-t broute -A BROUTING --vlan-id 10 -p 802_1Q -j DROP         # bridge-wide
+```
+
+`BGA` is ebtables' alias for the Bridge Group Address `01:80:c2:00:00:00` (STP BPDUs); with
+STP off the Linux bridge *forwards* frames to it, so without these a wireless client can inject
+BPDUs into the wired LAN, and the `802_1Q` pair says no client may inject VLAN-tagged frames.
+`l2guard.lua` re-expresses them as nft `bridge openuf_l2guard` on the **AP VAP netdevs only**:
+the bridge-wide `--vlan-id` rule is safe on the stock firmware only because its tagged uplink
+is an 8021q sub-device (`eth0.10`) that takes tagged frames before the bridge; on a DSA board
+openUF's tagged uplink is `br-lan.10`, on the bridge, and the same rule would drop the IoT
+WLAN's own uplink traffic. `qos.ebt.*` (WiFi Speed Limit) is the same replay mechanism.
 
 ### `radio.<n>.status` — per-radio disable
 
@@ -1683,6 +1731,9 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 36 | Hide WiFi Name | `wireless.<n>.hide_ssid` (+ duplicate `aaa.<n>.hide_ssid`) | ✅ Confirmed live 2026-07-18 by toggling the control in the UI and diffing `system_cfg`: exactly those two keys flipped `false`→`true`, on both band entries of the WLAN, nothing else moved. Always present, so "off" is explicit and is written back out as `hidden=0`. Note the `true`/`false` vocabulary rather than `enabled`/`disabled`. Previously **documented in USAGE.md as already applied, but no code read or wrote it** — the same doc-vs-code drift as `use_only_unifi_wlan`. |
 | 37 | MAC Address Filter | top-level `macacl.<m>.*`, joined on `wireless.<n>.devname` | ✅ Confirmed live 2026-07-18 by enabling the control with one allow-listed MAC and diffing `system_cfg`: the whole `macacl` section appeared at once, keyed by devname (`ath0`/`ath2`) and numbered independently of `wireless.<n>`, so **the devname join is mandatory**. Two keys already on the wire were **excluded** by the same diff: `wireless.<n>.mac_acl.status`/`.policy` (sit at `enabled`/`deny` with the control off) and `aaa.<n>.radius.macacl.status` (the separate RADIUS MAC Authentication control). → OpenWrt `macfilter` + `maclist`, whose allow/deny vocabulary matches the controller's 1:1. Enforced by hostapd itself, so no openUF-side ruleset is involved. |
 | 38 | WiFi Speed Limit | top-level `qos.vap.<m>.*`, joined on `wireless.<n>.devname` | ✅ Wire format confirmed live 2026-07-18 by creating a speed-limit profile (33/17 Mbps) and assigning it to a WLAN. Values are **kbps**, and the discriminator is the presence of `maxspeed` — an unlimited vap still gets a block, carrying only `minspeed` set to its raw `devspeed`. The cap is a **per-VAP aggregate**, not per-client. Requires a profile to exist before the per-WLAN toggle does anything. ⚠️ Enforcement is openUF's own `tc` ruleset (`shaper.lua`), since no hostapd/OpenWrt option expresses a throughput cap: HTB on egress for downlink, ingress policing for uplink. Every generated command is verified against real tc (iproute2 6.9.0), but the on-air throughput is unverified (no real radios). |
+| 40 | Controller-scheduled `11k-scan` (cron) | `system_cfg` `cron.*` → `/etc/crontabs/root`; `syswrapper.sh 11k-scan` → the daemon's neighbour scan | ✅ Wire confirmed live 2026-09-15 (AP2). Device side: the block is written, crond runs it, the verb leaves a request the next heartbeat consumes, `iw scan` runs on every radio and the following inform carries the fresh `scan_radio_table`. Verified on AP2 by running the verb by hand — the 04:00 firing itself has not been waited for. |
+| 41 | NTP servers and timezone | `system_cfg` `ntpclient.<n>.server`, `system.timezone` → UCI `system.ntp.server`, `system.@system[0].timezone` | ✅ Wire confirmed live 2026-09-15. On AP2 the timezone already matched (setup.sh had asked the same question) and the server list moved to `*.ubnt.pool.ntp.org` with the OpenWrt pool stamped as `openuf_ntp_orig`. Whether the jailed `sysntpd` then syncs is the open question from the same day: it had not in 30 minutes on the OpenWrt pool either, and the clock was stepped by hand. |
+| 42 | `ebtables.*` hardening | `system_cfg` `ebtables.<n>.cmd` → nft `bridge openuf_l2guard` on the AP VAPs | ⚠️ Wire confirmed live 2026-09-15; the three generated rules are accepted by nft on AP2 (kmod-nft-bridge present). On-air effect (a client's BPDU or tagged frame actually dropped) not verified. |
 | 39 | Ports view Connection column on an **uplink** port | `port_table[]` with **no** `mac_table` field on `is_uplink` ports | ✅ Blank (or a retained stale value) is the CORRECT state, verified upstream 2026-09-12. Reporting the one MAC on the other end of the cable is tempting — openUF knows it, since finding it is how the uplink socket is identified, and a real UniFi gateway visibly does it on its own uplink port — but it would invert the topology map: the controller files a known device seen alone on a port into this device's `downlink_table`, and the `isUplinkMac` guard against that is ANDed with `!is_uplink`, so it disables itself on exactly the port where it is needed. The gateway would hang beneath every AP that reported it. A real gateway escapes it only because the ISP's router is not an adopted device. Live proof of the correct shape: both of upstream's APs' `downlink_table` empty, the gateway's holding both APs. The stale text persists because `last_connection` is never recomputed when a port sends no `mac_table` field (and only ever recomputed when a port reports exactly **one** MAC) — clear it with the Ports view's **Clear Last Seen Device**. |
 
 ---

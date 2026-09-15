@@ -156,4 +156,32 @@ return {
 			assert_nil(sw._conf_state_file("/tmp/openuf_test_sw_nowhere/"), "nil without a conf.lua")
 		end
 	},
+	{
+		name = "syswrapper: 11k-scan leaves a dated request file for the inform daemon",
+		fn = function()
+			local FILE = "/tmp/openuf_test_sysw_scan"
+			os.remove(FILE)
+			sw._set_scan_request_file(FILE)
+			local real = io.stdout
+			io.stdout = {write = function() end}
+			local ok = sw.cmd_11k_scan()
+			io.stdout = real
+			assert_true(ok, "succeeds")
+			local f = io.open(FILE, "r")
+			assert_not_nil(f, "request written")
+			local body = f:read("*a"); f:close()
+			local at = tonumber(body:match("%d+"))
+			assert_true(at ~= nil and math.abs(os.time() - at) < 5, "carries the current epoch")
+			os.remove(FILE)
+			-- An unwritable path fails loudly rather than pretending.
+			sw._set_scan_request_file("/nonexistent-dir/x")
+			local err = ""
+			local rs = io.stderr
+			io.stderr = {write = function(_, s) err = err .. s end}
+			assert_false(sw.cmd_11k_scan(), "fails")
+			io.stderr = rs
+			assert_contains(err, "cannot write", "says so")
+			sw._set_scan_request_file("/tmp/openuf-scan-request")
+		end
+	},
 }

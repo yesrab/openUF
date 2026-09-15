@@ -102,6 +102,10 @@ local TYPED = {
 	-- back and the board keeps openUF's VLAN config forever.
 	swvlan_backup             = "table",
 	dsa_brlan_ports           = "table",
+	-- The controller's ebtables.* intent ({bpdu, tagdrop, ifnames}), so the
+	-- nft rules l2guard builds from it come back after a reboot like the
+	-- blocklist does.
+	l2guard                   = "table",
 }
 
 -- Load state from disk. Missing file returns defaults. Applies security

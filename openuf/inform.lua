@@ -60,6 +60,9 @@ local firewall  = _require_sibling("firewall")
 local usteer    = _require_sibling("usteer")
 local switchvlan = _require_sibling("switchvlan")
 local rrmscan   = _require_sibling("rrmscan")
+local unhandled = _require_sibling("unhandled")
+local sysconf   = _require_sibling("sysconf")
+local l2guard   = _require_sibling("l2guard")
 
 local M = {}
 
@@ -79,6 +82,9 @@ M._firewall  = firewall
 M._usteer    = usteer
 M._switchvlan = switchvlan
 M._rrmscan    = rrmscan
+M._unhandled  = unhandled
+M._sysconf    = sysconf
+M._l2guard    = l2guard
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -221,17 +227,36 @@ function M._state_mtime(path)
 	return M._read_file(path)
 end
 
+-- Whether `user`'s password is locked, read off /etc/shadow (BusyBox passwd
+-- -l prefixes the hash with "!"). nil when the file or the user cannot be
+-- read, which callers treat as "unknown, act anyway".
+M.SHADOW_FILE = "/etc/shadow"
+function M._account_locked(user)
+	local shadow = M._read_file(M.SHADOW_FILE)
+	if not shadow then return nil end
+	for line in shadow:gmatch("[^\n]+") do
+		local name, hash = line:match("^([^:]+):([^:]*):")
+		if name == user then return hash:sub(1, 1) == "!" end
+	end
+	return nil
+end
+
 -- Locks or unlocks the temporary SSH bootstrap account (see conf.lua's
 -- bootstrap_adopt_user and USAGE.md's SSH prerequisite section) to match
 -- the device's current adopted state. No-op if user is nil/false (feature
--- not enabled). Idempotent -- locking an already-locked account (or
--- unlocking an already-unlocked one) is a harmless no-op on BusyBox/shadow
--- passwd, so callers never need to track prior state themselves.
+-- not enabled). Checks the current state first: BusyBox passwd is harmless
+-- on an already-locked account but not silent -- it logs "password for ubnt
+-- is already locked" to auth.err, and this runs on every config push, so an
+-- adopted AP's log filled with it (seen on AP2, 2026-09-15). When the state
+-- cannot be read the command is issued regardless, as before.
 function M._sync_bootstrap_account(adopted, user)
 	if not user then return end
+	local locked = M._account_locked(user)
 	if adopted then
+		if locked == true then return end
 		M._run_cmd("passwd -l '" .. user .. "'")
 	else
+		if locked == false then return end
 		M._run_cmd("passwd -u '" .. user .. "'")
 	end
 end
@@ -2467,6 +2492,66 @@ function M._parse_switch_system_cfg(sys_raw)
 	return out
 end
 
+-- ─── The controller's heartbeat interval ─────────────────────────────────────
+
+-- Every `noop` carries `interval`, the cadence the controller wants
+-- (`{"_type":"noop","interval":10}` in every capture so far). Real firmware
+-- and amd989/unifi-gateway both adopt it; openUF ran a fixed 10 s and threw
+-- the field away. Clamped, because pre-adoption responses arrive in plain
+-- HTTP under the well-known key: a forged noop must not be able to make the
+-- device hammer the controller or go quiet for an hour. nil (no field, or
+-- not a number) means "back to the default".
+M.INTERVAL_MIN = 5
+M.INTERVAL_MAX = 300
+M._controller_interval = nil
+
+function M._sane_interval(v)
+	v = tonumber(v)
+	if not v then return nil end
+	if v < M.INTERVAL_MIN then return M.INTERVAL_MIN end
+	if v > M.INTERVAL_MAX then return M.INTERVAL_MAX end
+	return math.floor(v)
+end
+
+-- ─── Unhandled-surface ledger ────────────────────────────────────────────────
+
+-- Every response _type InformServlet can send (PROTOCOL-VALIDATION.md,
+-- "Response _types"), and every top-level field seen on the two that
+-- carry any. Anything outside these goes to unhandled.lua's ledger with
+-- its body -- always, not only with debug_dump_file on -- so the next
+-- `mesh-halt` leaves more behind than one logread line.
+local KNOWN_TYPES = {
+	noop = true, setparam = true, cmd = true, upgrade = true, reboot = true,
+	setdefault = true,
+}
+local KNOWN_TOP_FIELDS = {
+	noop     = {_type = true, interval = true, include_blocks = true,
+	            server_time_in_utc = true},
+	setparam = {_type = true, mgmt_cfg = true, system_cfg = true,
+	            server_time_in_utc = true, include_blocks = true, cfgversion = true},
+}
+
+-- pcall'd: the ledger is a diagnostic and must never cost a heartbeat.
+function M._ledger(category, key, payload)
+	if not M._unhandled then return end
+	local ok, err = pcall(M._unhandled.record, category, key, payload)
+	if not ok then
+		io.stderr:write("inform: unhandled ledger: " .. tostring(err) .. "\n")
+	end
+end
+
+-- Top-level fields of a noop/setparam that no handler reads. The field is
+-- recorded under its own name so the ledger's name-based redaction sees it.
+function M._note_unknown_fields(resp)
+	local known = type(resp) == "table" and KNOWN_TOP_FIELDS[resp._type]
+	if not known then return end
+	for k, v in pairs(resp) do
+		if not known[k] then
+			M._ledger("field", tostring(resp._type) .. "." .. tostring(k), {[tostring(k)] = v})
+		end
+	end
+end
+
 -- ─── Dropped-key visibility ──────────────────────────────────────────────────
 
 -- Key shapes some pass in openUF actually reads. Everything else in a config
@@ -2502,6 +2587,20 @@ local RECOGNIZED_SYSTEM_CFG = {
 	"^switch%.vlan%.status$",
 	"^switch%.vlan%.%d+%.",
 	"^switch%.port%.%d+%.",
+	-- Controller-managed system settings (sysconf.lua). cron.<n>.user is
+	-- deliberately NOT here: the pushed account does not exist and the jobs
+	-- run as root, so the key stays in the ledger as ignored.
+	"^system%.timezone$",
+	"^locale%.timezone$",
+	"^ntpclient%.status$",
+	"^ntpclient%.%d+%.",
+	"^cron%.status$",
+	"^cron%.%d+%.status$",
+	"^cron%.%d+%.job%.%d+%.",
+	-- The ebtables hardening block (l2guard.lua). ebtables.add_vlan.status
+	-- is not read and stays in the ledger.
+	"^ebtables%.status$",
+	"^ebtables%.%d+%.cmd$",
 }
 
 local RECOGNIZED_MGMT_CFG = {
@@ -2514,20 +2613,18 @@ local RECOGNIZED_MGMT_CFG = {
 -- than adding a second knob.
 M._debug_dropped_keys = false
 
--- Summarize the keys in a config blob that no pass recognized.
---
--- Emits key PREFIXES and counts only, never values: these blobs carry
--- aaa.<n>.wpa.psk and mgmt_cfg's authkey, and this goes to the log.
--- Numeric indices are collapsed to <n> so a four-VAP blob reports one line
--- per key shape rather than one per instance.
-function M._report_dropped_keys(label, raw, recognized)
-	if not M._debug_dropped_keys or type(raw) ~= "string" then return end
-	local counts, order, total = {}, {}, 0
+-- Tokenize a config blob into the key shapes no pass recognized. Returns an
+-- ordered list of {prefix, count, sample_key, sample_value}: numeric indices
+-- are collapsed to <n> so a four-VAP blob yields one row per key shape, each
+-- carrying the first key and value seen for it.
+function M._dropped_keys(raw, recognized)
+	local rows, by_prefix = {}, {}
+	if type(raw) ~= "string" then return rows end
 	for line in (raw .. "\n"):gmatch("([^\n]*)\n") do
 		-- Skip blanks and the literal comment a radio-less blob carries
 		-- ("# no wlan provisioned as no radio found").
 		if line ~= "" and not line:match("^%s*#") then
-			local k = line:match("^([^=]+)=")
+			local k, v = line:match("^([^=]+)=(.*)$")
 			if k then
 				local known = false
 				for _, pat in ipairs(recognized) do
@@ -2535,20 +2632,50 @@ function M._report_dropped_keys(label, raw, recognized)
 				end
 				if not known then
 					local prefix = k:gsub("%.%d+%.", ".<n>."):gsub("%.%d+$", ".<n>")
-					if not counts[prefix] then
-						counts[prefix] = 0
-						order[#order + 1] = prefix
+					local row = by_prefix[prefix]
+					if not row then
+						row = {prefix = prefix, count = 0, sample_key = k, sample_value = v}
+						by_prefix[prefix] = row
+						rows[#rows + 1] = row
 					end
-					counts[prefix] = counts[prefix] + 1
-					total = total + 1
+					row.count = row.count + 1
 				end
 			end
 		end
 	end
-	if total == 0 then return end
-	table.sort(order)
-	local parts = {}
-	for _, p in ipairs(order) do parts[#parts + 1] = p .. " x" .. counts[p] end
+	table.sort(rows, function(a, b) return a.prefix < b.prefix end)
+	return rows
+end
+
+-- Account for the keys in a config blob that no pass recognized.
+--
+-- Two consumers, one tokenizer. The LEDGER (unhandled.lua) always gets a
+-- row per key shape with the first key and its value -- redacted by name,
+-- bounded, on the overlay, persistent -- because that is the evidence a
+-- protocol investigation needs and the file exists to keep it. The LOG line
+-- is debug-gated and carries key prefixes and counts only, never values:
+-- these blobs hold aaa.<n>.wpa.psk and mgmt_cfg's authkey, and logread is
+-- world-readable and volatile.
+function M._report_dropped_keys(label, raw, recognized)
+	local rows = M._dropped_keys(raw, recognized)
+	if #rows == 0 then return end
+	if M._unhandled then
+		for _, r in ipairs(rows) do
+			-- Field names chosen to survive the ledger's own name-based
+			-- redaction: "sample" and "value", not anything ending in _key.
+			M._ledger(label, r.prefix, {
+				sample      = r.sample_key,
+				value       = M._unhandled.redact(r.sample_value, r.sample_key),
+				occurrences = r.count,
+			})
+		end
+	end
+	if not M._debug_dropped_keys then return end
+	local parts, total = {}, 0
+	for _, r in ipairs(rows) do
+		parts[#parts + 1] = r.prefix .. " x" .. r.count
+		total = total + r.count
+	end
 	io.stderr:write(("inform: %s: %d dropped key(s): %s\n")
 		:format(label, total, table.concat(parts, ", ")))
 end
@@ -2575,7 +2702,17 @@ function M.handle_response(json_str, st, cfg)
 
 	local _type = resp._type
 
+	-- New response shapes are the ledger's whole reason to exist: an unknown
+	-- _type is recorded with its full body, and a known one has any field no
+	-- handler reads recorded by name. Both before dispatch, so a handler
+	-- that raises still leaves the evidence behind.
+	if _type ~= nil and not KNOWN_TYPES[_type] then
+		M._ledger("response", _type, resp)
+	end
+	M._note_unknown_fields(resp)
+
 	if _type == "noop" then
+		M._controller_interval = M._sane_interval(resp.interval)
 		return false
 	end
 
@@ -2893,6 +3030,42 @@ function M.handle_response(json_str, st, cfg)
 					if M._sysinfo.forget_uplink_cache then M._sysinfo.forget_uplink_cache() end
 				end)
 			end
+
+			-- Controller-managed system settings: timezone, NTP servers and
+			-- the nightly `syswrapper.sh 11k-scan` cron job (sysconf.lua).
+			-- Each part is pcall'd inside apply(); this pcall is for parse.
+			if M._sysconf then
+				pcall(function()
+					local sc = M._sysconf.parse(sys_raw)
+					if sc then M._sysconf.apply(sc) end
+				end)
+			end
+
+			-- The ebtables.* hardening block (l2guard.lua): BPDU and
+			-- VLAN-tag drop on every AP VAP. Kernel state, so the intent
+			-- and the VAP names go to state.json for the startup rebuild.
+			-- After the WiFi pass on purpose: a VAP the push just added has
+			-- its netdev name by now.
+			if M._l2guard then
+				pcall(function()
+					local eb = M._l2guard.parse(sys_raw)
+					if not eb then return end
+					for _, u in ipairs(eb.unknown or {}) do
+						io.stderr:write("l2guard: unrecognised ebtables rule shape, not applied: "
+							.. ("%q"):format(u) .. "\n")
+					end
+					local spec = M._l2guard.spec_from(eb)
+					local names = (M._ucihelper and M._ucihelper.ap_ifnames)
+						and M._ucihelper.ap_ifnames() or {}
+					if #names == 0 and st.l2guard and type(st.l2guard.ifnames) == "table" then
+						names = st.l2guard.ifnames   -- wireless not answering yet: last known
+					end
+					spec.ifnames = names
+					st.l2guard = spec
+					M._state.save(st)
+					M._l2guard.reconcile(spec, names)
+				end)
+			end
 		end
 
 		M._state.save(st)
@@ -3088,6 +3261,13 @@ function M.handle_response(json_str, st, cfg)
 					end
 				end
 			end
+		else
+			-- Every other cmd is a no-op here, and its WHOLE body goes to
+			-- the ledger. On 2026-09-06 AP1 received `mesh-halt`, the first
+			-- device-facing mesh verb seen in this lab, and this branch
+			-- logged the name and dropped the rest (REVERSE-ENGINEERING.md,
+			-- Investigation 1). Never again.
+			M._ledger("cmd", cmd, resp)
 		end
 		-- other cmd values (e.g. mfi-output, restart): no-op
 		--
@@ -3481,19 +3661,20 @@ end
 -- see as a brief stall -- the reason this is off by default. Same `iw dev
 -- <if> scan` form the spectrum-scan handler uses, which is known to work on
 -- these boards' AP interfaces. Returns true when a scan was issued.
-function M._maybe_scan_neighbours(cfg, ctx)
-	local every = tonumber(cfg and cfg.config and cfg.config.neighbour_scan_interval)
-	if not every or every <= 0 then return false end
-	local now = M._time()
-	-- Never on the first pass: hostapd's own ACS scan is still running at
-	-- boot, and a restart must not cost every client a stall.
-	if not ctx.last_scan then ctx.last_scan = now; return false end
-	if now - ctx.last_scan < every then return false end
-	ctx.last_scan = now
+-- Where `syswrapper.sh 11k-scan` -- the controller's nightly cron job, see
+-- sysconf.lua -- leaves its dated request. Consumed and removed by the next
+-- heartbeat; ignored when older than SCAN_REQUEST_MAX_AGE, so a request a
+-- stopped daemon never saw does not fire at the next boot in the middle of
+-- hostapd's ACS sweep.
+M.SCAN_REQUEST_FILE    = "/tmp/openuf-scan-request"
+M.SCAN_REQUEST_MAX_AGE = 600
+
+-- `iw dev <if> scan` on every radio in hwassign. Returns how many were issued.
+function M._scan_all_radios(cfg)
 	local ufuci = M._ucihelper
-	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return false end
+	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return 0 end
 	local ok_r, radios = pcall(ufuci.get_radio_table, cfg and cfg.uap and cfg.uap.hwassign)
-	if not ok_r or type(radios) ~= "table" then return false end
+	if not ok_r or type(radios) ~= "table" then return 0 end
 	local issued = 0
 	for _, radio in ipairs(radios) do
 		local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
@@ -3502,7 +3683,40 @@ function M._maybe_scan_neighbours(cfg, ctx)
 			issued = issued + 1
 		end
 	end
-	return issued > 0
+	return issued
+end
+
+-- True when a fresh 11k-scan request was waiting; the file is removed
+-- either way.
+function M._scan_requested()
+	local raw = M._read_file(M.SCAN_REQUEST_FILE)
+	if not raw or raw == "" then return false end
+	os.remove(M.SCAN_REQUEST_FILE)
+	local at = tonumber(raw:match("%d+"))
+	if not at or M._time() - at > M.SCAN_REQUEST_MAX_AGE then
+		io.stderr:write("inform: ignoring a stale 11k-scan request\n")
+		return false
+	end
+	return true
+end
+
+function M._maybe_scan_neighbours(cfg, ctx)
+	-- The controller's scheduled scan first: it asked, so it runs now,
+	-- whatever the interval option says and even on the first pass.
+	if M._scan_requested() then
+		io.stderr:write("inform: 11k-scan requested -- scanning every radio\n")
+		ctx.last_scan = M._time()
+		return M._scan_all_radios(cfg) > 0
+	end
+	local every = tonumber(cfg and cfg.config and cfg.config.neighbour_scan_interval)
+	if not every or every <= 0 then return false end
+	local now = M._time()
+	-- Never on the first pass: hostapd's own ACS scan is still running at
+	-- boot, and a restart must not cost every client a stall.
+	if not ctx.last_scan then ctx.last_scan = now; return false end
+	if now - ctx.last_scan < every then return false end
+	ctx.last_scan = now
+	return M._scan_all_radios(cfg) > 0
 end
 
 -- One cycle of the client-assisted enrichment: keep the notification
@@ -3690,7 +3904,10 @@ end
 -- cycle now costs one heartbeat and one log line, and the next cycle gets
 -- another go.
 function M._tick(st, cfg, ufhw, ctx)
-	ctx.interval = ctx.interval or 10
+	-- base_interval is the device's own cadence; interval is what the loop
+	-- actually waits, which the controller's noop may have moved.
+	ctx.base_interval = ctx.base_interval or ctx.interval or 10
+	ctx.interval = ctx.interval or ctx.base_interval
 	ctx.backoff  = ctx.backoff  or ctx.interval
 	local dump_tx = cfg and cfg.config and cfg.config.debug_dump_requests
 
@@ -3724,7 +3941,11 @@ function M._tick(st, cfg, ufhw, ctx)
 		if dump_tx then M._debug_append(cfg, "ERR", tostring(err)) end
 		M._warn_http_400(err, st, cfg)
 		pcall(M._write_status, st, {last_fail = M._time(), last_fail_msg = tostring(err)})
-		ctx.backoff = math.min(ctx.backoff * 2, 60)
+		-- Doubles from the CURRENT cadence, capped at 60 s -- or at the
+		-- controller's own interval when that is longer, since a failure
+		-- must never make the device poll faster than it was asked to.
+		ctx.backoff = math.min(math.max(ctx.backoff, ctx.interval) * 2,
+			math.max(60, ctx.interval))
 		return ctx.backoff
 	end
 	ctx.backoff = ctx.interval
@@ -3738,10 +3959,16 @@ function M._tick(st, cfg, ufhw, ctx)
 	end
 	local rtype = tostring(json_body):match('"_type"%s*:%s*"([%w_%-]+)"') or "?"
 	local ok_h, applied = pcall(M.handle_response, json_body, st, cfg)
+	-- Whatever handle_response recorded on the way -- including on the way
+	-- to raising -- is written now if the ledger's own policy says so.
+	if M._unhandled then pcall(M._unhandled.flush) end
 	if not ok_h then
 		io.stderr:write("inform: handle_response failed: " .. tostring(applied) .. "\n")
 		return ctx.interval
 	end
+	-- The controller's requested cadence, or the device's own when the
+	-- last noop named none.
+	ctx.interval = M._controller_interval or ctx.base_interval
 	pcall(M._write_status, st, {last_ok = M._time(), last_type = rtype})
 	if applied then
 		-- The push ran `wifi reload`, which killed the RRM collector's
@@ -3757,6 +3984,20 @@ end
 -- cfg, ufhw: passed through to build_json()
 function M.run(cfg, ufhw)
 	local st = state.load()
+	-- The ledger of what the controller sent that nothing here acted on
+	-- (unhandled.lua), loaded before the first response so counts and
+	-- first_seen carry across restarts. conf.lua's unhandled_file names the
+	-- file; false keeps it in memory only. pcall'd: a full overlay must not
+	-- stop the daemon.
+	if M._unhandled then
+		local uf = cfg and cfg.config and cfg.config.unhandled_file
+		if uf ~= nil then M._unhandled._file = uf end
+		local ok_u, err_u = pcall(M._unhandled.load)
+		if not ok_u then
+			io.stderr:write("inform: could not load the unhandled ledger: "
+				.. tostring(err_u) .. "\n")
+		end
+	end
 	-- The MAC persisted by the previous run (state.save writes the whole
 	-- table and state.load now reads it all back), before _populate_net_info
 	-- overwrites it with the live one read off dev.conf.net.lan_cpueth.
@@ -3861,6 +4102,18 @@ function M.run(cfg, ufhw)
 	-- mac_table, which is the bug it exists to fix.
 	if M._switchvlan and M._switchvlan.reconcile_mac_taps then
 		pcall(M._switchvlan.reconcile_mac_taps)
+	end
+	-- The controller's ebtables hardening (BPDU and VLAN-tag drop on the
+	-- VAPs) is nft state too. Rebuilt from state.json's record with the live
+	-- VAP list, falling back to the names recorded at the last push when
+	-- wireless is not answering yet at this point of the boot.
+	if M._l2guard and type(st.l2guard) == "table" then
+		pcall(function()
+			local names = (M._ucihelper and M._ucihelper.ap_ifnames)
+				and M._ucihelper.ap_ifnames() or {}
+			if #names == 0 and type(st.l2guard.ifnames) == "table" then names = st.l2guard.ifnames end
+			M._l2guard.reconcile(st.l2guard, names)
+		end)
 	end
 
 	local socket = require("socket")

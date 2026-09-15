@@ -568,6 +568,7 @@ config = {
     inform_url  = "http://unifi:8080/inform",   -- first-boot URL; state.json's wins once set
     state_file  = "/etc/openuf/state.json",     -- honoured by inform, announce and syswrapper
     l2_announce = true,          -- see below
+    unhandled_file = "/etc/openuf/unhandled.json", -- ledger of what openUF ignored (see below)
     debug_dump_file = nil,       -- see below
     debug_dump_requests = false, -- with debug_dump_file: record requests and HTTP errors too
     debug_dump_max_bytes = 4194304, -- ceiling for that file; 0 = unbounded (see below)
@@ -617,6 +618,33 @@ and simply doesn't start the broadcaster). The reason to turn it off isn't
 noise: a controller that discovered a device via L2 adopts it *by SSHing in*,
 so on a device that can't accept that login, adoption fails while the inform
 loop looks perfectly healthy — see § 4.
+
+`unhandled_file` — **always on**, default `/etc/openuf/unhandled.json`; `false` keeps the
+ledger in memory only. Everything the controller sends that no handler in openUF acts on is
+recorded here: a response `_type` other than the six known ones and a `cmd` other than the
+handled ones, each with its **whole body**; a top-level field of a `noop`/`setparam` nothing
+reads; every `mgmt_cfg` key and every `system_cfg` key shape (indices collapsed to `<n>`) no
+parser consumes, each with one sample key and its value. Every entry carries a count and
+first/last seen, so the file reads as a living list of what the controller wants that openUF
+does not yet do. The 2026-09-06 `mesh-halt` command survived only as one `logread` line
+naming the verb; with this, its body would be on disk.
+
+```sh
+lua -e 'local c=require"cjson"; local f=io.open("/etc/openuf/unhandled.json"); local d=c.decode(f:read("*a"))
+  for id,e in pairs(d.entries) do print(e.count, e.last_seen, id) end' | sort -k3
+```
+
+Bounds, because the file lives on the overlay: 150 entries (the one seen longest ago is
+evicted), 2 KiB per recorded body (past that only its key list is kept), strings cut at 200
+characters, and any field whose **name** looks like a secret — `psk`, `passphrase`,
+`password`, `secret`, `authkey`, `token`, anything ending in `key` — is replaced by
+`<redacted>` at any depth. A new entry is written at once; a repeat count only every five
+minutes; both through a temp file and rename like `state.json`. The ledger is research data,
+not adoption state: a factory reset and `syswrapper.sh reset-inform` leave it alone.
+
+Most of what it lists is dropped **deliberately** (`switch.dot1x.status`, `qos.ebt.*`,
+`mgmt_url`, `bridge.*` — each explained in PROTOCOL-VALIDATION.md). Its value is the entry
+that was not there yesterday.
 
 `debug_dump_file` — opt-in, off by default. When set to a path (e.g.
 `"/var/log/openuf-informs.log"`), every decrypted controller inform response is
@@ -836,6 +864,10 @@ Persistent state is stored at `/etc/openuf/state.json`:
 | `mac` | The identity MAC the previous run informed under (read off `lan_cpueth` at startup). Compared against the live one on the next start: a difference on an adopted device is the HTTP-400-forever condition, and is shouted about |
 | `locating`, `led_enabled` | The controller's Locate and Manage → LED state, so a restart does not forget them |
 | `swvlan_backup` | Original `ports` strings of the stock `switch_vlan` sections, snapshotted before per-port VLAN assignment first modifies them; used to restore them (see § 6) |
+
+The sibling file `/etc/openuf/unhandled.json` is **not** state: it is the ledger of protocol
+surfaces openUF received and ignored (§ 3, `unhandled_file`). Deleting it loses history and
+nothing else.
 | `ip_mode`, `static_ip`, `static_netmask`, `static_gateway`, `static_dns` | The last "IP Settings" push. `ip_mode` is `"static"` or `"dhcp"`; the `static_*` fields are set only in static mode and cleared on a revert to DHCP. `static_dns` is an array in the controller's primary/secondary order, written to `/etc/resolv.conf`. On DHCP, DNS is left to the lease and openUF does not touch `resolv.conf`. In static mode these are **re-applied on every start**, because the address is `ip addr` state that a reboot discards and the controller does not re-push it (a matching `cfgversion` gets a `noop` back, carrying no `system_cfg` at all) — the same reason `blocked_stas` and `led_enabled` are reconciled at startup |
 
 Every field `state.save` writes is read back by `state.load` (the eight in the JSON
@@ -1133,6 +1165,26 @@ lua -e "dofile('/opt/openuf/ucihelper.lua').wlan_clear()"
 
 ---
 
+## 6a. Controller-managed system settings and hardening
+
+Three `system_cfg` blocks the controller sends on every full push are applied to the
+device itself rather than to WiFi (confirmed live 2026-09-15, PROTOCOL-VALIDATION.md):
+
+| Wire | Device side | Reversal |
+|---|---|---|
+| `system.timezone=IST-5:30` | UCI `system.@system[0].timezone` (the wire string is already a POSIX TZ string). Written only when it differs; `zonename` is retired to `openuf_zonename_orig` since it would name a different zone | `openuf_timezone_orig` holds what was there |
+| `ntpclient.<n>.server=…` ×4 | UCI `system.ntp.server`, then `sysntpd` restart | `openuf_ntp_orig` holds the board's own list; `ntpclient.status=disabled` on the wire puts it back |
+| `cron.<n>.job.<m>.schedule` / `.cmd` | A marked block in `/etc/crontabs/root` between `# openuf-cron-begin` and `# openuf-cron-end`, then `cron` enabled and restarted. **Only commands this build provides are installed** — today that is `syswrapper.sh 11k-scan` — and anything else is logged, never written: a pushed cron line is a string crond runs as root. The pushed `cron.<n>.user` is ignored (jobs run as root) | The block is removed when the push stops carrying installable jobs; lines outside the markers are never touched |
+| `ebtables.<n>.cmd=…` ×10 | nft table `bridge openuf_l2guard`: frames to the Bridge Group Address (`01:80:c2:00:00:00`, STP BPDUs) dropped in and out of every AP VAP, and 802.1Q-tagged frames from clients dropped on every AP VAP. Needs `kmod-nft-bridge` (already installed for the Blocker); a rejected rule is warned about by name. **Wired sockets are deliberately not covered** — see CLAUDE.md's landmine | `ebtables.status=disabled` tears the table down; it is rebuilt at every start from `state.json` |
+
+`syswrapper.sh 11k-scan` — what the controller's nightly 04:00 job runs — does not scan
+itself: it leaves a dated request in `/tmp/openuf-scan-request` that the running daemon
+picks up within one heartbeat, sweeps every radio (`iw dev <if> scan`, the same stall
+clients see with `neighbour_scan_interval`), and reports on the following inform. A request
+older than ten minutes is discarded, so one left behind by a stopped daemon cannot fire at
+the next boot. You can run it by hand to refresh the Environment view: `syswrapper.sh
+11k-scan`, then `logread -e openuf | grep 11k`.
+
 ## 7. LLDP topology
 
 `lldpd` must be running for topology announcements to work.  openUF queries `lldpctl -f json` and includes the neighbor table in each inform payload so the controller can render the upstream switch on its topology map.
@@ -1232,6 +1284,8 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Bootstrap account (`ubnt`) doesn't lock after adoption, or doesn't re-enable after a factory reset | `inform.lua` must be running for this — it's what detects the state change and runs `passwd -l`/`-u` (see § SSH prerequisite). Check `logread -e openuf`. |
 | Adopted, but every inform is answered `HTTP 400` and the controller shows the device Offline | The identity MAC changed underneath the adoption: `dev.conf.net.lan_cpueth` now names a different interface than the device was adopted under (a modelmap switch, or a reinstall that reset `conf.lua`). openUF says so at startup (it compares against the MAC the previous run persisted) and again on the first 400 of a streak. Forget the device in the controller and re-adopt, or point `lan_cpueth` back |
 | Insights → Environment shows nothing, or only right after boot | Nothing rescans: the kernel's BSS cache forgets neighbours after ~30 s and the controller drops entries with `age >= 30`. Set `neighbour_scan_interval` in `conf.lua` (§ 3), accepting the brief client stall each scan costs |
+| Device clock wrong although `sysntpd` runs | Seen on AP2 (eight days slow, 2026-09-15). `logread \| grep ntpd` empty means the jailed daemon never got a reply. Unjailed `ntpd -q -n -N -p 0.openwrt.pool.ntp.org` syncs at once; the cause inside the jail is still open (REVERSE-ENGINEERING.md backlog row 13) |
+| The controller does something and the device shows no sign of it | Look in `/etc/openuf/unhandled.json` (§ 3, `unhandled_file`) before arming `debug_dump_file`: if the controller sent a command or config key openUF does not implement, it is listed there with a count and its last body |
 | `logread` says `cannot read a MAC from dev.conf.net.lan_cpueth` | The modelmap names an interface this board does not have (a generic profile on a DSA board, say). The daemon keeps informing under the identity `state.json` persisted; fix `conf.lua` |
 
 Logs go to the system log via procd: `logread -e openuf` (follow with `logread -f`).

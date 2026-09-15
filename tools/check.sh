@@ -175,6 +175,11 @@ if [ -d /etc/openuf ]; then
 	else
 		info "state.json absent (will be created on first run)"
 	fi
+	# The ledger of controller traffic openUF received and ignored (USAGE § 3,
+	# unhandled_file). An entry count is enough here; the file is the detail.
+	if [ -f /etc/openuf/unhandled.json ]; then
+		info "unhandled.json present — $(grep -o '"category"' /etc/openuf/unhandled.json | wc -l | tr -d ' ') entries the controller sent that openUF does not act on"
+	fi
 else
 	info "/etc/openuf absent (install.sh will create it)"
 fi

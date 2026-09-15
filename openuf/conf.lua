@@ -79,6 +79,16 @@ config = {
 	-- Takes effect on service restart (the init script reads it).
 	l2_announce = true,
 
+	-- Where openUF keeps the ledger of what the controller sent that nothing
+	-- here acted on: unknown response types and commands (with their whole
+	-- body), mgmt_cfg keys and system_cfg key shapes no parser reads, each
+	-- with a count and first/last seen. Always on -- it is how the next
+	-- `mesh-halt` leaves more behind than one log line. Values are redacted
+	-- by field name (psk, passphrase, authkey, token, *key) and the file is
+	-- bounded (150 entries, 2 KiB per body). nil = this default path; false
+	-- = count in memory only, never write. See USAGE.md § 3.
+	unhandled_file = "/etc/openuf/unhandled.json",
+
 	-- Opt-in: when set, every decrypted controller inform response is appended
 	-- verbatim (with a UTC timestamp) to this file, before dispatch. Off by
 	-- default. Used to capture ground-truth payload shapes when validating
