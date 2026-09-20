@@ -603,8 +603,9 @@ fi
 
 head1 "2/6  Hardware profile (modelmap)"
 say "  The profile describes YOUR board: radio names, ethernet sockets, status"
-say "  LED. The UniFi identity presented to the controller is separate and"
-say "  stays U6-InWall."
+say "  LED. The UniFi identity presented to the controller is separate: the"
+say "  profile picks it (U6-InWall for most; the Archer A7/C7 profile presents"
+say "  the WiFi 5 In-Wall HD)."
 say ""
 sayb "  ${C_B}Board-specific${C_0}"
 MENU=""

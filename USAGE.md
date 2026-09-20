@@ -302,6 +302,10 @@ dev = dofile("modelmap/tl-wdr3500-v1.lua")
 -- For TP-Link WR1043ND v2 (single-band):
 dev = dofile("modelmap/tl-wr1043ndv2.lua")
 
+-- For TP-Link Archer A7 v5 / Archer C7 v4 / Archer C7 v5 (dual-band; one map for all three,
+-- presents as a UAP-IW-HD -- see "Device identity" below):
+dev = dofile("modelmap/archer-a7-v5.lua")
+
 -- For JioRouter AX6000 JIDU6101 (MT7986A / filogic — a DSA board):
 dev = dofile("modelmap/jiorouter-ax6000-jidu6101.lua")
 
@@ -539,7 +543,7 @@ The modelmap sets:
   field means. openUF never touches an unreported radio: a config push naming one is
   refused rather than applied
 
-### Device identity (`openuf/ufmodel/u6iw.lua`)
+### Device identity (`openuf/ufmodel/*.lua`)
 
 The U6-InWall identity is configured in `ufmodel/u6iw.lua`.  The firmware version
 (`fw.ver`) must be accepted by your controller.  If the controller rejects the
@@ -558,6 +562,17 @@ uap = {
     ...
 }
 ```
+
+The Archer A7/C7 profile selects `ufmodel/uhdiw.lua` instead: the **UAP-IW-HD**, the WiFi 5
+in-wall AP with the same five sockets, so a controller offers that board 802.11ac modes rather
+than the WiFi 6 ones it would push at a U6-InWall and openUF would have to clamp.  Its
+`platform`/`model` are `UHDIW`, and its `fw.ver` (`6.7.57.15670`) is the release-channel entry
+of Ubiquiti's firmware catalog for that platform — the value the controller compares the
+reported version against with a strict string equality, so it must stay bare (`M.m.p.build`,
+no model prefix) and must track the catalog.  When the controller shows a spurious "Update
+Available" for the device, re-read the catalog URL in the file's header and update `fw.ver`.
+⚠️ No controller has adopted a device under this identity yet; if adoption stalls, set
+`ufmodel = "u6iw"` in the modelmap and report what the controller did.
 
 ### Paths and options (`openuf/conf.lua`)
 

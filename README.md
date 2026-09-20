@@ -111,6 +111,14 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   **client Block/Unblock** and the **Multicast and Broadcast Blocker**. Its radio order is
   also the reverse of the Archer C5's — `radio0` is 2.4 GHz here
 - **TP-Link WR1043ND v2** (single-band 802.11n) — use `modelmap/tl-wr1043ndv2.lua`
+- **TP-Link Archer A7 v5 / Archer C7 v4 / Archer C7 v5** (dual-band 802.11n/ac, 3x3, QCA9563 +
+  QCA9880, ath79) — use `modelmap/archer-a7-v5.lua`, **one profile for all three**: OpenWrt's
+  `board.d` handles them in a single case (same switch layout, same LED names, same radios).
+  ⚠️ **Not yet run on the hardware**: derived from the OpenWrt DTS and `board.d`; the header
+  flags what to check first (the LAN1–LAN4 socket order and the radio order). 16 MB flash, so
+  a stock image fits. The first profile to present a **WiFi 5 identity** — `ufmodel/uhdiw.lua`,
+  the UAP-IW-HD, five sockets like the board — which no controller has adopted under yet; the
+  header says how to fall back to `u6iw`
 - **Xiaomi Mi Router AX3000T** (dual-band 802.11ax, 2x2, MT7981 / mediatek-filogic) — use
   `modelmap/xiaomi-ax3000t.lua`. Profile adopted from upstream (jonasevcik/openUF), where
   it is verified on the hardware: HE on both bands, 160 MHz on 5 GHz, DSA. Its four sockets
@@ -158,7 +166,7 @@ report the whole LAN, gateway included, as hosts plugged into it:
 | Per-port VLAN assignment | supported (`switch_vlan` sections) | supported (the socket moves into the VLAN's bridge; Native VLAN only) |
 | `dev.conf.vlan` | required | must be **absent** |
 
-The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end — `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
+The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end.  `ufmodel/uhdiw.lua` (UAP-IW-HD, the WiFi 5 in-wall with the same five sockets) is selected by the Archer A7/C7 profile so a WiFi 5 board is offered 802.11ac modes rather than WiFi 6 ones it has to clamp; its model code and firmware version come from Ubiquiti's own firmware catalog, but ⚠️ no controller has adopted a device under it yet.  `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
 
 ## Quick start
 

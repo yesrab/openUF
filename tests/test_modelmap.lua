@@ -413,4 +413,68 @@ return {
 			end)
 		end
 	},
+	{
+		name = "modelmap: archer-a7-v5 pins the one-trunk AR8327 board for all three Archers",
+		fn = function()
+			-- Board-specific regression guard, from the OpenWrt tree rather
+			-- than a live unit (none has run openUF yet). board.d gives the
+			-- A7 v5, C7 v4 and C7 v5 ONE case arm -- `0@eth0`, a TAGGED CPU
+			-- port on a single trunk, WAN on physical 1 and LAN1..4 on 2..5
+			-- -- and 01_leds' per-socket LED port masks say the same. None
+			-- of it is derivable from the table, so it is pinned here.
+			local dev = dofile(MODELMAP_DIR .. "/archer-a7-v5.lua")
+
+			-- One trunk: the identity / VLAN netdev is eth0 itself, never the
+			-- eth0.1 sub-device. A pushed VLAN must become eth0.20, a sibling
+			-- of eth0.1, not a sub-device of a sub-device.
+			assert_eq(dev.conf.net.lan_cpueth, "eth0", "the trunk, not the LAN VLAN sub-device")
+			assert_eq(dev.conf.vlan.cpu_lan, 0, "CPU port 0 serves the LAN VLAN")
+			assert_eq(dev.conf.vlan.cpu_wan, 0,
+				"and the same port serves the WAN VLAN -- the board has no second CPU port")
+
+			-- The LED is one no DTS alias drives: led-boot / led-failsafe /
+			-- led-running / led-upgrade all name green:system on these boards.
+			assert_eq(dev.conf.led, "green:wps", "an LED procd does not own")
+
+			-- Three compatible strings, one board as far as openUF reads.
+			local boards = {}
+			for _, b in ipairs(dev.openwrt_boards) do boards[#boards + 1] = b end
+			table.sort(boards)
+			assert_eq(table.concat(boards, " "),
+				"tplink,archer-a7-v5 tplink,archer-c7-v4 tplink,archer-c7-v5",
+				"claims the A7 v5 and both C7 revisions that share its board.d entry")
+
+			-- Five sockets, none a CPU port, none statically the uplink.
+			local ports = dev.conf.net.ports
+			assert_eq(#ports, 5, "one port per socket (4 LAN + WAN)")
+			local phys = {}
+			for _, p in ipairs(ports) do
+				assert_nil(p.uplink, "port " .. p.idx .. " is not statically flagged uplink")
+				assert_not_nil(p.swport, "port " .. p.idx .. " names a socket")
+				local n = dev.conf.vlan.ports[p.swport]
+				assert_not_nil(n, "swport " .. tostring(p.swport) .. " is in the switch map")
+				phys[#phys + 1] = n
+			end
+			table.sort(phys)
+			assert_eq(table.concat(phys, ","), "1,2,3,4,5",
+				"the five sockets, none of them the CPU port")
+
+			-- Switch map in case-label order: board.d "2:lan:1" .. "5:lan:4"
+			-- "1:wan", and 01_leds WAN=0x02, LAN1=0x04 .. LAN4=0x20. Unlike
+			-- the Archer C5 test this pins the ORDER, because the source
+			-- states it; a unit proving the labels reversed changes the map
+			-- and this assertion together.
+			assert_eq(dev.conf.vlan.ports.wan, 1, "physical 1 is the WAN socket")
+			for i = 1, 4 do
+				assert_eq(dev.conf.vlan.ports["lan" .. i], i + 1,
+					"LAN" .. i .. " is physical " .. (i + 1))
+			end
+
+			-- The WiFi 5 identity for WiFi 5 hardware with the same five
+			-- sockets. If this ever goes back to u6iw it should be because a
+			-- controller refused UHDIW, and the map header should say so.
+			assert_eq(dev.openuf.uap.ufmodel, "uhdiw", "presents as a UAP-IW-HD")
+			assert_eq(#dev.openuf.uap.hwassign, 2, "both radios reported")
+		end
+	},
 }

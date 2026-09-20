@@ -2210,4 +2210,36 @@ return {
 			assert_eq(dsa_forks.uptime, 1, "and /proc/uptime is read once for the payload")
 		end
 	},
+	{
+		name = "inform json: the uhdiw identity reaches the wire as model, platform and bare version",
+		fn = function()
+			-- build_json defaults model and platform to "U6IW" when the
+			-- identity table lacks them, so a second identity that quietly
+			-- failed to load would still yield a plausible payload -- one
+			-- adopting as the wrong model. Drive the shipped file through the
+			-- real builder rather than a hand-written stand-in.
+			inject_sysinfo(false, false, false, false)
+			local uap = dofile("openuf/ufmodel/uhdiw.lua")
+			local st = {
+				authkey    = state.DEFAULT_KEY,
+				adopted    = true,
+				cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform",
+				mac        = "aa:bb:cc:dd:ee:ff",
+				ip         = "192.168.1.100",
+				hostname   = "testap",
+			}
+			local d = cjson.decode(inform.build_json(st, nil, {uap = uap}))
+			assert_eq(d.model, "UHDIW", "model is the UAP-IW-HD's code")
+			assert_eq(d.platform, "UHDIW", "platform too")
+			-- Strict string equality against the catalog on the controller
+			-- side (PROTOCOL-VALIDATION.md, "Why version must be bare"): the
+			-- wire value is fw.ver itself, with no prefix added on the way.
+			assert_eq(d.version, uap.fw.ver, "version is the identity's fw.ver, unprefixed")
+			assert_true(d.version:match("^%d+%.%d+%.%d+%.%d+$") ~= nil,
+				"and it is bare M.m.p.build: " .. tostring(d.version))
+			assert_eq(d.required_version, uap.required_version, "required_version passes through")
+			assert_eq(d.bootrom_version, "", "bootrom_version is the identity's empty bootver")
+		end
+	},
 }

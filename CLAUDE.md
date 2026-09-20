@@ -10,7 +10,9 @@ Two orthogonal concepts, constantly confused:
 - **modelmap** (`openuf/modelmap/*.lua`) — *your real hardware*: radio names, ethernet
   sockets, switch geometry, status LED.
 - **ufmodel** (`openuf/ufmodel/*.lua`) — *the UniFi identity presented to the controller*.
-  `u6iw` is the only one validated end-to-end.
+  `u6iw` is the only one validated end-to-end. `uhdiw` (UAP-IW-HD: WiFi 5, the same five
+  sockets) is sourced from Ubiquiti's firmware catalog but has never adopted -- see
+  "Adding a UniFi identity" below.
 
 `openuf/conf.lua` picks one of each and holds runtime options. It is the file users
 hand-edit on the device, so it (and `modelmap/*`) keep their comments when packaged.
@@ -171,7 +173,8 @@ and the map needs a ⚠️ rather than silence.
 ### 2. Write the file
 
 `openuf/modelmap/<vendor>-<model>.lua`. Copy the closest existing map:
-`jiorouter-ax6000-jidu6101.lua` for DSA, `archer-c5-v1.lua` for swconfig.
+`jiorouter-ax6000-jidu6101.lua` for DSA, `archer-c5-v1.lua` for swconfig with two CPU
+netdevs, `archer-a7-v5.lua` for swconfig with one tagged CPU trunk (`0@eth0`).
 
 ```lua
 --[[
@@ -216,7 +219,10 @@ Then set:
   `hwassign` are never reported and never touched.
 - **`dev.openuf.uap.ufmodel`** — `"u6iw"` for anything dual-band. A single-radio board
   should use `"uapg1-lr"`; a one-radio device reporting U6IW leaves the controller
-  showing a radio that never comes up.
+  showing a radio that never comes up. `"uhdiw"` (UAP-IW-HD) is the WiFi 5 dual-band
+  choice -- the controller then offers 802.11ac modes instead of HE ones the hardware
+  cannot run -- but it is unvalidated until a controller adopts under it. The
+  `archer-a7-v5` map is the first to use it, and names `u6iw` as the fallback.
 
 ### 3. `lan_cpueth` decides the device's IDENTITY
 
@@ -286,12 +292,33 @@ Three places name the profiles and will drift silently:
 [ ] swconfig: dev.conf.vlan with verified physical port numbers
 [ ] led = an LED no DTS alias drives (or nil)
 [ ] hwassign, with a comment saying which radio is which band
-[ ] ufmodel: u6iw dual-band, uapg1-lr single-radio
+[ ] ufmodel: u6iw dual-band (uhdiw for WiFi 5 hardware, once validated), uapg1-lr single-radio
 [ ] ⚠️ marks on everything not confirmed on real hardware
 [ ] board-specific test added to tests/test_modelmap.lua
 [ ] lua tests/run_tests.lua passes
 [ ] README / USAGE / conf.lua header updated
 ```
+
+## Adding a UniFi identity (ufmodel)
+
+Rarer than a modelmap, and the facts come from Ubiquiti, not OpenWrt:
+
+- **The model code and current firmware** are in the controller's own catalog:
+  `https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-firmware&filter=eq~~platform~~<CODE>&filter=eq~~channel~~release`
+  returns `"platform": "UHDIW", "version": "v6.7.57+15670"`. `fw.ver` is that version
+  **bare**, `6.7.57.15670` -- the controller compares the inform's `version` to its catalog
+  entry with a strict string equality, so a prefix or a `+` is a permanent "Update
+  Available" (PROTOCOL-VALIDATION.md, "Why version must be bare").
+- **`buildtime` and `factoryver` are cosmetic**: they reach only the L2 discovery TLVs. Say
+  in the file where the values came from rather than making them look captured.
+- **What the model registry says about the code cannot be read from the device side.**
+  Port count and the switch feature decide whether `port_table` is processed at all
+  (`Device.isSwitch()`), and per-model WLAN gating is unknown. Until a controller has
+  adopted under the identity, the file and every map that selects it carry a ⚠️ and name
+  `u6iw` as the fallback. Never validate on AP1/AP2: their adoption records are keyed to
+  U6IW and changing `model` on an adopted device is untested.
+- `tests/test_ufmodel.lua` loads every identity and pins the shape both `announce.lua` and
+  `inform.build_json` read; add the model-specific facts there.
 
 ---
 

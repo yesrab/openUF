@@ -143,6 +143,7 @@ local test_files = {
 	"tests/test_shaper.lua",
 	"tests/test_switchvlan.lua",
 	"tests/test_modelmap.lua",
+	"tests/test_ufmodel.lua",
 	"tests/test_inflate.lua",
 	"tests/test_unhandled.lua",
 	"tests/test_sysconf.lua",
