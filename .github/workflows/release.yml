@@ -195,7 +195,18 @@ jobs:
           # and there is no files/*.init here anyway: the init script ships
           # inside the source archive and is syntax-checked in `verify`.
           NO_SHFMT_CHECK: true
-          V: s
+          # Not V=s: the SDK first compiles every dependency (lua, libubox,
+          # openssl, lldpd, the luci base...) on four cores, and verbose
+          # output from all of them interleaved is unreadable in the Actions
+          # viewer. BUILD_LOG (the action's default) keeps a log per package
+          # under logs/, uploaded below when something fails.
+      - name: Keep the per-package build logs when the SDK fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-logs-${{ matrix.format }}
+          path: logs/
+          if-no-files-found: ignore
       - name: Collect the packages
         run: |
           mkdir -p out
