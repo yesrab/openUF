@@ -126,6 +126,9 @@ return {
 				assert_eq(stas[2].rx_mcs, 5,                      "second client rx_mcs from 'MCS 5'")
 				assert_eq(stas[2].tx_generation, "n",            "second client is plain HT (bare MCS)")
 				assert_eq(stas[2].tx_nss, 1,                     "second client nss from MCS 6 -> floor(6/8)+1")
+				assert_eq(stas[1].tx_duration, 9835724,          "tx airtime in us")
+				assert_eq(stas[1].rx_duration, 14756520,         "rx airtime in us")
+				assert_eq(stas[2].tx_duration, nil,              "no airtime line: nil, not 0")
 			end)
 		end
 	},
@@ -153,6 +156,66 @@ return {
 				assert_eq(stas[2].tx_nss, 2, "HE-NSS 2 read directly")
 				assert_eq(stas[3].tx_generation, nil, "legacy rate has no generation token")
 				assert_eq(stas[3].tx_nss, nil, "legacy rate has no nss token")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: sta_table() reads the tx rate's channel width, 20 MHz when iw prints none",
+		fn = function()
+			local dump = "Station cc:cc:cc:cc:cc:cc (on wlan1)\n"
+				.. "\ttx bitrate:\t390.0 MBit/s VHT-MCS 8 80MHz short GI VHT-NSS 1\n"
+				.. "\trx bitrate:\t433.3 MBit/s VHT-MCS 9 160MHz short GI VHT-NSS 1\n"
+				.. "Station dd:dd:dd:dd:dd:dd (on wlan1)\n"
+				.. "\ttx bitrate:\t65.0 MBit/s MCS 7\n"
+			with_fixtures({}, {["station dump"] = dump}, function()
+				local stas = sysinfo.sta_table("wlan1")
+				assert_eq(stas[1].tx_width, 80, "80MHz token on the tx line")
+				assert_eq(stas[2].tx_width, 20, "no token: 20 MHz")
+				assert_eq(stas[1].rx_width, 160, "the rx line's own width")
+				assert_eq(stas[2].rx_width, nil, "no rx line: no rx width")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: hostapd_sta_caps() reads each station's association ceiling",
+		fn = function()
+			-- `hostapd_cli all_sta`, trimmed, as captured on an ath10k VHT
+			-- BSS, an mt76 2.4 GHz BSS, and a legacy-only station.
+			local out = "00:00:5e:00:53:01\n"
+				.. "flags=[AUTH][ASSOC][AUTHORIZED][SHORT_PREAMBLE][WMM][HT][VHT]\n"
+				.. "aid=1\ncapability=0x31\n"
+				.. "rx_vht_mcs_map=fffe\ntx_vht_mcs_map=fffe\n"
+				.. "ht_mcs_bitmask=ff000000010000000000\n"
+				.. "vht_caps_info=0x33c07030\nvht_capab=3070c033feff8601feff8601\n"
+				.. "ht_caps_info=0x006e\next_capab=0000000020000040\n"
+				.. "00:00:5E:00:53:02\n"
+				.. "flags=[AUTH][ASSOC][AUTHORIZED][SHORT_PREAMBLE][WMM][MFP][HT]\n"
+				.. "ht_mcs_bitmask=ff000000000000000000\nht_caps_info=0x0020\n"
+				.. "00:00:5e:00:53:03\n"
+				.. "flags=[AUTH][ASSOC][AUTHORIZED][WMM]\n"
+				.. "00:00:5e:00:53:04\n"
+				.. "flags=[AUTH][ASSOC][AUTHORIZED][WMM][HT][VHT][HE]\n"
+				.. "rx_vht_mcs_map=fffa\nht_mcs_bitmask=ffff0000000000000000\n"
+				.. "vht_caps_info=0x0000000c\nht_caps_info=0x0002\n"
+			with_fixtures({}, {["all_sta"] = out}, function()
+				local c = sysinfo.hostapd_sta_caps("phy0-ap0")
+				local vht = c["00:00:5e:00:53:01"]
+				assert_eq(vht.mode, "vht", "[VHT] flag")
+				assert_eq(vht.nss, 1, "fffe: stream 1 at MCS 0-9, the rest unsupported")
+				assert_eq(vht.max_mcs, 9, "fffe: stream 1 value 2 -> MCS 9")
+				assert_eq(vht.width, 80, "vht_caps_info width set 0 -> 80 MHz")
+				local ht = c["00:00:5e:00:53:02"]
+				assert_not_nil(ht, "MAC keyed lower-case")
+				assert_eq(ht.mode, "ht", "[HT] only")
+				assert_eq(ht.nss, 1, "one ff byte in the HT bitmask")
+				assert_eq(ht.max_mcs, 7, "HT tops out at MCS 7 per stream")
+				assert_eq(ht.width, 20, "ht_caps_info 0x0020: 40 MHz bit clear")
+				assert_true(c["00:00:5e:00:53:03"] == nil, "no HT: no ceiling to compare against")
+				local he = c["00:00:5e:00:53:04"]
+				assert_eq(he.mode, "he", "[HE] flag")
+				assert_eq(he.max_mcs, 11, "HE is taken as MCS 0-11")
+				assert_eq(he.nss, 2, "fffa: two streams")
+				assert_eq(he.width, 160, "vht_caps_info width set 3 -> 160 MHz")
 			end)
 		end
 	},
@@ -729,6 +792,75 @@ return {
 		end
 	},
 	{
+		name = "sysinfo: scan_table() tags a sibling openUF AP from the nl80211 reader",
+		fn = function()
+			-- OpenWrt's iw build never prints our vendor element (checked live
+			-- on both boards), so the tag comes from peer_macs' ucode/nl80211
+			-- read, joined on the BSSID.
+			with_fixtures({}, {
+				["scan dump"] = fixture("iw_scan_dump.txt"),
+				["ucode -e"]  = "AA:BB:CC:DD:EE:01 00:00:5E:00:53:20\n",
+			}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(nets[1].peer_mac, "00:00:5e:00:53:20", "the sibling's identity MAC, case-folded")
+				assert_eq(nets[2].peer_mac, nil, "a BSS the reader did not name is not a sibling")
+				assert_eq(nets[1].essid, "NeighborNet", "the iw-parsed fields are untouched")
+			end)
+			with_fixtures({}, {["scan dump"] = fixture("iw_scan_dump.txt")}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(#nets, 2, "no ucode on the box: the scan still reports")
+				assert_eq(nets[1].peer_mac, nil, "...with no siblings")
+			end)
+		end
+	},
+	{
+		name = "sysinfo: peer_scan_cmd() matches exactly the element peer_ie_hex() builds",
+		fn = function()
+			local hex = sysinfo.peer_ie_hex("00:00:5E:00:53:20")
+			assert_eq(hex, "dd0d026f556f55460100005e005320", "hostapd vendor_elements value")
+			-- The reader compares the element body's first 7 bytes (OUI,
+			-- magic, version) and takes the 6 after them. Pin that prefix to
+			-- the builder's, byte for byte, so the two cannot drift.
+			local cmd = sysinfo.peer_scan_cmd("phy0-ap0")
+			local want = hex:sub(5, 18):gsub("(%x%x)", "\\x%1")
+			assert_true(cmd:find('"' .. want .. '"', 1, true) ~= nil, "prefix matches the builder")
+			assert_true(cmd:find("length(d)==13", 1, true) ~= nil, "body length is 0x0d")
+			assert_true(cmd:find('dev:"phy0-ap0"', 1, true) ~= nil, "asks about the right interface")
+			assert_eq(sysinfo.peer_scan_cmd("x'; reboot; '"), nil, "an interface name cannot break out of the quoting")
+			assert_eq(sysinfo.peer_ie_hex(nil), nil, "no identity, no IE")
+			assert_eq(sysinfo.peer_ie_hex("not-a-mac"), nil, "garbage, no IE")
+		end
+	},
+	{
+		name = "sysinfo: scan_table() decodes iw's \\xNN SSID escapes",
+		fn = function()
+			-- iw escapes every byte that is not printable ASCII. A hotspot
+			-- with an accented name reached the Environment tab as literal
+			-- escapes (upstream saw it live 2026-09-27), e.g. "Caf\xc3\xa9 Guest".
+			local function bss(n, ssid)
+				return "BSS 00:00:5e:00:53:0" .. n .. "(on wlan0)\n" ..
+					"\tfreq: 2437\n\tsignal: -60.00 dBm\n" ..
+					"\tlast seen: 100 ms ago\n\tSSID: " .. ssid .. "\n"
+			end
+			local dump = bss(1, "Caf\\xc3\\xa9 Guest") ..
+				bss(2, "a\\x5cb") ..
+				bss(3, "\\x20Net") ..
+				bss(4, "\\x00\\x00\\x00") ..
+				bss(5, "")
+			with_fixtures({}, {["scan dump"] = dump}, function()
+				local nets = sysinfo.scan_table("wlan0")
+				assert_eq(#nets, 5, "all five BSSes parsed")
+				assert_eq(nets[1].essid,
+					"Caf" .. string.char(0xc3, 0xa9) .. " Guest",
+					"UTF-8 bytes decoded")
+				assert_eq(nets[2].essid, "a\\b", "escaped backslash decodes to one backslash")
+				assert_eq(nets[3].essid, " Net", "escaped leading space kept")
+				assert_eq(nets[4].essid, nil, "NUL-filled hidden SSID has no essid")
+				assert_eq(nets[5].essid, nil, "empty hidden SSID has no essid")
+			end)
+		end
+	},
+	{
 		name = "sysinfo: scan_table() classifies Privacy-only (no RSN/WPA IE) as wep",
 		fn = function()
 			local dump = "BSS cc:cc:cc:cc:cc:cc(on wlan0)\n"
@@ -896,6 +1028,83 @@ return {
 
 			sysinfo._read_file = orig
 			sysinfo._sae_supported_cache = nil
+		end
+	},
+	{
+		name = "sysinfo: ppsk_supported() needs both the station generator and hostapd's VLAN support",
+		fn = function()
+			-- Claimed as wifi_caps 0x100000: the controller then pushes WLANs
+			-- whose keys each carry a VLAN. A generator without vlanid= or a
+			-- hostapd without VLAN support would put every client on the
+			-- VAP's own network.
+			local orig_r, orig_c = sysinfo._read_file, sysinfo._run_cmd
+			local cmds
+			local function probe(gen, hostapd_yes)
+				sysinfo._ppsk_supported_cache = nil
+				cmds = {}
+				sysinfo._read_file = function(path)
+					if path == "/usr/share/ucode/wifi/ap.uc" then return gen end
+					return nil
+				end
+				sysinfo._run_cmd = function(cmd)
+					cmds[#cmds + 1] = cmd
+					return hostapd_yes and "yes\n" or ""
+				end
+				return sysinfo.ppsk_supported()
+			end
+			local ok, err = pcall(function()
+				-- OpenWrt 25.12's ap.uc, iface_wpa_stations.
+				local gen = "station = `vlanid=${sta.config.vid} ` + station;"
+				assert_true(probe(gen, true), "generator + VLAN-capable hostapd -> supported")
+				assert_true(cmds[1]:find("from wpa_psk_file", 1, true) ~= nil,
+					"asks the hostapd binary itself")
+				assert_false(probe(gen, false), "hostapd without VLAN support -> not claimed")
+				assert_false(probe(nil, true), "no ucode generator -> not claimed")
+				assert_eq(#cmds, 0, "and hostapd is not even searched")
+				assert_false(probe("let x = 'psk-sae';", true),
+					"a generator without per-station VLANs -> not claimed")
+				sysinfo._read_file = function() error("probed twice") end
+				assert_false(sysinfo.ppsk_supported(), "cached")
+			end)
+			sysinfo._read_file, sysinfo._run_cmd = orig_r, orig_c
+			sysinfo._ppsk_supported_cache = nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "sysinfo: owe_supported() needs both hostapd's OWE build and the ucode generator",
+		fn = function()
+			-- Claimed as radio_caps2 0x8: the controller then pushes Enhanced
+			-- Open WLANs, and a transition one as a pair openUF writes as one
+			-- owe_transition section. Both halves must be there.
+			local orig_r, orig_c = sysinfo._read_file, sysinfo._run_cmd
+			local cmds
+			local function probe(gen, hostapd_yes)
+				sysinfo._owe_supported_cache = nil
+				cmds = {}
+				sysinfo._read_file = function(path)
+					if path == "/usr/share/ucode/wifi/hostapd.uc" then return gen end
+					return nil
+				end
+				sysinfo._run_cmd = function(cmd)
+					cmds[#cmds + 1] = cmd
+					return hostapd_yes and "yes\n" or ""
+				end
+				return sysinfo.owe_supported()
+			end
+			local ok, err = pcall(function()
+				local gen = "let owe = interface.config.encryption == 'owe' && interface.config.owe_transition;"
+				assert_true(probe(gen, true), "generator + hostapd -vowe -> supported")
+				assert_true(cmds[1]:find("hostapd -vowe", 1, true) ~= nil, "asks hostapd itself")
+				assert_false(probe(gen, false), "hostapd built without OWE -> not claimed")
+				assert_false(probe(nil, true), "no ucode generator -> not claimed")
+				assert_eq(#cmds, 0, "and hostapd is not even asked")
+				assert_false(probe("hostapd_set_bss_options", true),
+					"a generator without owe_transition cannot write transition mode")
+			end)
+			sysinfo._read_file, sysinfo._run_cmd = orig_r, orig_c
+			sysinfo._owe_supported_cache = nil
+			if not ok then error(err, 0) end
 		end
 	},
 	{

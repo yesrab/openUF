@@ -35,6 +35,13 @@
 	`l2guard` record plus the live VAP list. iifname/oifname in the bridge
 	family are meta expressions and need kmod-nft-bridge, like the Blocker's
 	rule; a rejected rule is warned about by name for the same reason.
+
+	The VAP list is a snapshot, and VAPs come and go: a push that adds an SSID
+	runs `wifi reload` asynchronously, so the netdev may not exist yet when the
+	push is handled, and at boot wireless is often not up when the daemon
+	starts. inform.lua therefore re-reads the list once a minute
+	(_l2guard_resync) and rebuilds the table when it changed, rather than
+	leaving a new VAP unguarded until the next push.
 ]]--
 
 local M = {}

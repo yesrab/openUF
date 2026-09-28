@@ -73,6 +73,10 @@ services:
       # Needed only to validate that code path against this disposable
       # container; not a requirement of openUF itself.
       - NET_ADMIN
+    # A writable stand-in for mac80211's debugfs; entrypoint.sh seeds the
+    # per-phy airtime_flags that openuf/airtime.lua switches.
+    tmpfs:
+      - /sys/kernel/debug
     networks:
       - validation
     # Not exposed to the host on purpose -- the controller reaches this

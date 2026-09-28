@@ -295,7 +295,12 @@ end
 -- Each entry: {mac, signal, tx_bitrate, rx_bitrate, tx_mcs, rx_mcs,
 --              tx_generation, tx_nss, rx_generation, rx_nss, tx_bytes,
 --              rx_bytes, tx_packets, rx_packets, tx_retries, tx_failed,
---              inactive_ms, connected_sec}
+--              inactive_ms, connected_sec, tx_width, rx_width,
+--              tx_duration, rx_duration}
+-- tx_duration/rx_duration: airtime in µs, from mac80211's per-station
+-- airtime accounting (drivers that call ieee80211_sta_register_airtime:
+-- ath9k, ath10k, mt76). ath9k counts every retry attempt into it; nil where
+-- the driver reports none.
 -- tx_retries/tx_failed: iw(8) only exposes TX-side retry/failure counters
 -- (802.11 ARQ is TX-side by nature) -- there is no rx-side equivalent in
 -- `station dump` output, confirmed via `strings /usr/sbin/iw`.
@@ -332,9 +337,16 @@ function M.sta_table(ifname)
 			local rx_mcs     = line:match("rx bitrate:.*MCS%s+(%d+)")
 			if line:find("tx bitrate:") then
 				cur.tx_generation, cur.tx_nss = _bitrate_generation_nss(line)
+				-- "80MHz"; iw prints no width token for 20 MHz rates.
+				cur.tx_width = tonumber(line:match("(%d+)MHz")) or 20
 			elseif line:find("rx bitrate:") then
 				cur.rx_generation, cur.rx_nss = _bitrate_generation_nss(line)
+				cur.rx_width = tonumber(line:match("(%d+)MHz")) or 20
 			end
+			local tx_dur = line:match("^%s*tx duration:%s+(%d+)")
+			local rx_dur = line:match("^%s*rx duration:%s+(%d+)")
+			if tx_dur then cur.tx_duration = tonumber(tx_dur) end
+			if rx_dur then cur.rx_duration = tonumber(rx_dur) end
 			local tx_bytes   = line:match("tx bytes:%s+(%d+)")
 			local rx_bytes   = line:match("rx bytes:%s+(%d+)")
 			local tx_pkts    = line:match("tx packets:%s+(%d+)")
@@ -362,13 +374,155 @@ function M.sta_table(ifname)
 	return clients
 end
 
+-- Integer value of a hostapd hex field ("0x006e" or "fffe"), or nil.
+local function _hex(v)
+	if not v then return nil end
+	return tonumber((v:gsub("^0x", "")), 16)
+end
+
+-- The ceiling one station negotiated at association, from hostapd's record
+-- of its capability elements: {mode = "ht"/"vht"/"he", nss, max_mcs, width}.
+-- nil for a station without HT (legacy rates only), whose rate has no MCS
+-- to compare. `rx_vht_mcs_map` is what the STATION can receive, so what the
+-- AP can send it: two bits per spatial stream, 3 = stream unsupported,
+-- 0/1/2 = MCS 0-7/0-8/0-9. The HT bitmask has one byte per stream. HE
+-- stations are taken as MCS 0-11 with the HT/VHT stream count and width:
+-- hostapd's `all_sta` on these builds has shown no HE-specific fields yet.
+local function _sta_ceiling(f)
+	local flags = f.flags or ""
+	if not flags:find("[HT]", 1, true) then return nil end
+	local c = {mode = "ht", max_mcs = 7, nss = 0}
+	local bm = f.ht_mcs_bitmask or ""
+	for i = 1, 4 do
+		local byte = bm:sub(i * 2 - 1, i * 2)
+		if byte ~= "" and byte ~= "00" then c.nss = i end
+	end
+	-- ht_caps_info bit 1: Supported Channel Width Set (40 MHz).
+	local ht = _hex(f.ht_caps_info) or 0
+	c.width = math.floor(ht / 2) % 2 == 1 and 40 or 20
+	local vmap = _hex(f.rx_vht_mcs_map)
+	if flags:find("[VHT]", 1, true) and vmap then
+		local nss, mcs = 0, nil
+		for stream = 0, 7 do
+			local v = math.floor(vmap / 4 ^ stream) % 4
+			if v ~= 3 then
+				nss = stream + 1
+				mcs = mcs or 7 + v
+			end
+		end
+		c.mode = "vht"
+		if nss > 0 then c.nss, c.max_mcs = nss, mcs end
+		-- vht_caps_info bits 2-3: Supported Channel Width Set; 0 = 80 MHz.
+		local vw = math.floor((_hex(f.vht_caps_info) or 0) / 4) % 4
+		c.width = vw == 0 and 80 or 160
+	end
+	if flags:find("[HE]", 1, true) then
+		c.mode, c.max_mcs = "he", 11
+	end
+	if c.nss == 0 then c.nss = 1 end
+	return c
+end
+
+-- Per-station association ceilings on one hostapd BSS, keyed by MAC, from
+-- `hostapd_cli all_sta`: one fork per BSS. See _sta_ceiling().
+function M.hostapd_sta_caps(ifname)
+	if not ifname then return {} end
+	local out = M._run_cmd("hostapd_cli -i " .. ifname .. " all_sta")
+	local fields, cur = {}, nil
+	for line in out:gmatch("[^\n]+") do
+		local mac = line:match("^(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
+		if mac then
+			cur = {}
+			fields[mac:lower()] = cur
+		elseif cur then
+			local k, v = line:match("^([%w_]+)=(.*)$")
+			if k then cur[k] = v end
+		end
+	end
+	local caps = {}
+	for mac, f in pairs(fields) do caps[mac] = _sta_ceiling(f) end
+	return caps
+end
+
+-- Sibling-AP recognition. The controller decides whether a scanned BSS is
+-- one of its own from the REPORTING AP's word alone, never from the site's
+-- vap_tables (decompiled 10.6.101, com.ubnt.service.aS.rhAW): a scan entry
+-- tagged is_unifi=true is resolved to a device by its serialno and, if that
+-- device is adopted in the site, recorded as a UniFi neighbour; an untagged
+-- one is a rogue whenever its SSID is one of the site's. Real UniFi APs learn
+-- the tag from a Ubiquiti vendor IE in each other's beacons. openUF had no
+-- such IE, so every openUF AP showed up in AirView as a third-party AP
+-- impersonating the network -- seen live, all six sibling BSSes at home had
+-- is_rogue=true while the vap_tables the controller held were correct.
+--
+-- So every openUF VAP beacons this IE, carrying its device's identity MAC:
+--   dd 0d | 02 6f 55 (OUI) | 6f 55 46 ("oUF") | 01 (version) | 6-byte MAC
+-- The OUI is deliberately NOT Ubiquiti's 00:27:22 -- a real UniFi AP parsing
+-- our layout as theirs would read garbage -- and the magic makes a collision
+-- with any real user of 02:6f:55 harmless in both directions.
+M.PEER_IE_OUI   = "02:6f:55"
+M.PEER_IE_MAGIC = "6f5546"
+M.PEER_IE_VER   = "01"
+
+-- The hostapd vendor_elements value (the whole element as hex) announcing
+-- mac ("xx:xx:xx:xx:xx:xx"), or nil when mac is not a MAC.
+function M.peer_ie_hex(mac)
+	if type(mac) ~= "string" then return nil end
+	local hex = mac:lower():gsub(":", "")
+	if not hex:match("^%x+$") or #hex ~= 12 then return nil end
+	return "dd0d" .. M.PEER_IE_OUI:gsub(":", "") .. M.PEER_IE_MAGIC
+		.. M.PEER_IE_VER .. hex
+end
+
+-- Reading it back cannot go through `iw`: OpenWrt's default iw build strips
+-- the printer for vendor elements it does not know, so ours never appears in
+-- `iw scan dump` output, with or without -u. Checked live 2026-09-26 on both
+-- boards (iw 6.17): not one "Vendor specific" line across a dozen neighbours,
+-- while the same kernel scan cache, read over nl80211, held our element.
+-- ucode's nl80211 module is what OpenWrt's own wifi scripts are built on, so
+-- it is present wherever those are. The script prints "<bssid> <mac>" per
+-- sibling BSS and nothing else; any failure (no ucode, no module) is simply
+-- no siblings.
+local function ucode_bytes(hex)
+	return (hex:gsub("(%x%x)", "\\x%1"))
+end
+
+function M.peer_scan_cmd(ifname)
+	if type(ifname) ~= "string" or not ifname:match("^[%w%.%-_]+$") then return nil end
+	local head = ucode_bytes(M.PEER_IE_OUI:gsub(":", "") .. M.PEER_IE_MAGIC .. M.PEER_IE_VER)
+	local script = 'let nl=require("nl80211");'
+		.. 'let r=nl.request(nl.const.NL80211_CMD_GET_SCAN,nl.const.NLM_F_DUMP,{dev:"' .. ifname .. '"});'
+		.. 'for(let x in (r||[])){let b=x.bss;if(!b)continue;'
+		.. 'for(let l in [b.information_elements||[],b.beacon_ies||[]]){let hit=null;'
+		.. 'for(let e in l){let d=e.data;'
+		.. 'if(e.type==221&&length(d)==13&&substr(d,0,7)=="' .. head .. '"){'
+		.. 'let m=[];for(let i=7;i<13;i++)push(m,sprintf("%02x",ord(d,i)));'
+		.. 'hit=join(":",m);break;}}'
+		.. 'if(hit){print(b.bssid," ",hit,"\\n");break;}}}'
+	return "ucode -e '" .. script .. "' 2>/dev/null"
+end
+
+-- {bssid = identity MAC} for every BSS in ifname's scan cache that carries
+-- the sibling-AP element.
+function M.peer_macs(ifname)
+	local cmd = M.peer_scan_cmd(ifname)
+	if not cmd then return {} end
+	local peers = {}
+	for bssid, mac in (M._run_cmd(cmd) or ""):gmatch(
+			"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x) (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)") do
+		peers[bssid:lower()] = mac:lower()
+	end
+	return peers
+end
+
 -- Returns a table of neighboring wireless networks visible to ifname, by
 -- parsing `iw dev <ifname> scan dump` -- the kernel's already-cached BSS
 -- list from cfg80211, not a fresh scan (that's what the spectrum-scan cmd
 -- handler's separate `iw dev <ifname> scan` call triggers; reading the
 -- cache here is cheap and non-disruptive enough to do on every inform,
 -- unlike a real scan).
--- Each entry: {bssid, essid, freq, channel, signal, security, age, bw}
+-- Each entry: {bssid, essid, freq, channel, signal, security, age, bw,
+-- peer_mac} -- peer_mac only for a sibling openUF AP (see peer_ie_hex).
 -- `bw` is channel width in MHz, from iw's own "BSS operating channel width:
 -- N MHz" line (only present for HE/VHT-capable neighbors; confirmed via
 -- `strings /usr/sbin/iw`). The controller's Environment tab's "Ch. Width"
@@ -383,6 +537,19 @@ end
 -- last_seen itself as (report_time - age); it also silently drops any entry
 -- with age >= 30 as stale before it ever reaches the rogue-AP list, so this
 -- must be a small, genuinely-fresh number, not whatever we last computed.
+-- iw prints an SSID with every byte that is not printable ASCII -- all UTF-8,
+-- a backslash, a leading or trailing space -- as \xNN, so "Café Guest" reached
+-- the Environment tab as the literal "Caf\xc3\xa9 Guest", and the controller's
+-- evil-twin check (essid in the site's SSIDs) could not match such a name.
+-- Decoding is unambiguous because the backslash is itself escaped. A hidden
+-- network (empty, or NUL-filled) gets no essid at all: the tab then shows the
+-- BSSID, and no NUL bytes go into the JSON.
+local function unescape_iw_ssid(s)
+	s = s:gsub("\\x(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+	if s == string.rep(string.char(0), #s) then return nil end
+	return s
+end
+
 function M.scan_table(ifname)
 	if not ifname then return {} end
 	local output = M._run_cmd("iw dev " .. ifname .. " scan dump")
@@ -476,7 +643,7 @@ function M.scan_table(ifname)
 				cur.channel = M.channel_from_freq(freq)
 			end
 			if signal then cur.signal = tonumber(signal) end
-			if ssid and not cur.essid then cur.essid = ssid end
+			if ssid and not cur.essid then cur.essid = unescape_iw_ssid(ssid) end
 			if last_ms then
 				cur.age = math.floor(tonumber(last_ms) / 1000)
 			elseif last_bt and cur.age == nil and now_up > 0 then
@@ -489,6 +656,10 @@ function M.scan_table(ifname)
 		end
 	end
 	flush()
+	if #nets > 0 then
+		local peers = M.peer_macs(ifname)
+		for _, n in ipairs(nets) do n.peer_mac = peers[n.bssid:lower()] end
+	end
 	return nets
 end
 
@@ -533,6 +704,54 @@ function M.sae_supported()
 		if legacy and legacy:find("sae", 1, true) then found = true end
 	end
 	M._sae_supported_cache = found
+	return found
+end
+
+M._owe_supported_cache = nil
+
+-- Can this device run an Enhanced Open (OWE) WLAN, including its transition
+-- mode?
+--
+-- Claimed to the controller as radio_caps2 bit 0x8; without it an OWE WLAN is
+-- not provisioned at all, and a transition one goes out as plain open. Both
+-- halves are needed. `hostapd -v<feature>` exits 0 only when the running
+-- hostapd build has that feature compiled in (it exits 1 on a name it does not
+-- know), and transition mode is written as one wifi-iface with
+-- owe_transition=1, which only the ucode generator (24.10+) expands into the
+-- hidden OWE BSS plus the open one.
+function M.owe_supported()
+	if M._owe_supported_cache ~= nil then return M._owe_supported_cache end
+	local found = false
+	local gen = M._read_file("/usr/share/ucode/wifi/hostapd.uc")
+	if gen and gen:find("owe_transition", 1, true) then
+		found = M._run_cmd("/usr/sbin/hostapd -vowe >/dev/null 2>&1 && echo yes")
+			:find("yes", 1, true) ~= nil
+	end
+	M._owe_supported_cache = found
+	return found
+end
+
+M._ppsk_supported_cache = nil
+
+-- Can this device run Private Pre-Shared Keys: several passphrases on one
+-- SSID, each putting its client on its own VLAN?
+--
+-- Claimed to the controller as wifi_caps 0x100000; without it a PPSK WLAN is
+-- skipped entirely. Both halves are needed. The generator must turn
+-- wifi-station sections into a wpa_psk_file with vlanid= (ap.uc,
+-- iface_wpa_stations, OpenWrt 24.10+), and hostapd must be built with VLAN
+-- support: a build without it has no "from wpa_psk_file" log string and would
+-- ignore every key's VLAN. There is no -v<feature> probe for VLAN, so the
+-- binary is searched once.
+function M.ppsk_supported()
+	if M._ppsk_supported_cache ~= nil then return M._ppsk_supported_cache end
+	local found = false
+	local gen = M._read_file("/usr/share/ucode/wifi/ap.uc")
+	if gen and gen:find("vlanid=", 1, true) then
+		found = M._run_cmd("grep -qF 'from wpa_psk_file' /usr/sbin/hostapd && echo yes")
+			:find("yes", 1, true) ~= nil
+	end
+	M._ppsk_supported_cache = found
 	return found
 end
 
@@ -650,6 +869,9 @@ function M.radio_caps(ifname)
 	local txpower = tonumber(dev_info:match("txpower%s+([%d%.]+)"))
 	caps.channel  = channel and tonumber(channel) or nil
 	caps.tx_power = txpower and math.floor(txpower) or nil
+	-- Live channel width in MHz ("width: 80 MHz"), for the satisfaction
+	-- estimate's rate ceiling. Not a wire field: build_json takes it off.
+	caps.width    = tonumber(dev_info:match("width:%s+(%d+)"))
 
 	return caps
 end

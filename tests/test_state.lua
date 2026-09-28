@@ -189,6 +189,7 @@ return {
 				st.swvlan_backup = {["1"] = "0t 1 2 3 4"}
 				st.locating      = true
 				st.led_enabled   = false
+				st.atf_enabled   = false
 				state.save(st)
 				local loaded = state.load()
 				assert_eq(loaded.mac, "00:00:5e:00:53:1a", "identity MAC round-trips")
@@ -198,6 +199,7 @@ return {
 				assert_eq(loaded.swvlan_backup["1"], "0t 1 2 3 4", "switch ledger round-trips")
 				assert_eq(loaded.locating, true, "locating round-trips")
 				assert_eq(loaded.led_enabled, false, "an explicit false round-trips")
+				assert_eq(loaded.atf_enabled, false, "a pushed Airtime Fairness off round-trips as false, not nil")
 			end)
 		end
 	},

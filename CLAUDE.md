@@ -54,8 +54,11 @@ tag.
 ### Lua
 
 **Lua 5.1** on the device (CI runs `lua5.1`). No `goto`, no `//`, no native bitwise
-operators (`luabitop` provides `bit.*`), `break` must be the last statement in its block.
-A newer local Lua will happily accept code the device rejects — CI is the check.
+operators (`luabitop` provides `bit.*`), `break` must be the last statement in its block,
+no `\xNN` string escapes (5.1 silently emits the letters `x07`; use `string.char`), no `\z`,
+`\u{}` or `table.unpack`. `os.execute` returns a number on 5.1, and both 0 and 1 are truthy,
+so normalise before branching. A newer local Lua will happily accept code the device rejects —
+CI is the check, and AP2's own `lua` (`loadfile` on each module) is the quickest local one.
 `openuf/lib/lib.lua` is what lets one source tree run on both: it resolves `bit` from
 luabitop, bit32, or native 5.3+ operators built with `load()` so 5.1 never parses the
 newer syntax. Follow that pattern rather than branching on `_VERSION`.
@@ -436,10 +439,25 @@ factory reset.
   The `noop`'s `interval` is honoured (clamped 5–300 s); `_tick` re-reads it every cycle.
 - **`syswrapper.sh 11k-scan` does not scan. It leaves a dated request file** (`/tmp/openuf-
   scan-request`) that the daemon's `_maybe_scan_neighbours` consumes on the next heartbeat,
-  ignoring anything older than ten minutes. The scan code, the radios' netdev names and the
+  ignoring anything older than ten minutes. Every sweep goes through `_force_scan`
+  (`iw dev <if> scan ap-force`, exit status judged through `_popen`'s `&& echo scan-ok`):
+  `_popen` drops stderr, so before that a refused scan looked exactly like a successful one. The scan code, the radios' netdev names and the
   cache the result lands in all live in the daemon; a second implementation in the hook
   would drift. A request older than the cutoff is what a stopped daemon leaves behind, and
   firing it at the next boot would land in hostapd's ACS sweep.
+- **A capability bit is claimed only where a device-side probe passes**, and the probe is
+  cached: `sae_supported` (`radio_caps2` 0x1/0x2), `owe_supported` (0x8), `airtime.supported`
+  (`wifi_caps` 0x20), `ppsk_supported` (0x100000). `wifi_caps` 0xC and `wifi_caps2` 0x60 are
+  unconditional because they only make the controller *send* blocks openUF parses. The
+  controller keeps a setting it could not push (upstream found `atf_enabled: false` stored
+  from before the bit existed), so a newly claimed bit can change device state on the first
+  push after an upgrade. `debug_caps` replaces a mask whole. PROTOCOL-VALIDATION.md's
+  "Capability bitmasks" lists what every other bit would unlock and why it is not claimed.
+- **`_forget_controller` is what a factory reset owes the kernel.** `setdefault` and an
+  out-of-process `reset-inform` (seen by `_reload_if_changed` as adopted → not adopted) both
+  drop the controller's interval, the l2guard table, the cron block and put Airtime Fairness
+  back on. A new controller-driven kernel or system state belongs in that function too, or a
+  forgotten AP keeps acting for a controller that no longer manages it.
 - **`l2guard` protects the VAPs only, never a wired socket, by design.** The controller's
   `--vlan-id <n> -p 802_1Q -j DROP` is bridge-wide on the stock firmware because there the
   tagged uplink is an 8021q sub-device that takes tagged frames before the bridge sees them.
@@ -467,6 +485,19 @@ factory reset.
   go through `is_ipv4`/`is_mac` at the parser *and* again in netconfig/firewall/bcfilter.
   Pre-adoption the inform channel is plain HTTP under the well-known key, so a forged
   `setparam` is within reach of anyone on the path; without these it was a root shell.
+- **One VAP can be several netdevs.** An OWE-transition section brings up a second, open BSS
+  that netifd's status never lists (read from `hostapd bss_info`), and each private
+  pre-shared key VLAN gets `<vap>-<vid>` (listed under the interface's `vlans[]`).
+  `get_ifnames_for_vap` returns all of them, and stations, the blocker and the shaper must
+  cover all of them; `get_ifname_for_vap` (singular) is only for something that addresses the
+  hostapd BSS itself. A station seen on a VLAN netdev is kicked or BTM-requested through its
+  BSS (`bss_ifname`), which is the only place hostapd listens.
+- **Roaming Assistant and Band Steering share usteer but not its decision.** `usteer.lua`
+  writes `band_steering_interval` (0 = off; the daemon default steers) and never the inert
+  `band_steering_threshold`; `roamassist.lua` reads usteer's cross-AP table and sends its own
+  BTM request and disassociation, per WLAN, only toward an AP that hears the client
+  `roam_assist_diff_db` louder. `usteer.set_enabled(steering, cfg, roam_assist)` runs the
+  daemon for either.
 - **`get_vap_table` reports AP-mode sections only, and `use_only_unifi_wlan` never touches
   a non-AP one.** A mesh point or station interface (a wireless backhaul) is a link, not a
   competing SSID, and may be the device's own uplink. `keep_wlan_sections` exempts named
@@ -500,9 +531,12 @@ factory reset.
   reapplies, in order: the pushed static IP (`_reapply_static_ip`, before
   `_populate_net_info`), the bridge identity (`ensure_bridge_identity`), the blocked-client
   rules, the blocker and speed limit from the `openuf_bcfilt*`/`openuf_ratelimit_*` stamps
-  (`reapply_runtime_rules`), the LED state, and the nft MAC tap
-  (`switchvlan.reconcile_mac_taps`, from the `openuf_brport<vid>_<socket>` sections). Every
-  one is pcall'd. A new kernel-resident feature belongs in that list or it is a reboot bug.
+  (`reapply_runtime_rules`), the LED state, Airtime Fairness from `st.atf_enabled`
+  (`_reapply_airtime`; debugfs resets to on), the nft MAC tap
+  (`switchvlan.reconcile_mac_taps`, from the `openuf_brport<vid>_<socket>` sections) and the
+  l2guard table from `st.l2guard`, whose VAP list `_l2guard_resync` then corrects once a
+  minute. Every one is pcall'd. A new kernel-resident feature belongs in that list or it is a
+  reboot bug.
   The IP branch of `handle_response` saves state the moment the interface changes, not at
   the tail: anything after it can raise, and the startup reapply reads what was saved.
 - **AES-GCM is mandatory for adoption.** UniFi 10.4.57 will not finish provisioning a

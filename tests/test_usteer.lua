@@ -28,6 +28,11 @@ local function new_mock_uci()
 		return s and s[option]
 	end
 
+	function cursor:delete(config, section, option)
+		local s = db[config] and db[config][section]
+		if s then s[option] = nil end
+	end
+
 	-- Recorded, not applied -- the counter lets tests catch a dropped commit.
 	local commits = {}
 	function cursor:commit(config)
@@ -58,13 +63,13 @@ end
 
 return {
 	{
-		name = "usteer: set_enabled(false) neutralizes threshold and stops/disables the daemon",
+		name = "usteer: set_enabled(false) writes interval 0 and stops/disables the daemon",
 		fn = function()
 			with_usteer(function(db, cmds)
 				local ok = usteer.set_enabled(false, nil)
 				assert_true(ok, "set_enabled returns true")
 				local s = db.usteer["local"]
-				assert_eq(s.band_steering_threshold, "0", "threshold neutralized")
+				assert_eq(s.band_steering_interval, "0", "band steering off")
 				assert_eq(s.network, "lan", "defaults network to lan without cfg")
 				assert_true(cmds_contain(cmds, "usteer stop"), "stops the daemon")
 				assert_true(cmds_contain(cmds, "usteer disable"), "disables the daemon")
@@ -72,21 +77,17 @@ return {
 		end
 	},
 	{
-		name = "usteer: set_enabled(true) runs the daemon with a nonzero threshold",
+		name = "usteer: set_enabled(true) runs the daemon at its default steering interval",
 		fn = function()
 			with_usteer(function(db, cmds)
 				local ok = usteer.set_enabled(true, nil)
 				assert_true(ok, "set_enabled returns true")
 				local s = db.usteer["local"]
-				-- NB: this pins the option NAME as a regression lock only --
-				-- usteer.lua's header flags `band_steering_threshold` and its
-				-- default as BEST-EFFORT/UNCONFIRMED against the real usteer
-				-- schema. If a real-deploy verification renames the option,
-				-- update this assertion together with the source; a red here
-				-- after such a change is expected, not a regression.
-				assert_eq(s.band_steering_threshold,
-					tostring(usteer.USTEER_DEFAULTS.band_steering_threshold),
-					"nonzero band-preference threshold")
+				-- Unset, not a number of our own: usteer's default interval
+				-- is the one that steered a real client (band_steering.c;
+				-- 0 is the only value that disables it).
+				assert_nil(s.band_steering_interval, "daemon default interval")
+				assert_nil(s.band_steering_threshold, "inert threshold not written")
 				assert_true(cmds_contain(cmds, "usteer enable"), "enables the daemon")
 				assert_true(cmds_contain(cmds, "usteer restart"), "restarts the daemon")
 			end)
@@ -111,6 +112,61 @@ return {
 				assert_true(after_disable > after_first, "transition to disabled acts")
 				usteer.set_enabled(false, nil)
 				assert_eq(#cmds, after_disable, "repeated disable issues no further commands")
+			end)
+		end
+	},
+	{
+		name = "usteer: Roaming Assistant alone runs the daemon with band steering off",
+		fn = function()
+			with_usteer(function(db, cmds)
+				usteer.set_enabled(false, nil, true)
+				local s = db.usteer["local"]
+				-- The daemon default steers, so running usteer for Roaming
+				-- Assistant without this would band-steer too.
+				assert_eq(s.band_steering_interval, "0", "no band steering")
+				assert_eq(s.openuf_active, "1", "stamped as running")
+				assert_true(cmds_contain(cmds, "usteer restart"), "daemon started")
+				assert_false(cmds_contain(cmds, "usteer stop"), "not stopped")
+				-- usteer's own device-wide roam trigger stays off: the decision
+				-- is roamassist.lua's, per WLAN.
+				assert_nil(s.roam_trigger_snr, "no roam_trigger_snr")
+				assert_nil(s.signal_diff_threshold, "no signal_diff_threshold")
+			end)
+		end
+	},
+	{
+		name = "usteer: turning Roaming Assistant off (band steering off) stops the daemon",
+		fn = function()
+			-- The case an options-only guard would swallow: the interval is
+			-- "0" before and after, only the running state moves.
+			with_usteer(function(db, cmds)
+				usteer.set_enabled(false, nil, true)
+				local n = #cmds
+				usteer.set_enabled(false, nil, false)
+				assert_true(#cmds > n, "acted on the transition")
+				assert_true(cmds_contain(cmds, "usteer stop"), "stopped")
+				assert_eq(db.usteer["local"].openuf_active, "0", "stamped as stopped")
+				local m = #cmds
+				usteer.set_enabled(false, nil, false)
+				assert_eq(#cmds, m, "steady off is a no-op")
+			end)
+		end
+	},
+	{
+		name = "usteer: a device configured by an older openUF is rewritten once",
+		fn = function()
+			with_usteer(function(db, cmds, commits)
+				local cursor = usteer._uci.cursor()
+				cursor:set("usteer", "local", "usteer")
+				cursor:set("usteer", "local", "network", "lan")
+				cursor:set("usteer", "local", "band_steering_threshold", "5")
+				cursor:set("usteer", "local", "openuf_active", "1")
+				usteer.set_enabled(true, nil)
+				assert_eq(commits.usteer, 1, "one migration write")
+				assert_nil(db.usteer["local"].band_steering_threshold,
+					"the threshold the old version wrote is removed")
+				usteer.set_enabled(true, nil)
+				assert_eq(commits.usteer, 1, "then steady")
 			end)
 		end
 	},

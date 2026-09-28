@@ -411,6 +411,7 @@ local SECURITY_MAP = {
 	["wpa2"]       = "psk2",
 	["wpa3"]       = "sae",
 	["wpa2/wpa3"]  = "sae-mixed",
+	["owe"]        = "owe",
 }
 
 -- Deterministic 16-bit id from a string, formatted as 4 hex chars (802.11r
@@ -444,8 +445,89 @@ function M.wlan_clear(radio)
 			end
 		end
 	end)
+	-- The private pre-shared keys and their VLANs (M.ppsk_add) go with their
+	-- VAP. netifd applies a wifi-station or wifi-vlan section without an iface
+	-- to EVERY VAP, so one left behind would not stay harmless.
+	local cleared = {}
+	for _, name in ipairs(to_delete) do cleared[name] = true end
+	for _, stype in ipairs({"wifi-station", "wifi-vlan"}) do
+		cursor:foreach("wireless", stype, function(s)
+			local name = s[".name"]
+			if name and name:sub(1, #OPENUF_PREFIX) == OPENUF_PREFIX then
+				local ifaces = s.iface
+				if type(ifaces) ~= "table" then ifaces = {ifaces} end
+				local ours = radio == nil
+				for _, i in ipairs(ifaces) do
+					if cleared[i] then ours = true end
+				end
+				if ours then to_delete[#to_delete + 1] = name end
+			end
+		end)
+	end
 	for _, name in ipairs(to_delete) do
 		cursor:delete("wireless", name)
+	end
+	cursor:commit("wireless")
+end
+
+-- Every VLAN id one vap_table entry needs an L2 for: the WLAN's own, plus the
+-- VLAN of each private pre-shared key. Sorted, no duplicates.
+function M.vap_vlan_ids(vap)
+	local seen, out = {}, {}
+	local function add(v)
+		v = tonumber(v)
+		if v and not seen[v] then seen[v] = true; out[#out + 1] = v end
+	end
+	if vap.vlan_enabled then add(vap.vlan) end
+	for _, k in ipairs(vap.ppsk or {}) do add(k.vid) end
+	table.sort(out)
+	return out
+end
+
+-- Private Pre-Shared Keys for the VAP in wifi-iface section `iface`.
+--
+-- OpenWrt has the whole feature already: each wifi-station section becomes
+-- one line of hostapd's wpa_psk_file (and sae_password_file for SAE),
+--   vlanid=20 00:00:00:00:00:00 <passphrase>
+-- and each wifi-vlan section one line of its vlan_file, for which netifd
+-- creates a netdev named <vap ifname>-<name> and puts it in the bridge of the
+-- network it names. A key without a VLAN puts its client on the VAP's own
+-- network.
+--
+-- keys:     vap.ppsk, {key=, vid=} each
+-- networks: vid -> UCI network section for that VLAN (ensure_vlan_network)
+-- A key whose VLAN has no network is left out rather than provisioned
+-- without one: that client would land on the VAP's own network, past the
+-- segmentation the key exists for.
+function M.ppsk_add(iface, keys, networks)
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	for i, k in ipairs(keys or {}) do
+		local net = k.vid and networks[k.vid]
+		if k.vid and not net then
+			io.stderr:write(("ucihelper: %s: private pre-shared key %d left out, "
+				.. "no network for VLAN %d\n"):format(iface, i, k.vid))
+		else
+			-- Two keys on one VLAN share its section.
+			if k.vid then
+				local vs = iface .. "_vlan" .. k.vid
+				cursor:set("wireless", vs, "wifi-vlan")
+				cursor:set("wireless", vs, "iface", {iface})
+				-- The netdev is <vap ifname>-<name>: "phy0-ap0-20" stays
+				-- inside the 15-character limit, where "v20" might not.
+				cursor:set("wireless", vs, "name", tostring(k.vid))
+				cursor:set("wireless", vs, "vid", tostring(k.vid))
+				cursor:set("wireless", vs, "network", {net})
+			end
+			local ss = iface .. "_psk" .. i
+			cursor:set("wireless", ss, "wifi-station")
+			cursor:set("wireless", ss, "iface", {iface})
+			cursor:set("wireless", ss, "mac", {"00:00:00:00:00:00"})
+			cursor:set("wireless", ss, "key", k.key)
+			if k.vid then
+				cursor:set("wireless", ss, "vid", tostring(k.vid))
+			end
+		end
 	end
 	cursor:commit("wireless")
 end
@@ -572,8 +654,8 @@ end
 -- Create a new wifi-iface section named openuf_<ssid> on the given radio.
 -- radio:    UCI radio name, e.g. "radio0" or "radio1"
 -- ssid:     SSID string
--- security: "open" | "wpa2" | "wpa3" | "wpa2/wpa3"
--- password: WPA pre-shared key (ignored when security == "open")
+-- security: "open" | "owe" | "wpa2" | "wpa3" | "wpa2/wpa3"
+-- password: WPA pre-shared key (ignored when security is "open" or "owe")
 -- extra:    optional table of additional UCI key/value pairs (802.11r/k/v etc.)
 -- network:  UCI network/interface name to bridge this SSID onto (defaults to
 --           "lan"); pass a VLAN-tagged interface from ensure_vlan_network() to
@@ -627,7 +709,7 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	if wlanconf_id then
 		cursor:set("wireless", section_name, "openuf_wlanconf_id", wlanconf_id)
 	end
-	if password and enc ~= "none" then
+	if password and enc ~= "none" and enc ~= "owe" then
 		cursor:set("wireless", section_name, "key", password)
 	end
 	-- 802.11r/k/v
@@ -653,6 +735,7 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 		end
 	end
 	cursor:commit("wireless")
+	return section_name
 end
 
 -- True when this OpenWrt is 21.02+, i.e. netifd expects `config device`
@@ -1341,10 +1424,13 @@ end
 --       BSS Transition on for every managed iface regardless of each WLAN's
 --       own bss_transition setting, since usteer (Band Steering) needs it
 --       network-wide to function at all -- see openuf/usteer.lua. nil/false
---       leaves each vap's own setting in effect. opts.device_name is the
+--       leaves each vap's own setting in effect. opts.roam_assist_active
+--       (boolean) forces the same, for Roaming Assistant. opts.device_name is the
 --       controller-assigned device name, used as the WPS Device Name value
 --       when a vap has advertise_ap_name enabled ("Show Access Point Name in
---       Beacon"); defaults to "openUF" if nil.
+--       Beacon"); defaults to "openUF" if nil. opts.peer_ie is the
+--       vendor_elements hex every VAP beacons so sibling openUF APs can tell
+--       it is not a rogue (sysinfo.peer_ie_hex); nil removes it.
 -- Handles vap_table and radio_table from the setparam/config response.
 function M.apply_config(resp, cfg, opts)
 	local radio_table   = resp.radio_table   or {}
@@ -1482,14 +1568,16 @@ function M.apply_config(resp, cfg, opts)
 				-- computes the same key with no coordination, the same
 				-- reasoning behind derive_mobility_domain above.
 			end
-			if opts and opts.band_steering_active then
+			if opts and (opts.band_steering_active or opts.roam_assist_active) then
 				-- usteer requires 802.11k (neighbor reports) + BSS
 				-- Transition on every managed iface network-wide to
 				-- function at all -- confirmed via the OpenWrt wiki's
 				-- usteer setup guide. This overrides each WLAN's own
 				-- bss_transition/ieee80211k value while device-wide Band
 				-- Steering is on, since usteer can't be scoped to a
-				-- single SSID.
+				-- single SSID. Roaming Assistant needs the same: usteer
+				-- running on every iface for its cross-AP view, and
+				-- bss_transition for hostapd's bss_transition_request.
 				extra.ieee80211k          = "1"
 				extra.bss_transition      = "1"
 				extra.rrm_neighbor_report = "1"
@@ -1534,6 +1622,16 @@ function M.apply_config(resp, cfg, opts)
 				if vap.pmf_status == "enabled" then w = vap.pmf_mode or 1 end
 				extra.ieee80211w = tostring(w)
 			end
+			if vap.owe_transition then
+				-- Enhanced Open transition mode: the ucode generator (24.10+,
+				-- hostapd.uc/mac80211.sh) turns this one section into the
+				-- hidden OWE BSS plus an open BSS under the section's SSID,
+				-- each pointing at the other. The controller sends the same
+				-- pair as two VAPs; inform.lua keeps the open one only.
+				-- Absent otherwise: wlan_clear drops the section on every
+				-- rebuild.
+				extra.owe_transition = "1"
+			end
 			if vap.mcast_enhance ~= nil then
 				-- Multicast Enhancement: multicast_to_unicast is the
 				-- OpenWrt/mac80211 wifi-iface option that proxies multicast
@@ -1556,6 +1654,13 @@ function M.apply_config(resp, cfg, opts)
 				-- and off, mirroring bss_transition/mcast_enhance.
 				extra.proxy_arp = vap.proxy_arp and "1" or "0"
 			end
+			if vap.roam_assist_enabled then
+				-- "Roaming Assistant" threshold in dBm, read back by
+				-- get_vap_table for openuf/roamassist.lua. Absent means off:
+				-- wlan_clear drops the whole section before every rebuild,
+				-- so switching it off in the controller leaves nothing behind.
+				extra.openuf_roam_assist = tostring(vap.roam_assist_rssi or -75)
+			end
 			if vap.bcfilt_enabled ~= nil then
 				-- "Multicast and Broadcast Blocker". Recorded on the section so
 				-- the configured state is visible in `uci show` and survives to
@@ -1574,6 +1679,12 @@ function M.apply_config(resp, cfg, opts)
 				-- hostapd_common_add_bss_config declaration list.
 				extra.isolate = vap.l2_isolation and "1" or "0"
 			end
+			-- Sibling-AP recognition: the vendor element that tells the other
+			-- openUF APs' scans this BSS is ours (see sysinfo.peer_ie_hex --
+			-- without it the controller lists it as a rogue impersonating the
+			-- network). Removed when the identity MAC is unknown rather than
+			-- left announcing a stale one.
+			extra.vendor_elements = (opts and opts.peer_ie) or M.DELETE
 			if vap.hide_ssid ~= nil then
 				-- "Hide WiFi Name": leave the SSID out of beacons (clients must
 				-- know the name to associate). OpenWrt's wifi-iface option is
@@ -1663,14 +1774,32 @@ function M.apply_config(resp, cfg, opts)
 			local vlan_enabled = vap.vlan_enabled
 			local vlan_id      = vap.vlan
 
-			local network = "lan"
-			if vlan_enabled and vlan_id and cpueth then
-				network = M.ensure_vlan_network(cpueth, vlan_id)
-				wanted_vlans[tonumber(vlan_id) or vlan_id] = true
+			-- One L2 per VLAN the VAP needs: its own and each private
+			-- pre-shared key's.
+			local vlan_networks = {}
+			if cpueth then
+				for _, vid in ipairs(M.vap_vlan_ids(vap)) do
+					vlan_networks[vid] = M.ensure_vlan_network(cpueth, vid)
+					wanted_vlans[vid] = true
+				end
 			end
 
-			M.wlan_add(vap.radio, vap.ssid, vap.security, vap.x_passphrase, extra,
-				network, vap.wlanconf_id)
+			local network = "lan"
+			if vlan_enabled and vlan_id and cpueth then
+				network = vlan_networks[tonumber(vlan_id)]
+			end
+
+			-- The wire sends dynamic_vlan=1 with every key list, and
+			-- OpenWrt's ap.uc writes hostapd's VLAN options (vlan_no_bridge
+			-- above all: netifd, not hostapd, bridges the VLAN netdev) only
+			-- when it is set.
+			if vap.ppsk then extra.dynamic_vlan = "1" end
+
+			local section = M.wlan_add(vap.radio, vap.ssid, vap.security,
+				vap.x_passphrase, extra, network, vap.wlanconf_id)
+			if vap.ppsk and section then
+				M.ppsk_add(section, vap.ppsk, vlan_networks)
+			end
 		end
 	end
 
@@ -1734,9 +1863,9 @@ function M.apply_config(resp, cfg, opts)
 	for _, vap in ipairs(vap_table) do
 		if vap.ssid and vap.radio then
 			-- Resolved once per VAP and shared by both features -- this used to
-			-- be two lookups per VAP through the same ubus status call.
-			local ifname = M.get_ifname_for_vap(vap.radio, vap.ssid)
-			if ifname then
+			-- be two lookups per VAP through the same ubus status call. An OWE
+			-- transition VAP has two netdevs, and both get the rules.
+			for _, ifname in ipairs(M.get_ifnames_for_vap(vap.radio, vap.ssid)) do
 				entries[#entries + 1] = {
 					ifname         = ifname,
 					bcfilt_enabled = vap.bcfilt_enabled,
@@ -1778,19 +1907,21 @@ function M.reapply_runtime_rules()
 		-- teardown: the reload that disabled it took its interface, and with it
 		-- every qdisc and every nft rule that named it.
 		if s.disabled == "1" then return end
-		local ok_if, ifname = pcall(M.get_ifname_for_vap, s.device, s.ssid)
-		if not (ok_if and ifname) then return end
+		local ok_if, ifnames = pcall(M.get_ifnames_for_vap, s.device, s.ssid)
+		if not ok_if then return end
 		local macs = {}
 		for mac in (s.openuf_bcfilt_macs or ""):gmatch("%S+") do
 			macs[#macs + 1] = mac
 		end
-		entries[#entries + 1] = {
-			ifname         = ifname,
-			bcfilt_enabled = (s.openuf_bcfilt == "1"),
-			bcfilt_macs    = macs,
-			down_kbps      = tonumber(s.openuf_ratelimit_down),
-			up_kbps        = tonumber(s.openuf_ratelimit_up),
-		}
+		for _, ifname in ipairs(ifnames) do
+			entries[#entries + 1] = {
+				ifname         = ifname,
+				bcfilt_enabled = (s.openuf_bcfilt == "1"),
+				bcfilt_macs    = macs,
+				down_kbps      = tonumber(s.openuf_ratelimit_down),
+				up_kbps        = tonumber(s.openuf_ratelimit_up),
+			}
+		end
 	end)
 	reconcile_runtime(entries)
 	return #entries
@@ -1943,6 +2074,57 @@ local function wireless_status()
 	return status
 end
 
+-- The second netdev of an Enhanced Open transition section, or nil.
+--
+-- owe_transition=1 makes the generator bring up TWO BSSes from one section:
+-- the section's own netdev is the hidden OWE BSS, and the open BSS gets a
+-- netdev netifd's status never lists (mac80211.sh assigns it as
+-- owe_transition_ifname and hands it only to hostapd). hostapd reports it in
+-- its bss_info, which is where OpenWrt's own iwinfo.uc reads it too. Asked
+-- only for sections that have the option, so no other VAP pays for a ubus
+-- call.
+local function owe_transition_ifname(iface)
+	local on = type(iface.config) == "table" and iface.config.owe_transition
+	if not (on == true or on == 1 or on == "1") then return nil end
+	-- Interpolated into a shell command line.
+	if type(iface.ifname) ~= "string" or not iface.ifname:match("^[%w%-%._]+$") then
+		return nil
+	end
+	local cjson = get_cjson()
+	if not cjson then return nil end
+	local out = M._popen("ubus call hostapd bss_info '{\"iface\":\"" .. iface.ifname .. "\"}'")
+	local ok, info = pcall(cjson.decode, out or "")
+	local peer = ok and type(info) == "table" and info.owe_transition_ifname
+	if type(peer) == "string" and peer:match("^[%w%-%._]+$") and peer ~= iface.ifname then
+		return peer
+	end
+	return nil
+end
+
+-- The VLAN netdevs of one VAP (private pre-shared keys: a client whose key
+-- carries a VLAN is associated on <vap ifname>-<vid>, not on the VAP's own
+-- netdev, and `iw dev <vap> station dump` does not list it). netifd reports
+-- them under the interface's vlans[].
+-- Each one is remembered against its VAP for M.bss_ifname.
+M._vlan_parent = {}
+local function vlan_ifnames(iface, out)
+	for _, v in ipairs(type(iface.vlans) == "table" and iface.vlans or {}) do
+		if type(v) == "table" and type(v.ifname) == "string" and v.ifname ~= "" then
+			out[#out + 1] = v.ifname
+			M._vlan_parent[v.ifname] = iface.ifname
+		end
+	end
+	return out
+end
+
+-- The netdev whose hostapd serves a station seen on `ifname`: the VAP itself
+-- for a VLAN netdev from get_ifnames_for_vap, else ifname unchanged. hostapd
+-- has a control socket and a ubus object per BSS only, so a kick or a BSS
+-- transition request aimed at the VLAN netdev would reach nothing.
+function M.bss_ifname(ifname)
+	return M._vlan_parent[ifname] or ifname
+end
+
 -- The live netdev of every AP-mode VAP on the device, from netifd's status
 -- (radio order, then interface order). A station or mesh interface -- a
 -- wireless backhaul -- is not a VAP and is left out: l2guard's tag-drop on
@@ -1962,6 +2144,8 @@ function M.ap_ifnames()
 			local mode = type(i.config) == "table" and i.config.mode or nil
 			if type(i.ifname) == "string" and i.ifname ~= "" and (mode == nil or mode == "ap") then
 				out[#out + 1] = i.ifname
+				out[#out + 1] = owe_transition_ifname(i)
+				vlan_ifnames(i, out)
 			end
 		end
 	end
@@ -1993,7 +2177,7 @@ end
 -- hosts a single SSID -- not good enough for per-WLAN features like the
 -- Multicast and Broadcast Blocker, where picking the wrong VAP's netdev would
 -- silently apply one SSID's filter to another. Returns nil if unresolvable.
-function M.get_ifname_for_vap(radio, ssid)
+local function find_vap_iface(radio, ssid)
 	if not radio or not ssid then return nil end
 	local status = wireless_status()
 	if not status then return nil end
@@ -2002,7 +2186,7 @@ function M.get_ifname_for_vap(radio, ssid)
 	for _, iface in ipairs(dev.interfaces) do
 		if type(iface) == "table" and iface.ifname
 			and type(iface.config) == "table" and iface.config.ssid == ssid then
-			return iface.ifname
+			return iface
 		end
 	end
 	-- Fall back to the radio's only interface when the SSID could not be
@@ -2013,9 +2197,28 @@ function M.get_ifname_for_vap(radio, ssid)
 	-- a wrong guess would apply one SSID's filter to another, which is worse
 	-- than not applying it at all.
 	if #dev.interfaces == 1 and type(dev.interfaces[1]) == "table" then
-		return dev.interfaces[1].ifname
+		return dev.interfaces[1]
 	end
 	return nil
+end
+
+function M.get_ifname_for_vap(radio, ssid)
+	local iface = find_vap_iface(radio, ssid)
+	return iface and iface.ifname
+end
+
+-- Every live netdev of one VAP: its own, the open BSS of an OWE transition
+-- section, and the VLAN netdev of each private pre-shared key's VLAN.
+-- Per-VAP features (station reporting, the blocker, the speed limit) have to
+-- cover them all, or those clients would fall outside them. Empty when the
+-- VAP cannot be resolved.
+function M.get_ifnames_for_vap(radio, ssid)
+	local iface = find_vap_iface(radio, ssid)
+	if not iface then return {} end
+	local out = {iface.ifname}
+	local peer = owe_transition_ifname(iface)
+	if peer then out[#out + 1] = peer end
+	return vlan_ifnames(iface, out)
 end
 
 -- "Minimum RSSI" enforcement: send a single 802.11 deauthentication frame to
@@ -2108,6 +2311,9 @@ function M.get_vap_table()
 			-- stays in its own UCI option for the VLAN/mobility-domain logic.)
 			id            = s.openuf_wlanconf_id,
 			wlanconf_id   = s.openuf_wlanconf_id,
+			-- Internal, never serialized: build_json consumes it for
+			-- Roaming Assistant and removes it.
+			roam_assist_rssi = tonumber(s.openuf_roam_assist),
 		}
 	end)
 	return vaps

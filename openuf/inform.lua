@@ -63,6 +63,8 @@ local rrmscan   = _require_sibling("rrmscan")
 local unhandled = _require_sibling("unhandled")
 local sysconf   = _require_sibling("sysconf")
 local l2guard   = _require_sibling("l2guard")
+local roamassist = _require_sibling("roamassist")
+local airtime   = _require_sibling("airtime")
 
 local M = {}
 
@@ -85,6 +87,8 @@ M._rrmscan    = rrmscan
 M._unhandled  = unhandled
 M._sysconf    = sysconf
 M._l2guard    = l2guard
+M._roamassist = roamassist
+M._airtime    = airtime
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -142,10 +146,30 @@ M._spectrum_cache = {}
 -- used to delta-sample a throughput estimate the same way M._sysinfo's
 -- cpu_percent() delta-samples /proc/stat between calls (first sample for a
 -- given MAC has no prior delta, so throughput is reported as 0 that time).
+-- It also carries the per-station state behind satisfaction (smoothed
+-- terms and the airtime window base): see estimate_satisfaction().
 M._sta_stats_cache = {}
 -- Forget a station's previous sample once it has been gone this long (see the
 -- sweep in build_json). Exported so a test can drive the window.
 M.STA_STATS_FORGET_AFTER = 600
+-- Weight of each new sample in the satisfaction terms' EWMAs.
+M.RATE_EWMA_ALPHA = 0.2
+-- Satisfaction tunables (see estimate_satisfaction()). Judgements, not
+-- calibrated against a real UniFi AP:
+-- * the downlink airtime term is sampled once a window holds this many
+--   frames, so a quiet client's few frames aren't a verdict;
+M.SAT_AIRTIME_MIN_PKTS = 20
+-- * the uplink rate is sampled only in an inform in which the client sent
+--   this many frames: iw's rx bitrate is the LAST frame's rate, and a
+--   near-idle client's odd frame (seen on hardware: a speaker sending 1-15
+--   frames per 10 s, some at VHT MCS 2 among MCS 9) isn't its uplink;
+M.SAT_UPLINK_MIN_PKTS = 20
+-- * the ideal fixed cost of one frame on air (preamble, SIFS, ACK, backoff),
+--   measured as ~110 us for small frames of clean 2.4 GHz clients;
+M.SAT_FRAME_OVERHEAD_US = 110
+-- * the noise floor is taken as at least this: drivers report floors no
+--   receiver achieves (ath10k -106, ath9k -107), which would inflate SNR.
+M.SAT_NOISE_FLOOR_MIN = -95
 
 -- Injectable: override in tests to control elapsed time deterministically
 -- (used by the sta_table throughput delta-sample below).
@@ -452,24 +476,108 @@ end
 -- controller 10.4.57 that the controller itself does no computation: it
 -- just reads "satisfaction" straight off the client doc, which is
 -- populated verbatim from whatever the AP sent in that sta_table entry).
--- Community reports (community.ui.com) describe it as driven by signal
--- quality and tx-retry ratio -- e.g. a client with great signal but very
--- low PHY rate/high retries still scores low -- so this combines a
--- signal-quality score and a retry-quality score and takes the worse of
--- the two, matching that "worst factor wins" description. Not a measured
--- value; flagged the same way as capacity/throughput above.
--- signal: dBm (nil if iw reported none). retry_pct: 0-100.
--- Returns an integer 0-100, or nil if signal is unavailable.
-local function estimate_satisfaction(signal, retry_pct)
-	if not signal then return nil end
-	local SIGNAL_FLOOR, SIGNAL_CEIL = -85, -50
-	local signal_score = (signal - SIGNAL_FLOOR) / (SIGNAL_CEIL - SIGNAL_FLOOR) * 100
-	if signal_score < 0 then signal_score = 0 end
-	if signal_score > 100 then signal_score = 100 end
-	local retry_score = 100 - (retry_pct or 0)
-	if retry_score < 0 then retry_score = 0 end
-	local score = math.min(signal_score, retry_score)
+-- The UI buckets it >=90 Excellent, >=70 Good, else Poor.
+--
+-- It is the worst of three terms, after the split commercial controllers
+-- use (Aruba/Aerohive client health, Mist's coverage/throughput SLEs):
+--  * dl: downlink airtime efficiency -- the airtime this client's frames
+--    would take at its ceiling rate (sta_ceiling_mbps()) plus a fixed
+--    per-frame cost, as a share of the airtime mac80211 says they took
+--    (airtime_pct()). Every retry costs airtime whatever a driver calls it,
+--    so this sees a failing link that rate control doesn't: on hardware a
+--    -71 dBm client held MCS 7 while 89 % of attempts failed, lost 8-18 %
+--    of pings and took 4x the airtime per frame of its neighbours. Until a
+--    station has an airtime sample (or on a driver without tx duration)
+--    the tx rate against its ceiling stands in (rate_pct()).
+--  * ul: the uplink rate against the ceiling, at half weight (50-100): the
+--    AP can't see the client's own retries, only the rate it settles on.
+--    Judged only while the client really sends (M.SAT_UPLINK_MIN_PKTS).
+--  * cov: SNR against the radio's noise floor, 5 dB -> 0, 20 dB -> 90,
+--    25 dB -> 100 (Cisco's data-grade guideline is 20 dB; Meraki counts
+--    <=15 dB as poor), smoothed per station so 1 dB of jitter doesn't flip
+--    the bucket.
+-- Power-save clients score lower on dl: frames sent while they doze are
+-- re-sent, and that airtime is lost to everyone on the radio.
+-- The iw retry/failed counters aren't used: they mean different things per
+-- driver (mt76's tx failed counts failed attempts and can exceed packets;
+-- ath10k's is always 0), and neither tracked ping loss on hardware (see
+-- PROTOCOL-VALIDATION.md).
+-- snr: dB (nil when signal is unknown), dl/ul: 0-100 or nil (unknown: the
+-- term is skipped). Returns an integer 0-100, or nil without snr.
+local function snr_score(snr)
+	if snr <= 5 then return 0 end
+	if snr <= 20 then return (snr - 5) * 6 end
+	if snr <= 25 then return 90 + (snr - 20) * 2 end
+	return 100
+end
+
+local function estimate_satisfaction(snr, dl, ul)
+	if not snr then return nil end
+	local score = snr_score(snr)
+	if dl and dl < score then score = dl end
+	if ul and 50 + ul / 2 < score then score = 50 + ul / 2 end
+	if score < 0 then score = 0 end
 	return math.floor(score)
+end
+
+-- Relative data rate per spatial stream at 20 MHz, indexed by MCS + 1:
+-- HT/VHT MCS 0-9 and HE MCS 0-11 (Mbit/s at long GI). Only ratios are used,
+-- so GI cancels out.
+local VHT_MCS_RATE = {6.5, 13, 19.5, 26, 39, 52, 58.5, 65, 78, 86.7}
+local HE_MCS_RATE = {8.6, 17.2, 25.8, 34.4, 51.6, 68.8, 77.4, 86, 103.2, 114.7, 129, 143.4}
+-- Data subcarriers per channel width, which is what a wider channel scales.
+local WIDTH_SUBCARRIERS = {[20] = 52, [40] = 108, [80] = 234, [160] = 468}
+
+-- The station's ceiling in Mbit/s (long GI): its association caps
+-- (sysinfo.hostapd_sta_caps) capped by the AP's own stream count and live
+-- channel width, at one MCS below the top. Rate control only probes the top
+-- MCS and keeps stepping between it and the next, so a ceiling at the top
+-- made a -48 dBm client alternating VHT MCS 8/9 swing across the
+-- Good/Excellent line on every sample. nil without caps.
+local function sta_ceiling_mbps(caps, ap_nss, ap_width)
+	if not caps then return nil end
+	local ceil = (caps.mode == "he" and HE_MCS_RATE or VHT_MCS_RATE)[caps.max_mcs]
+	local nss = caps.nss
+	if ap_nss and ap_nss < nss then nss = ap_nss end
+	local width = caps.width
+	if ap_width and ap_width < width then width = ap_width end
+	local sc = WIDTH_SUBCARRIERS[width]
+	if not (ceil and sc) then return nil end
+	return ceil * nss * sc / WIDTH_SUBCARRIERS[20]
+end
+
+-- One direction's rate (sta_table's generation, MCS, NSS and width for tx
+-- or rx) as a percentage of ceil_mbps. nil when either side is unknown: a
+-- legacy rate, no ceiling, or an EHT rate (no table here).
+local function rate_pct(gen, mcs, nss, width, ceil_mbps)
+	if not (ceil_mbps and mcs) then return nil end
+	local rate
+	if gen == "ax" then
+		rate = HE_MCS_RATE[mcs + 1]
+	elseif gen == "ac" then
+		rate = VHT_MCS_RATE[mcs + 1]
+	elseif gen == "n" then
+		-- HT MCS indexes run on across streams: MCS 15 is MCS 7 on two.
+		rate = VHT_MCS_RATE[mcs % 8 + 1]
+	end
+	local sc = WIDTH_SUBCARRIERS[width or 20]
+	if not (rate and sc) then return nil end
+	local pct = rate * (nss or 1) * sc / WIDTH_SUBCARRIERS[20] * 100 / ceil_mbps
+	if pct > 100 then pct = 100 end
+	return pct
+end
+
+-- Downlink airtime efficiency over one window of pkts frames and bytes
+-- bytes that took dur_us of airtime: the ideal airtime (a fixed cost per
+-- frame plus the payload at ceil_mbps) as a percentage of the actual,
+-- capped at 100. Aggregated traffic beats the per-frame cost and caps out,
+-- so the term only bites on links that spend airtime they shouldn't.
+local function airtime_pct(pkts, bytes, dur_us, ceil_mbps)
+	if not ceil_mbps or dur_us <= 0 then return nil end
+	local ideal = pkts * M.SAT_FRAME_OVERHEAD_US + bytes * 8 / ceil_mbps
+	local pct = ideal * 100 / dur_us
+	if pct > 100 then pct = 100 end
+	return pct
 end
 
 -- ─── JSON payload builder ────────────────────────────────────────────────────
@@ -713,6 +821,8 @@ function M.build_json(st, cfg, ufhw)
 		-- reading) so the enforcement check further down is a plain
 		-- sta.signal comparison.
 		local minrssi_threshold_by_radio = {}
+		-- Live channel width and noise floor per radio, for satisfaction.
+		local width_by_radio, noise_by_radio = {}, {}
 		for _, radio in ipairs(radio_table) do
 			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
 			if ok_if and ifname then
@@ -724,6 +834,8 @@ function M.build_json(st, cfg, ufhw)
 				-- Radios tab excluded the device entirely.
 				local ok_caps, caps = pcall(M._sysinfo.radio_caps, ifname)
 				if ok_caps and caps then
+					width_by_radio[radio.name] = caps.width
+					caps.width = nil
 					for k, v in pairs(caps) do radio[k] = v end
 					-- The live negotiated channel is band-authoritative once
 					-- ACS has picked one: UCI's config value may be the
@@ -825,14 +937,30 @@ function M.build_json(st, cfg, ufhw)
 					-- fails the bit test, so every WPA3 WLAN was downgraded.
 					-- Gated on real SAE support for the same reason as
 					-- wpa3_supported: never claim what hostapd cannot run.
+					--
+					-- Bit 0x2 is FT with WPA3 (10.6.101: radio DTO
+					-- ytajcagDggPuTaL(), tested in the per-radio security
+					-- filter plVcFpIybmrpXclX). Without it the controller
+					-- forces wpa3_fast_roaming off on every SAE WLAN, and on
+					-- a WPA3-only one fast_roaming_enabled too, so no 802.11r
+					-- goes out. hostapd runs FT-SAE wherever it runs SAE.
+					--
+					-- Bit 0x8 is Enhanced Open (radio DTO NoFWvUa(), same
+					-- filter). Without it an OWE WLAN is not provisioned at
+					-- all and an OWE transition WLAN goes out as plain open.
+					-- Probed separately: hostapd can have SAE without OWE.
 					if M._sysinfo.sae_supported and M._sysinfo.sae_supported() then
-						radio.radio_caps2 = 0x1
+						radio.radio_caps2 = 0x3
 					else
 						radio.radio_caps2 = 0
+					end
+					if M._sysinfo.owe_supported and M._sysinfo.owe_supported() then
+						radio.radio_caps2 = radio.radio_caps2 + 0x8
 					end
 				end
 				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 				local in_use = ok_rs and _in_use_survey(stats) or nil
+				noise_by_radio[radio.name] = in_use and in_use.noise
 				-- min_rssi (outbound field, confirmed via decompile alongside
 				-- radio_caps/tx_power/athstats in the same DTO) converts
 				-- rf_config()'s stored raw wire units back to dBm with the
@@ -986,6 +1114,16 @@ function M.build_json(st, cfg, ufhw)
 							security   = net.security,
 							essid      = net.essid,
 						}
+						-- A sibling openUF AP, identified by the IE it beacons
+						-- (sysinfo.peer_ie_hex). is_unifi + serialno is what
+						-- the controller resolves to an adopted device; without
+						-- them every BSS of ours carrying a site SSID was
+						-- listed as an impersonating third-party AP.
+						if net.peer_mac then
+							local e = scan_table[#scan_table]
+							e.is_unifi = true
+							e.serialno = net.peer_mac
+						end
 					end
 					-- 802.11k enrichment: BSSes a CLIENT went off-channel
 					-- and saw, which this radio never could from its own
@@ -1035,6 +1173,9 @@ function M.build_json(st, cfg, ufhw)
 			radio_live_by_name[radio.name] = radio
 		end
 		local now = M._time()
+		-- Roaming Assistant: one observation per station on a vap that has
+		-- it on, decided on after the loop (see openuf/roamassist.lua).
+		local roam_obs = {}
 		for _, vap in ipairs(vap_table) do
 			local live = radio_live_by_name[vap.radio_name]
 			if live then
@@ -1068,12 +1209,35 @@ function M.build_json(st, cfg, ufhw)
 			-- `essid` is what get_vap_table() calls it -- the vap has no
 			-- `ssid` field, and passing one silently resolves to nil, which
 			-- would empty every sta_table instead of fixing anything.
-			local ok_if, ifname = pcall(ufuci.get_ifname_for_vap,
+			--
+			-- An Enhanced Open transition VAP is two BSSes, the hidden OWE
+			-- one and the open one, and its clients are the union of both.
+			local ok_if, ifnames = pcall(ufuci.get_ifnames_for_vap,
 				vap.radio_name, vap.essid)
-			local stas = {}
-			if ok_if and ifname then
+			-- sta_ifname[i] is the hostapd BSS stas[i] is on, for the kick
+			-- and Roaming Assistant below. A private pre-shared key's VLAN
+			-- netdev lists its own stations but has no hostapd of its own,
+			-- so those go to the VAP's.
+			--
+			-- sta_caps: each station's association ceiling, read once per
+			-- hostapd BSS (a PPSK VLAN netdev's stations are its BSS's).
+			local stas, sta_ifname, sta_caps, caps_read = {}, {}, {}, {}
+			for _, ifname in ipairs(ok_if and ifnames or {}) do
 				local ok_sta, rv2 = pcall(M._sysinfo.sta_table, ifname)
-				if ok_sta then stas = rv2 end
+				if ok_sta then
+					local bss = ufuci.bss_ifname and ufuci.bss_ifname(ifname) or ifname
+					if not caps_read[bss] and M._sysinfo.hostapd_sta_caps then
+						caps_read[bss] = true
+						local ok_c, c = pcall(M._sysinfo.hostapd_sta_caps, bss)
+						if ok_c then
+							for mac, v in pairs(c) do sta_caps[mac] = v end
+						end
+					end
+					for _, sta in ipairs(rv2) do
+						stas[#stas + 1] = sta
+						sta_ifname[#stas] = bss
+					end
+				end
 			end
 			vap.num_sta = #stas
 			-- Per-VAP traffic/retry counters ("Air Stats" in the controller
@@ -1095,7 +1259,8 @@ function M.build_json(st, cfg, ufhw)
 			-- outside this loop (sat_sum_all/sat_count_all) -- see below.
 			local sat_sum, sat_count = 0, 0
 			local sta_table = {}
-			for _, sta in ipairs(stas) do
+			for sta_i, sta in ipairs(stas) do
+				local ifname = sta_ifname[sta_i]
 				station_macs[sta.mac] = true
 				vap_rx_bytes    = vap_rx_bytes    + (sta.rx_bytes or 0)
 				vap_tx_bytes    = vap_tx_bytes    + (sta.tx_bytes or 0)
@@ -1116,6 +1281,12 @@ function M.build_json(st, cfg, ufhw)
 				local minrssi_threshold = minrssi_threshold_by_radio[vap.radio_name]
 				if minrssi_threshold and sta.signal and sta.signal < minrssi_threshold then
 					pcall(ufuci.kick_station, ifname, sta.mac)
+				elseif vap.roam_assist_rssi and sta.signal then
+					roam_obs[#roam_obs + 1] = {
+						ifname = ifname, ssid = vap.essid, mac = sta.mac,
+						signal = sta.signal, connected_sec = sta.connected_sec,
+						threshold = vap.roam_assist_rssi,
+					}
 				end
 				-- throughput: delta-sampled byte rate (bytes/sec), same
 				-- approach as M._sysinfo.cpu_percent()'s /proc/stat delta
@@ -1131,25 +1302,75 @@ function M.build_json(st, cfg, ufhw)
 						)
 					end
 				end
-				M._sta_stats_cache[sta.mac] = {
-					rx_bytes = sta.rx_bytes or 0,
-					tx_bytes = sta.tx_bytes or 0,
-					time     = now,
-				}
-
 				-- wifi_tx_attempts: total transmission attempts (successful +
 				-- retried), i.e. tx_packets + tx_retries -- both already
 				-- parsed from iw. wifi_tx_retries_percentage: retries as a
 				-- fraction of attempts. Confirmed real field names/semantics
 				-- via the decompiled wireless-client model
 				-- (com.ubnt.service.l.e.AQODNNoMmBlFpWXX) and unpoller/unifi's
-				-- REST client struct.
+				-- REST client struct. Lifetime values; the satisfaction
+				-- estimate doesn't use them (see estimate_satisfaction()).
 				local wifi_tx_attempts = (sta.tx_packets or 0) + (sta.tx_retries or 0)
 				local wifi_tx_retries_pct = 0
 				if wifi_tx_attempts > 0 then
 					wifi_tx_retries_pct = (sta.tx_retries or 0) * 100 / wifi_tx_attempts
 				end
-				local satisfaction_now = estimate_satisfaction(sta.signal, wifi_tx_retries_pct)
+				-- Satisfaction terms (see estimate_satisfaction()). Each is
+				-- smoothed, since one sample swings with each rate-control
+				-- step; a sample without data keeps the last value.
+				local function ewma(old, new)
+					if not new then return old end
+					return old and old + M.RATE_EWMA_ALPHA * (new - old) or new
+				end
+				local ceil_mbps = sta_ceiling_mbps(sta_caps[sta.mac:lower()],
+					live and live.nss, width_by_radio[vap.radio_name])
+				local rate_ewma = ewma(prev and prev.rate_ewma, rate_pct(sta.tx_generation,
+					sta.tx_mcs, sta.tx_nss, sta.tx_width, ceil_mbps))
+				-- Uplink: only while the client sends enough frames for the
+				-- last one's rate to stand for its uplink.
+				local ul_ewma = prev and prev.ul_ewma
+				if prev and prev.rx_packets
+					and (sta.rx_packets or 0) - prev.rx_packets >= M.SAT_UPLINK_MIN_PKTS then
+					ul_ewma = ewma(ul_ewma, rate_pct(sta.rx_generation, sta.rx_mcs,
+						sta.rx_nss, sta.rx_width, ceil_mbps))
+				end
+				-- Downlink airtime: a window from the base counters, sampled
+				-- once it holds SAT_AIRTIME_MIN_PKTS frames. A counter going
+				-- backwards (a new association) restarts it.
+				local air_ewma = prev and prev.air_ewma
+				local air_pkts, air_bytes, air_dur = prev and prev.air_pkts,
+					prev and prev.air_bytes, prev and prev.air_dur
+				local tp, tb, td = sta.tx_packets, sta.tx_bytes, sta.tx_duration
+				if not (tp and tb and td) then
+					air_pkts, air_bytes, air_dur = nil, nil, nil
+				elseif not air_pkts or tp < air_pkts or tb < air_bytes or td < air_dur then
+					air_pkts, air_bytes, air_dur = tp, tb, td
+				elseif tp - air_pkts >= M.SAT_AIRTIME_MIN_PKTS then
+					air_ewma = ewma(air_ewma, airtime_pct(tp - air_pkts, tb - air_bytes,
+						td - air_dur, ceil_mbps))
+					air_pkts, air_bytes, air_dur = tp, tb, td
+				end
+				-- Coverage: SNR, noise floored at SAT_NOISE_FLOOR_MIN.
+				local noise = noise_by_radio[vap.radio_name]
+				if not noise or noise == 0 or noise < M.SAT_NOISE_FLOOR_MIN then
+					noise = M.SAT_NOISE_FLOOR_MIN
+				end
+				local snr_ewma = ewma(prev and prev.snr_ewma, sta.signal and sta.signal - noise)
+				M._sta_stats_cache[sta.mac] = {
+					rx_bytes   = sta.rx_bytes or 0,
+					tx_bytes   = sta.tx_bytes or 0,
+					rx_packets = sta.rx_packets,
+					time       = now,
+					rate_ewma  = rate_ewma,
+					ul_ewma    = ul_ewma,
+					air_ewma   = air_ewma,
+					air_pkts   = air_pkts,
+					air_bytes  = air_bytes,
+					air_dur    = air_dur,
+					snr_ewma   = snr_ewma,
+				}
+				local satisfaction_now = estimate_satisfaction(sta.signal and snr_ewma,
+					air_ewma or rate_ewma, ul_ewma)
 				if satisfaction_now then
 					sat_sum, sat_count = sat_sum + satisfaction_now, sat_count + 1
 					sat_sum_all, sat_count_all = sat_sum_all + satisfaction_now, sat_count_all + 1
@@ -1329,6 +1550,11 @@ function M.build_json(st, cfg, ufhw)
 				vap.cu_self_tx = cu.cu_self_tx
 				vap.cu_interf  = cu.cu_interf
 			end
+			vap.roam_assist_rssi = nil  -- internal, consumed above
+		end
+		if M._roamassist and #roam_obs > 0 then
+			pcall(M._roamassist.tick, roam_obs, now,
+				{diff_db = cfg and cfg.config and cfg.config.roam_assist_diff_db})
 		end
 		-- Forget stations not seen for ten minutes. Each entry is tiny, but
 		-- the table is keyed by client MAC and was never emptied, so on a
@@ -1668,10 +1894,26 @@ function M.build_json(st, cfg, ufhw)
 		-- an obfuscation-induced macOS case-folding extraction bug along
 		-- the way).
 		fw_caps          = (dbg_caps and tonumber(dbg_caps.fw_caps)) or 0x110,
-		-- wifi_caps gates supportBandsteering()/supportZeroHandoff() and is
-		-- deliberately absent (see PROTOCOL-VALIDATION.md); only debug_caps
-		-- can put it on the wire.
-		wifi_caps        = dbg_caps and tonumber(dbg_caps.wifi_caps) or nil,
+		-- wifi_caps, the first WiFi bitmask. Bit 0x4 is
+		-- Device.supportBandsteering(): without it the controller never emits
+		-- the device-level bandsteering.* block (the AP's own Band Steering
+		-- setting). Bit 0x8, supportVapBasedBandsteering(), keeps that block
+		-- enabled when some WLAN has no 2.4/5 GHz pair; without it one
+		-- single-band WLAN switches the device's steering off. See
+		-- _parse_bandsteering_system_cfg. Bit 0x20 is supportATFConfig():
+		-- without it no atf.* block (Airtime Fairness) is sent; claimed only
+		-- where mac80211's airtime_flags can be switched (airtime.lua). Bit
+		-- 0x100000 is supportWpaPpsk(): without it a WLAN with Private
+		-- Pre-Shared Keys is skipped entirely ("PPSK is not supported ...
+		-- will be skipped"); claimed only where hostapd can put each key on
+		-- its own VLAN (sysinfo.ppsk_supported). Decompiled from controller
+		-- 10.6.101 by upstream, captured on 10.4.57. The other bits gate
+		-- features openUF does not implement (PROTOCOL-VALIDATION.md,
+		-- Capability bitmasks); debug_caps can still put any value on the
+		-- wire for an experiment.
+		wifi_caps        = (dbg_caps and tonumber(dbg_caps.wifi_caps))
+			or (0xC + ((M._airtime and M._airtime.supported()) and 0x20 or 0)
+				+ ((M._sysinfo.ppsk_supported and M._sysinfo.ppsk_supported()) and 0x100000 or 0)),
 		-- Bit 0x40 (64): Device.supportAdvertisingDeviceNameInBeacon() in the
 		-- decompiled controller is exactly hasWifiCapability2(64) -- i.e. bit
 		-- 6 of a SECOND capability bitmask, wifi_caps2, entirely separate
@@ -1682,12 +1924,17 @@ function M.build_json(st, cfg, ufhw)
 		-- Beacon" WLAN toggle is silently dropped, which is exactly what a
 		-- live capture showed (toggling it produced zero system_cfg/mgmt_cfg
 		-- diff, and the controller didn't even bother re-pushing config on
-		-- the next change) before this bit was added. Only this one bit is
-		-- claimed -- wifi_caps2 also gates several other real-hardware-only
-		-- features (Mesh MLO parent/child, assisted roaming, etc., see
-		-- PROTOCOL-VALIDATION.md) that openUF does not implement and must
-		-- not claim.
-		wifi_caps2       = (dbg_caps and tonumber(dbg_caps.wifi_caps2)) or 0x40,
+		-- the next change) before this bit was added.
+		--
+		-- Bit 0x20 (32): Device.supportsAssistedRoaming(). Without it the
+		-- controller never emits a WLAN's "Roaming Assistant"
+		-- (wireless.<n>.btm_disassoc.*), which openuf/roamassist.lua
+		-- implements. Decompiled from controller 10.6.101 (upstream).
+		--
+		-- No other bit is claimed: wifi_caps2 also gates real-hardware-only
+		-- features (Mesh MLO parent/child and others, see
+		-- PROTOCOL-VALIDATION.md) that openUF does not implement.
+		wifi_caps2       = (dbg_caps and tonumber(dbg_caps.wifi_caps2)) or 0x60,
 		-- Device-level (not per-radio -- see radio_table_stats above)
 		-- Device-level Experience: the mean of every connected client's own
 		-- satisfaction, across all VAPs. Same reasoning as the per-VAP copy
@@ -2066,19 +2313,48 @@ function M._parse_wifi_system_cfg(sys_raw)
 		end
 	end
 
+	-- Aggregate every aaa.<n>.wpa.key.<k>.mgmt entry (transition mode can
+	-- list WPA-PSK and SAE either space-joined on one key or across separate
+	-- keys).
+	local function akm_of(a)
+		local akm = ""
+		for k, val in pairs(a) do
+			if k:match("^wpa%.key%.%d+%.mgmt$") then akm = akm .. " " .. val end
+		end
+		return akm
+	end
+
+	-- Enhanced Open (OWE) transition mode arrives as a PAIR of VAPs per radio
+	-- with the same SSID: an open one with no akm at all, and a hidden one with
+	-- `wpa.key.1.mgmt=OWE`. Each names the other's devname in owe_devname.
+	-- OpenWrt builds that pair from ONE wifi-iface (encryption=owe plus
+	-- owe_transition=1), so the open half becomes the VAP and the hidden half
+	-- is dropped here. Provisioning both as they stand is not an option: they
+	-- share radio and SSID, so they would collapse into one UCI section, and
+	-- the hidden one would win. Captured on 10.4.57 with radio_caps2 0xB
+	-- (PROTOCOL-VALIDATION.md).
+	local aaa_by_dev = {}
+	for _, a in pairs(aaa) do
+		if a.devname then aaa_by_dev[a.devname] = a end
+	end
+	local owe_hidden_half = {}
+	for _, a in pairs(aaa) do
+		local partner = a.owe_devname and aaa_by_dev[a.owe_devname]
+		if partner and not akm_of(a):find("OWE", 1, true)
+				and akm_of(partner):find("OWE", 1, true) then
+			owe_hidden_half[a.owe_devname] = true
+		end
+	end
+
 	local vap_table = {}
 	for _, idx in ipairs(sorted_indices(wireless)) do
 		local w = wireless[idx]
 		local a = aaa[idx] or {}
 
-		-- Aggregate every aaa.<n>.wpa.key.<k>.mgmt entry (transition mode can
-		-- list WPA-PSK and SAE either space-joined on one key or across
-		-- separate keys). Hoisted out of the security branch below because the
-		-- WPA-Enterprise check needs it before anything else is decided.
-		local akm = ""
-		for k, val in pairs(a) do
-			if k:match("^wpa%.key%.%d+%.mgmt$") then akm = akm .. " " .. val end
-		end
+		-- Hoisted out of the security branch below because the WPA-Enterprise
+		-- check needs it before anything else is decided.
+		local akm = akm_of(a)
+		local owe_transition = a.owe_devname ~= nil and owe_hidden_half[a.owe_devname] == true
 
 		-- WPA-Enterprise (802.1X, mgmt "WPA-EAP"). openUF cannot provision it:
 		-- the wire carries no RADIUS server/port/secret -- aaa.<n>.wpa.psk is
@@ -2096,9 +2372,30 @@ function M._parse_wifi_system_cfg(sys_raw)
 				:format(w.ssid, (akm:gsub("^%s+", ""))))
 		end
 
-		if w.ssid and w.parent and not is_enterprise then
+		-- A UID IoT WLAN whose keys come from RADIUS only. Claiming
+		-- wifi_caps 0x100000 (PPSK) lets it through too, with
+		-- aaa.<n>.wpa.psk_radius = 0/1/2 (disabled/optional/required, the
+		-- same values as hostapd's wpa_psk_radius; enum decompiled from
+		-- 10.6.101, not seen on the wire). As with Enterprise the push names
+		-- no RADIUS server for it, so "required" is a WLAN nobody could
+		-- join. "optional" keeps working on its local keys.
+		local radius_psk_only = a["wpa.psk_radius"] == "2"
+		if radius_psk_only and w.ssid then
+			io.stderr:write(("inform: skipping WLAN %q -- its keys come from RADIUS "
+				.. "(wpa.psk_radius=2), and openUF has no RADIUS configuration on "
+				.. "this wire protocol\n"):format(w.ssid))
+		end
+
+		if w.ssid and w.parent and not is_enterprise and not radius_psk_only
+				and not (a.devname and owe_hidden_half[a.devname]) then
 			local security = "open"
-			if a.wpa == "2" or a.wpa == "3" then
+			-- Enhanced Open: the akm is the only marker. It carries no
+			-- aaa.<n>.wpa and no psk. The pmf.* keys that do come along
+			-- cannot reach hostapd: OpenWrt's ap.uc forces ieee80211w=2 on
+			-- an OWE BSS and writes 0 on the open transition BSS.
+			if owe_transition or (a.wpa == nil and akm:find("OWE", 1, true)) then
+				security = "owe"
+			elseif a.wpa == "2" or a.wpa == "3" then
 				local has_sae = akm:find("SAE", 1, true) ~= nil
 				local has_psk = akm:find("PSK", 1, true) ~= nil
 				-- WPA3 rides on its OWN keys, and the akm set alone cannot
@@ -2171,10 +2468,53 @@ function M._parse_wifi_system_cfg(sys_raw)
 			end
 			if bcfilt_macs then table.sort(bcfilt_macs) end
 
+			-- Private Pre-Shared Keys: several passphrases on one SSID, each
+			-- landing its client on its own VLAN. Pushed only to a device
+			-- claiming wifi_caps 0x100000 (see build_json). Captured on 10.4.57:
+			--   aaa.<n>.dynamic_vlan=1
+			--   aaa.<n>.wpa.psk_file.status=enabled
+			--   aaa.<n>.wpa.psk_file.<k>.psk=<passphrase>
+			--   aaa.<n>.wpa.psk_file.<k>.vlanid=<vid>
+			-- vlanid is left out for a key on a VLAN-1 network: that client
+			-- stays on the VAP's own network. aaa.<n>.wpa.psk still comes
+			-- along, a random passphrase the controller generates for the
+			-- WLAN, and is provisioned like any other key.
+			local ppsk
+			if _wire_bool(a["wpa.psk_file.status"]) and security ~= "open"
+					and security ~= "owe" then
+				local idxs = {}
+				for k in pairs(a) do
+					local i = k:match("^wpa%.psk_file%.(%d+)%.psk$")
+					if i then idxs[#idxs + 1] = tonumber(i) end
+				end
+				table.sort(idxs)
+				for _, i in ipairs(idxs) do
+					local key = a["wpa.psk_file." .. i .. ".psk"]
+					local vid_raw = a["wpa.psk_file." .. i .. ".vlanid"]
+					local vid = tonumber(vid_raw)
+					-- hostapd's own limits: a passphrase is 8..63 characters,
+					-- or the PSK itself as 64 hex digits.
+					local key_ok = (#key >= 8 and #key <= 63)
+						or (#key == 64 and key:match("^%x+$") ~= nil)
+					local vid_ok = vid_raw == nil
+						or (vid ~= nil and vid == math.floor(vid) and vid >= 1 and vid <= 4094)
+					if key_ok and vid_ok then
+						ppsk = ppsk or {}
+						ppsk[#ppsk + 1] = {key = key, vid = vid}
+					else
+						io.stderr:write(("inform: WLAN %q: skipping private pre-shared key %d "
+							.. "(%s)\n"):format(w.ssid, i,
+							key_ok and ("bad VLAN id " .. tostring(vid_raw))
+								or "passphrase is not 8-63 characters or 64 hex digits"))
+					end
+				end
+			end
+
 			vap_table[#vap_table + 1] = {
 				ssid                  = w.ssid,
 				radio                 = w.parent,
 				security              = security,
+				owe_transition        = owe_transition or nil,
 				-- aaa.<n>.id is the controller's wlanconf ObjectId; the
 				-- controller only accepts a vap_table entry whose "id" echoes
 				-- it back (vapInformProcessor drops usage=user vaps without
@@ -2195,6 +2535,9 @@ function M._parse_wifi_system_cfg(sys_raw)
 				wpa3_fast_roaming_enabled = wpa3_ft,
 				vlan_enabled          = vlan_id ~= nil,
 				vlan                  = vlan_id,
+				-- {key=, vid=} per private pre-shared key, in wire order;
+				-- nil when the WLAN has none.
+				ppsk                  = ppsk,
 				-- aaa.<n>.bss_transition: CONFIRMED live 2026-07-15 (toggled
 				-- "BSS Transition (802.11v)" in the Behavior Controls panel,
 				-- diffed system_cfg via debug_dump_file) -- present on every
@@ -2291,6 +2634,17 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- derivation). "enabled"/"disabled" string, same
 				-- convention as bss_transition/no2ghz_oui.
 				advertise_ap_name     = _wire_bool(w.advertise_ap_name),
+				-- wireless.<n>.btm_disassoc.status/.threshold: the WLAN's
+				-- "Roaming Assistant". Decompiled from controller 10.6.101
+				-- (com.ubnt.service.config.ubntconf, the class holding the
+				-- -75/-88 constants): emitted only for 5GHz/6GHz vaps, only
+				-- when wifi_caps2 bit 0x20 (supportsAssistedRoaming) is
+				-- claimed, and only while the per-band toggle is on --
+				-- status=enabled plus threshold=<dBm>, default -75 (na) /
+				-- -88 (6e). Absent means off; there is no status=disabled.
+				-- Enforced by openuf/roamassist.lua, not by UCI.
+				roam_assist_enabled   = _wire_bool(w["btm_disassoc.status"]) or false,
+				roam_assist_rssi      = tonumber(w["btm_disassoc.threshold"]),
 				-- NOT parsed: aaa.<n>.sae.anti_clogging / aaa.<n>.sae.sync
 				-- ("SAE Anti-clogging" / "SAE Sync Time"). They are real
 				-- wire keys (decompiled: plain integers, emitted only when
@@ -2389,6 +2743,73 @@ function M._parse_wifi_system_cfg(sys_raw)
 	end
 
 	return radio_table, vap_table
+end
+
+-- Parse the device-level `bandsteering.*` block: the AP's own Band Steering
+-- setting (Devices -> [AP] -> Band Steering: Off / Prefer 5G / Balance),
+-- REST field device.bandsteering_mode. The controller emits it only for a
+-- device claiming wifi_caps 0x4 (see build_json). Captured live by upstream
+-- 2026-09-27:
+--
+--   bandsteering.status=enabled
+--   bandsteering.mode=prefer_5g          -- or "equal" (Balance)
+--   bandsteering.1.status=enabled        -- one pair per WLAN whose 2.4 and
+--   bandsteering.1.vap.1.devname=ath1    -- 5 GHz vaps share name, security
+--   bandsteering.1.vap.2.devname=ath3    -- and passphrase (needs 0x8)
+--
+-- Off is bandsteering.status=disabled with no mode. So is "no WLAN can be
+-- paired", and so is the site's advanced features switch being off, so
+-- "disabled" means only "no device-level steering", never "turn the per-WLAN
+-- toggle (no2ghz_oui) off". The pairs are not read: usteer steers a client
+-- only toward a same-SSID 5 GHz interface, which is the pairing already.
+--
+-- Returns nil when the blob has no bandsteering.status line, else
+-- {enabled = bool, mode = string|nil}.
+function M._parse_bandsteering_system_cfg(sys_raw)
+	local status = sys_raw:match("\nbandsteering%.status=([%w_]+)")
+		or sys_raw:match("^bandsteering%.status=([%w_]+)")
+	if not status then return nil end
+	return {
+		enabled = status == "enabled",
+		mode    = sys_raw:match("\nbandsteering%.mode=([%w_]+)")
+			or sys_raw:match("^bandsteering%.mode=([%w_]+)"),
+	}
+end
+
+-- Whether usteer should band-steer and whether Roaming Assistant needs it,
+-- from the parsed vaps and the raw system_cfg (for the device-level block).
+function M._steering_flags(vap_table, sys_raw)
+	-- Band Steering (wireless.<n>.no2ghz_oui) is confirmed live to be a
+	-- per-WLAN wire field, not a per-device one -- but usteer (the daemon
+	-- that actually implements steering on OpenWrt) is a single device-wide
+	-- config, so band steering is treated as active for the whole device
+	-- whenever ANY WLAN has it enabled.
+	--
+	-- Roaming Assistant (wireless.<n>.btm_disassoc) is decided per WLAN by
+	-- openuf/roamassist.lua, but it reads usteer's cross-AP view and sends
+	-- 802.11v requests, so it needs the daemon and 802.11k/v the same way.
+	local steering_active, roam_assist_active = false, false
+	for _, vap in ipairs(vap_table) do
+		if vap.no2ghz_oui then steering_active = true end
+		if vap.roam_assist_enabled then roam_assist_active = true end
+	end
+	-- The device-level setting adds to the per-WLAN one. "equal" (Balance)
+	-- has no usteer equivalent: usteer balances client counts only by
+	-- rejecting association requests (assoc_steering), which would also
+	-- move clients between APs; probe_steering is compiled in but not
+	-- configurable. It is reported, not faked.
+	local bs = M._parse_bandsteering_system_cfg(sys_raw)
+	if bs and bs.enabled then
+		if bs.mode == "prefer_5g" then
+			steering_active = true
+		elseif not M._warned_bandsteering_mode then
+			M._warned_bandsteering_mode = true
+			io.stderr:write(("inform: device Band Steering mode %q "
+				.. "is not supported, only prefer_5g; per-WLAN "
+				.. "Band Steering still applies\n"):format(tostring(bs.mode)))
+		end
+	end
+	return steering_active, roam_assist_active
 end
 
 -- Parse the `switch.*` block: per-port VLAN assignment.
@@ -2573,6 +2994,13 @@ local RECOGNIZED_SYSTEM_CFG = {
 	"^radio%.%d+%.",     -- per-radio config
 	"^stamgr%.%d+%.",    -- Minimum RSSI
 	"^macacl%.%d+%.",    -- MAC Address Filter
+	-- Device-level Band Steering. The per-WLAN pairs (bandsteering.<n>.*)
+	-- are not read, so they stay in the report.
+	"^bandsteering%.status$",
+	"^bandsteering%.mode$",
+	-- Airtime Fairness (airtime.lua).
+	"^atf%.status$",
+	"^atf%.mode$",
 	"^qos%.vap%.%d+%.",  -- WiFi Speed Limit
 	"^netconf%.1%.",     -- IP Settings
 	"^route%.1%.gateway$",
@@ -2920,22 +3348,15 @@ function M.handle_response(json_str, st, cfg)
 			local ufuci = M._ucihelper
 			if ufuci and ufuci.apply_config then
 				if #radio_table > 0 or #vap_table > 0 then
-					-- Band Steering (wireless.<n>.no2ghz_oui) is confirmed
-					-- live to be a per-WLAN wire field, not a per-device
-					-- one -- but usteer (the daemon that actually
-					-- implements steering on OpenWrt) is a single
-					-- device-wide config, so band steering is treated as
-					-- active for the whole device whenever ANY WLAN has it
-					-- enabled.
-					local steering_active = false
-					for _, vap in ipairs(vap_table) do
-						if vap.no2ghz_oui then steering_active = true end
-					end
-					M._usteer.set_enabled(steering_active, cfg)
+					local steering_active, roam_assist_active =
+						M._steering_flags(vap_table, sys_raw)
+					M._usteer.set_enabled(steering_active, cfg, roam_assist_active)
 					pcall(ufuci.apply_config,
 						{radio_table = radio_table, vap_table = vap_table, network_table = {}},
 						cfg, {band_steering_active = steering_active,
-							device_name = device_name, keep_vlans = port_vlans})
+							roam_assist_active = roam_assist_active,
+							device_name = device_name, keep_vlans = port_vlans,
+							peer_ie = M._sysinfo.peer_ie_hex(st and st.mac)})
 				end
 			end
 
@@ -2947,11 +3368,16 @@ function M.handle_response(json_str, st, cfg)
 					-- Every VLAN a tagged SSID lands on. The switch drops
 					-- frames for a VID it has no entry for, so these need
 					-- trunking whether or not per-port VLAN is in use.
+					-- A private pre-shared key's VLAN counts the same.
 					local wireless_vlans, seen = {}, {}
 					for _, vap in ipairs(vap_table or {}) do
-						if vap.vlan_enabled and vap.vlan and not seen[vap.vlan] then
-							seen[vap.vlan] = true
-							wireless_vlans[#wireless_vlans + 1] = vap.vlan
+						local vids = (ufuci and ufuci.vap_vlan_ids) and ufuci.vap_vlan_ids(vap)
+							or ((vap.vlan_enabled and vap.vlan) and {vap.vlan} or {})
+						for _, vid in ipairs(vids) do
+							if not seen[vid] then
+								seen[vid] = true
+								wireless_vlans[#wireless_vlans + 1] = vid
+							end
 						end
 					end
 					-- Which socket the uplink cable is in, so a pushed port
@@ -3041,30 +3467,31 @@ function M.handle_response(json_str, st, cfg)
 				end)
 			end
 
+			-- Airtime Fairness (airtime.lua). Kept in state.json because the
+			-- debugfs switch resets on reboot and the controller does not
+			-- push again; M.run reapplies it. No block, no change.
+			if M._airtime then
+				local atf = M._airtime.parse(sys_raw)
+				if atf ~= nil then
+					st.atf_enabled = atf
+					local ok_atf, err_atf = pcall(M._airtime.set_enabled, atf)
+					if not ok_atf then
+						io.stderr:write("inform: airtime: " .. tostring(err_atf) .. "\n")
+					end
+				end
+			end
+
 			-- The ebtables.* hardening block (l2guard.lua): BPDU and
 			-- VLAN-tag drop on every AP VAP. Kernel state, so the intent
-			-- and the VAP names go to state.json for the startup rebuild.
-			-- After the WiFi pass on purpose: a VAP the push just added has
-			-- its netdev name by now.
+			-- and the VAP names go to state.json (saved below) for the
+			-- startup rebuild. After the WiFi pass on purpose, so a VAP
+			-- this push added has its netdev by now if netifd was quick;
+			-- _l2guard_resync picks it up if not.
 			if M._l2guard then
-				pcall(function()
-					local eb = M._l2guard.parse(sys_raw)
-					if not eb then return end
-					for _, u in ipairs(eb.unknown or {}) do
-						io.stderr:write("l2guard: unrecognised ebtables rule shape, not applied: "
-							.. ("%q"):format(u) .. "\n")
-					end
-					local spec = M._l2guard.spec_from(eb)
-					local names = (M._ucihelper and M._ucihelper.ap_ifnames)
-						and M._ucihelper.ap_ifnames() or {}
-					if #names == 0 and st.l2guard and type(st.l2guard.ifnames) == "table" then
-						names = st.l2guard.ifnames   -- wireless not answering yet: last known
-					end
-					spec.ifnames = names
-					st.l2guard = spec
-					M._state.save(st)
-					M._l2guard.reconcile(spec, names)
-				end)
+				local ok_l2, err_l2 = pcall(M._l2guard_apply_push, sys_raw, st)
+				if not ok_l2 then
+					io.stderr:write("inform: l2guard: " .. tostring(err_l2) .. "\n")
+				end
 			end
 		end
 
@@ -3085,6 +3512,7 @@ function M.handle_response(json_str, st, cfg)
 		st.mac, st.ip, st.hostname = mac, ip, hostname
 		M._sync_bootstrap_account(false, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 		M._firewall.reconcile(st.blocked_stas)
+		M._forget_controller()
 		return false
 	end
 
@@ -3232,7 +3660,10 @@ function M.handle_response(json_str, st, cfg)
 									end
 								end
 							end
-							ufuci._popen("iw dev " .. ifname .. " scan")
+							-- A refused sweep still leaves the operating
+							-- channel's survey, so the table is built either
+							-- way; _force_scan has logged the refusal.
+							M._force_scan(ufuci, ifname, "spectrum-scan")
 							local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
 							if ok_rs then
 								local width = _width_from_htmode(radio.ht)
@@ -3455,11 +3886,40 @@ end
 -- bootstrap account (if enabled) locked/unlocked to match the reloaded
 -- adopted state. Returns the current mtime (unchanged from last_mtime if
 -- the file didn't change).
+
+-- What a controller left behind outside state.json, torn down when the
+-- device stops being adopted -- a `setdefault` (controller "Forget") or an
+-- out-of-process `syswrapper.sh reset-inform`. The l2guard table is kernel
+-- state that st.l2guard no longer describes once the reset cleared it; the
+-- nightly 11k-scan cron job would keep scanning every radio on behalf of a
+-- controller that no longer manages the device; and a long noop interval
+-- would slow re-adoption to one attempt per interval. The pushed timezone and
+-- NTP servers stay: they are sane settings for the board either way, and
+-- their originals remain stamped in UCI (USAGE § 6a).
+function M._forget_controller()
+	M._controller_interval = nil
+	if M._l2guard then pcall(M._l2guard.reconcile, nil, {}) end
+	if M._sysconf then pcall(M._sysconf.apply_cron, {enabled = false, jobs = {}}) end
+	-- A controller that switched Airtime Fairness off no longer does.
+	if M._airtime then pcall(M._airtime.set_enabled, true) end
+end
+
+-- Airtime Fairness is debugfs state, back at the kernel's default (on) after
+-- every reboot, and the controller does not push it again (cfgversion
+-- matches). Reapplied at startup from state.json; nil means never pushed, and
+-- the board's default stays. Returns whether it wrote.
+function M._reapply_airtime(st)
+	if not (st and st.atf_enabled ~= nil and M._airtime) then return false end
+	pcall(M._airtime.set_enabled, st.atf_enabled)
+	return true
+end
+
 function M._reload_if_changed(st, cfg, last_mtime)
 	local mtime = M._state_mtime(M._state._state_file)
 	if mtime == nil or mtime == last_mtime then
 		return last_mtime
 	end
+	local was_adopted = st.adopted
 	-- mac/ip/hostname are populated once at M.run() startup and never
 	-- persisted to state.json -- preserve them across the reload.
 	local mac, ip, hostname = st.mac, st.ip, st.hostname
@@ -3469,6 +3929,7 @@ function M._reload_if_changed(st, cfg, last_mtime)
 	st.mac, st.ip, st.hostname = mac, ip, hostname
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
 	M._firewall.reconcile(st.blocked_stas)
+	if was_adopted and not st.adopted then M._forget_controller() end
 	return mtime
 end
 
@@ -3650,6 +4111,67 @@ function M._warn_http_400(err, st, cfg)
 	return true
 end
 
+-- ─── The controller's ebtables hardening (l2guard.lua) ──────────────────────
+
+-- The live AP-mode VAP netdevs, or {} while wireless is not answering.
+function M._l2guard_live_ifnames()
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci.ap_ifnames) then return {} end
+	local ok, names = pcall(ufuci.ap_ifnames)
+	return (ok and type(names) == "table") and names or {}
+end
+
+local function same_names(a, b)
+	if type(a) ~= "table" or type(b) ~= "table" or #a ~= #b then return false end
+	for i = 1, #a do if a[i] ~= b[i] then return false end end
+	return true
+end
+
+-- A push's ebtables.* block -> st.l2guard, and the table rebuilt. A push
+-- without the block (a partial one) leaves the current state alone.
+function M._l2guard_apply_push(sys_raw, st)
+	local eb = M._l2guard.parse(sys_raw)
+	if not eb then return false end
+	for _, u in ipairs(eb.unknown or {}) do
+		io.stderr:write("l2guard: unrecognised ebtables rule shape, not applied: "
+			.. ("%q"):format(u) .. "\n")
+	end
+	local spec = M._l2guard.spec_from(eb)
+	local names = M._l2guard_live_ifnames()
+	if #names == 0 and type(st.l2guard) == "table" and type(st.l2guard.ifnames) == "table" then
+		names = st.l2guard.ifnames   -- wireless not answering yet: last known
+	end
+	spec.ifnames = names
+	st.l2guard = spec
+	M._l2guard.reconcile(spec, names)
+	return true
+end
+
+-- Once a minute: if the live VAP list no longer matches the one the table was
+-- built for (an SSID added by a push whose `wifi reload` had not finished, or
+-- wireless coming up after the daemon at boot), rebuild. An empty live list
+-- is "not answering", never "no VAPs": it leaves the table alone. Returns true
+-- when it rebuilt.
+M.L2GUARD_RESYNC_INTERVAL = 60
+M._l2guard_next = 0
+function M._l2guard_resync(st)
+	local g = st and st.l2guard
+	if not (M._l2guard and type(g) == "table" and (g.bpdu or g.tagdrop)) then return false end
+	local now = M._time()
+	if now < M._l2guard_next then return false end
+	M._l2guard_next = now + M.L2GUARD_RESYNC_INTERVAL
+	local names = M._l2guard_live_ifnames()
+	if #names == 0 or same_names(names, g.ifnames) then return false end
+	io.stderr:write("l2guard: AP interfaces changed (" .. table.concat(names, " ")
+		.. ") -- rebuilding\n")
+	g.ifnames = names
+	M._state.save(st)
+	M._l2guard.reconcile(g, names)
+	return true
+end
+
+-- ─── The controller's scheduled neighbour scan ──────────────────────────────
+
 -- Opt-in background neighbour scan (conf.lua neighbour_scan_interval, in
 -- seconds; 0/nil = off). scan_radio_table is read from the kernel's cached
 -- BSS list, and cfg80211 drops a cached BSS about 30 s after it was last
@@ -3658,9 +4180,9 @@ end
 -- 10.4.57), so after the boot-time ACS sweep the Environment view drains to
 -- empty, and any parent-AP list built from neighbours would have nothing to
 -- work from. A scan takes the radio off-channel for a moment, which clients
--- see as a brief stall -- the reason this is off by default. Same `iw dev
--- <if> scan` form the spectrum-scan handler uses, which is known to work on
--- these boards' AP interfaces. Returns true when a scan was issued.
+-- see as a brief stall -- the reason this is off by default. Returns true
+-- when a scan was issued.
+--
 -- Where `syswrapper.sh 11k-scan` -- the controller's nightly cron job, see
 -- sysconf.lua -- leaves its dated request. Consumed and removed by the next
 -- heartbeat; ignored when older than SCAN_REQUEST_MAX_AGE, so a request a
@@ -3669,7 +4191,30 @@ end
 M.SCAN_REQUEST_FILE    = "/tmp/openuf-scan-request"
 M.SCAN_REQUEST_MAX_AGE = 600
 
--- `iw dev <if> scan` on every radio in hwassign. Returns how many were issued.
+-- One blocking off-channel sweep on an AP netdev: `iw dev <if> scan
+-- ap-force`. A plain `scan` does sweep on a beaconing AP with the drivers
+-- seen so far: AP2 (mt7986/mt76, OpenWrt 25.12) answered one with 26
+-- scan_table rows on 2026-09-15, and upstream compared plain and `ap-force`
+-- channel by channel on ath9k/ath10k and mt76 (2026-09-25) and found them
+-- identical. `ap-force` (NL80211_SCAN_FLAG_AP) is kept as a free guard for
+-- a driver/kernel that does refuse. What matters more is the exit status:
+-- _popen drops stderr, so a refused scan used to be indistinguishable from
+-- a successful one, and the 11k-scan count was of commands sent, not of
+-- sweeps that ran. The scan output itself is discarded (callers read the
+-- kernel's caches: `scan dump`, `survey dump`). Returns true when the sweep
+-- ran; logs and returns false when iw refused.
+function M._force_scan(ufuci, ifname, who)
+	local out = ufuci._popen("iw dev " .. ifname
+		.. " scan ap-force >/dev/null 2>&1 && echo scan-ok") or ""
+	if out:find("scan-ok", 1, true) then return true end
+	io.stderr:write("inform: " .. who .. ": iw refused to scan " .. ifname .. "\n")
+	return false
+end
+
+-- A forced sweep on every reported radio (the modelmap's hwassign, as
+-- build_json uses). Blocking, a few seconds per radio -- which is the point:
+-- build_json runs next and its `scan dump` then carries the fresh results.
+-- Returns how many sweeps actually ran, not how many were asked for.
 function M._scan_all_radios(cfg)
 	local ufuci = M._ucihelper
 	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return 0 end
@@ -3678,8 +4223,7 @@ function M._scan_all_radios(cfg)
 	local issued = 0
 	for _, radio in ipairs(radios) do
 		local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
-		if ok_if and ifname then
-			M._run_cmd("iw dev " .. ifname .. " scan")
+		if ok_if and ifname and M._force_scan(ufuci, ifname, "11k-scan") then
 			issued = issued + 1
 		end
 	end
@@ -3916,6 +4460,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- Before build_json, so anything a client reported since the last cycle
 	-- rides out on THIS inform rather than waiting for the next.
 	pcall(M._rrm_tick, cfg)
+	pcall(M._l2guard_resync, st)
 
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
 	-- build_json opens a ucihelper lookup pass and closes it on its normal
@@ -4092,6 +4637,7 @@ function M.run(cfg, ufhw)
 	if st.led_enabled ~= nil then
 		M._led.set_enabled(cfg and cfg.led, st.led_enabled)
 	end
+	M._reapply_airtime(st)
 	-- Per-port byte counters are a switch-driver setting that some boards ship
 	-- switched off; without it every socket reports 0 B in the Ports view.
 	if M._switchvlan then pcall(M._switchvlan.enable_mib_polling, cfg) end
@@ -4106,11 +4652,11 @@ function M.run(cfg, ufhw)
 	-- The controller's ebtables hardening (BPDU and VLAN-tag drop on the
 	-- VAPs) is nft state too. Rebuilt from state.json's record with the live
 	-- VAP list, falling back to the names recorded at the last push when
-	-- wireless is not answering yet at this point of the boot.
+	-- wireless is not answering yet at this point of the boot;
+	-- _l2guard_resync corrects the list once it is.
 	if M._l2guard and type(st.l2guard) == "table" then
 		pcall(function()
-			local names = (M._ucihelper and M._ucihelper.ap_ifnames)
-				and M._ucihelper.ap_ifnames() or {}
+			local names = M._l2guard_live_ifnames()
 			if #names == 0 and type(st.l2guard.ifnames) == "table" then names = st.l2guard.ifnames end
 			M._l2guard.reconcile(st.l2guard, names)
 		end)

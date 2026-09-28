@@ -155,6 +155,11 @@ config = {
 	-- point is to keep the Environment view honest, not to poll.
 	rrm_request_interval = 600,
 
+	-- Roaming Assistant (controller: WLAN -> Advanced, 5 GHz): how much louder,
+	-- in dB, another AP must hear a weak client before openUF moves it there.
+	-- The threshold itself comes from the controller.
+	roam_assist_diff_db = 8,
+
 	-- Regulatory domain override: an ISO 3166-1 alpha-2 code programmed into
 	-- the driver INSTEAD of the one the controller pushes. nil = off, and the
 	-- controller's own value is used (the normal case).
