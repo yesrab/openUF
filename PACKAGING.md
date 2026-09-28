@@ -17,13 +17,14 @@ openUF/
 │   ├── openuf/                   -> openwrt/packages: net/openuf
 │   │   ├── Makefile
 │   │   ├── files/openuf.config   -> /etc/config/openuf
-│   │   ├── files/openuf.init     -> /etc/init.d/openuf   (procd, USE_PROCD=1)
 │   │   ├── files/openuf.upgrade  -> /lib/upgrade/keep.d/openuf
+│   │   │                         (the init script is openuf/etc/init.d/openuf inside
+│   │   │                          the source archive: install.sh ships the same file)
 │   │   └── test.sh               feed CI runtime check (openuf --version)
 │   └── luci-app-openuf/          -> openwrt/luci: applications/luci-app-openuf
 │       ├── Makefile              LUCI_TITLE, LUCI_DEPENDS:=+luci-base +openuf
 │       ├── htdocs/luci-static/resources/view/openuf/{overview,settings,log}.js
-│       ├── htdocs/luci-static/resources/view/status/include/70_openuf.js
+│       ├── htdocs/luci-static/resources/view/status/include/05_openuf.js
 │       │                         the essentials on Status → Overview
 │       ├── root/usr/share/rpcd/ucode/luci.openuf        the backend (ucode)
 │       ├── root/usr/share/rpcd/acl.d/luci-app-openuf.json
@@ -57,7 +58,7 @@ openuf/uciconf.lua                /etc/config/openuf -> the `dev`/`config` table
 ## The LuCI app
 
 Menu: `admin/services/openuf` → *Overview*, *Settings*, *Log*; plus a few lines on
-*Status → Overview* (`view/status/include/70_openuf.js`).
+*Status → Overview* (`view/status/include/05_openuf.js`, numbered so it sorts before the stock `10_system` block and shows first).
 
 Everything the pages show comes from `openuf probe …` (`openuf/hook/probe.lua`), which
 runs the daemon's own loader and reports how the configuration resolved. The ucode backend
@@ -116,12 +117,20 @@ none and attaches the files if there is. Everything the run creates with the bui
 token never re-triggers the workflow, and a release made in the web UI with a new tag
 (which fires `push` and `release` together) is serialised by a concurrency group.
 
-Two lessons from the first attempts (2026-09-28/29): release `0.0.1` was published from
-the web UI while the workflow listened only for pushed `v*.*.*` tags, so nothing ran; and
+A fourth choice, **rebuild**, builds the newest version tag again and replaces its
+files: for a run that failed after the tag and release were made, since a re-run of the
+failed jobs uses the workflow file as it was, not the fix.
+
+Lessons from the first attempts (2026-09-28/29): release `0.0.1` was published from the
+web UI while the workflow listened only for pushed `v*.*.*` tags, so nothing ran;
 `softprops/action-gh-release` updating that release failed with "Invalid
 target_commitish" because it re-sends the release's recorded target, the `packaging`
-branch, which had been deleted after its merge. The run now uses `gh` and never updates
-a release, only creates one or uploads to it.
+branch, which had been deleted after its merge (the run now uses `gh` and never updates
+a release, only creates one or uploads to it); and `v0.0.2`'s package jobs failed in
+`openwrt/gh-action-sdk`'s init-script check, which runs `git diff` inside the mounted
+feed directory, not a git repository in the container, so it fails on git before shfmt
+sees anything (`NO_SHFMT_CHECK: true`; there is no `files/*.init` to check, and the init
+script is syntax-checked in `verify`).
 
 1. **verify**: Lua 5.1 + luarocks, `lua tests/run_tests.lua`, `sh tools/dist.sh --verify`,
    `bash -n` and `dash -n` on the shell files; upload `openuf-<ver>.tar.gz` as the release

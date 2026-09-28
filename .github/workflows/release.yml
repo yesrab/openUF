@@ -25,9 +25,9 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Which part of the newest version tag this release raises"
+        description: "Which part of the newest version tag this release raises; rebuild builds the newest tag again and replaces its files"
         type: choice
-        options: [patch, minor, major]
+        options: [patch, minor, major, rebuild]
         default: patch
         required: true
   push:
@@ -48,6 +48,11 @@ jobs:
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
       version: ${{ steps.pick.outputs.version }}
+      # What the build jobs check out: the tag for a rebuild, otherwise empty,
+      # which is the event's own commit (the chosen branch's head, or the
+      # pushed or released tag's commit). A tag being created cannot be
+      # checked out yet.
+      ref: ${{ steps.pick.outputs.ref }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,25 +63,41 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -eu
+          ref=""
           case "$GITHUB_EVENT_NAME" in
             workflow_dispatch)
               # The newest vX.Y.Z (or X.Y.Z) tag anywhere in the repository,
               # by number rather than by date; no tag yet means 0.0.0.
               latest=$(git tag -l | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
                 | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+              latest_tag=""
+              if [ -n "$latest" ]; then
+                latest_tag="v$latest"
+                git rev-parse -q --verify "refs/tags/$latest_tag" >/dev/null || latest_tag="$latest"
+              fi
               : "${latest:=0.0.0}"
               major=${latest%%.*}; rest=${latest#*.}; minor=${rest%%.*}; patch=${rest#*.}
               case "$BUMP" in
                 major) major=$((major + 1)); minor=0; patch=0 ;;
                 minor) minor=$((minor + 1)); patch=0 ;;
                 patch) patch=$((patch + 1)) ;;
+                rebuild)
+                  # The newest tag again, its files replaced: for a build
+                  # that failed after the tag and release were made.
+                  [ -n "$latest_tag" ] || { echo "nothing to rebuild: no version tag" >&2; exit 1; }
+                  ref=$latest_tag ;;
                 *) echo "unknown bump '$BUMP'" >&2; exit 1 ;;
               esac
-              tag="v$major.$minor.$patch"
-              if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-                echo "tag $tag already exists" >&2; exit 1
+              if [ "$BUMP" = rebuild ]; then
+                tag=$latest_tag
+                echo "rebuilding the newest version tag $tag"
+              else
+                tag="v$major.$minor.$patch"
+                if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+                  echo "tag $tag already exists" >&2; exit 1
+                fi
+                echo "newest version tag ${latest_tag:-none}, $BUMP release: $tag"
               fi
-              echo "newest version tag $latest, $BUMP release: $tag"
               ;;
             release) tag="$RELEASE_TAG" ;;
             *)       tag="$GITHUB_REF_NAME" ;;
@@ -84,7 +105,8 @@ jobs:
           version="${tag#v}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Releasing **$tag** (version $version) from \`$GITHUB_REF_NAME\` at $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Releasing **$tag** (version $version) from \`${ref:-$GITHUB_REF_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
 
   verify:
     name: Verify, then create the release with the source archive
@@ -96,8 +118,9 @@ jobs:
       TAG: ${{ needs.version.outputs.tag }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      # The event's own commit: the chosen branch's head, or the tag's commit.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
       - name: Install Lua 5.1 and the bindings the suite needs
         run: |
           sudo apt-get update -qq
@@ -149,6 +172,8 @@ jobs:
             format: apk
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
       - name: Point the Makefiles at this release's archive
         run: |
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VERSION/" package/openuf/Makefile package/luci-app-openuf/Makefile
@@ -164,6 +189,12 @@ jobs:
           FEED_DIR: ${{ github.workspace }}/package
           PACKAGES: openuf luci-app-openuf
           NO_REFRESH_CHECK: true
+          # The action's init-script check runs `git diff` inside the mounted
+          # feed directory, which is not a git repository in the container
+          # (only package/ is mounted), so it fails on git, not on shfmt --
+          # and there is no files/*.init here anyway: the init script ships
+          # inside the source archive and is syntax-checked in `verify`.
+          NO_SHFMT_CHECK: true
           V: s
       - name: Collect the packages
         run: |

@@ -2,12 +2,12 @@ msgid ""
 msgstr "Content-Type: text/plain; charset=UTF-8"
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:32
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:23
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:23
 msgid "%d hours ago"
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:31
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:22
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:22
 msgid "%d minutes ago"
 msgstr ""
 
@@ -16,7 +16,7 @@ msgid "%d on a switch chip"
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:29
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:20
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:20
 msgid "%d seconds ago"
 msgstr ""
 
@@ -95,7 +95,7 @@ msgid ""
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:71
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:46
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:46
 msgid "Adoption"
 msgstr ""
 
@@ -188,7 +188,7 @@ msgid "Configured through"
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:259
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:48
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:48
 msgid "Controller"
 msgstr ""
 
@@ -380,7 +380,7 @@ msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:95
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:267
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:50
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:50
 msgid "Hardware profile"
 msgstr ""
 
@@ -429,7 +429,7 @@ msgid "Label"
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:72
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:47
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:47
 msgid "Last contact with the controller"
 msgstr ""
 
@@ -578,7 +578,7 @@ msgstr ""
 msgid "Ports, radios and LED of the selected shipped profile"
 msgstr ""
 
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:49
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:49
 msgid "Presented as"
 msgstr ""
 
@@ -905,7 +905,7 @@ msgstr ""
 msgid "Unable to read the log: %s"
 msgstr ""
 
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:27
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:27
 msgid "UniFi access point (openUF)"
 msgstr ""
 
@@ -999,7 +999,7 @@ msgid "a switch chip with a VLAN table"
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:66
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:43
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:43
 msgid "adopted"
 msgstr ""
 
@@ -1018,7 +1018,7 @@ msgid ""
 "configuration to /etc/config/openuf"
 msgstr ""
 
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:41
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:41
 msgid "configuration error, see Services → openUF"
 msgstr ""
 
@@ -1043,12 +1043,12 @@ msgid "generic"
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:27
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:18
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:18
 msgid "just now"
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:24
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:15
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:15
 msgid "never"
 msgstr ""
 
@@ -1085,7 +1085,7 @@ msgid "none resolved"
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:72
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:47
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:47
 msgid "none yet"
 msgstr ""
 
@@ -1094,7 +1094,7 @@ msgid "none, so \"Locate\" in the controller has no effect"
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:67
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:44
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:44
 msgid "not adopted yet"
 msgstr ""
 
@@ -1117,12 +1117,12 @@ msgid ""
 "itself. Each one enables a feature."
 msgstr ""
 
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:35
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:35
 msgid "openUF is not answering."
 msgstr ""
 
 #: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:69
-#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:39
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/05_openuf.js:39
 msgid "openUF is not running"
 msgstr ""
 
