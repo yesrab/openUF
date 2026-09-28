@@ -20,10 +20,12 @@ TARBALL=openuf.tar.gz
 # conf.lua and the modelmaps are the files a user is *expected* to hand-edit on
 # the device (modelmap selection, inform_url, radio names, LED sysfs path).
 # Their comments are operating instructions, so they ship intact -- ~1.8 KB of
-# the ~84 KB result, and worth it.
+# the ~84 KB result, and worth it. The identities (ufmodel/*) keep theirs for
+# the same reason since the web UI lists them by their header title, and
+# hook/probe.lua reads that title off the installed file.
 keep_comments() {
 	case "$1" in
-		openuf/conf.lua|openuf/modelmap/*) return 0 ;;
+		openuf/conf.lua|openuf/modelmap/*|openuf/ufmodel/*) return 0 ;;
 		*) return 1 ;;
 	esac
 }
@@ -58,7 +60,7 @@ done
 
 # Preserve the executable bit the installer relies on.
 chmod +x "$STAGE/etc/init.d/openuf" "$STAGE/hook/syswrapper.sh" \
-	"$STAGE/hook/adopt-shell.sh"
+	"$STAGE/hook/adopt-shell.sh" "$STAGE/hook/openuf-cli.sh" "$STAGE/hook/openuf-convert.sh"
 
 # Build stamp: which commit this tarball is, so `openuf-update --check` on a
 # device can say what it runs. "-dirty" means uncommitted changes were in the

@@ -161,6 +161,75 @@ openUF's own nftables tables live in `bridge openuf` and `bridge openuf_bcfilt`,
 deliberately outside `fw4`'s `inet fw4`, so client Block/Unblock and the Multicast and
 Broadcast Blocker keep working with the firewall service off.
 
+### As an OpenWrt package
+
+The release page carries `openuf_<version>-<release>_all.ipk` (OpenWrt 24.10 and earlier,
+`opkg`) and `openuf_<version>-<release>_all.apk` (25.12 and later, `apk`), built by the
+release workflow from the same comment-stripped tree `tools/dist.sh --verify` proves. The
+package installs to `/usr/lib/openuf`, its configuration is `/etc/config/openuf`, and both
+that file and `/etc/openuf/` (the state) survive `sysupgrade`.
+
+```sh
+# 25.12 and later
+apk add --allow-untrusted ./openuf_0.9.0-1_all.apk
+# 24.10 and earlier
+opkg install ./openuf_0.9.0-1_all.ipk
+
+uci set openuf.main.inform_url='http://<controller>:8080/inform'   # if not "unifi"
+uci commit openuf && /etc/init.d/openuf enable && /etc/init.d/openuf start
+openuf status
+```
+
+With `modelmap 'auto'` (the default) the daemon runs as the shipped profile that declares
+this board, exactly the match `setup.sh` makes. A board no profile declares is a refusal,
+not a guess -- the log says `no modelmap declares board <name>` and the service does not
+start -- because the generic profiles carry a `lan_cpueth` that is wrong for a DSA board,
+and that field is the identity MAC. Pick a profile (`uci set openuf.main.modelmap=...`) or
+describe the board in a custom map (§ 3, or the LuCI app's Settings page, which fills the
+form in from what the board reports about itself).
+
+**`luci-app-openuf`** (same release page, same two formats) adds *Services → openUF* to
+LuCI, for OpenWrt 24.10 and later:
+
+- *Overview*: the service and adoption state, the profile and identity in use, the WiFi
+  networks the controller pushed, which optional packages are missing and the command that
+  installs them, and Restart / Scan for neighbours / Forget the controller. A few of the
+  same lines appear on *Status → Overview*.
+- *Settings*: every `openuf.main` option with a plain-language description. The hardware
+  profile and the UniFi model are dropdowns of the shipped presets plus "custom"; both are
+  locked while the device is adopted, because either changes the address the controller
+  knows the device by. Choosing "custom" reveals the custom profile form, filled in from
+  what the board reports about itself (sockets, radios, LEDs and what OpenWrt already
+  drives), the socket table and the custom identity form. Once saved, *Export the saved
+  custom profile as a file* produces a modelmap file to contribute. While the device is
+  still a router, *Convert to an access point and reboot* runs `openuf-convert` behind a
+  confirmation; *Turn back into a router* on the Overview page runs `--revert`.
+- *Log*: openUF's lines from the system log, newest first.
+
+`openuf-convert` is the conversion `setup.sh`'s last phase performs, as a command:
+
+```sh
+openuf-convert --check      # {"state":"router"|"ap","reasons":[...],"converted":...}
+openuf-convert --convert [--address dhcp|<ip>/<prefix>] [--gateway <ip>] \
+                         [--dns "<ip> <ip>"] [--keep-wan-socket]
+openuf-convert --revert     # the backed-up files come back at the next reboot
+```
+
+`--convert` removes `wan`/`wan6`, joins the WAN socket to the LAN (into the switch's LAN
+VLAN on a swconfig board whose profile proves the geometry, into `br-lan` otherwise), gives
+the LAN a DHCP address unless a static one is named, switches off the DHCP server, stops and
+disables the firewall, dnsmasq and odhcpd, points the resolver and lldpd's chassis id away
+from what is gone, and enables every radio. It commits and does not apply: the caller (the
+LuCI button, or you) reboots, the only safe way to apply a network teardown you are
+connected through. The configuration files it touches are saved to
+`/etc/openuf/convert-backup.tgz` and a stamp in `openuf.convert` is what `--check` reports
+and `--revert` restores from. Every unknown is a refusal, for the same reason `setup.sh`
+refuses: a wrong guess is a device that does not come back from the reboot.
+
+The optional feature packages are not dependencies (each is larger than openUF): install
+`nftables kmod-nft-bridge tc-tiny kmod-sched-act-police usteer hostapd-utils` and a full
+`wpad-*` build as § 1 describes, and openUF logs by name what it cannot enforce without them.
+
 ### By hand
 
 Download the source tree directly on the device over SSH — no git client or scp required.
@@ -573,6 +642,39 @@ no model prefix) and must track the catalog.  When the controller shows a spurio
 Available" for the device, re-read the catalog URL in the file's header and update `fw.ver`.
 ⚠️ No controller has adopted a device under this identity yet; if adoption stalls, set
 `ufmodel = "u6iw"` in the modelmap and report what the controller did.
+
+### `/etc/config/openuf` (package installs)
+
+On a package install the configuration is UCI, and whenever `/etc/config/openuf` has a
+`main` section it replaces `conf.lua`'s `dev` and `config` tables (`uciconf.lua`).
+Options the section leaves out keep `conf.lua`'s defaults, so a package upgrade that adds
+an option needs no migration. LuCI's "Save & Apply" on this file restarts the daemons.
+
+| `openuf.main` option | Meaning |
+|---|---|
+| `modelmap` | `auto` (the shipped profile that declares this board), a profile name from `/usr/lib/openuf/modelmap/`, or `custom` (the `device`, `port`, `vlan`, `swport` and `radio` sections) |
+| `ufmodel` | `auto` (the profile's own identity), a name from `/usr/lib/openuf/ufmodel/`, or `custom` (the `identity` section) |
+| `inform_url`, `use_only_unifi_wlan`, `keep_wlan_section` (a list), `l2_announce`, `neighbour_scan_interval`, `rrm_enrichment`, `rrm_request_interval`, `roam_assist_diff_db`, `country_override`, `bootstrap_adopt_user`, `debug_dump_file`, `debug_dump_requests`, `debug_dump_max_bytes`, `state_file`, `unhandled_file` | The `conf.lua` option of the same name, below. Booleans are `1`/`0`; an empty string clears an optional one |
+
+A custom hardware profile is the modelmap's fields as UCI sections -- one `port` section
+per RJ45 socket (`idx`, then `ifname` on DSA or `swport` on swconfig), a `vlan` section
+named `custom_vlan` plus one `swport` section per label→physical-port pair on swconfig,
+`radio` sections named `na`/`ng` for the per-band policy, and `device 'custom'` for
+`lan_cpueth`, `wan_cpueth`, `uplink_detect`, `led`, `hwassign` and `openwrt_board`. It is
+checked against the same invariants every shipped profile passes (`tests/test_modelmap.lua`)
+before it is used; a map that fails is refused with the reason and the service does not
+start. A custom identity (`identity 'custom_identity'`: `platform`, `model`, `fw_ver` as a
+bare `M.m.p.build`, `fw_buildtime`, `fw_factoryver`, `required_version`) is checked the same
+way. The full section reference is the header of `uciconf.lua`.
+
+`openuf --version`, `openuf status`, `openuf set-inform <url>`, `openuf reset-inform` and
+`openuf 11k-scan` are the command line; the last three are `syswrapper.sh`'s verbs.
+`openuf probe status|presets|discover|export` prints JSON: how the configuration resolved
+(the profile, identity and options in use, the state with the authkey left out, the
+refusal reason if there is one), the shipped presets, what the board reports about itself
+(the seed for a custom profile: sockets, switch geometry, radios, LEDs and which of them
+OpenWrt already drives), and the saved custom profile as a modelmap file. The LuCI app
+reads nothing else, so what it shows is what the daemon would run.
 
 ### Paths and options (`openuf/conf.lua`)
 

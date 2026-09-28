@@ -1,39 +1,134 @@
+# On a version tag: prove the tree, publish the source archive the OpenWrt
+# package fetches, build the package with the OpenWrt SDK for both package
+# formats, and attach everything to the GitHub release.
+#
+# The package Makefile (package/openuf/Makefile) is a feed-style Makefile: it
+# downloads openuf-<version>.tar.xz from the release by PKG_SOURCE_URL and
+# checks PKG_HASH. So the archive has to be on the release before the SDK
+# runs, and the Makefile's version and hash are substituted from the tag here.
+# Both packages are architecture-independent (PKGARCH:=all), so one SDK per
+# package format is enough: 24.10 produces .ipk (opkg), 25.12 produces .apk.
 name: Release
-
+# Three ways to start a release, all ending in the same run:
+#   1. push a tag:            git tag v0.1.0 && git push origin v0.1.0
+#      (the release is created by the run, with generated notes)
+#   2. publish a release in the web UI (draft it, then "Publish release":
+#      a draft fires nothing) -- the run attaches the packages to it
+#   3. Actions -> Release -> "Run workflow" with an existing tag, to rebuild
+#      or to build a release that was made before this file existed
+# The first release (0.0.1) was made in the web UI while this file only
+# listened for pushed v*.*.* tags, so nothing ran and it has no assets.
 on:
   push:
-    tags: ["v*.*.*"]
-
+    tags: ["v[0-9]*", "[0-9]*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must exist), e.g. v0.1.0"
+        required: true
+        type: string
 permissions:
   contents: write
-
+env:
+  # The tag this run releases, whichever way it started.
+  TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+# A release created in the web UI with a NEW tag fires both `push` and
+# `release`; serialise the two so they do not upload the same files at once.
+concurrency:
+  group: release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
 jobs:
-  build-and-publish:
-    name: Build release tarball
+  verify:
+    name: Verify and publish the source archive
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha256: ${{ steps.meta.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Lua and dependencies
+        with:
+          ref: ${{ env.TAG }}
+      - name: Install Lua 5.1 and the bindings the suite needs
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y lua5.1 liblua5.1-dev lua-bitop luarocks openssl
+          sudo apt-get install -y lua5.1 liblua5.1-dev lua-bitop luarocks openssl dash
           sudo ln -sf /usr/bin/lua5.1 /usr/local/bin/lua
           sudo luarocks --lua-version 5.1 install lua-cjson LUA_INCDIR=/usr/include/lua5.1
-
-      # dist.sh ships a comment-stripped tree (roughly half the bytes; OpenWrt
-      # flash is scarce) and --verify proves it is bytecode-identical to the
-      # source and still passes the suite before anything is published.
-      - name: Build openuf.tar.gz
-        run: sh tools/dist.sh --verify
-
-      - name: Generate checksum
-        run: sha256sum openuf.tar.gz > openuf.tar.gz.sha256
-
-      - name: Publish release
+      - name: Shell syntax, both shells
+        run: |
+          for f in setup.sh install.sh update.sh tools/deploy.sh tools/dist.sh \
+              tools/release-archive.sh openuf/etc/init.d/openuf openuf/hook/*.sh \
+              package/openuf/test.sh; do
+            bash -n "$f" && dash -n "$f"
+          done
+      - name: Build the archives (dist.sh --verify runs the suite on the stripped tree)
+        id: meta
+        run: |
+          version="${TAG#v}"
+          echo "releasing tag $TAG as version $version"
+          sh tools/release-archive.sh "$version"
+          sha256sum openuf.tar.gz > openuf.tar.gz.sha256
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 "openuf-$version.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
+      - name: Publish the source archives
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           files: |
+            openuf-*.tar.gz
+            openuf-*.tar.gz.sha256
             openuf.tar.gz
             openuf.tar.gz.sha256
           generate_release_notes: true
+
+  packages:
+    name: Build ${{ matrix.format }} with the ${{ matrix.sdk }} SDK
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Branch snapshot SDK images track each release branch; pin to a
+          # point release (e.g. x86_64-24.10.4) once one is known good.
+          - sdk: x86_64-24.10-SNAPSHOT
+            format: ipk
+          - sdk: x86_64-25.12-SNAPSHOT
+            format: apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Point the Makefile at this tag's archive
+        run: |
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ needs.verify.outputs.version }}/" package/openuf/Makefile
+          sed -i "s/^PKG_HASH:=.*/PKG_HASH:=${{ needs.verify.outputs.sha256 }}/" package/openuf/Makefile
+          # The Makefile's URL says v<version>; the tag being built may lack the v.
+          sed -i "s|/releases/download/[^/]*/|/releases/download/$TAG/|" package/openuf/Makefile
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ needs.verify.outputs.version }}/" package/luci-app-openuf/Makefile
+          grep -E '^PKG_(VERSION|HASH|SOURCE_URL):=' package/openuf/Makefile
+      - name: Build with the OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.sdk }}
+          FEEDNAME: openuf
+          FEED_DIR: ${{ github.workspace }}/package
+          PACKAGES: openuf luci-app-openuf
+          NO_REFRESH_CHECK: true
+          V: s
+      - name: Collect the packages
+        run: |
+          mkdir -p out
+          find bin -type f \( -name 'openuf*.ipk' -o -name 'openuf*.apk' -o -name 'luci-app-openuf*.ipk' -o -name 'luci-app-openuf*.apk' \) -exec cp -v {} out/ \;
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openuf-${{ matrix.format }}
+          path: out/*
+      - name: Attach the packages to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: out/*

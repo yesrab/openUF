@@ -1,0 +1,40 @@
+{
+	"admin/services/openuf": {
+		"title": "openUF",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-openuf" ],
+			"fs": { "/etc/init.d/openuf": "executable" }
+		}
+	},
+
+	"admin/services/openuf/overview": {
+		"title": "Overview",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "openuf/overview"
+		}
+	},
+
+	"admin/services/openuf/settings": {
+		"title": "Settings",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "openuf/settings"
+		}
+	},
+
+	"admin/services/openuf/log": {
+		"title": "Log",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "openuf/log"
+		}
+	}
+}

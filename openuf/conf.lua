@@ -1,6 +1,12 @@
 --[[
 	openUF main configuration.
 
+	On an OpenWrt PACKAGE install this file is only the shipped default: the
+	configuration is /etc/config/openuf (see USAGE.md § 3 and the section
+	reference at the top of uciconf.lua), and whenever that file has a `main`
+	section it replaces the `dev` and `config` tables set here. Everything
+	below applies as written to a tarball install (setup.sh / install.sh).
+
 	Select the modelmap that matches your hardware (see openuf/modelmap/).
 	setup.sh picks this for you from the board name; edit it by hand only if
 	you are installing without the guided installer.

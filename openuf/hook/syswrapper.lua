@@ -39,16 +39,37 @@ local function conf_state_file(dir)
 	return nil
 end
 
+-- On a package install the configuration is /etc/config/openuf, and its
+-- state_file (or state.lua's default when the option is unset) is what the
+-- daemons use -- conf.lua is then only the shipped default and must not be
+-- consulted. Returns present, path: present says whether UCI is in charge.
+local function uci_state_file()
+	local ok, uci = pcall(require, "uci")
+	if not ok or type(uci) ~= "table" then return false, nil end
+	local ok2, present, path = pcall(function()
+		local c = uci.cursor()
+		if not c:get("openuf", "main") then return false, nil end
+		local v = c:get("openuf", "main", "state_file")
+		if type(v) ~= "string" or v == "" then v = nil end
+		return true, v
+	end)
+	if not ok2 then return false, nil end
+	return present, path
+end
+
 local function load_state()
 	if state then return state end
-	-- Try relative paths: called from openuf/ dir or from an absolute install path
-	local paths = {"state.lua", "openuf/state.lua", "/opt/openuf/state.lua"}
+	-- Try relative paths: called from openuf/ dir, or from either install
+	-- prefix (the package's /usr/lib/openuf, install.sh's /opt/openuf).
+	local paths = {"state.lua", "openuf/state.lua", "/usr/lib/openuf/state.lua",
+		"/opt/openuf/state.lua"}
 	for _, p in ipairs(paths) do
 		local f = io.open(p, "r")
 		if f then
 			f:close()
 			state = dofile(p)
-			local sf = conf_state_file(p:match("^(.*/)") or "")
+			local present, sf = uci_state_file()
+			if not present then sf = conf_state_file(p:match("^(.*/)") or "") end
 			if sf then state._state_file = sf end
 			return state
 		end

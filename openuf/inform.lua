@@ -4683,6 +4683,10 @@ if not OPENUF_TEST_MODE then
 			if not ok2 then dofile("openuf/lib/lib.lua") end
 		end
 		dofile("conf.lua")
+		-- /etc/config/openuf, when it has a main section, replaces conf.lua's
+		-- dev and config (uciconf.lua: the package's configuration). A custom
+		-- identity comes back as a table; a preset is still a file.
+		local custom_uap = _require_sibling("uciconf").apply()
 		-- conf.lua's state_file was documented as the state path for years
 		-- and read by nothing: every entry point used state.lua's hardcoded
 		-- default. announce.lua and hook/syswrapper.lua honour it the same
@@ -4701,7 +4705,7 @@ if not OPENUF_TEST_MODE then
 		if config and type(config.inform_url) == "string" and config.inform_url ~= "" then
 			state.DEFAULT_INFORM_URL = config.inform_url
 		end
-		local ufhw = {uap = dofile("ufmodel/" .. dev.openuf.uap.ufmodel .. ".lua")}
+		local ufhw = {uap = custom_uap or dofile("ufmodel/" .. dev.openuf.uap.ufmodel .. ".lua")}
 		-- config (debug_dump_file, state_file, ...) is a separate global set by
 		-- conf.lua, not a field of dev.conf -- merge it in under .config so
 		-- handle_response's cfg.config.debug_dump_file check can see it.
