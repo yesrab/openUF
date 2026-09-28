@@ -101,7 +101,20 @@ ACL: read `ubus luci.openuf getStatus/listPresets/discover/exportPreset/getConve
 `file exec` for `logread -e *`, `/etc/init.d/openuf start|stop|restart`, `openuf
 reset-inform|11k-scan`, `uci openuf`; write `ubus luci.openuf convert/revert`, `uci openuf`.
 
-## Release workflow (GitHub Actions, on a `v*` tag)
+## Release workflow (GitHub Actions)
+
+Three ways to start it, all the same run: push a tag (`git tag v0.1.0 && git push origin
+v0.1.0`; the run creates the release with generated notes), publish a release in the web
+UI (a *draft* fires nothing until "Publish release"; the run attaches the packages to it),
+or *Actions → Release → Run workflow* with an existing tag (a rebuild, or a release made
+before the workflow listened for it). The run resolves the tag once (`TAG`), checks out
+that tag, and names it on every upload, so the three paths cannot drift. A release created
+in the web UI with a new tag fires both `push` and `release`; a concurrency group keyed on
+the tag serialises the pair. `v0.1.0` is the convention (the package Makefile's download
+URL says `v<version>`), and a bare `0.1.0` builds too: the URL is rewritten to the actual
+tag. Learned the hard way: release `0.0.1` (2026-09-28) was published from the web UI
+while the workflow listened only for pushed `v*.*.*` tags, so nothing ran and it has no
+assets; `Run workflow` with `0.0.1` is what builds it.
 
 1. **verify**: Lua 5.1 + luarocks, `lua tests/run_tests.lua`, `sh tools/dist.sh --verify`,
    `bash -n` and `dash -n` on the shell files; upload `openuf-<ver>.tar.gz` as the release

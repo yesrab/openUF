@@ -9,11 +9,36 @@
 # Both packages are architecture-independent (PKGARCH:=all), so one SDK per
 # package format is enough: 24.10 produces .ipk (opkg), 25.12 produces .apk.
 name: Release
+# Three ways to start a release, all ending in the same run:
+#   1. push a tag:            git tag v0.1.0 && git push origin v0.1.0
+#      (the release is created by the run, with generated notes)
+#   2. publish a release in the web UI (draft it, then "Publish release":
+#      a draft fires nothing) -- the run attaches the packages to it
+#   3. Actions -> Release -> "Run workflow" with an existing tag, to rebuild
+#      or to build a release that was made before this file existed
+# The first release (0.0.1) was made in the web UI while this file only
+# listened for pushed v*.*.* tags, so nothing ran and it has no assets.
 on:
   push:
-    tags: ["v*.*.*"]
+    tags: ["v[0-9]*", "[0-9]*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must exist), e.g. v0.1.0"
+        required: true
+        type: string
 permissions:
   contents: write
+env:
+  # The tag this run releases, whichever way it started.
+  TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+# A release created in the web UI with a NEW tag fires both `push` and
+# `release`; serialise the two so they do not upload the same files at once.
+concurrency:
+  group: release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
 jobs:
   verify:
     name: Verify and publish the source archive
@@ -23,6 +48,8 @@ jobs:
       sha256: ${{ steps.meta.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - name: Install Lua 5.1 and the bindings the suite needs
         run: |
           sudo apt-get update -qq
@@ -39,7 +66,8 @@ jobs:
       - name: Build the archives (dist.sh --verify runs the suite on the stripped tree)
         id: meta
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
+          echo "releasing tag $TAG as version $version"
           sh tools/release-archive.sh "$version"
           sha256sum openuf.tar.gz > openuf.tar.gz.sha256
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -47,6 +75,7 @@ jobs:
       - name: Publish the source archives
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           files: |
             openuf-*.tar.gz
             openuf-*.tar.gz.sha256
@@ -70,12 +99,16 @@ jobs:
             format: apk
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - name: Point the Makefile at this tag's archive
         run: |
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ needs.verify.outputs.version }}/" package/openuf/Makefile
           sed -i "s/^PKG_HASH:=.*/PKG_HASH:=${{ needs.verify.outputs.sha256 }}/" package/openuf/Makefile
+          # The Makefile's URL says v<version>; the tag being built may lack the v.
+          sed -i "s|/releases/download/[^/]*/|/releases/download/$TAG/|" package/openuf/Makefile
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ needs.verify.outputs.version }}/" package/luci-app-openuf/Makefile
-          grep -E '^PKG_(VERSION|HASH):=' package/openuf/Makefile
+          grep -E '^PKG_(VERSION|HASH|SOURCE_URL):=' package/openuf/Makefile
       - name: Build with the OpenWrt SDK
         uses: openwrt/gh-action-sdk@main
         env:
@@ -97,4 +130,5 @@ jobs:
       - name: Attach the packages to the release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           files: out/*
