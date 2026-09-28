@@ -427,6 +427,16 @@ factory reset.
 
 ## Landmines
 
+- **Two install prefixes, one rule for the configuration.** The OpenWrt package installs
+  to `/usr/lib/openuf`, `install.sh` to `/opt/openuf`; the init script, `syswrapper.sh`
+  and `openuf-cli.sh` probe for whichever holds `inform.lua`. Whenever `/etc/config/openuf`
+  has a `main` section, `uciconf.lua` replaces conf.lua's `dev` and `config` in both daemons
+  and the hook -- conf.lua is then only the shipped default. `install.sh` never creates
+  that section, so a tarball device keeps its conf.lua identity. `modelmap 'auto'` with
+  no matching preset is a refusal (the init script's probe), never a generic fallback: the
+  generic maps' `lan_cpueth` would move the identity MAC. A custom map goes through
+  `uciconf.validate`, which is `test_modelmap.lua`'s invariants as refusals -- add an
+  invariant in both places.
 - **Everything the controller sends that openUF does not act on goes to the unhandled
   ledger, always.** `handle_response` records an unknown `_type` or `cmd` with its whole
   body, unknown top-level fields, and (through `_report_dropped_keys`) every `mgmt_cfg` key
@@ -708,11 +718,18 @@ openuf/
   state.lua         /etc/openuf/state.json (authkey, adopted, cfgversion, inform_url)
   lib/lib.lua       globals every script expects; wraps `bit` so the same source runs
                     on the device's Lua 5.1 (luabitop) and a 5.3+ dev interpreter
+  uciconf.lua       /etc/config/openuf -> the `dev`/`config` tables when a `main` section
+                    exists; a custom profile passes test_modelmap's invariants or is refused
   hook/             syswrapper.sh|.lua (set-adopt / set-inform / reset-inform),
                     adopt-shell.sh — the forced login shell for the bootstrap account,
                     which permits exactly `syswrapper.sh set-adopt <url> <key>` and
-                    refuses everything else. That restriction IS the security boundary
-  etc/init.d/openuf procd service: announce + inform instances
+                    refuses everything else. That restriction IS the security boundary;
+                    openuf-cli.sh (/usr/bin/openuf), probe.lua (`openuf probe status|
+                    presets|discover|export`, the one source the LuCI app reads),
+                    openuf-convert.sh (/usr/sbin/openuf-convert: setup.sh's AP
+                    conversion as --check/--convert/--revert)
+  etc/init.d/openuf procd service: announce + inform instances; finds either prefix
+package/            the OpenWrt feed: openuf (net/) and luci-app-openuf (see PACKAGING.md)
 setup.sh            guided installer: AP conversion + deps + install
 install.sh          file/service install and dependency resolution
 update.sh           on-device updater (installed as openuf-update): backup, install keeping

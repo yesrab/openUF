@@ -1,0 +1,26 @@
+{
+	"luci-app-openuf": {
+		"description": "Grant access to LuCI app openUF",
+		"read": {
+			"ubus": {
+				"luci.openuf": [ "getStatus", "listPresets", "discover", "exportPreset", "getConvertState" ],
+				"file": [ "exec" ]
+			},
+			"file": {
+				"/sbin/logread -e *": [ "exec" ],
+				"/etc/init.d/openuf restart": [ "exec" ],
+				"/etc/init.d/openuf start": [ "exec" ],
+				"/etc/init.d/openuf stop": [ "exec" ],
+				"/usr/bin/openuf reset-inform": [ "exec" ],
+				"/usr/bin/openuf 11k-scan": [ "exec" ]
+			},
+			"uci": [ "openuf" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.openuf": [ "convert", "revert" ]
+			},
+			"uci": [ "openuf" ]
+		}
+	}
+}

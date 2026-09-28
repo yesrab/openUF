@@ -1,0 +1,1190 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:32
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:23
+msgid "%d hours ago"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:31
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:22
+msgid "%d minutes ago"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:92
+msgid "%d on a switch chip"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:29
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:20
+msgid "%d seconds ago"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:91
+msgid ""
+"%d, each its own network interface; the uplink socket is detected from the "
+"cable"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:165
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:169
+msgid "%s failed: %s"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:89
+msgid "(custom identity)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:272
+msgid "(not yet verified on real hardware)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:283
+msgid "(not yet verified with a controller)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:101
+msgid "/etc/config/openuf (the Settings page)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:478
+msgid "2.4 GHz radio: what \"Auto\" means on this board"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:478
+msgid "5 GHz radio: what \"Auto\" means on this board"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:516
+msgid "6.0.0 when empty."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:530
+msgid ""
+"A custom identity keeps the shipped profile's mapping. To change the "
+"mapping, choose \"Custom profile\" above: it starts from what this board "
+"reports."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:345
+msgid ""
+"A two-letter country code programmed into the radios instead of the one the "
+"controller sends. Leave empty to follow the controller."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:78
+msgid "AES-CBC (the controller has not switched to GCM yet)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:78
+msgid "AES-GCM, as current controllers require"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:185
+msgid "Address and prefix length"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:76
+msgid "Address the controller knows this device by"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:359
+msgid ""
+"Adds every outgoing heartbeat to the same file. Only meaningful with a file "
+"set above."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:71
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:46
+msgid "Adoption"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:192
+msgid ""
+"After the reboot the device will most likely have a different address. Find "
+"it in your router's DHCP client list or through the controller once it is "
+"adopted; this page will not reconnect on its own."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:358
+msgid "Also write what openUF sends to the controller"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:302
+msgid "Announce the device on the local network"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:328
+msgid "Ask a client every (seconds)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:323
+msgid "Ask clients to report nearby networks"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:269
+msgid "Automatic (no shipped profile matches this board)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:280
+msgid "Automatic (the profile's choice)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:269
+msgid "Automatic (this board: %s)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:146
+msgid "BSSID"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:508
+msgid "Bare, as 6.8.2.15592."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:94
+msgid "Board"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:518
+msgid "Boot loader version"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:313
+msgid "Broadcast only the controller's WiFi networks"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:303
+msgid ""
+"Broadcasts on UDP port 10001 so the controller lists the device for adoption "
+"without any manual step. Switch off only when the controller is on another "
+"network and the address above is set."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:454
+msgid "CPU port of the LAN"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:456
+msgid "CPU port of the WAN"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:181
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:211
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:197
+msgid "Cancel"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:496
+msgid "Channels allowed for automatic selection"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:545
+msgid "Close"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:101
+msgid "Configured through"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:259
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:48
+msgid "Controller"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:74
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:293
+msgid "Controller address"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:75
+msgid "Controller configuration"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:238
+msgid "Controller connection"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:244
+msgid "Controller features not supported yet"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:215
+msgid "Convert and reboot"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:190
+msgid "Convert this device into an access point?"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:222
+msgid "Convert to an access point and reboot"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:515
+msgid "Cosmetic, as above."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:514
+msgid "Cosmetic, reaches only the discovery broadcast. Written as YYMMDD.HHMM."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:344
+msgid "Country code override"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:501
+msgid "Custom UniFi identity"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:372
+msgid "Custom hardware profile"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:284
+msgid "Custom identity (the identity section of /etc/config/openuf)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:273
+msgid ""
+"Custom profile (the device, port, vlan and radio sections of /etc/config/"
+"openuf)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:187
+msgid "DNS servers, space separated"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:268
+msgid ""
+"Describes this board to openUF: its Ethernet sockets, radios and status LED. "
+"\"Automatic\" picks the shipped profile made for this board, and openUF "
+"refuses to start rather than guess if none was made for it."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:215
+msgid "Done. The device is ready to be adopted again."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:170
+msgid "Download %s"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:115
+msgid "Enables"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:96
+msgid "Ethernet sockets"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:427
+msgid "Ethernet sockets as the controller lists them"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:133
+msgid "Every optional package is installed; all features are available."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/log.js:40
+msgid ""
+"Everything openUF wrote to the system log, newest at the bottom. Refreshes "
+"every five seconds."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:550
+msgid "Export the saved custom profile as a file"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:515
+msgid "Factory firmware version"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:324
+msgid ""
+"Fills the controller's Environment view without taking the radios off their "
+"channels: one capable client at a time is asked to look around and report "
+"what it sees (802.11k)."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:397
+msgid "Find the uplink socket from where the cable is"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:514
+msgid "Firmware build time"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:513
+msgid "Firmware name prefix"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:508
+msgid "Firmware version"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:233
+msgid ""
+"Fix it on the Settings page or in /etc/config/openuf and restart openUF."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:444
+msgid "Fixed uplink"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:504
+msgid "For example U6IW or UHDIW."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:513
+msgid ""
+"For example U6IW. (with the dot). Empty means the model code plus a dot."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:355
+msgid ""
+"For troubleshooting only: every message the controller sends is written to "
+"this file. It contains WiFi passwords, so keep it on /tmp (cleared at "
+"reboot) and empty this field when done."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:214
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:216
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:219
+msgid "Forget the controller"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:208
+msgid "Forget the controller?"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:511
+msgid "Four numbers separated by dots, for example 6.8.2.15592"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:186
+msgid "Gateway"
+msgstr ""
+
+#: package/luci-app-openuf/root/usr/share/rpcd/acl.d/luci-app-openuf.json:3
+msgid "Grant access to LuCI app openUF"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:318
+msgid "Hand-made WiFi networks to keep on air"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:258
+msgid "Hardware and identity"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:95
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:267
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:50
+msgid "Hardware profile"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:340
+msgid ""
+"How much more strongly another access point must hear a weak client before "
+"openUF moves the client there. The Roaming Assistant itself is switched on "
+"per WiFi network in the controller. 8 when left empty."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:329
+msgid ""
+"How often one client is asked to report. 600 (ten minutes) when left empty."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:77
+msgid "IP address and hostname"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:114
+msgid "Installed"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:97
+msgid "Interface the controller identifies the device by"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:385
+msgid "Interface whose address identifies the device"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:482
+msgid "Keep automatic channel selection off DFS channels"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:422
+msgid "LAN VLAN id"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:419
+msgid "LAN network name"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:463
+msgid "Label"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:72
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:47
+msgid "Last contact with the controller"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:73
+msgid "Last failed contact"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:195
+msgid "Leave the WAN socket out of the LAN (keep it unused)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:264
+msgid ""
+"Locked while the device is adopted: changing this would change the address "
+"the controller knows the device by, and the controller would refuse every "
+"message afterwards. Use \"Forget the controller\" on the Overview page "
+"first, then change it and adopt again."
+msgstr ""
+
+#: package/luci-app-openuf/root/usr/share/luci/menu.d/luci-app-openuf.json:33
+msgid "Log"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:193
+msgid "Management address"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:363
+msgid "Maximum size of that file (bytes)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:78
+msgid "Message encryption"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:516
+msgid "Minimum controller version"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:506
+msgid "Model code"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:299
+msgid "Must be a web address starting with http:// or https://"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:486
+msgid "Narrowest channel width to use"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:143
+msgid "Network name"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:144
+msgid "No shipped profile is selected."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:140
+msgid ""
+"None yet. The controller sends its WiFi networks once the device is adopted."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:539
+msgid "Nothing to export: %s"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:186
+msgid "Nothing was changed:"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:398
+msgid ""
+"On a board with one interface per socket the uplink is detected at runtime, "
+"so the cable can be in any socket. Off for switch-chip boards, which have no "
+"such per-socket view."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:147
+msgid "On air"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:535
+msgid ""
+"Once saved, the custom profile can be exported as a profile file for the "
+"openUF project, so the next owner of this board gets it as a shipped "
+"profile. It is exported with a note that it has not been verified by the "
+"maintainers."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:428
+msgid ""
+"One line per RJ45 socket on the case. The port number is what the controller "
+"shows and keys per-port settings on, so pick it once and never renumber. The "
+"list starts in the order OpenWrt names the sockets, which is usually the "
+"order on the case but not always."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:378
+msgid "OpenWrt board name"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:319
+msgid ""
+"OpenWrt wireless section names (for example default_radio0) that stay "
+"enabled even with the option above ticked."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:241
+msgid "Optional packages"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:479
+msgid ""
+"Overrides the controller where the board needs it: widths the driver "
+"advertises but cannot run, DFS channels to leave to ACS. Leave empty to "
+"follow the controller."
+msgstr ""
+
+#: package/luci-app-openuf/root/usr/share/luci/menu.d/luci-app-openuf.json:15
+msgid "Overview"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:113
+msgid "Package"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:466
+msgid "Physical port"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:504
+msgid "Platform code"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:155
+msgid "Port in the controller"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:433
+msgid "Port number"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:529
+msgid "Ports, radios and LED of the selected shipped profile"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:49
+msgid "Presented as"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:100
+msgid "Presented to the controller as"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:542
+msgid "Profile file %s"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:483
+msgid ""
+"Radar-detection channels take a minute of silence before use and can be "
+"vacated at any time."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:144
+msgid "Radio"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:98
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:412
+msgid "Radios reported to the controller"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:160
+msgid "Radios reported: %s. Status LED: %s. Identity interface: %s."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:189
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:210
+msgid "Rebooting"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:200
+msgid "Restart"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:202
+msgid "Restart openUF"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:192
+msgid "Restore the router configuration and reboot"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:339
+msgid "Roaming Assistant: required signal advantage (dB)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:307
+msgid "SSH account for adoption"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:204
+msgid "Scan"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:334
+msgid "Scan for nearby networks every (seconds)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:206
+msgid "Scan for nearby networks now"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:205
+msgid ""
+"Scan requested. openUF sweeps every radio within the next ten seconds and "
+"reports the result to the controller; clients notice a short pause."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:145
+msgid "Security"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:103
+msgid "Service"
+msgstr ""
+
+#: package/luci-app-openuf/root/usr/share/luci/menu.d/luci-app-openuf.json:24
+msgid "Settings"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:534
+msgid "Share this profile"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:156
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:437
+msgid "Socket"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:99
+msgid "Status LED"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:403
+msgid "Status LED used for Locate"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:449
+msgid "Switch chip"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:452
+msgid "Switch device"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:442
+msgid "Switch port label"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:458
+msgid "Switch port labels"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:177
+msgid "Take an address from the network's DHCP server (recommended)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:237
+msgid ""
+"Testing overrides are active in conf.lua (debug_caps or "
+"debug_payload_extra): the device is telling the controller it supports "
+"things it may not. Clear them when the test is done."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:404
+msgid ""
+"The LED the controller's Locate blinks. Pick one nothing else drives; the "
+"ones OpenWrt itself uses at boot or for WiFi activity are marked."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:419
+msgid ""
+"The OpenWrt network the identity interface belongs to; \"lan\" on a stock "
+"configuration."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:279
+msgid ""
+"The Ubiquiti access point the controller will believe this device is. "
+"\"Automatic\" is the profile's own choice. Match the hardware generation: a "
+"WiFi 5 board should present as a WiFi 5 model, a board with one radio as a "
+"single-radio model."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:422
+msgid ""
+"The VLAN of the LAN on the switch chip; 1 unless the board tags its CPU port."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:335
+msgid ""
+"The access point itself looks around at this interval. 0 or empty means "
+"never. Each scan takes a radio off its channel for a moment, which clients "
+"notice as a short pause."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:179
+msgid ""
+"The configuration files backed up when the device was converted are put back "
+"and the services that were enabled then are enabled again, then the device "
+"reboots. openUF stays installed. Anything changed in those files since the "
+"conversion is lost."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:386
+msgid ""
+"The controller adopts the device under this interface's MAC address, and a "
+"pushed IP setting lands on it. On a board with one interface per socket this "
+"is the LAN bridge; on a switch-chip board it is the CPU-side interface of "
+"the LAN."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:246
+msgid ""
+"The controller has not sent anything this version of openUF does not handle."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:245
+msgid ""
+"The controller has sent %d kinds of setting or command that this version of "
+"openUF does not act on. That is normal: openUF records them in %s (passwords "
+"removed) so its developers can see what to build next. Nothing needs your "
+"attention."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:207
+msgid "The conversion was refused, nothing was changed:"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:209
+msgid ""
+"The device forgets its adoption and the controller's address, and the "
+"controller shows it as disconnected until it is adopted again. The device is "
+"not removed from the controller: use \"Forget\" there as well for a clean "
+"start."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:190
+msgid "The device reboots now and comes back as a router."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:212
+msgid "The device reboots now and comes back as an access point."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:131
+msgid ""
+"The features next to a missing package are simply left off; everything else "
+"works. To add them:"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:364
+msgid ""
+"The file starts over once it reaches this size, so it cannot fill /tmp. "
+"4194304 (4 MiB) when left empty."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:201
+msgid ""
+"The fixed address must be written as address/prefix, for example "
+"192.168.1.20/24."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:308
+msgid ""
+"The locked-down user the controller may log in as during adoption (created "
+"by `install.sh --bootstrap-adopt`). It is locked once the device is adopted "
+"and unlocked again after a reset. Leave empty if you adopt with the root "
+"account or by address."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:379
+msgid ""
+"The name OpenWrt reports for this board (vendor,model). \"Automatic\" "
+"matches shipped profiles by it."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:392
+msgid ""
+"The socket a router uses for its uplink. Listed so it can be reported like "
+"the others; openUF never assumes the cable is in it."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:260
+msgid ""
+"This OpenWrt device presents itself to a UniFi Network Application as a "
+"Ubiquiti access point. This page refreshes every ten seconds."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:239
+msgid "This device"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:251
+msgid ""
+"This device has no /etc/config/openuf file yet, so saving here would fail. "
+"Create it once with `touch /etc/config/openuf` (newer installers do this) "
+"and reload this page."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:290
+msgid ""
+"This device is currently configured by its conf.lua file. The values shown "
+"are the ones it runs with; saving moves the configuration to /etc/config/"
+"openuf and changes nothing else."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:221
+msgid ""
+"This device is still set up as a router: %s. An access point should not "
+"route, serve DHCP or run a firewall, and its WAN socket should be an "
+"ordinary LAN socket. openUF works either way, but the network will see two "
+"routers until this is done."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:191
+msgid ""
+"This removes the WAN interfaces, joins the WAN socket to the LAN, switches "
+"off the DHCP server, the firewall and dnsmasq, enables every radio, and "
+"reboots. The device stops routing: everything on it will reach the network "
+"through the LAN sockets. A backup of the configuration is kept so this can "
+"be undone from the Overview page."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:413
+msgid ""
+"Tick the radios openUF should present and manage. A radio left out is never "
+"reported and never touched."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:261
+msgid "Troubleshooting"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:195
+msgid "Turn back into a router"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:178
+msgid "Turn this device back into a router?"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:220
+msgid "Turn this device into an access point"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:314
+msgid ""
+"Turns off WiFi networks that were set up by hand in OpenWrt, so the radios "
+"carry only what the controller sends. openUF remembers what it turned off; "
+"unticking this brings them back."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:350
+msgid "Two letters, for example SE"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/log.js:17
+msgid "Unable to read the log: %s"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:27
+msgid "UniFi access point (openUF)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:278
+msgid "UniFi model to present"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:178
+msgid "Use a fixed address"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:502
+msgid ""
+"Used only while \"UniFi model to present\" above is \"Custom identity\". The "
+"model code and firmware version come from Ubiquiti's own firmware catalogue; "
+"the controller compares the version character for character, so a prefix or "
+"a \"+\" shows as a permanent \"Update available\"."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:373
+msgid ""
+"Used only while the hardware profile above is \"Custom profile\". Filled in "
+"from what this board reports about itself (%s, %s); check every line against "
+"the device, because two of them cannot be read off the board: which socket "
+"carries which label, and which LED is free for Locate."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:518
+msgid "Usually left empty."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:506
+msgid "Usually the same as the platform code."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:105
+msgid "Version"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:391
+msgid "WAN socket or interface"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:294
+msgid ""
+"Where the device sends its heartbeats until the controller assigns another "
+"address during adoption. When the controller is on the same network, "
+"discovery finds it and this can stay as it is."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:254
+msgid ""
+"Which hardware this device is, which UniFi access point it presents itself "
+"as, and how it behaves. Saving restarts openUF; the controller sees a pause "
+"of a few seconds and nothing else changes."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:459
+msgid "Which physical switch port carries which socket label."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:450
+msgid ""
+"Which switch device carries the LAN and which of its ports are the CPU "
+"ports. Board truth: read it off the board's stock configuration, not from "
+"guesswork."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:260
+msgid "WiFi behaviour"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:240
+msgid "WiFi networks from the controller"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:491
+msgid "Widest channel width to use"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:354
+msgid "Write the controller's messages to a file"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:382
+msgid "Written as vendor,model"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:375
+msgid "a switch chip with a VLAN table"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:66
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:43
+msgid "adopted"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:98
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:161
+msgid "all"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:388
+msgid "bridge"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:102
+msgid ""
+"conf.lua, from a tarball install. Saving the Settings page moves the "
+"configuration to /etc/config/openuf"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:41
+msgid "configuration error, see Services → openUF"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:87
+msgid "custom profile from /etc/config/openuf"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:104
+msgid "does not start at boot"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:150
+msgid "fixed uplink"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:346
+msgid "for example SE"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:271
+msgid "generic"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:27
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:18
+msgid "just now"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:24
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:15
+msgid "never"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:36
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:125
+msgid "no"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:492
+msgid "no cap"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:487
+msgid "no floor"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:73
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:89
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:161
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:393
+msgid "none"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:405
+msgid "none (Locate does nothing)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:75
+msgid "none received yet"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:85
+msgid "none resolved"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:72
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:47
+msgid "none yet"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:99
+msgid "none, so \"Locate\" in the controller has no effect"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:67
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:44
+msgid "not adopted yet"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:375
+msgid "one network interface per socket"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:259
+#: package/luci-app-openuf/root/usr/share/luci/menu.d/luci-app-openuf.json:3
+msgid "openUF"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:231
+msgid "openUF cannot start because its configuration does not load:"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:242
+msgid ""
+"openUF does not depend on these packages because each is larger than openUF "
+"itself. Each one enables a feature."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:35
+msgid "openUF is not answering."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:69
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/status/include/70_openuf.js:39
+msgid "openUF is not running"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/log.js:39
+msgid "openUF log"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:201
+msgid ""
+"openUF restarted. The controller sees a pause of a few seconds and nothing "
+"else changes."
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:253
+msgid "openUF settings"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:75
+msgid "received (version %s)"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:103
+msgid "running"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:388
+msgid "socket"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:104
+msgid "starts at boot"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:103
+msgid "stopped"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:375
+msgid "switch layout unknown"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:149
+msgid "switch port %s"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:409
+msgid "trigger %s"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:105
+msgid "unknown"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:374
+msgid "unknown board"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/settings.js:408
+msgid "used by %s"
+msgstr ""
+
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:36
+#: package/luci-app-openuf/htdocs/luci-static/resources/view/openuf/overview.js:124
+msgid "yes"
+msgstr ""

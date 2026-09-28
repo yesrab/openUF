@@ -385,9 +385,12 @@ if not OPENUF_TEST_MODE then
 	local ok, err = pcall(function()
 		if not ufpkt then dofile("lib/lib.lua") end
 		dofile("conf.lua")
+		-- Same rule as inform.lua: /etc/config/openuf wins when it has a
+		-- main section, so both daemons announce and inform the same identity.
+		local custom_uap = dofile("uciconf.lua").apply()
 
 		local ufhw = {}
-		ufhw.uap = dofile("ufmodel/" .. dev.openuf.uap.ufmodel .. ".lua")
+		ufhw.uap = custom_uap or dofile("ufmodel/" .. dev.openuf.uap.ufmodel .. ".lua")
 
 		local iface = dev.conf.net.lan_cpueth or "eth1"
 		local mac   = M.get_mac(iface) or {0x24, 0xa4, 0x3c, 0x00, 0xd3, 0xad}

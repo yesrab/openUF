@@ -176,6 +176,15 @@ The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi ident
 
 ## Quick start
 
+**OpenWrt package** (24.10 `opkg`, 25.12 `apk`; both on the release page, built by the
+release workflow): `apk add --allow-untrusted ./openuf_<ver>_all.apk`, set
+`openuf.main.inform_url` if your controller is not reachable as `unifi`, start the service.
+The configuration is `/etc/config/openuf`; see [USAGE § 2](USAGE.md#as-an-openwrt-package).
+`luci-app-openuf` adds *Services → openUF* to LuCI (24.10 and later): status, every option
+with a plain-language description, a custom hardware profile filled in from what the board
+reports, an export of that profile as a file to contribute, and the conversion into an AP
+(WAN off, DHCP and firewall off) as a button; from the shell that is `openuf-convert`.
+
 One command on the device, over SSH:
 
 ```sh

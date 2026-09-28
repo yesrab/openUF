@@ -9,24 +9,43 @@ START=99
 STOP=01
 USE_PROCD=1
 
-OPENUF_DIR=/opt/openuf
+# The package installs under /usr/lib/openuf, install.sh under /opt/openuf;
+# whichever holds inform.lua is the tree that runs.
+OPENUF_DIR=""
+for d in /usr/lib/openuf /opt/openuf; do
+	if [ -f "$d/inform.lua" ]; then OPENUF_DIR=$d; break; fi
+done
 
 start_service() {
+	if [ -z "$OPENUF_DIR" ]; then
+		echo "openuf: not installed (no /usr/lib/openuf or /opt/openuf)" >&2
+		return 1
+	fi
 	# The Lua scripts (and conf.lua's modelmap dofile) load siblings with
 	# cwd-relative paths, but procd starts services with cwd "/". Run each from
 	# $OPENUF_DIR via `sh -c "cd ... && exec lua ..."` so those loads resolve.
 	#
-	# config.l2_announce = false (conf.lua) skips the broadcaster entirely,
-	# for L3-only adoption. The instance is not started rather than started
-	# and exited: procd would respawn a self-exiting process forever.
-	#
-	# conf.lua dofiles its modelmap by relative path, so the check has to run
-	# from $OPENUF_DIR. Anything unexpected (missing lua, unreadable conf)
-	# leaves the value empty and the broadcaster starts -- fail open, since
-	# that is the documented default.
-	l2=$(cd "$OPENUF_DIR" 2>/dev/null && lua -e 'dofile("conf.lua")
-		print((config and config.l2_announce == false) and "off" or "on")' 2>/dev/null)
-	if [ "$l2" != "off" ]; then
+	# One probe answers two questions. Does the configuration load: conf.lua,
+	# then /etc/config/openuf on top when it has a main section (uciconf.lua)
+	# -- a configuration that does not load is refused here, with the reason,
+	# rather than started as a daemon procd respawns every few seconds. And
+	# is the L2 broadcaster wanted: config.l2_announce = false skips it, for
+	# L3-only adoption; the instance is not started rather than started and
+	# exited, since procd would respawn a self-exiting process forever.
+	# Anything else unexpected (no lua) leaves the probe empty and the
+	# broadcaster starts -- fail open, since that is the documented default.
+	probe=$(cd "$OPENUF_DIR" 2>/dev/null && lua -e '
+		local ok, err = pcall(dofile, "conf.lua")
+		if ok then ok, err = pcall(function() dofile("uciconf.lua").apply() end) end
+		if not ok then print("error " .. tostring(err)) return end
+		print((config and config.l2_announce == false) and "off" or "on")' 2>&1)
+	case "$probe" in
+		error*)
+			echo "openuf: not starting: ${probe#error }" >&2
+			return 1
+			;;
+	esac
+	if [ "$probe" != "off" ]; then
 		procd_open_instance announce
 		procd_set_param command /bin/sh -c "cd '$OPENUF_DIR' && exec lua announce.lua"
 		procd_set_param respawn 3600 5 0
@@ -64,7 +83,19 @@ stop_service() {
 	return 0
 }
 
-# NO service_triggers(). A procd_add_reload_trigger on "network"/"wireless" was
+service_triggers() {
+	# Only openUF's own UCI file: a LuCI "Save & Apply" on /etc/config/openuf
+	# has to restart the daemons, which read the modelmap, the identity and
+	# the options once at start. "network"/"wireless" are deliberately NOT
+	# here -- see the note below.
+	procd_add_reload_trigger "openuf"
+}
+
+reload_service() {
+	restart
+}
+
+# No trigger on "network"/"wireless". A procd_add_reload_trigger on those was
 # registered here and was unwired in both directions. It never fired for
 # openUF's own writes -- those go through libuci-lua, which does not emit the
 # ubus config.change event procd listens for -- and when something else fired

@@ -168,6 +168,12 @@ case "$ACTION" in
 
 		# Create state directory
 		mkdir -p "$STATE_DIR"
+		# The UCI file the OpenWrt package and its LuCI app configure openUF
+		# through. Created EMPTY here: uciconf.lua only takes over when the
+		# file has a `main` section, so a tarball install keeps running as its
+		# conf.lua says -- but LuCI's uci.load() rejects a file that does not
+		# exist, and the Settings page could not create it on first save.
+		[ -e /etc/config/openuf ] || : > /etc/config/openuf
 
 		# Keep the device's identity across a firmware upgrade.
 		# sysupgrade preserves /etc/config and a short built-in list; it knows
@@ -205,6 +211,14 @@ case "$ACTION" in
 		# Symlink syswrapper.sh into PATH
 		ln -sf "$INSTALL_DIR/hook/syswrapper.sh" "$BIN_LINK"
 		chmod +x "$BIN_LINK"
+		# And the command-line front door (`openuf status`, `openuf --version`),
+		# the same one the OpenWrt package installs.
+		ln -sf "$INSTALL_DIR/hook/openuf-cli.sh" /usr/bin/openuf
+		chmod +x "$INSTALL_DIR/hook/openuf-cli.sh"
+		# The router-to-AP conversion as a command (setup.sh's last phase),
+		# for the LuCI app's button and for --revert.
+		ln -sf "$INSTALL_DIR/hook/openuf-convert.sh" /usr/sbin/openuf-convert
+		chmod +x "$INSTALL_DIR/hook/openuf-convert.sh"
 
 		# The updater, as a command. Copied rather than symlinked: it has to
 		# survive its own `rm -rf /opt/openuf` during a rollback.
@@ -441,7 +455,7 @@ case "$ACTION" in
 		fi
 
 		# Remove symlink, and the updater command
-		rm -f "$BIN_LINK" /usr/bin/openuf-update
+		rm -f "$BIN_LINK" /usr/bin/openuf-update /usr/bin/openuf /usr/sbin/openuf-convert
 
 		# The controller's cron jobs (sysconf.lua) call the symlink just
 		# removed; take openUF's marked block out of root's crontab so crond

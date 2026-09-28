@@ -1,0 +1,20 @@
+{
+	"model": { "id": "tplink,archer-c5-v1", "name": "TP-Link Archer C5 v1" },
+	"switch": { "switch0": { "enable": true, "reset": true,
+		"ports": [
+			{ "num": 0, "device": "eth1", "need_tag": false, "want_untag": true },
+			{ "num": 2, "role": "lan" }, { "num": 3, "role": "lan" }, { "num": 4, "role": "lan" }, { "num": 5, "role": "lan" },
+			{ "num": 6, "device": "eth0", "need_tag": false, "want_untag": true },
+			{ "num": 1, "role": "wan" }
+		],
+		"roles": [ { "role": "lan", "ports": "2 3 4 5 0", "device": "eth1" }, { "role": "wan", "ports": "1 6", "device": "eth0" } ] } },
+	"network": {
+		"lan": { "device": "eth1", "protocol": "static" },
+		"wan": { "device": "eth0", "protocol": "dhcp" }
+	},
+	"led": { "wlan2g": { "name": "WLAN2G", "sysfs": "blue:wlan2g", "trigger": "phy1tpt" } },
+	"wlan": {
+		"phy0": { "path": "pci0000:00/0000:00:00.0", "info": { "bands": { "5G": { "ht": true, "vht": true, "max_width": 80, "modes": [ "NOHT", "HT20", "VHT20", "HT40", "VHT40", "VHT80" ], "default_channel": 36 } } } },
+		"phy1": { "path": "platform/ahb/18100000.wmac", "info": { "bands": { "2G": { "ht": true, "max_width": 40, "modes": [ "NOHT", "HT20", "HT40" ], "default_channel": 1 } } } }
+	}
+}
