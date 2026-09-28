@@ -1,55 +1,103 @@
-# On a version tag: prove the tree, publish the source archive the OpenWrt
-# package fetches, build the package with the OpenWrt SDK for both package
-# formats, and attach everything to the GitHub release.
+# Release: prove the tree, publish the source archive the OpenWrt package
+# fetches, build the packages with the OpenWrt SDK for both package formats,
+# and attach everything to the GitHub release.
+#
+# How a release starts:
+#   Actions -> Release -> "Run workflow": pick the branch, then whether this
+#   is a patch, minor or major release. The run finds the newest version tag,
+#   raises that part, and -- only once the tree has passed verification --
+#   creates the tag on the chosen branch and the release with generated
+#   notes. A run that fails verification leaves no tag and no release behind.
+#   A tag pushed by hand (git push origin v0.1.0) or a release published in
+#   the web UI is built the same way: the run creates the release if there is
+#   none and attaches the files to it if there is. What this workflow creates
+#   with the built-in token never re-triggers it, so a run never doubles.
 #
 # The package Makefile (package/openuf/Makefile) is a feed-style Makefile: it
-# downloads openuf-<version>.tar.xz from the release by PKG_SOURCE_URL and
+# downloads openuf-<version>.tar.gz from the release by PKG_SOURCE_URL and
 # checks PKG_HASH. So the archive has to be on the release before the SDK
-# runs, and the Makefile's version and hash are substituted from the tag here.
-# Both packages are architecture-independent (PKGARCH:=all), so one SDK per
-# package format is enough: 24.10 produces .ipk (opkg), 25.12 produces .apk.
+# runs, and the Makefile's version, hash and download URL are substituted
+# from the tag here. Both packages are architecture-independent
+# (PKGARCH:=all), so one SDK per package format is enough: 24.10 produces
+# .ipk (opkg), 25.12 produces .apk.
 name: Release
-# Three ways to start a release, all ending in the same run:
-#   1. push a tag:            git tag v0.1.0 && git push origin v0.1.0
-#      (the release is created by the run, with generated notes)
-#   2. publish a release in the web UI (draft it, then "Publish release":
-#      a draft fires nothing) -- the run attaches the packages to it
-#   3. Actions -> Release -> "Run workflow" with an existing tag, to rebuild
-#      or to build a release that was made before this file existed
-# The first release (0.0.1) was made in the web UI while this file only
-# listened for pushed v*.*.* tags, so nothing ran and it has no assets.
 on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part of the newest version tag this release raises"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: true
   push:
     tags: ["v[0-9]*", "[0-9]*"]
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to build (must exist), e.g. v0.1.0"
-        required: true
-        type: string
 permissions:
   contents: write
-env:
-  # The tag this run releases, whichever way it started.
-  TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
 # A release created in the web UI with a NEW tag fires both `push` and
-# `release`; serialise the two so they do not upload the same files at once.
+# `release`; serialise the pair so they do not upload the same files at once.
 concurrency:
-  group: release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  group: release-${{ github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 jobs:
-  verify:
-    name: Verify and publish the source archive
+  version:
+    name: Decide the version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.meta.outputs.version }}
-      sha256: ${{ steps.meta.outputs.sha256 }}
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
+          fetch-depth: 0   # every tag, to find the newest version
+      - id: pick
+        env:
+          BUMP: ${{ inputs.bump }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch)
+              # The newest vX.Y.Z (or X.Y.Z) tag anywhere in the repository,
+              # by number rather than by date; no tag yet means 0.0.0.
+              latest=$(git tag -l | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+              : "${latest:=0.0.0}"
+              major=${latest%%.*}; rest=${latest#*.}; minor=${rest%%.*}; patch=${rest#*.}
+              case "$BUMP" in
+                major) major=$((major + 1)); minor=0; patch=0 ;;
+                minor) minor=$((minor + 1)); patch=0 ;;
+                patch) patch=$((patch + 1)) ;;
+                *) echo "unknown bump '$BUMP'" >&2; exit 1 ;;
+              esac
+              tag="v$major.$minor.$patch"
+              if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+                echo "tag $tag already exists" >&2; exit 1
+              fi
+              echo "newest version tag $latest, $BUMP release: $tag"
+              ;;
+            release) tag="$RELEASE_TAG" ;;
+            *)       tag="$GITHUB_REF_NAME" ;;
+          esac
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing **$tag** (version $version) from \`$GITHUB_REF_NAME\` at $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Verify, then create the release with the source archive
+    needs: version
+    runs-on: ubuntu-latest
+    outputs:
+      sha256: ${{ steps.meta.outputs.sha256 }}
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      # The event's own commit: the chosen branch's head, or the tag's commit.
+      - uses: actions/checkout@v4
       - name: Install Lua 5.1 and the bindings the suite needs
         run: |
           sudo apt-get update -qq
@@ -66,27 +114,29 @@ jobs:
       - name: Build the archives (dist.sh --verify runs the suite on the stripped tree)
         id: meta
         run: |
-          version="${TAG#v}"
-          echo "releasing tag $TAG as version $version"
-          sh tools/release-archive.sh "$version"
+          sh tools/release-archive.sh "$VERSION"
           sha256sum openuf.tar.gz > openuf.tar.gz.sha256
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "sha256=$(cut -d' ' -f1 "openuf-$version.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
-      - name: Publish the source archives
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          files: |
-            openuf-*.tar.gz
-            openuf-*.tar.gz.sha256
-            openuf.tar.gz
-            openuf.tar.gz.sha256
-          generate_release_notes: true
+          echo "sha256=$(cut -d' ' -f1 "openuf-$VERSION.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
+      - name: Create the release (and its tag) unless it exists, then attach the source archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            # A tag that does not exist yet is created at this run's commit.
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "openUF $TAG" --generate-notes
+          fi
+          gh release upload "$TAG" --clobber \
+            openuf-"$VERSION".tar.gz openuf-"$VERSION".tar.gz.sha256 openuf.tar.gz openuf.tar.gz.sha256
 
   packages:
     name: Build ${{ matrix.format }} with the ${{ matrix.sdk }} SDK
-    needs: verify
+    needs: [version, verify]
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA256: ${{ needs.verify.outputs.sha256 }}
     strategy:
       fail-fast: false
       matrix:
@@ -99,15 +149,12 @@ jobs:
             format: apk
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
-      - name: Point the Makefile at this tag's archive
+      - name: Point the Makefiles at this release's archive
         run: |
-          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ needs.verify.outputs.version }}/" package/openuf/Makefile
-          sed -i "s/^PKG_HASH:=.*/PKG_HASH:=${{ needs.verify.outputs.sha256 }}/" package/openuf/Makefile
-          # The Makefile's URL says v<version>; the tag being built may lack the v.
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VERSION/" package/openuf/Makefile package/luci-app-openuf/Makefile
+          sed -i "s/^PKG_HASH:=.*/PKG_HASH:=$SHA256/" package/openuf/Makefile
+          # The committed URL says v<version>; a tag made by hand may lack the v.
           sed -i "s|/releases/download/[^/]*/|/releases/download/$TAG/|" package/openuf/Makefile
-          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ needs.verify.outputs.version }}/" package/luci-app-openuf/Makefile
           grep -E '^PKG_(VERSION|HASH|SOURCE_URL):=' package/openuf/Makefile
       - name: Build with the OpenWrt SDK
         uses: openwrt/gh-action-sdk@main
@@ -128,7 +175,7 @@ jobs:
           name: openuf-${{ matrix.format }}
           path: out/*
       - name: Attach the packages to the release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.TAG }}
-          files: out/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" --clobber out/*

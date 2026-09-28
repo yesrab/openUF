@@ -103,18 +103,25 @@ reset-inform|11k-scan`, `uci openuf`; write `ubus luci.openuf convert/revert`, `
 
 ## Release workflow (GitHub Actions)
 
-Three ways to start it, all the same run: push a tag (`git tag v0.1.0 && git push origin
-v0.1.0`; the run creates the release with generated notes), publish a release in the web
-UI (a *draft* fires nothing until "Publish release"; the run attaches the packages to it),
-or *Actions → Release → Run workflow* with an existing tag (a rebuild, or a release made
-before the workflow listened for it). The run resolves the tag once (`TAG`), checks out
-that tag, and names it on every upload, so the three paths cannot drift. A release created
-in the web UI with a new tag fires both `push` and `release`; a concurrency group keyed on
-the tag serialises the pair. `v0.1.0` is the convention (the package Makefile's download
-URL says `v<version>`), and a bare `0.1.0` builds too: the URL is rewritten to the actual
-tag. Learned the hard way: release `0.0.1` (2026-09-28) was published from the web UI
-while the workflow listened only for pushed `v*.*.*` tags, so nothing ran and it has no
-assets; `Run workflow` with `0.0.1` is what builds it.
+*Actions → Release → Run workflow*: pick the branch, then whether this is a **patch, minor
+or major** release. The run finds the newest version tag by number (`v0.0.1` and `0.0.1`
+both count; none means `0.0.0`), raises that part, refuses if the tag exists, and only
+once the tree has passed verification creates the tag on the chosen branch and the
+release with generated notes, so a failed run leaves no tag and no release behind. The
+tag is the version: `PKG_VERSION`, `PKG_HASH` and the download URL in the Makefiles are
+substituted from it in the build and never committed by the run. A tag pushed by hand
+(`git push origin v0.1.0`) or a release published in the web UI (a *draft* fires nothing
+until "Publish release") is built the same way: the run creates the release if there is
+none and attaches the files if there is. Everything the run creates with the built-in
+token never re-triggers the workflow, and a release made in the web UI with a new tag
+(which fires `push` and `release` together) is serialised by a concurrency group.
+
+Two lessons from the first attempts (2026-09-28/29): release `0.0.1` was published from
+the web UI while the workflow listened only for pushed `v*.*.*` tags, so nothing ran; and
+`softprops/action-gh-release` updating that release failed with "Invalid
+target_commitish" because it re-sends the release's recorded target, the `packaging`
+branch, which had been deleted after its merge. The run now uses `gh` and never updates
+a release, only creates one or uploads to it.
 
 1. **verify**: Lua 5.1 + luarocks, `lua tests/run_tests.lua`, `sh tools/dist.sh --verify`,
    `bash -n` and `dash -n` on the shell files; upload `openuf-<ver>.tar.gz` as the release
