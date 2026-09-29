@@ -47,28 +47,21 @@ function kmod(name) {
 
 const IPV4 = /^([0-9]{1,3}\.){3}[0-9]{1,3}$/;
 
-// The feature packages openuf does not depend on -- each is larger than the
-// daemon -- with what each one unlocks. The overview lists the missing ones
-// with the install command rather than installing anything itself.
-function optional_packages() {
-	return [
-		{ pkg: 'nftables', present: access('/usr/sbin/nft', 'x'),
-		  unlocks: 'client blocking, multicast/broadcast blocker, L2 hardening' },
-		{ pkg: 'kmod-nft-bridge', present: kmod('nft_meta_bridge'),
-		  unlocks: 'the blocker and L2 hardening rules (bridge meta match)' },
-		{ pkg: 'tc-tiny', present: access('/sbin/tc', 'x') || access('/usr/sbin/tc', 'x'),
-		  unlocks: 'WiFi speed limit' },
-		{ pkg: 'kmod-sched-act-police', present: kmod('act_police'),
-		  unlocks: 'the upload half of the WiFi speed limit' },
-		{ pkg: 'usteer', present: access('/sbin/usteerd', 'x') || access('/usr/sbin/usteerd', 'x'),
-		  unlocks: 'band steering, roaming assistant' },
-		{ pkg: 'hostapd-utils', present: access('/usr/sbin/hostapd_cli', 'x'),
-		  unlocks: 'client kick, minimum RSSI, WiFi Experience ceilings' },
-		{ pkg: 'wpad (full build)', present: shell_ok('grep -q bss_transition /usr/sbin/hostapd'),
-		  unlocks: '802.11k/v, band steering, roaming assistant' },
-		{ pkg: 'lldpd', present: access('/usr/sbin/lldpd', 'x'),
-		  unlocks: 'topology (the parent device in the controller)' }
-	];
+// What openUF needs installed, from `openuf deps --check`
+// (hook/openuf-deps.sh): the hostapd build -- full or basic, and the one
+// thing the package cannot pull in by itself -- and every package with what
+// it unlocks. Never throws: a command that is not there reads as unknown.
+function deps_state() {
+	const r = run('/usr/bin/openuf deps --check');
+	let doc = null;
+	if (r.code == 0) {
+		try { doc = json(r.output); } catch (e) { doc = null; }
+	}
+	if (type(doc) == 'object')
+		return doc;
+	return { wpad: { installed: null, full: null, suggested: null, choices: [] },
+	         packages: [], missing: [], ok: null,
+	         error: trim(r.output) || '`openuf deps --check` produced nothing' };
 }
 
 // openuf-convert --check, parsed. Never throws: an absent command reads as
@@ -102,7 +95,7 @@ const methods = {
 				running: shell_ok('/etc/init.d/openuf running'),
 				enabled: shell_ok('/etc/init.d/openuf enabled')
 			};
-			s.optional = optional_packages();
+			s.deps = deps_state();
 			s.convert = convert_state();
 			return s;
 		}

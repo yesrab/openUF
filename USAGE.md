@@ -2,9 +2,30 @@
 
 ## 1. Dependencies
 
-Install the following apk packages on the OpenWrt device before running openUF.
-OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10 and earlier substitute
-`opkg update` / `opkg install`.
+The `openuf` package (§ 2) depends on every package below except the wpad build,
+so a package install pulls them in; this list is for a tarball install, and for
+knowing what each one is for. OpenWrt 25.12 replaced `opkg` with `apk`; on 24.10
+and earlier substitute `opkg update` / `opkg install`.
+
+**A full wpad build is not negotiable.** Every WiFi network the controller pushes
+carries the 802.11v `bss_transition` option, which a `wpad-basic-*` build rejects
+as unknown and takes the radio down with: the device is adopted, silent, and
+has no WiFi. openUF therefore refuses to start until a full build is installed
+(the log says so, naming the fix). No package dependency can say "any full
+build" (every wpad variant provides the same names), so the swap is a command:
+
+```sh
+openuf deps --check                          # what is installed and what is missing, as JSON
+openuf deps --install                        # install what is missing and swap a basic wpad
+openuf deps --install --wpad wolfssl         # ...for a full build of another crypto library
+```
+
+The swap replaces the basic build with the full one of the **same** crypto
+library (`wpad-basic-mbedtls` → `wpad-mbedtls`), so no second TLS library lands on
+the flash; `--wpad openssl|wolfssl|mbedtls` chooses another. The radios are down
+for about ten seconds in between, then brought back up on the new build and
+openUF is restarted, so run it over a cable. The LuCI overview offers the same
+as a button. `install.sh` and `setup.sh` run the swap themselves.
 
 ```sh
 apk update
@@ -226,9 +247,14 @@ connected through. The configuration files it touches are saved to
 and `--revert` restores from. Every unknown is a refusal, for the same reason `setup.sh`
 refuses: a wrong guess is a device that does not come back from the reboot.
 
-The optional feature packages are not dependencies (each is larger than openUF): install
-`nftables kmod-nft-bridge tc-tiny kmod-sched-act-police usteer hostapd-utils` and a full
-`wpad-*` build as § 1 describes, and openUF logs by name what it cannot enforce without them.
+The package depends on everything openUF works through (`nftables`,
+`kmod-nft-bridge`, `tc-tiny`, `kmod-sched-act-police`, `usteer`, `hostapd-utils`,
+`ip-bridge`, `lldpd`, the Lua bindings), so one install brings them all. The one
+thing it cannot bring is a **full wpad build**, which OpenWrt cannot express as a
+dependency: on a stock image the service refuses to start until `openuf deps
+--install` (or the button on the LuCI overview) has replaced the `wpad-basic-*`
+build with the full one of the same crypto library. The package's install
+message says so when it applies; § 1 has the why.
 
 ### By hand
 

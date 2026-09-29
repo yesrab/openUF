@@ -107,31 +107,92 @@ function deviceBlock(s) {
 	return table(rows);
 }
 
-function optionalBlock(s) {
+// What openUF needs installed. The package brings every dependency in
+// except the hostapd build: every wpad variant provides the same names, so
+// no dependency can say "a full one", and a wpad-basic-* build rejects the
+// 802.11v option every controller WLAN carries and takes the radio down.
+// openUF refuses to start until a full build is there; the button below
+// runs `openuf deps --install`, which does the swap and installs whatever
+// else is missing. Rendered once, outside the polled block (see render()).
+function installButton(w, missing) {
+	const swap = (w.full === false);
+	const choices = arr(w.choices);
+	const select = E('select', { 'class': 'cbi-input-select' },
+		choices.map(c => E('option', { 'value': c, 'selected': (c == w.suggested) ? '' : null }, c)));
+	const label = swap
+		? (missing.length ? _('Replace hostapd with the full build and install the missing packages') : _('Replace hostapd with the full build'))
+		: _('Install the missing packages');
+	const btn = E('button', { 'class': 'btn cbi-button cbi-button-positive', 'click': function() {
+		const chosen = swap ? select.value : null;
+		ui.showModal(label, [
+			swap ? E('p', {}, _('%s is removed and %s installed. The radios are down for about ten seconds in between, then brought back up on the new build, and openUF is restarted. Do this over a cable, not over WiFi.').format(w.installed || _('the basic build'), chosen))
+			     : E('p', {}, _('The packages are downloaded from the OpenWrt repository and installed, then openUF is restarted. The device needs internet access for this.')),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')), ' ',
+				E('button', { 'class': 'btn cbi-button-positive', 'click': ui.createHandlerFn(this, function() {
+					const args = [ 'deps', '--install' ];
+					if (chosen)
+						args.push('--wpad', chosen.replace(/^(wpad|hostapd)-/, ''));
+					ui.showModal(_('Installing'), [ E('p', { 'class': 'spinning' }, _('Downloading and installing. This takes a minute or two; the page reloads when it is done.')) ]);
+					const close = E('div', { 'class': 'right' }, E('button', { 'class': 'btn', 'click': function() { window.location.reload(); } }, _('Close')));
+					return fs.exec_direct('/usr/bin/openuf', args, 'text', false, true).then(function(out) {
+						ui.showModal(label, [ E('pre', {}, out || _('(no output)')), close ]);
+					}).catch(function(e) {
+						ui.showModal(label, [ E('pre', {}, String(e.message || e)), close ]);
+					});
+				}) }, _('Go ahead'))
+			])
+		]);
+	} }, label);
+	return E('div', {}, swap ? [ E('label', {}, _('Full build to install: ')), ' ', select, ' ', btn ] : [ btn ]);
+}
+
+function softwareBlock(s) {
+	const d = s.deps || {};
+	const w = d.wpad || {};
+	const missing = arr(d.missing);
+	function installed(ok, mandatory, detail) {
+		if (ok)
+			return E('span', { 'class': 'label success' }, detail ? _('yes (%s)').format(detail) : _('yes'));
+		return E('span', { 'class': 'label ' + (mandatory ? 'danger' : 'warning') }, detail ? _('no: %s').format(detail) : _('no'));
+	}
 	const t = E('table', { 'class': 'table' }, [
 		E('tr', { 'class': 'tr table-titles' }, [
 			E('th', { 'class': 'th' }, _('Package')),
+			E('th', { 'class': 'th' }, _('Needed')),
 			E('th', { 'class': 'th' }, _('Installed')),
 			E('th', { 'class': 'th' }, _('Enables'))
 		])
 	]);
-	let missing = [];
-	for (const p of arr(s.optional)) {
-		if (!p.present)
-			missing.push(p.pkg);
+	// The hostapd build first: the one thing the package cannot pull in.
+	let build;
+	if (w.full === true)
+		build = installed(true, true, w.installed || _('not from a package'));
+	else if (w.full === false)
+		build = installed(false, true, w.installed || _('a basic build'));
+	else
+		build = E('em', {}, d.error || _('could not be determined'));
+	t.appendChild(E('tr', { 'class': 'tr' }, [
+		E('td', { 'class': 'td' }, _('wpad, full build')),
+		E('td', { 'class': 'td' }, _('mandatory')),
+		E('td', { 'class': 'td' }, build),
+		E('td', { 'class': 'td' }, _('802.11k/v, which every network from the controller uses; band steering, roaming assistant'))
+	]));
+	for (const p of arr(d.packages))
 		t.appendChild(E('tr', { 'class': 'tr' }, [
 			E('td', { 'class': 'td' }, p.pkg),
-			E('td', { 'class': 'td' }, p.present ? E('span', { 'class': 'label success' }, _('yes')) :
-				E('span', { 'class': 'label warning' }, _('no'))),
+			E('td', { 'class': 'td' }, p.required ? _('mandatory') : _('optional')),
+			E('td', { 'class': 'td' }, installed(p.present, p.required)),
 			E('td', { 'class': 'td' }, p.unlocks)
 		]));
-	}
-	const names = missing.filter(x => x.indexOf(' ') < 0).join(' ');
-	const note = missing.length ? E('p', {}, [
-		_('The features next to a missing package are simply left off; everything else works. To add them:'),
-		E('pre', {}, 'apk add %s   # or: opkg install %s'.format(names, names))
-	]) : E('p', {}, _('Every optional package is installed; all features are available.'));
-	return E('div', {}, [ t, note ]);
+	const parts = [ t ];
+	if (w.full === false)
+		parts.push(E('p', {}, _('openUF will not start with a basic hostapd build: it rejects the 802.11v option every network from the controller carries and takes the radio down with it. The full build of the same crypto library is suggested, so nothing else on the device changes and no extra flash is used.')));
+	if (missing.length)
+		parts.push(E('p', {}, _('A missing mandatory package stops openUF from running; a missing optional one leaves that feature off. Everything is installed from the OpenWrt package repository, so the device needs internet access for this.')));
+	if (w.full === false || missing.length)
+		parts.push(installButton(w, missing));
+	return E('div', {}, parts);
 }
 
 function wlanBlock(s) {
@@ -232,19 +293,25 @@ function body(s) {
 			s.config_error,
 			E('p', {}, _('Fix it on the Settings page or in /etc/config/openuf and restart openUF.'))
 		]));
+	if (s.deps && s.deps.wpad && s.deps.wpad.full === false)
+		parts.push(E('div', { 'class': 'alert-message error' }, [
+			E('strong', {}, _('openUF is not running: hostapd is a basic build (%s). ').format(s.deps.wpad.installed || 'wpad-basic')),
+			_('It has no 802.11v support, which every network from the controller needs. Replace it with the full build under "Software openUF needs" below.')
+		]));
 	if (s.config && s.config.debug_overrides)
 		parts.push(E('div', { 'class': 'alert-message warning' },
 			_('Testing overrides are active in conf.lua (debug_caps or debug_payload_extra): the device is telling the controller it supports things it may not. Clear them when the test is done.')));
 	parts.push(section(_('Controller connection'), controllerBlock(s)));
 	parts.push(section(_('This device'), deviceBlock(s)));
 	parts.push(section(_('WiFi networks from the controller'), wlanBlock(s)));
-	parts.push(section(_('Optional packages'), optionalBlock(s),
-		_('openUF does not depend on these packages because each is larger than openUF itself. Each one enables a feature.')));
-	const unsupported = (s.ledger || {}).entries || 0;
-	parts.push(section(_('Controller features not supported yet'), E('p', {},
-		unsupported ? _('The controller has sent %d kinds of setting or command that this version of openUF does not act on. That is normal: openUF records them in %s (passwords removed) so its developers can see what to build next. Nothing needs your attention.').format(unsupported, (s.ledger || {}).file || '/etc/openuf/unhandled.json')
-			: _('The controller has not sent anything this version of openUF does not handle.'))));
 	return E('div', {}, parts);
+}
+
+function ledgerBlock(s) {
+	const unsupported = (s.ledger || {}).entries || 0;
+	return section(_('Controller features not supported yet'), E('p', {},
+		unsupported ? _('The controller has sent %d kinds of setting or command that this version of openUF does not act on. That is normal: openUF records them in %s (passwords removed) so its developers can see what to build next. Nothing needs your attention.').format(unsupported, (s.ledger || {}).file || '/etc/openuf/unhandled.json')
+			: _('The controller has not sent anything this version of openUF does not handle.')));
 }
 
 return view.extend({
@@ -259,11 +326,19 @@ return view.extend({
 			E('h2', {}, _('openUF')),
 			E('p', { 'class': 'cbi-section-descr' }, _('This OpenWrt device presents itself to a UniFi Network Application as a Ubiquiti access point. This page refreshes every ten seconds.')),
 			E('div', { 'id': 'openuf-status' }, body(status)),
+			// Not polled: it holds the install button and its dropdown, and
+			// the answer changes only when the button has done its work,
+			// after which the page reloads.
+			section(_('Software openUF needs'), softwareBlock(status),
+				_('The OpenWrt packages openUF works through, and the hostapd build. The openuf package brings every one of them in except the hostapd build, which OpenWrt cannot express as a dependency.')),
+			// Polled on its own so it can sit below the software section.
+			E('div', { 'id': 'openuf-ledger' }, ledgerBlock(status)),
 			actions(status)
 		]);
 		poll.add(function() {
 			return callStatus().then(function(s) {
 				dom.content(container.querySelector('#openuf-status'), body(s));
+				dom.content(container.querySelector('#openuf-ledger'), ledgerBlock(s));
 			});
 		}, 10);
 		return container;

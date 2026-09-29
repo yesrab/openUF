@@ -219,6 +219,9 @@ case "$ACTION" in
 		# for the LuCI app's button and for --revert.
 		ln -sf "$INSTALL_DIR/hook/openuf-convert.sh" /usr/sbin/openuf-convert
 		chmod +x "$INSTALL_DIR/hook/openuf-convert.sh"
+		# openuf-deps: what openUF needs installed, and the wpad swap.
+		ln -sf "$INSTALL_DIR/hook/openuf-deps.sh" /usr/sbin/openuf-deps
+		chmod +x "$INSTALL_DIR/hook/openuf-deps.sh"
 
 		# The updater, as a command. Copied rather than symlinked: it has to
 		# survive its own `rm -rf /opt/openuf` during a rollback.
@@ -329,26 +332,14 @@ case "$ACTION" in
 			https*) try_optional luasec "TLS for the https:// inform URL" ;;
 		esac
 
-		# A full wpad build. BSS Transition and Band Steering need real
-		# 802.11k/v support: wpad-basic-* lacks bss_transition entirely and
-		# errors with "unknown configuration item 'bss_transition'". Any full
-		# build provides it -- checking only for wolfssl/openssl would miss a
-		# device already shipping wpad-mbedtls (the OpenWrt 25.12 ath79
-		# default) and needlessly swap out a working hostapd, bouncing every
-		# SSID on the device for no gain.
-		HAVE_WPAD=0
-		for pkg in wpad wpad-wolfssl wpad-openssl wpad-mbedtls; do
-			if pkg_installed "$pkg"; then
-				HAVE_WPAD=1
-				break
-			fi
-		done
-		if [ "$HAVE_WPAD" = "0" ]; then
-			echo "Installing a full wpad build (BSS Transition / Band Steering) ..."
-			pkg_add wpad-wolfssl \
-				|| pkg_add wpad-openssl \
-				|| pkg_add wpad-mbedtls \
-				|| echo "WARNING: failed to install a full wpad build -- BSS Transition and Band Steering will not function (wpad-basic-* lacks 802.11v support)."
+		# A full wpad build, not negotiable: every controller-pushed WLAN
+		# carries bss_transition, which wpad-basic-* rejects and takes the
+		# radio down with. The swap -- the same crypto library, so no extra
+		# flash; the radios bounce once -- lives in hook/openuf-deps.sh, the
+		# command the LuCI overview's button runs too. The init script
+		# refuses to start until a full build is in place.
+		if ! "$INSTALL_DIR/hook/openuf-deps.sh" --install --only-wpad; then
+			echo "WARNING: no full wpad build is installed -- openUF will not start until there is one (openuf deps --install)."
 		fi
 
 		# Enable and start services
@@ -455,7 +446,7 @@ case "$ACTION" in
 		fi
 
 		# Remove symlink, and the updater command
-		rm -f "$BIN_LINK" /usr/bin/openuf-update /usr/bin/openuf /usr/sbin/openuf-convert
+		rm -f "$BIN_LINK" /usr/bin/openuf-update /usr/bin/openuf /usr/sbin/openuf-convert /usr/sbin/openuf-deps
 
 		# The controller's cron jobs (sysconf.lua) call the symlink just
 		# removed; take openUF's marked block out of root's crontab so crond

@@ -32,7 +32,9 @@ define Package/openuf
   SUBMENU:=Wireless
   TITLE:=UniFi access point emulation
   URL:=https://github.com/yesrab/openUF
-  DEPENDS:=+lua +luabitop +lua-cjson +libuci-lua +lua-openssl +lldpd
+  DEPENDS:=+lua +luabitop +lua-cjson +luasocket +lua-openssl +libuci-lua +iw \
+	+lldpd +ip-bridge +hostapd-utils +usteer +nftables +kmod-nft-bridge \
+	+tc-tiny +kmod-sched-act-police
   PKGARCH:=all
 endef
 
@@ -45,15 +47,25 @@ define Package/openuf/description
   presets or a custom one, the identity to present, the inform URL). The web
   front end is luci-app-openuf.
 
-  Optional features need packages this one does not depend on, since each is
-  larger than openUF itself: nftables and kmod-nft-bridge (client blocking,
-  the broadcast filter, L2 hardening), tc-tiny and kmod-sched-act-police
-  (WiFi speed limits), usteer and a full wpad build (band steering, roaming
-  assistant). openUF logs which are missing.
+  Needs a FULL wpad build (wpad-openssl, wpad-wolfssl or wpad-mbedtls; a
+  wpad-basic-* build rejects the 802.11v option every controller WLAN
+  carries and takes the radio down). No dependency can say "any full
+  build", so `openuf deps --install` -- also a button on the LuCI
+  overview -- replaces the basic build with the full one of the same
+  crypto library; the service refuses to start until then.
 endef
 
 define Package/openuf/conffiles
 /etc/config/openuf
+endef
+
+# Sourced by default_postinst on the device (never at image build time):
+# the one dependency the package cannot pull in is named, with the fix.
+define Package/openuf/postinst-pkg
+if [ -z "$${IPKG_INSTROOT}" ] && ! grep -q bss_transition /usr/sbin/hostapd 2>/dev/null; then
+	echo "openuf: hostapd is a basic build (no 802.11v): openUF will not start until a full wpad is installed." >&2
+	echo "openuf: run 'openuf deps --install', or use the button on LuCI's openUF overview." >&2
+fi
 endef
 
 define Build/Configure
@@ -81,6 +93,7 @@ define Package/openuf/install
 	$(LN) ../lib/openuf/hook/openuf-cli.sh $(1)/usr/bin/openuf
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(LN) ../lib/openuf/hook/openuf-convert.sh $(1)/usr/sbin/openuf-convert
+	$(LN) ../lib/openuf/hook/openuf-deps.sh $(1)/usr/sbin/openuf-deps
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/openuf/etc/init.d/openuf $(1)/etc/init.d/openuf
 	$(INSTALL_DIR) $(1)/etc/config

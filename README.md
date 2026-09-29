@@ -180,10 +180,16 @@ The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi ident
 release workflow): `apk add --allow-untrusted ./openuf_<ver>_all.apk`, set
 `openuf.main.inform_url` if your controller is not reachable as `unifi`, start the service.
 The configuration is `/etc/config/openuf`; see [USAGE § 2](USAGE.md#as-an-openwrt-package).
-`luci-app-openuf` adds *Services → openUF* to LuCI (24.10 and later): status, every option
-with a plain-language description, a custom hardware profile filled in from what the board
-reports, an export of that profile as a file to contribute, and the conversion into an AP
-(WAN off, DHCP and firewall off) as a button; from the shell that is `openuf-convert`.
+The package depends on everything openUF uses except a **full wpad build**, which OpenWrt
+cannot express as a dependency and which is not negotiable (a `wpad-basic-*` build rejects
+the 802.11v option every controller WLAN carries and takes the radio down): `openuf deps
+--install` swaps the basic build for the full one of the same crypto library, and the
+service refuses to start until that has happened.
+`luci-app-openuf` adds *Services → openUF* to LuCI (24.10 and later): status, the wpad swap
+and missing packages as a button, every option with a plain-language description, a custom
+hardware profile filled in from what the board reports, an export of that profile as a file
+to contribute, and the conversion into an AP (WAN off, DHCP and firewall off) as a button;
+from the shell that is `openuf-convert`.
 
 One command on the device, over SSH:
 

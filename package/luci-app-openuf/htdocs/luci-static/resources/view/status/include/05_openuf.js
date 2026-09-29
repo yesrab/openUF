@@ -35,7 +35,10 @@ return baseclass.extend({
 			return E('em', {}, _('openUF is not answering.'));
 		const st = s.state || {}, h = s.health || {}, mm = s.modelmap || {}, id = s.identity || {};
 		let adoption;
-		if (!s.service || !s.service.running)
+		const wpad = (s.deps || {}).wpad || {};
+		if (wpad.full === false)
+			adoption = E('span', { 'class': 'label danger' }, _('not running: hostapd is a basic build, see Services → openUF'));
+		else if (!s.service || !s.service.running)
 			adoption = E('span', { 'class': 'label danger' }, _('openUF is not running'));
 		else if (s.config_error)
 			adoption = E('span', { 'class': 'label danger' }, _('configuration error, see Services → openUF'));

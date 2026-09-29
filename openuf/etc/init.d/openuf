@@ -34,6 +34,17 @@ start_service() {
 	# exited, since procd would respawn a self-exiting process forever.
 	# Anything else unexpected (no lua) leaves the probe empty and the
 	# broadcaster starts -- fail open, since that is the documented default.
+	# A full hostapd build is not negotiable. Every WLAN the controller
+	# pushes carries bss_transition (802.11v), which a wpad-basic-* build
+	# rejects as an unknown option and takes the whole radio down with:
+	# adopted, silent, no WiFi. Refused here instead, naming the fix --
+	# `openuf deps --install` (also a button on the LuCI overview) replaces
+	# the basic build with the full one of the same crypto library.
+	if ! grep -q bss_transition /usr/sbin/hostapd 2>/dev/null; then
+		echo "openuf: not starting: hostapd has no 802.11v support (a wpad-basic build, or none)" >&2
+		echo "openuf: install a full wpad build: openuf deps --install" >&2
+		return 1
+	fi
 	probe=$(cd "$OPENUF_DIR" 2>/dev/null && lua -e '
 		local ok, err = pcall(dofile, "conf.lua")
 		if ok then ok, err = pcall(function() dofile("uciconf.lua").apply() end) end

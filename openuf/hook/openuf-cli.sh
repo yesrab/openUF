@@ -9,6 +9,9 @@
 #   openuf start|stop|restart   the procd service
 #   openuf probe status|presets|discover|export
 #                               JSON for the web UI (hook/probe.lua)
+#   openuf deps --check | --install [--wpad mbedtls|openssl|wolfssl]
+#                               what openUF needs installed, and the swap of a
+#                               basic wpad for a full one (hook/openuf-deps.sh)
 #
 # The set-*/reset-*/11k-scan verbs are syswrapper.sh's, the hook the
 # controller itself drives over SSH; this wrapper only saves typing its name.
@@ -22,7 +25,7 @@ for d in /usr/lib/openuf /opt/openuf; do
 done
 
 usage() {
-	sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "$1" in
@@ -57,6 +60,11 @@ case "$1" in
 		# it has to run from the install directory).
 		[ -n "$DIR" ] || { echo "openuf: not installed" >&2; exit 1; }
 		cd "$DIR" && exec lua hook/probe.lua "$2"
+		;;
+	deps)
+		[ -n "$DIR" ] || { echo "openuf: not installed" >&2; exit 1; }
+		shift
+		exec "$DIR/hook/openuf-deps.sh" "$@"
 		;;
 	start|stop|restart|reload|enable|disable|running)
 		exec /etc/init.d/openuf "$1"

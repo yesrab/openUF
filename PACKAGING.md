@@ -48,7 +48,7 @@ openuf/uciconf.lua                /etc/config/openuf -> the `dev`/`config` table
 | Install prefix | `/usr/lib/openuf/` for the modules, presets and hook; `/usr/bin/syswrapper.sh` symlink (the controller's SSH adoption runs it by name); `/usr/bin/openuf` a tiny CLI (`--version`, `status`, `reset-inform`); `/etc/openuf/` for `state.json` and the ledger | Feed packages do not install under `/opt`. The cwd-relative `dofile` design stays: only the init script and the hook name the directory |
 | Configuration | `/etc/config/openuf` (UCI). `conf.lua` becomes a loader that builds today's `config`/`dev` tables from UCI; presets stay Lua files under `modelmap/` and `ufmodel/`; a custom map is UCI sections (`device`, `port`, `vlan`, `radio`, `identity`) turned into the same `dev` table by one loader that applies `test_modelmap.lua`'s invariants as refusals | LuCI forms edit UCI; the presets are tried and true and keep their tests |
 | Backend | ucode rpcd plugin `luci.openuf` under `/usr/share/rpcd/ucode/` (`rpcd-mod-ucode`, which `luci-base` already depends on) | Every current LuCI app with a backend is ucode or shell; Lua rpcd plugins are not what upstream takes |
-| Daemon deps | Hard: `+lua +luabitop +lua-cjson +libuci-lua +lua-openssl +lldpd`. Optional (runtime-checked, listed on the status page with the install command): `nftables`, `kmod-nft-bridge`, `tc-tiny`, `kmod-sched-act-police`, `usteer`, `hostapd-utils`, a full `wpad-*` | OpenWrt has no "any full wpad" dependency, and the optional set outweighs the daemon on 8 MB flash |
+| Daemon deps | Hard: `+lua +luabitop +lua-cjson +luasocket +lua-openssl +libuci-lua +iw +lldpd +ip-bridge +hostapd-utils +usteer +nftables +kmod-nft-bridge +tc-tiny +kmod-sched-act-police` (2026-09-29: the feature packages were optional at first; the user found the package install leaving features off and made them hard). Not expressible: a **full wpad build**, so `openuf deps --install` (hook/openuf-deps.sh, `/usr/sbin/openuf-deps`) swaps a `wpad-basic-*` for the full build of the same crypto library, the init script refuses to start without one, the package's postinst-pkg says so, and the LuCI overview has the button | Every wpad variant PROVIDES the same names, so no virtual package tells full from basic; naming one variant would CONFLICT with the stock `wpad-basic-*` and make the package uninstallable; a postinst cannot swap under the package manager's own lock |
 | Package source | `PKG_SOURCE_URL` = the GitHub release archive `openuf-<ver>.tar.gz` (gzip, not xz: busybox tar on a device cannot unpack xz, and the same archive serves a manual install), which the release workflow produces from `tools/dist.sh --verify` (comment-stripped, proven bytecode-identical, tests passed) | Feed rules want an official release archive; the stripped tree halves the installed size, and the proof stays in CI logs |
 | Version | `PKG_VERSION` from the tag `vX.Y.Z`; `PKG_RELEASE` reset to 1 on a version change; `BUILD` stamp kept | Feed convention |
 | Minimum target | LuCI app: OpenWrt 24.10 and later (ucode rpcd, JS LuCI); daemon: unchanged reach | Both package formats the release builds (`opkg` on 24.10, `apk` on 25.12) |
@@ -67,9 +67,11 @@ packages, `openuf-convert --check`. So the UI can never describe a configuration
 would read differently.
 
 - **Overview**: state and adoption, the profile and identity in use (and the refusal
-  reason when there is one), the pushed WiFi networks, the optional packages that are
-  missing with the install command, and Restart / Scan for neighbours / Forget the
-  controller behind confirmations. *Turn back into a router* appears only on a device
+  reason when there is one), the pushed WiFi networks, *Software openUF needs* (the
+  hostapd build, full or basic, and the missing packages, from `openuf deps --check`,
+  with the button that runs `openuf deps --install` through `fs.exec_direct` -- cgi-io,
+  no ubus timeout -- and reloads), and Restart / Scan for neighbours / Forget the
+  controller behind confirmations. A basic build is also a red banner at the top. *Turn back into a router* appears only on a device
   `openuf-convert` converted.
 - **Settings**: `form.Map('openuf')` on `openuf.main`, in tabs, every field with a
   fully descriptive label and a plain-language description. Two dropdowns, *Hardware
@@ -98,9 +100,10 @@ would read differently.
     DNS), "keep the WAN socket as WAN", and the warning that the address will change.
 - **Log**: `logread -e ^` (ubox's `-e daemon` matched nothing) filtered client-side.
 
-ACL: read `ubus luci.openuf getStatus/listPresets/discover/exportPreset/getConvertState`,
-`file exec` for `logread -e *`, `/etc/init.d/openuf start|stop|restart`, `openuf
-reset-inform|11k-scan`, `uci openuf`; write `ubus luci.openuf convert/revert`, `uci openuf`.
+ACL: read `cgi-io exec`, `ubus luci.openuf getStatus/listPresets/discover/exportPreset/
+getConvertState`, `file exec` for `logread -e *`, `/etc/init.d/openuf start|stop|restart`,
+`openuf reset-inform|11k-scan|deps --check`, `uci openuf`; write `ubus luci.openuf
+convert/revert`, `file exec openuf deps --install [*]`, `uci openuf`.
 
 ## Release workflow (GitHub Actions)
 

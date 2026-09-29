@@ -602,10 +602,16 @@ factory reset.
 - **A fresh OpenWrt ships every radio `disabled='1'`.** openUF writes that option only
   when the controller explicitly pushes a radio status, so a push that omits it leaves the
   radio off — provisioning "succeeds" and not one SSID is on the air. `setup.sh` clears it.
-- **`wpad-basic-*` has no `bss_transition` at all** and errors the radio down. A full build
-  is required for BSS Transition and Band Steering. `install.sh` cannot swap one out (the
-  packages conflict, so `add` without `del` fails) — `setup.sh` does, keeping the same
-  crypto library so it costs no extra flash.
+- **`wpad-basic-*` has no `bss_transition` at all** and errors the radio down, and every
+  controller-pushed WLAN carries it. A full build is therefore **not negotiable**: the init
+  script refuses to start without one (`grep bss_transition /usr/sbin/hostapd`), the
+  package's postinst-pkg says so, and `hook/openuf-deps.sh` (`openuf deps --install`,
+  `/usr/sbin/openuf-deps`, the LuCI overview's button) does the swap -- `del` the basic
+  build, `add` the full one of the same crypto library, put the basic one back if that
+  fails, `wifi up`, restart openUF -- and `--check` is the JSON the overview reads.
+  `install.sh` and `setup.sh` run it too. No package dependency can express "any full
+  build": every wpad variant PROVIDES the same names, and naming one CONFLICTS with the
+  stock basic one.
 - **lldpd's chassis ID must match `lan_cpueth`'s MAC** (`uci set
   lldpd.config.cid_interface=lan`) or the controller shows the wrong Parent Device: lldpd
   otherwise picks the lowest-numbered interface, which the gateway then learns under an ID
@@ -727,7 +733,9 @@ openuf/
                     openuf-cli.sh (/usr/bin/openuf), probe.lua (`openuf probe status|
                     presets|discover|export`, the one source the LuCI app reads),
                     openuf-convert.sh (/usr/sbin/openuf-convert: setup.sh's AP
-                    conversion as --check/--convert/--revert)
+                    conversion as --check/--convert/--revert), openuf-deps.sh
+                    (/usr/sbin/openuf-deps, `openuf deps`: what openUF needs
+                    installed as JSON, and the basic-to-full wpad swap)
   etc/init.d/openuf procd service: announce + inform instances; finds either prefix
 package/            the OpenWrt feed: openuf (net/) and luci-app-openuf (see PACKAGING.md)
 setup.sh            guided installer: AP conversion + deps + install

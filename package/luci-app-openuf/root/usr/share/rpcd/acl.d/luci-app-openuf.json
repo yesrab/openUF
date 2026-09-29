@@ -2,12 +2,14 @@
 	"luci-app-openuf": {
 		"description": "Grant access to LuCI app openUF",
 		"read": {
+			"cgi-io": [ "exec" ],
 			"ubus": {
 				"luci.openuf": [ "getStatus", "listPresets", "discover", "exportPreset", "getConvertState" ],
 				"file": [ "exec" ]
 			},
 			"file": {
 				"/sbin/logread -e *": [ "exec" ],
+				"/usr/bin/openuf deps --check": [ "exec" ],
 				"/etc/init.d/openuf restart": [ "exec" ],
 				"/etc/init.d/openuf start": [ "exec" ],
 				"/etc/init.d/openuf stop": [ "exec" ],
@@ -19,6 +21,10 @@
 		"write": {
 			"ubus": {
 				"luci.openuf": [ "convert", "revert" ]
+			},
+			"file": {
+				"/usr/bin/openuf deps --install": [ "exec" ],
+				"/usr/bin/openuf deps --install *": [ "exec" ]
 			},
 			"uci": [ "openuf" ]
 		}
