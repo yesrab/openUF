@@ -201,18 +201,30 @@ return {
 		end
 	},
 	{
-		name = "backhaul: parent_for_bssid() prefers the controller's parent, then the sibling element, never a guess",
+		name = "backhaul: parent_for_bssid() names the sibling behind the BSS joined, from the RAW scan entry, before the push's parent",
 		fn = function()
+			-- sysinfo.scan_table's entries carry the sibling element as peer_mac;
+			-- is_unifi/serialno exist only on the payload's scan_radio_table.
 			local si = {scan_table = function() return {
-				{bssid = "aa:bb:cc:dd:ee:ff", is_unifi = false},
-				{bssid = "7A:BB:C1:FE:3F:CB", is_unifi = true, serialno = "78:bb:c1:fe:3f:c9"},
+				{bssid = "aa:bb:cc:dd:ee:ff"},
+				{bssid = "7A:BB:C1:FE:3F:CB", peer_mac = "78:BB:C1:FE:3F:C9"},
 			} end}
-			assert_eq(backhaul.parent_for_bssid({backhaul_parent = "11:22:33:44:55:66"}, "7a:bb:c1:fe:3f:cb", "phy1-sta0", si),
-				"11:22:33:44:55:66", "the controller's priority-1 parent wins")
 			assert_eq(backhaul.parent_for_bssid({backhaul_parent = ""}, "7a:bb:c1:fe:3f:cb", "phy1-sta0", si),
-				"78:bb:c1:fe:3f:c9", "else the sibling element's serialno, case-insensitively")
-			assert_nil(backhaul.parent_for_bssid({backhaul_parent = ""}, "aa:bb:cc:dd:ee:ff", "phy1-sta0", si), "a non-sibling BSS: unknown")
-			assert_nil(backhaul.parent_for_bssid({backhaul_parent = ""}, "7a:bb:c1:fe:3f:cb", nil, si), "no interface to scan from: unknown")
+				"78:bb:c1:fe:3f:c9", "the raw entry's peer_mac, case-insensitively on both sides")
+			assert_eq(backhaul.parent_for_bssid({backhaul_parent = "11:22:33:44:55:66"}, "7a:bb:c1:fe:3f:cb", "phy1-sta0", si),
+				"78:bb:c1:fe:3f:c9", "the BSS actually joined beats the parent the last push named")
+			-- Payload-shaped entries still work (is_unifi + serialno).
+			local si2 = {scan_table = function() return {
+				{bssid = "7a:bb:c1:fe:3f:cb", is_unifi = true, serialno = "78:bb:c1:fe:3f:c9"},
+			} end}
+			assert_eq(backhaul.parent_for_bssid({}, "7a:bb:c1:fe:3f:cb", "phy1-sta0", si2), "78:bb:c1:fe:3f:c9", "decoded shape too")
+			-- The push's parent is the fallback, never the first word.
+			assert_eq(backhaul.parent_for_bssid({backhaul_parent = "11:22:33:44:55:66"}, "aa:bb:cc:dd:ee:ff", "phy1-sta0", si),
+				"11:22:33:44:55:66", "a BSS with no sibling element: the push's parent")
+			assert_eq(backhaul.parent_for_bssid({backhaul_parent = "11:22:33:44:55:66"}, "7a:bb:c1:fe:3f:cb", nil, si),
+				"11:22:33:44:55:66", "no interface to scan from: the push's parent")
+			assert_nil(backhaul.parent_for_bssid({backhaul_parent = ""}, "aa:bb:cc:dd:ee:ff", "phy1-sta0", si), "neither: unknown, never a guess")
+			assert_nil(backhaul.parent_for_bssid({backhaul_parent = ""}, "7a:bb:c1:fe:3f:cb", nil, si), "no interface and no push: unknown")
 		end
 	},
 	{

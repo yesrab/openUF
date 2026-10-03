@@ -1130,6 +1130,21 @@ and a wrong attribution is worse than none). This is the same first-class field 
 side already fills, which is why it was chosen over OUI games or renaming the station.
 Implemented on both APs' trees 2026-10-03; it runs on whichever AP is the parent.
 
+**The child's half had a cold-boot hole (found and fixed the same evening).** AP2 was
+powered off, cabled off, and powered on: the station joined AP1 in 40 s, informs flowed
+over the hop, AP1 named the child — and the controller still drew AP2 wired on the
+gateway's port 2. The uplink VAP's one station had no `serialno`: `parent_for_bssid()`
+tested the scan entries for `is_unifi`/`serialno`, which exist only on the payload's
+`scan_radio_table`; `sysinfo.scan_table()` returns the raw sibling element as `peer_mac`.
+The live test that day had passed because the controller's push names the parent
+(`mesh.serial1` → `st.backhaul_parent`), and a device that boots straight onto the air with
+a matching `cfgversion` never receives that push. The lookup now reads `peer_mac` too and
+prefers the BSS actually joined over the push's parent (which describes the push's
+topology, not where the station roamed to). Verified: the controller flipped AP2 to
+`uplink.type: wireless`, `uplink_mac` = AP1, `name: ath4`, −53 dBm, channel 100, within one
+heartbeat of the deploy. Lesson for the next field read off a scan entry: the two shapes
+differ, and a test with hand-built entries proves nothing about which one a caller gets.
+
 ## RF scans: Airtime Scan, Quick Scan and Radio AI's sweep — 2026-10-03
 
 Three different commands, one device-side job. Everything below is read from controller

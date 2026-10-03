@@ -193,18 +193,29 @@ end
 -- openUF AP's BSSes with its identity MAC as serialno). nil when unknown --
 -- never a guess, the controller would attribute the link to a wrong device.
 function M.parent_for_bssid(st, bssid, ifname, sysinfo)
-	if st and is_mac(st.backhaul_parent) then return st.backhaul_parent end
-	if not (is_mac(bssid) and sysinfo and sysinfo.scan_table and type(ifname) == "string") then
-		return nil
-	end
-	local ok_s, entries = pcall(sysinfo.scan_table, ifname)
-	if not (ok_s and type(entries) == "table") then return nil end
-	for _, e in ipairs(entries) do
-		if type(e) == "table" and type(e.bssid) == "string" and e.bssid:lower() == bssid:lower()
-				and e.is_unifi and is_mac(e.serialno) then
-			return e.serialno:lower()
+	-- The BSS actually joined decides. sysinfo.scan_table hands back RAW
+	-- entries: the sibling element is `peer_mac` there, and is_unifi/serialno
+	-- are only stamped on later, when inform.lua builds scan_radio_table --
+	-- the first version tested for those and so found nothing after a cold
+	-- boot (AP2, 2026-10-03: station up, informs fine, serialno nil, and the
+	-- controller fell back to the gateway's MAC table: "wired via port 2").
+	-- It had passed its live test only because the controller's push had
+	-- named the parent (mesh.serial1 -> st.backhaul_parent) -- which a boot
+	-- straight onto the air, with cfgversion matching, never receives.
+	if is_mac(bssid) and sysinfo and sysinfo.scan_table and type(ifname) == "string" then
+		local ok_s, entries = pcall(sysinfo.scan_table, ifname)
+		for _, e in ipairs((ok_s and type(entries) == "table") and entries or {}) do
+			if type(e) == "table" and type(e.bssid) == "string"
+					and e.bssid:lower() == bssid:lower() then
+				local sn = e.serialno or e.peer_mac
+				if (e.is_unifi or e.peer_mac) and is_mac(sn) then return sn:lower() end
+			end
 		end
 	end
+	-- Fallback: the parent the controller's last push named. Second, not
+	-- first: it describes the push's topology, and a station that has since
+	-- joined another parent's downlink must not be filed under the old one.
+	if st and is_mac(st.backhaul_parent) then return st.backhaul_parent:lower() end
 	return nil
 end
 
