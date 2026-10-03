@@ -34,7 +34,10 @@ keep_comments() {
 rm -rf "$BUILD"
 mkdir -p "$STAGE"
 
-for src in $(find openuf -type f | sort); do
+# macOS leaves AppleDouble `._*` siblings and .DS_Store next to edited files on
+# some volumes; staged, they would ship (AP2 carried hook/._*.sh and lib/._lib.lua
+# from an earlier tarball). Neither is a source file.
+for src in $(find openuf -type f ! -name '._*' ! -name .DS_Store | sort); do
 	dst="$STAGE/${src#openuf/}"
 	mkdir -p "$(dirname "$dst")"
 
@@ -130,7 +133,10 @@ fi
 
 # ── Package ─────────────────────────────────────────────────────────────────
 rm -f "$TARBALL"
-tar czf "$TARBALL" -C "$BUILD" openuf install.sh setup.sh update.sh LICENSE
+# COPYFILE_DISABLE: macOS bsdtar otherwise adds a `._<name>` AppleDouble entry
+# for every file that carries extended attributes, and update.sh extracts them
+# onto the device as junk files beside the real ones.
+COPYFILE_DISABLE=1 tar czf "$TARBALL" -C "$BUILD" openuf install.sh setup.sh update.sh LICENSE
 
 before=$(find openuf -type f -exec cat {} + | wc -c | tr -d ' ')
 after=$(find "$STAGE" -type f -exec cat {} + | wc -c | tr -d ' ')

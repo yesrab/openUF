@@ -433,4 +433,70 @@ return {
 			assert_eq(announce.VERSION_SUFFIX, "-openUF-0.2", "the shipped value")
 		end
 	},
+	{
+		name = "announce: a v1 discovery request is answered with a version 1 / command 0 packet carrying the same TLVs",
+		fn = function()
+			local cfg = sample_cfg()
+			local reply = announce.reply_for("\1\0\0\0", cfg)
+			assert_true(reply ~= nil, "a v1 request gets a reply")
+			assert_eq(string.byte(reply, 1), 0x01, "version 1")
+			assert_eq(string.byte(reply, 2), 0x00, "command 0, as a UCG Ultra answers it")
+			assert_eq(find_tlv(reply, 0x0b), "openUF", "hostname TLV")
+			assert_eq(find_tlv(reply, 0x0c), "U6IW", "platform TLV")
+			assert_eq(find_tlv(reply, 0x16), "6.6.55-openUF-0.1", "short firmware TLV")
+			-- Same body as the broadcast: only the two header bytes differ.
+			assert_eq(reply:sub(3), announce.build_packet(cfg):sub(3), "identical TLVs and length")
+		end
+	},
+	{
+		name = "announce: a v2 discovery request is answered with version 2 / command 9",
+		fn = function()
+			local reply = announce.reply_for("\2\8\0\0", sample_cfg())
+			assert_true(reply ~= nil, "a v2 request gets a reply")
+			assert_eq(string.byte(reply, 1), 0x02, "version 2")
+			assert_eq(string.byte(reply, 2), 0x09, "command 9 (0x08 was the request)")
+			assert_eq(find_tlv(reply, 0x01), string.char(0x24, 0xa4, 0x3c, 0x00, 0xd3, 0xad), "hardware address TLV")
+		end
+	},
+	{
+		name = "announce: anything that is not a request gets no reply",
+		fn = function()
+			local cfg = sample_cfg()
+			assert_nil(announce.reply_for(announce.build_packet(cfg), cfg), "our own broadcast, echoed back by the kernel")
+			assert_nil(announce.reply_for("\2\9\0\0", cfg), "another device's v2 reply")
+			assert_nil(announce.reply_for("\1\0\0\5abcde", cfg), "a v1 header with a body")
+			assert_nil(announce.reply_for("\1\0\0", cfg), "too short")
+			assert_nil(announce.reply_for(nil, cfg), "nothing received")
+			assert_nil(announce.reply_for("", cfg), "empty datagram")
+		end
+	},
+	{
+		name = "announce: _serve_requests answers each request to its sender and falls back to a plain sleep without a listener",
+		fn = function()
+			local sent, slept = {}, {}
+			local queue = {{"\1\0\0\0", "192.168.1.150", 40001}, {"\2\6\0\5xxxxx", "192.168.1.147", 10001}, {"\2\8\0\0", "10.0.0.5", 5000}}
+			local now = 100
+			local fake_socket = {
+				gettime = function() return now end,
+				select = function(r, _, timeout)
+					if r == nil then slept[#slept + 1] = timeout; now = now + timeout; return nil end
+					if #queue == 0 then now = now + timeout; return {} end
+					return {r[1]}
+				end,
+			}
+			local udpl = {
+				receivefrom = function() local q = table.remove(queue, 1); return q[1], q[2], q[3] end,
+				sendto = function(_, data, ip, port) sent[#sent + 1] = {data = data, ip = ip, port = port}; return 1 end,
+			}
+			announce._serve_requests(udpl, sample_cfg(), 10, fake_socket)
+			assert_eq(#sent, 2, "two requests answered, the stray announce ignored")
+			assert_eq(sent[1].ip .. ":" .. sent[1].port, "192.168.1.150:40001", "unicast back to the asker's own port")
+			assert_eq(string.byte(sent[1].data, 1), 0x01, "v1 reply for the v1 request")
+			assert_eq(sent[2].ip, "10.0.0.5", "second asker")
+			assert_eq(string.byte(sent[2].data, 2), 0x09, "v2 reply for the v2 request")
+			assert_eq(now, 110, "the interval was waited out")
+			announce._serve_requests(nil, sample_cfg(), 7, fake_socket)
+			assert_eq(slept[1], 7, "no listener: the old sleep")
+		end
+	},
 }

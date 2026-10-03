@@ -285,6 +285,82 @@ local IW_PHY_WITH_BEACON_RATE = (ARCHER_C5_IW_PHY:gsub(
 
 return {
 	{
+		name = "ucihelper: backhaul_apply writes the hidden WDS downlink AP and the disabled 4addr station, and neither is a VAP",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper.wlan_add("radio1", "user", "wpa2", "hunter22", nil, nil, "6a540dd2ffb26b8537ec967d")
+				local written = ucihelper.backhaul_apply({
+					downlink = {radio = "radio1", ssid = "vwire-5f3369181f7fbab5", key = "0123456789abcdef0123456789abcdef"},
+					uplink   = {radio = "radio1", ssid = "vwire-5f3369181f7fbab5", key = "0123456789abcdef0123456789abcdef", enabled = false},
+				})
+				assert_eq(#written, 2, "two sections")
+				local dl = db.wireless.openuf_bh_dl_radio1
+				assert_eq(dl.mode, "ap", "downlink is an AP")
+				assert_eq(dl.wds, "1", "4-address")
+				assert_eq(dl.hidden, "1", "hidden")
+				assert_eq(dl.encryption, "psk2", "WPA2-PSK")
+				assert_eq(dl.network, "lan", "bridged into lan")
+				assert_eq(dl.openuf_backhaul, "downlink", "marked")
+				assert_nil(dl.vendor_elements, "no sibling element unless given")
+				ucihelper.backhaul_apply({downlink = {radio = "radio1", ssid = "vwire-5f3369181f7fbab5", key = "0123456789abcdef", vendor_elements = "dd0d026f556f554601aabbccddeeff"}})
+				assert_eq(db.wireless.openuf_bh_dl_radio1.vendor_elements, "dd0d026f556f554601aabbccddeeff", "sibling element beaconed on the downlink")
+				assert_eq(#ucihelper.backhaul_downlink_sections(), 1, "downlink listed")
+				local ul = db.wireless.openuf_bh_ul_radio1
+				assert_eq(ul.mode, "sta", "uplink is a station")
+				assert_eq(ul.wds, "1", "4-address")
+				assert_eq(ul.disabled, "1", "disabled while wired")
+				assert_nil(ul.bssid, "no pin")
+				assert_nil(ul.openuf_vport_essid, "no vport name unless given")
+				ucihelper.backhaul_apply({uplink = {radio = "radio1", ssid = "vwire-5f3369181f7fbab5", key = "0123456789abcdef", enabled = false, vport = "vport-ac10076fc670", devname = "ath4"}})
+				assert_eq(db.wireless.openuf_bh_ul_radio1.openuf_vport_essid, "vport-ac10076fc670", "vport name stashed")
+				assert_eq(db.wireless.openuf_bh_ul_radio1.openuf_devname, "ath4", "controller devname stashed")
+				local v2 = {}
+				for _, v in ipairs(ucihelper.get_vap_table()) do v2[v.usage] = v end
+				assert_eq(v2.uplink.essid, "vwire-5f3369181f7fbab5", "the uplink VAP's essid stays the mesh essid, not the vport name")
+				assert_eq(v2.uplink.name, "ath4", "under the controller's own devname")
+				assert_eq(ucihelper.backhaul_uplink_sections()[1].devname, "ath4", "devname in the section listing")
+				-- the VAP table reports them typed by usage, the way a real UAP does
+				local vaps = ucihelper.get_vap_table()
+				assert_eq(#vaps, 3, "user WLAN + downlink + uplink")
+				local by = {}
+				for _, v in ipairs(vaps) do by[v.usage] = v end
+				assert_eq(by.user.essid, "user", "the user one")
+				assert_eq(by.downlink.essid, "vwire-5f3369181f7fbab5", "downlink beacons the mesh essid")
+				assert_true(by.downlink.hidden, "hidden")
+				assert_nil(by.downlink.id, "no wlanconf id")
+				assert_eq(by.uplink.state, "INIT", "station not associated (no live netdev in tests)")
+				assert_false(by.uplink.up, "down")
+				assert_eq(by.uplink.bssid, "00:00:00:00:00:00", "all-zero BSSID while down, as fxkr saw")
+				assert_true(type(by.uplink._ifnames) == "table" and #by.uplink._ifnames == 0, "no live netdev in tests, so nothing to dump")
+				assert_eq(by.uplink.essid, "vwire-5f3369181f7fbab5", "the uplink VAP's essid is the site mesh essid (is_mesh_v3 in the controller)")
+				-- and wlan_clear takes the backhaul sections too (openuf_ prefix)
+				ucihelper.wlan_clear()
+				assert_nil(db.wireless.openuf_bh_dl_radio1, "cleared with the rest")
+				assert_nil(db.wireless.openuf_bh_ul_radio1, "cleared with the rest")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: backhaul_set_uplink_enabled flips the station and reloads wifi once, only on a change",
+		fn = function()
+			with_ucihelper(function(db, cmds)
+				ucihelper.backhaul_apply({uplink = {radio = "radio1", ssid = "vwire-x", key = "0123456789abcdef", enabled = false}})
+				local before = #cmds
+				assert_true(ucihelper.backhaul_set_uplink_enabled(true), "changed")
+				assert_eq(db.wireless.openuf_bh_ul_radio1.disabled, "0", "enabled")
+				assert_eq(cmds[#cmds], "wifi reload", "one reload")
+				assert_eq(#cmds, before + 1, "exactly one")
+				assert_false(ucihelper.backhaul_set_uplink_enabled(true), "no change, no reload")
+				assert_eq(#cmds, before + 1, "still one")
+				assert_true(ucihelper.backhaul_set_uplink_enabled(false), "back")
+				assert_eq(db.wireless.openuf_bh_ul_radio1.disabled, "1", "disabled")
+				local secs = ucihelper.backhaul_uplink_sections()
+				assert_eq(#secs, 1, "listed")
+				assert_true(secs[1].disabled, "as disabled")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: wlan_add defaults network to lan",
 		fn = function()
 			with_ucihelper(function(db)

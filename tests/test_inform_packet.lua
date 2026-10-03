@@ -2190,6 +2190,77 @@ return {
 		end
 	},
 	{
+		name = "inform packet: mesh backhaul entries (uplink station, downlink vwire AP) are never provisioned as user APs",
+		fn = function()
+			-- Captured live 2026-10-03 (AP2, 10.6.106): a meshing device's push
+			-- adds, on the 5 GHz radio, the DOWNLINK `mode=master usage=downlink`
+			-- (a hidden WPA2 AP, ssid vwire-<site>, the backhaul PSK) and the
+			-- UPLINK `mode=managed usage=uplink` (a 4addr station, ssid
+			-- vport-<mac>). Every entry this parser passes becomes an ordinary
+			-- AP SSID, so both must be dropped. Wired pushes carry
+			-- mode=master/usage=user.
+			local sys_cfg = "aaa.1.ssid=user-wlan\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "aaa.1.wpa.psk=basepass123\n"
+				.. "wireless.1.ssid=user-wlan\nwireless.1.parent=radio0\n"
+				.. "wireless.1.mode=master\nwireless.1.usage=user\n"
+				-- the uplink station (fxkr's 2015 capture and the 2026 one agree on vport-)
+				.. "aaa.2.ssid=vport-ac10076fc670\naaa.2.status=disabled\n"
+				.. "wireless.2.ssid=vport-ac10076fc670\nwireless.2.parent=radio1\n"
+				.. "wireless.2.mode=managed\nwireless.2.usage=uplink\nwireless.2.wds=enabled\n"
+				.. "wireless.2.vport=enabled\nwireless.2.hide_ssid=true\n"
+				-- the downlink AP
+				.. "aaa.3.ssid=vwire-5f3369181f7fbab5\naaa.3.wpa=2\naaa.3.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "aaa.3.wpa.psk=backhaulsecret\naaa.3.hide_ssid=true\n"
+				.. "wireless.3.ssid=vwire-5f3369181f7fbab5\nwireless.3.parent=radio1\n"
+				.. "wireless.3.mode=master\nwireless.3.usage=downlink\nwireless.3.wds=enabled\n"
+				.. "wireless.3.vwire=enabled\nwireless.3.hide_ssid=true\n"
+			local _, vt, bh = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(#vt, 1, "only the user WLAN survives")
+			assert_eq(vt[1].ssid, "user-wlan", "and it is the user one")
+			-- ... and both come back as backhaul entries for backhaul.lua
+			assert_eq(#bh, 2, "two backhaul entries")
+			local by_role = {}
+			for _, e in ipairs(bh) do by_role[e.role] = e end
+			assert_eq(by_role.uplink.radio, "radio1", "uplink on the 5 GHz radio")
+			assert_eq(by_role.uplink.ssid, "vport-ac10076fc670", "the station's own vport name")
+			assert_eq(by_role.downlink.ssid, "vwire-5f3369181f7fbab5", "the downlink beacons the mesh essid")
+			assert_eq(by_role.downlink.psk, "backhaulsecret", "with the site PSK from its aaa block")
+			assert_true(by_role.downlink.hidden, "hidden")
+			-- Either marker alone is enough; an entry without them is untouched.
+			local function count(extra)
+				local cfg = "aaa.1.ssid=x\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\naaa.1.wpa.psk=basepass123\n"
+					.. "wireless.1.ssid=x\nwireless.1.parent=radio0\n" .. extra
+				local _, v = inform._parse_wifi_system_cfg(cfg)
+				return #v
+			end
+			assert_eq(count("wireless.1.mode=managed\n"), 0, "mode alone")
+			assert_eq(count("wireless.1.usage=uplink\n"), 0, "usage alone")
+			assert_eq(count(""), 1, "no markers: an ordinary WLAN")
+			assert_eq(count("wireless.1.mode=master\nwireless.1.usage=user\n"), 1, "the wired shape")
+		end
+	},
+	{
+		name = "inform packet: the mesh and connectivity blocks are parsed (captured 2026-10-03)",
+		fn = function()
+			local raw = "# mesh\nmesh.status=enabled\nmesh.version=3\nmesh.essid=vwire-5f3369181f7fbab5\n"
+				.. "mesh.psk=0123456789abcdef0123456789abcdef\nmesh.serial1=78:bb:c1:fe:3f:c9\n"
+				.. "# connectivity\nconnectivity.status=enabled\nconnectivity.uplink_wds=ath4\n"
+				.. "connectivity.uplink_eth=eth0\nconnectivity.uplink_bridge=br0\n"
+			local m = inform._parse_mesh_system_cfg(raw)
+			assert_true(m.status, "enabled")
+			assert_eq(m.version, 3, "version 3")
+			assert_eq(m.essid, "vwire-5f3369181f7fbab5", "essid")
+			assert_eq(m.psk, "0123456789abcdef0123456789abcdef", "psk")
+			assert_eq(m.serial1, "78:bb:c1:fe:3f:c9", "priority-1 parent")
+			assert_true(m.connectivity.status, "connectivity on")
+			assert_eq(m.connectivity.uplink_wds, "ath4", "the wireless uplink devname")
+			assert_eq(m.connectivity.uplink_eth, "eth0", "the wired one")
+			local off = inform._parse_mesh_system_cfg("mesh.status=disabled\nconnectivity.status=disabled\n")
+			assert_false(off.status, "the wired baseline: disabled")
+			assert_nil(inform._parse_mesh_system_cfg("radio.1.channel=auto\n"), "no mesh block at all: nil")
+		end
+	},
+	{
 		name = "inform packet: invalid private pre-shared keys are dropped, the rest kept",
 		fn = function()
 			local function parse(extra, head)
@@ -2578,7 +2649,7 @@ return {
 		end
 	},
 	{
-		name = "inform packet: handle_response cmd spectrum-scan builds spectrum_table from survey dump",
+		name = "inform packet: handle_response cmd spectrum-scan reports every width's rows from the survey dump",
 		fn = function()
 			local st = sample_state()
 			-- Save/restore everything this test stubs: these are module-level
@@ -2590,15 +2661,19 @@ return {
 			local popens = {}
 			inform._ucihelper = {
 				get_radio_table = function()
-					return { { name = "radio0", channel = "6", ht = "HT40" } }
+					return { { name = "radio0", radio = "ng", channel = "6", ht = "HT40" } }
 				end,
 				get_ifname_for_radio = function() return "wlan0" end,
 				_popen = function(cmd) popens[#popens + 1] = cmd; return "scan-ok\n" end,
 			}
 			inform._sysinfo.radio_stats = function()
 				return {
-					{ freq = 2437, noise = -95, channel_time = 5000, channel_time_busy = 1850 },
-					{ freq = 2412, noise = -90, channel_time = 100,  channel_time_busy = 12 },
+					{ freq = 2437, noise = -95, channel_time = 5000, channel_time_busy = 1850,
+					  channel_time_rx = 1000, channel_time_tx = 500 },
+					{ freq = 2412, noise = -90, channel_time = 100,  channel_time_busy = 12,
+					  channel_time_rx = 2, channel_time_tx = 0 },
+					-- never visited: a bare frequency line, no counters
+					{ freq = 2462, noise = -91 },
 				}
 			end
 
@@ -2608,12 +2683,18 @@ return {
 
 				local cached = inform._spectrum_cache.radio0
 				assert_true(cached ~= nil, "spectrum-scan cmd populates _spectrum_cache for the radio")
-				assert_true(#cached.table == 2, "one spectrum_table entry per survey-dump frequency")
-				assert_true(cached.table[1].channel == 6, "channel derived from 2437MHz")
-				assert_true(cached.table[1].center_freq == 2437, "center_freq passed through from survey dump")
-				assert_true(cached.table[1].width == 40, "width derived from radio's HT40 htmode")
-				assert_true(cached.table[1].utilization == 37, "utilization = channel_time_busy/channel_time * 100")
-				assert_true(cached.table[1].interference == -95, "interference is best-effort noise-floor passthrough")
+				assert_true(cached.scanned_at ~= nil, "the sweep's time is kept, for the age the payload reports")
+				assert_eq(#cached.table, 4, "two measured channels x the two 2.4 GHz widths; the unvisited one is left out")
+				local r20, r40 = cached.table[1], cached.table[2]
+				assert_eq(r20.channel, 6, "channel derived from 2437MHz")
+				assert_eq(r20.width, 20, "a 20 MHz row first")
+				assert_eq(r20.center_freq, 2437, "a 20 MHz block is the channel itself")
+				assert_eq(r20.utilization, 37, "utilization = channel_time_busy/channel_time * 100")
+				assert_eq(r20.interference, 7, "interference = (busy - rx - tx)/channel_time * 100, a percentage")
+				assert_eq(r40.width, 40, "then the 40 MHz row for the same channel")
+				assert_eq(r40.center_freq, 2447, "channel 6 pairs upward (HT40+): centre 2447")
+				assert_eq(r40.utilization, 37, "the row carries its own channel's figures; the view averages a block")
+				assert_eq(cached.table[3].channel, 1, "the second measured channel")
 				-- One sweep, forced: ap-force guards against a driver that
 				-- refuses to scan on a beaconing AP (ours do not; see
 				-- inform._force_scan), and its exit status is what is judged.
@@ -2637,7 +2718,7 @@ return {
 				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
 			end}
 			inform._ucihelper = {
-				get_radio_table = function() return { { name = "radio0", channel = "6", ht = "HT20" } } end,
+				get_radio_table = function() return { { name = "radio0", radio = "ng", channel = "6", ht = "HT20" } } end,
 				get_ifname_for_radio = function() return "wlan0" end,
 				_popen = function() return "" end,   -- iw failed: no scan-ok
 			}
@@ -2651,59 +2732,93 @@ return {
 			assert_true(ok, tostring(err))
 			assert_contains(table.concat(logged), "spectrum-scan: iw refused to scan wlan0",
 				"the refusal is visible, not silent")
-			assert_true(cached ~= nil and #cached.table == 1, "the operating channel is still reported")
+			assert_true(cached ~= nil and #cached.table == 2, "the operating channel is still reported, at both widths")
+			assert_eq(cached.table[1].utilization, 10, "from the counters it has")
+			assert_nil(cached.table[1].interference, "no rx/tx counters: no interference figure rather than a guess")
 		end
 	},
 	{
-		name = "inform packet: spectrum-scan keeps the pre-sweep noise when the post-sweep read is 0",
+		name = "inform packet: quick-scan sweeps the requested band only, scan_band the named one, unknown bands nothing",
 		fn = function()
-			-- On real hardware the OPERATING channel's noise reads back as 0
-			-- immediately after an `iw scan` sweep -- the radio has just
-			-- returned from off-channel -- while the same channel reports
-			-- -106 dBm moments later. 0 dBm is not a plausible noise floor,
-			-- and this value goes to the controller as `interference`.
 			local st = sample_state()
 			local orig_uci, orig_stats = inform._ucihelper, inform._sysinfo.radio_stats
-			local orig_cache = inform._spectrum_cache
+			local orig_cache, orig_stderr = inform._spectrum_cache, io.stderr
 			inform._spectrum_cache = {}
-			local scanned = false
+			local logged, popens = {}, {}
+			io.stderr = {write = function(_, ...)
+				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
+			end}
 			inform._ucihelper = {
 				get_radio_table = function()
-					return { { name = "radio0", channel = "36", ht = "HT40" } }
-				end,
-				get_ifname_for_radio = function() return "wlan0" end,
-				_popen = function(cmd)
-					if tostring(cmd):match("scan") then scanned = true end
-					return "scan-ok\n"
-				end,
-			}
-			inform._sysinfo.radio_stats = function()
-				if not scanned then
-					-- pre-sweep: the operating channel has a real noise floor
 					return {
-						{ freq = 5180, noise = -106, channel_time = 1000, channel_time_busy = 10 },
-						{ freq = 5200, noise = -105, channel_time = 46, channel_time_busy = 0 },
+						{ name = "radio0", radio = "ng", channel = "6",  ht = "HT40" },
+						{ name = "radio1", radio = "na", channel = "36", ht = "HE160" },
+					}
+				end,
+				get_ifname_for_radio = function(name) return name == "radio0" and "wlan0" or "wlan1" end,
+				_popen = function(cmd) popens[#popens + 1] = cmd; return "scan-ok\n" end,
+			}
+			inform._sysinfo.radio_stats = function(ifname)
+				if ifname == "wlan1" then
+					return {
+						{ freq = 5180, channel_time = 1000, channel_time_busy = 300, channel_time_rx = 100, channel_time_tx = 50 },
+						{ freq = 5745, channel_time = 1000, channel_time_busy = 100, channel_time_rx = 0,   channel_time_tx = 0 },
 					}
 				end
-				-- post-sweep: operating channel's noise has gone to 0
-				return {
-					{ freq = 5180, noise = 0,    channel_time = 5000, channel_time_busy = 500 },
-					{ freq = 5200, noise = -104, channel_time = 46, channel_time_busy = 0 },
-				}
+				return { { freq = 2437, channel_time = 1000, channel_time_busy = 100, channel_time_rx = 10, channel_time_tx = 10 } }
 			end
-
 			local ok, err = pcall(function()
-				inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
-				local t = inform._spectrum_cache.radio0.table
-				assert_eq(t[1].interference, -106,
-					"operating channel keeps its pre-sweep noise floor, not 0")
-				assert_eq(t[1].utilization, 10,
-					"utilization still comes from the fresh post-sweep counters")
-				assert_eq(t[2].interference, -104,
-					"a valid post-sweep reading always wins over the pre-sweep one")
+				-- The controller's own encoding: band index 1 = 5 GHz, width in MHz.
+				assert_true(inform.handle_response('{"_type":"cmd","cmd":"quick-scan","scan-band":1,"scan-bw":80}', st),
+					"re-inform right after the sweep")
+				assert_eq(#popens, 1, "one sweep")
+				assert_contains(popens[1], "iw dev wlan1 scan ap-force", "on the 5 GHz radio only")
+				assert_nil(inform._spectrum_cache.radio0, "the 2.4 GHz radio was not touched")
+				local t = inform._spectrum_cache.radio1.table
+				assert_eq(#t, 8, "two channels x the four 5 GHz widths")
+				local centres = {}
+				for _, r in ipairs(t) do
+					if r.channel == 36 then centres[r.width] = r.center_freq end
+				end
+				assert_eq(centres[20], 5180, "36 @20: itself")
+				assert_eq(centres[40], 5190, "36 @40: 36+40 block")
+				assert_eq(centres[80], 5210, "36 @80: 36-48 block")
+				assert_eq(centres[160], 5250, "36 @160: 36-64 block")
+				local upper = {}
+				for _, r in ipairs(t) do
+					if r.channel == 149 then upper[r.width] = r.center_freq end
+				end
+				assert_eq(upper[40], 5755, "149 @40: the upper run is aligned from 5745, not from 5180")
+				assert_eq(upper[80], 5775, "149 @80: 149-161 block")
+				assert_eq(upper[160], 5815, "149 @160: 149-177 block")
+				assert_eq(t[1].utilization, 30, "busy 300/1000")
+				assert_eq(t[1].interference, 15, "(300-100-50)/1000")
+
+				-- Radio AI's own verb names the band in words.
+				assert_true(inform.handle_response('{"_type":"cmd","cmd":"scan_band","band":"ng"}', st), "re-inform")
+				assert_eq(#popens, 2, "a second sweep")
+				assert_contains(popens[2], "iw dev wlan0 scan ap-force", "on the 2.4 GHz radio")
+				assert_eq(#inform._spectrum_cache.radio0.table, 2, "its survey at both 2.4 GHz widths")
+
+				-- The sweep leaves the event the controller dates it by.
+				local ev = inform._pending_notif
+				assert_true(ev ~= nil, "a finished sweep queues one EVT_AP_QuickScanEvent")
+				assert_eq(ev.event_string, "EVT_AP_QuickScanEvent", "the handler's name")
+				assert_eq(ev.radio .. "/" .. ev.radio_name, "ng/radio0", "the radio the last sweep ran on")
+				assert_eq(ev.channel, 6, "one row: its channel")
+				assert_eq(ev.width, 20, "its width")
+				assert_eq(ev.center_freq, 2437, "its block centre")
+				assert_eq(ev.utilization, 10, "its utilization")
+				assert_eq(ev.interference, 8, "its interference")
+				inform._pending_notif = nil
+
+				-- A band this device cannot map sweeps nothing and says so.
+				assert_true(inform.handle_response('{"_type":"cmd","cmd":"quick-scan","scan-band":7,"scan-bw":20}', st), "still re-informs")
+				assert_eq(#popens, 2, "no sweep for an unknown band")
+				assert_contains(table.concat(logged), "quick-scan: unknown scan-band 7", "logged")
 			end)
 			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
-			inform._spectrum_cache = orig_cache
+			inform._spectrum_cache, io.stderr = orig_cache, orig_stderr
 			if not ok then error(err, 0) end
 		end
 	},
@@ -4454,6 +4569,42 @@ return {
 
 			io.stderr = orig_stderr
 			inform._warned_bandsteering_mode = false
+		end
+	},
+	{
+		name = "inform packet: _post_notif sends the heartbeat's payload again as a notification inform, once",
+		fn = function()
+			local st = sample_state()
+			local cjson = require("cjson")
+			local o_bp, o_post, o_pending = inform.build_packet, inform.http_post, inform._pending_notif
+			local posted = {}
+			inform.build_packet = function(json) return json end
+			inform.http_post = function(url, pkt) posted[#posted + 1] = {url = url, body = pkt}; return "ok" end
+			local ok, err = pcall(function()
+				inform._pending_notif = {event_string = "EVT_AP_QuickScanEvent", radio = "na", radio_name = "radio1",
+					channel = 36, width = 80, center_freq = 5210, utilization = 30, interference = 15}
+				local heartbeat = '{"mac":"ac:10:07:6f:c6:70","model":"U6IW","vap_table":[],"radio_table":[{"name":"radio1"}]}'
+				assert_true(inform._post_notif(st, nil, heartbeat), "delivered")
+				assert_eq(#posted, 1, "one POST")
+				assert_eq(posted[1].url, st.inform_url, "to the inform URL")
+				local sent = cjson.decode(posted[1].body)
+				assert_eq(sent.inform_as_notif, true, "flagged as a notification inform")
+				assert_eq(sent.notif_reason, "event", "reason: a device event (devmgr.l's enum)")
+				assert_eq(sent.notif_payload.event_string, "EVT_AP_QuickScanEvent", "the handler's name in the payload")
+				assert_eq(sent.notif_payload.channel, 36, "the row")
+				assert_eq(sent.mac, "ac:10:07:6f:c6:70", "the heartbeat's identity fields ride along")
+				assert_contains(posted[1].body, '"vap_table":[]', "empty lists stay lists")
+				assert_nil(inform._pending_notif, "consumed")
+				assert_eq(inform._post_notif(st, nil, heartbeat), false, "nothing pending: nothing sent")
+				assert_eq(#posted, 1, "still one POST")
+				-- A transport failure drops the event rather than retrying forever.
+				inform.http_post = function() return nil, "connection refused" end
+				inform._pending_notif = {event_string = "EVT_AP_QuickScanEvent"}
+				assert_eq(inform._post_notif(st, nil, heartbeat), false, "not delivered")
+				assert_nil(inform._pending_notif, "and not kept")
+			end)
+			inform.build_packet, inform.http_post, inform._pending_notif = o_bp, o_post, o_pending
+			if not ok then error(err, 0) end
 		end
 	},
 }

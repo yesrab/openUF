@@ -108,6 +108,11 @@ local TYPED = {
 	l2guard                   = "table",
 	-- Airtime Fairness (atf.mode): a debugfs flag, back on after a reboot.
 	atf_enabled               = "boolean",
+	-- Mesh backhaul (backhaul.lua): "wired" | "wireless", the wired socket the
+	-- gateway was last seen behind, and the controller's priority-1 parent.
+	backhaul_mode             = "string",
+	backhaul_wired_port       = "string",
+	backhaul_parent           = "string",
 }
 
 -- Load state from disk. Missing file returns defaults. Applies security

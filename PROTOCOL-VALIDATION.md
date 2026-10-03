@@ -456,6 +456,28 @@ analysis target than the AP's encrypted ARM firmware (see [dead ends](#dead-ends
    for browsing and for properly-scoped class listings.
 4. For frontend behavior, fetch the live controller's own React chunks
    (`react-app-wrapper.*.js`, `radiosPage.*.js`, `swai.*.js`, `airview.*.js`) and grep them.
+   **Where they are (10.6.106):** the UniFi OS shell at `/` is public but only loads its own
+   bundles; the Network app lives behind `/proxy/network/manage/` (401 without a session). A
+   UniFi OS **API key** sent as `X-API-KEY` opens it: `/proxy/network/manage/` returns the
+   shell whose loader is `angular/<build>/js/index.js`; that file's chunk manifest names ~49
+   entry chunks served from `/proxy/network/manage/react/js/<name>.<hash>.js`; the main bundle
+   `swai.<hash>.js` (~5.5 MB) carries the capability constant tables and a map of ~1,600 lazy
+   chunks (`<id>.<hash>.js`, same directory; ~21 MB in all) which hold the device settings
+   forms. The same key works on the legacy API (`stat/device`, `rest/device`, `rest/setting`,
+   `cmd/devmgr`) and on `/proxy/network/v2/api/...`, so a REST write can be reproduced without
+   the UI and the response compared with the UI's behaviour (2026-10-03, mesh).
+5. **Without a controller at hand at all (2026-10-03):** Ubiquiti's firmware catalog
+   (`https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-controller&filter=eq~~channel~~release`)
+   lists the current Network release per platform with a direct download; the `debian` entry
+   is a .deb (147 MB for 10.6.106, build `atag-10.6.106-36011`, i.e. the UCG Ultra's own
+   build). `ar x` it, `tar xf data.tar.xz`, and the application is
+   `usr/lib/unifi/lib/internal/internal-dependencies.jar`. Unzip on a case-sensitive volume
+   (step 2), find the classes by constant-pool string with `grep -rlaF` (the binary flag
+   matters, and a `grep` that is really ugrep skips class files silently), then run `jadx`
+   (Homebrew, pulls openjdk) on just those `.class` files. This is how the wireless-uplink
+   contract was read in an afternoon after three guessed payload shapes had failed: the UAP
+   inform processor is `com.ubnt.service.devmgr.iceUMDuewFNFLMOqti`, the VAP/uplink processor
+   `com.ubnt.service.devmgr.C.RxFvcetMTlkSFFxK` (names are per build).
    Where a decode function's logic matters, the webpack module registry
    (`window["webpackChunk…"].push([[Symbol()], {}, req => …])`) gives a direct reference to
    the **live** function, which can be called with a sweep of inputs — ground truth, not a guess.
@@ -996,6 +1018,220 @@ a re-enable.
 
 ---
 
+## Wireless uplink (mesh): the push, the contract, and the live result — 2026-10-03
+
+Captured on AP2 against the UCG Ultra (Network 10.6.106) by claiming `wifi_caps` bits through
+`debug_caps`, setting the device's mesh-connect flag and priority-1 parent through the
+controller's own REST and command endpoints, and diffing the resulting `setparam`s against the
+wired baseline; then **implemented (`backhaul.lua`) and verified end to end the same day**:
+AP2's cable pulled, AP2 joined AP1's hidden downlink as a 4-address station at −10 dBm with
+HE160 4×4 rates both ways, kept its address, informed over the hop, carried a VLAN-10 IoT
+client to its own network, and the controller showed the uplink as wireless with AP1 as the
+parent and AP1 listing AP2 as a wireless downlink. Full evidence: REVERSE-ENGINEERING.md,
+Investigation 1.
+
+**The reporting contract, from the controller's inform processor** (`internal-dependencies.jar`
+of the matching Linux package, jadx on `com.ubnt.service.devmgr.iceUMDuewFNFLMOqti` and
+`...devmgr.C.RxFvcetMTlkSFFxK`; the three shapes guessed before reading it were all wrong):
+
+- The top-level **`uplink` is a string**: the *name* of the uplink interface. Default `"eth0"`;
+  `"down"` marks an isolated device. When it names an entry of `if_table`, the wired path runs
+  (counters from that entry, identity from the gateway's LLDP downlink). When it names a
+  `vap_table` entry of `usage` `uplink`, the wireless path runs. Sending an object here is
+  read as the default and yields a stale "wired via port N".
+- A **wireless uplink is a `vap_table` entry** with `usage: "uplink"`, `name` equal to the
+  `uplink` string, `up: true`, a non-zero `channel`, `essid` equal to the site's mesh ESSID
+  (that is what sets `is_mesh_v3`), `bssid` = the station's own address, `state` RUN, and a
+  **`sta_table` holding exactly one station: the parent's downlink BSS**, with `rx_packets > 0`
+  and the attributes the controller copies onto the uplink (`signal`, `rssi`, `tx_rate`,
+  `rx_rate`, `tx_packets`, `rx_packets`, `tx_bytes`, `rx_bytes`). That station is resolved to
+  a device **by its `serialno`** when that is a MAC; the fallbacks are a `(vwire|vport)-<12
+  hex>` ESSID (mesh v2, where the name encoded the parent) and an OUI-based derivation that
+  only knows Ubiquiti prefixes, so openUF must supply `serialno` — the controller's priority-1
+  parent (`mesh.serial1`), else the sibling element of the BSS joined.
+- A **downlink is a `vap_table` entry** with `usage: "downlink"` (same validity rules), whose
+  `sta_table` lists the children's 4-address stations; each resolves to a child by `serialno`,
+  then by the controller's own BSSID tracker, else it logs "Can't resolve wireless mac".
+- `uplink_table`, `vwire_table`, `vwire_vap_table`, `downlink_table` and the v2
+  `wireless-links` view are **computed by the controller** from the above; device-sent
+  copies are ignored. `meshv3_peer_mac` and `uplink_bssid` are stored verbatim.
+- A `vap_table` entry whose ESSID starts with `vport-`/`vwire-` but has `usage: user` is
+  dropped with "handling is done differently, update AP firmware".
+
+**Device side (openUF, 2026-10-03 evening):** `_parse_wifi_system_cfg` hands the push's two
+entries to `backhaul.lua`; `_parse_mesh_system_cfg` reads the `mesh`/`connectivity` blocks.
+The downlink becomes `openuf_bh_dl_<radio>` (hidden `wds 1` WPA2-PSK AP in `lan`, beaconing
+the sibling element), the uplink `openuf_bh_ul_<radio>` (4-address station, enabled only
+while the wired uplink socket has no link). `get_vap_table` reports both as typed entries
+named with the controller's devnames (`vwire3`, `ath4`), the uplink with its station
+interface's own `station dump` as its one-entry `sta_table` plus `serialno`, the downlink
+with the per-station WDS netdevs' dumps as its children; Minimum RSSI and Roaming Assistant
+never act on either. `uplink` is the uplink VAP's name while associated. `wifi_caps`
+`0x1|0x800` are claimed by default on DSA boards.
+
+**How the controller is told.** The device settings form issues
+`PUT /api/s/<site>/rest/device/<_id>` with `mesh_sta_vap_enabled` (and `mesh_uplink_1`/`_2`),
+then `POST /api/s/<site>/cmd/devmgr {"cmd":"set-priority-uplink","mac":<child>,"prefer1":<parent>}`
+(`prefer2` optional; `unset-priority-uplink` clears). The flag is persisted only for a device
+claiming `wifi_caps` `0x1`, and the controller turns it **on by itself** once a device claims
+that bit. The parent dropdown is the device's `uplink_table`, which the controller derives from
+the uplink VAP's resolved station.
+
+**What arrives** (child = AP2, parent `78:bb:c1:fe:3f:c9` = AP1, 5 GHz radio is `radio.2`):
+
+```
+# mesh                                       (needs 0x1 + 0x800)
+mesh.status=enabled
+mesh.version=3
+mesh.essid=vwire-5f3369181f7fbab5             ← site setting connectivity.x_mesh_essid
+mesh.psk=<32 chars>                           ← site setting connectivity.x_mesh_psk
+mesh.serial1=78:bb:c1:fe:3f:c9                ← priority-1 parent (mesh_uplink_1)
+# connectivity                               (needs 0x1)
+connectivity.status=enabled
+connectivity.uplink_wds=ath4
+connectivity.uplink_eth=eth0
+connectivity.uplink_bridge=br0
+# the downlink: a hidden WPA2 AP for children (needs 0x1 + 0x800; flag on or off)
+radio.2.virtual.1.devname=vwire3   radio.2.virtual.1.mode=master   radio.2.virtual.1.status=enabled
+wireless.4.devname=vwire3  mode=master  usage=downlink  wds=enabled  vwire=enabled  vport=disabled
+wireless.4.ssid=vwire-5f3369181f7fbab5  hide_ssid=true  parent=radio1  security=none  authmode=1
+aaa.4.devname=vwire3  ssid=vwire-…  wpa=2  wpa.key.1.mgmt=WPA-PSK  wpa.psk=<same 32 chars>
+aaa.4.wpa.1.pairwise=CCMP  hide_ssid=true  status=enabled  br.devname=br0  pmf.status=disabled
+# the uplink: a 4-address station toward the parent (needs 0x1 and the device's mesh flag)
+radio.2.virtual.2.devname=ath4     radio.2.virtual.2.mode=managed  radio.2.virtual.2.status=enabled
+wireless.5.devname=ath4  mode=managed  usage=uplink  wds=enabled  vport=enabled  vwire=disabled
+wireless.5.ssid=vport-ac10076fc670  hide_ssid=true  parent=radio1  security=none
+aaa.5.devname=ath4  ssid=vport-ac10076fc670  status=disabled   (no key here: the station uses mesh.psk)
+# plumbing: both devnames join the bridges, tagged for every VLAN the AP carries
+bridge.1.port.4.devname=ath4   bridge.1.port.5.devname=vwire3
+vlan.2.devname=ath4 vlan.2.id=10   vlan.3.devname=vwire3 vlan.3.id=10
+bridge.2.port.3.devname=ath4.10   bridge.2.port.4.devname=vwire3.10
+netconf.<n>: ath4/vwire3 up=disabled promisc=enabled; ath4.10/vwire3.10 up=enabled
+```
+
+Everything else in the push was unchanged, including `radio.2.channel=auto` — the controller
+does not pin the child to the parent's channel in the config, so the station itself has to
+follow the parent (the parent's own channel is in its push). The `vport-<mac>` naming matches
+fxkr's 2015 capture of a real UAP's uplink VAP.
+
+### The parent names its children — 2026-10-03
+
+The controller resolves each station of a downlink VAP to a device by the station's
+`serialno`, else by a BSS it has scanned with that MAC, else by Ubiquiti's OUI arithmetic
+(first byte rewritten, fourth byte − 1). A 4-address station never beacons and a
+TP-Link/Jio board has no Ubiquiti OUI, so without `serialno` the parent logged "Can't
+resolve wireless mac" and its `downlink_table` stayed empty while the child's uplink
+resolved fine. The parent can name the child itself: hostapd parks each WDS peer on its
+own netdev (`phy1-ap1.sta<N>`), the bridge learns the child's identity MAC behind that
+netdev, and the sibling element in the parent's scans says which MACs are site APs.
+`backhaul.child_serialno()` intersects the two and the station's `serialno` is set when
+exactly one sibling is behind the netdev (two would mean a grandchild on a multi-hop path,
+and a wrong attribution is worse than none). This is the same first-class field the uplink
+side already fills, which is why it was chosen over OUI games or renaming the station.
+Implemented on both APs' trees 2026-10-03; it runs on whichever AP is the parent.
+
+## RF scans: Airtime Scan, Quick Scan and Radio AI's sweep — 2026-10-03
+
+Three different commands, one device-side job. Everything below is read from controller
+10.6.106's bytecode (`com.ubnt.service.system.l.*`, `devmgr.b.g.ctfbDsCjrxgkv`,
+`devmgr.iceUMDuewFNFLMOqti`, `devmgr.kDxteQiUX`, `devmgr.e.c.VsCpQiCuGEvNvUNmH`,
+`stat.hyFnQ`) and its frontend bundles (`swai`, `airview`, `react-app-wrapper`), then
+confirmed live against AP2 the same day.
+
+**The gates.** Airtime Scan (Devices → [AP] → Radios → Airtime): button shown with
+`wifi_caps` `0x10` (RF_SCAN) on a wired AP; the view's "scan while serving" flag is
+`wifi_caps2` `0x2` (MONITOR_RF_SCAN). Quick Scan: `wifi_caps2` `0x80`; the REST handler
+also requires `!isWirelessUplink()`, an active device, and no scan already running. Radio
+AI's prescan asks every AP with `supportQuickScan()` that is not on a wireless uplink.
+`stat/spectrum-scan`, the endpoint the view reads, skips any device without
+`supportSpectrumScan()` — so without `0x10` the data is invisible even when sent.
+
+**The commands.**
+
+| cmd | arguments as the device receives them | who sends it |
+|---|---|---|
+| `spectrum-scan` | `{mac}` | the Airtime Scan button |
+| `quick-scan` | `{mac, "scan-band": 0\|1\|2, "scan-bw": 20\|40\|80\|160}` — band index (ng/na/6e) and width in MHz, both **integers** (the REST side takes `"na"`/`80` and re-encodes) | the Quick Scan dialog; Radio AI's prescan |
+| `scan_band` | `{band: "ng"\|"na"}` | the controller's scheduled neighbour sweep (`XbYOtjBEpjeHWlUU`); it sets the record's `scanning` and takes the next inform's `scan_radio_table` |
+
+**What the device reports.** The sweep itself is `iw dev <if> scan ap-force` followed by
+`iw dev <if> survey dump`, 1.5–2.7 s per radio; all three commands run it inside their own
+dispatch, so the inform that follows the command already carries the result.
+
+- `radio_table[].spectrum_table` — rows `{channel, width, center_freq, utilization,
+  interference}`, one per 20 MHz channel per width the band offers (ng 20/40, na
+  20/40/80/160). `utilization` is busy airtime in %, `interference` the busy time that was
+  neither this radio's rx nor tx in %, both 0–100. The table must be on the **radio_table
+  entry**: the UAP processor walks `payload.radio_table` (as it does for `athstats`) and
+  copies `spectrum_table` from each radio into the stored `radio_table_stats` when the
+  device is not mid-quick-scan and the list is non-empty. A table only in
+  `radio_table_stats` is never read — two live sweeps left `stat/spectrum-scan` empty
+  until the table moved. openUF sends it in both places.
+- `radio_table[].spectrum_table_time` — seconds **since** the sweep. The processor stores
+  `now − value` as the sweep's epoch; the view prints it as "N minutes ago".
+- `quickscan_scanning` / `spectrum_scanning` — booleans. The controller set the record's
+  `quick_scan_state.in_progress` when it dispatched the quick-scan; the device's `false`
+  on the next inform is the "just finished" edge that pushes the fresh tables to the open
+  view (`kDxteQiUX`). A quick-scan the device never answers times out after ten minutes.
+- `EVT_AP_QuickScanEvent` — a **notification inform**: the regular payload plus
+  `inform_as_notif: true`, `notif_reason: "event"` and `notif_payload: {event_string:
+  "EVT_AP_QuickScanEvent", radio, radio_name, channel, width, center_freq, utilization,
+  interference}`. The inform entry (`devmgr.l.AqxpICcpcuIxnda`) takes that branch before
+  any statistics processing and answers a bare `noop`; the handler upserts the row and
+  stamps the record's `spectrum_scan_timestamp` (ms) — which is the Quick Scan card's
+  "last scan" and what Radio AI's prescan waits for before it reads the tables. The
+  device's own top-level `spectrum_scan_timestamp` is ignored. openUF posts one such
+  inform after the heartbeat that carried a sweep's table; one row is enough.
+- The row shape, the averaging and the width tabs come from the frontend: `renderChannel`
+  filters rows with `width === tab` whose `channel` is in the block's `subChannels` (which
+  for 2.4 GHz 40 MHz blocks span every overlapping 20 MHz channel) and **averages** them
+  (module 178221), so each row carries its own channel's figures.
+
+**Live, 2026-10-03, AP2 (JIDU6101, 25 channels on 5 GHz):** `quick-scan` with
+`scan-band: "na", scan-bw: 80` through `cmd/devmgr` → `cmd: quick-scan` in the daemon
+log, `quick_scan_state.in_progress: true` with `last_band: na, last_width: 80`, then
+`false` on the next inform; the notification inform set `spectrum_scan_timestamp` (ms)
+and, once the table rode the radio_table entry, `stat/spectrum-scan` held **100 rows for
+radio1 — 25 channels at each of 20/40/80/160 MHz** — with `spectrum_table_time` as the
+sweep's epoch (the age the device sent, converted). `spectrum-scan` arrived and swept both
+radios the same way. Three runs in all; the first two (table only in `radio_table_stats`)
+left the stat empty, which is how that mistake was found.
+The DTO (`stat/device`) strips `spectrum_table` from `radio_table_stats` unless a quick
+scan is in progress, by design; `stat/spectrum-scan/<mac>` is the read path.
+
+**Still approximate.** `interference` as "busy minus own rx/tx" counts other BSSs' traffic
+as interference, which a real AP's hardware spectral scan would not. The survey counters
+are cumulative since boot for the operating channel and a few ms for the others, so the
+operating channel's figure is a long-run average while the rest are the sweep's dwell.
+
+## Discovery requests and WiFiman — 2026-10-03
+
+**WiFiman is console-side.** The site setting is `mgmt.wifiman_enabled`; the controller
+never pushes any wifiman key to an AP (AP2's ledger has none after weeks), and the app
+reads the console: `GET /v2/api/site/<site>/wifiman/<clientIp>` (client info: channel,
+link rates, experience history, `uplink_devices` chain, `nearest_neighbors`, ISP
+capability) and `.../wifiman/<clientIp>/devices`; `POST .../feedback` stores the app's
+speed tests. The controller finds the client **by its IP** in the active clients, follows
+`ap_mac` to the AP and `uplink.uplink_mac` up the chain, and asks the AP for an inform
+within ten seconds (`wifiManInformService`). Queried with the API key for a laptop on
+openUF's AP1, every field came back populated except `noise: 0` and `channel_width: null`
+(openUF reports neither per station). The REST classes (`com.ubnt.service.wifiman.*`,
+`com.ubnt.net.l.aN.RxFvcetMTlkSFFxK`) are the whole feature; the same `GET` under
+`/api/` instead of `/v2/api/` answers `api.err.InvalidObject`, which cost an hour.
+
+**The AP-side gap was discovery.** WiFiman's Discovery tab, the UniFi mobile app and the
+Device Discovery Tool list Ubiquiti devices by broadcasting the four-byte probes
+`01 00 00 00` (v1) and `02 08 00 00` (v2) to UDP 10001 and listing who answers. openUF's
+announcer only ever **broadcast** (version 2, command 6) from an ephemeral port and never
+listened on 10001, so those tools saw a bare host next to the UCG Ultra's full entry —
+"no extra info". Captured 2026-10-03 with a probe script: the UCG answers v1 with version
+1 / command 0 and v2 with version 2 / command 9, the same TLVs (hardware address, IP,
+hostname, platform, firmware, uptime, …) in both, unicast from port 10001 to the asker's
+own port; AP1 and AP2 answered nothing. `announce.lua` now binds 10001 and answers each
+probe the same way (`reply_for`, `_serve_requests`); the first probe after the deploy got
+four replies from AP2. The periodic broadcast is unchanged, and `l2_announce = false`
+still turns both off together.
+
 ## Outbound payload field reference
 
 Everything openUF sends. Names were audited against the controller's own Device model
@@ -1045,12 +1281,18 @@ by the controller's own startup log: `firmware[U6IW] new version (6.8.2.15592) i
 | `fw_caps` | `0x100` (256) | `Device.hasOWRTSwitch()` = `hasFirmwareCapability(256)` | Per-port VLAN assignment is rejected outright — see below. |
 | `wifi_caps2` | `0x40` (64) | `Device.supportAdvertisingDeviceNameInBeacon()` = `hasWifiCapability2(64)` | The controller never emits `wireless.<n>.advertise_ap_name` at all, and doesn't even re-push config on the toggle. |
 | `wifi_caps2` | `0x20` (32) | `Device.supportsAssistedRoaming()` | A WLAN's Roaming Assistant (`wireless.<n>.btm_disassoc.*`) is never emitted. Claimed since 2026-09-28 (`roamassist.lua`). |
+| `wifi_caps2` | `0x80` (128) | `Device.supportQuickScan()` | The Quick Scan button is hidden and the REST `quick-scan` cmd is refused (`devmgr.b.g.ctfbDsCjrxgkv`); Radio AI's prescan skips the AP ("no quick-scan-capable eligible AP"). Claimed since 2026-10-03 — see [RF scans](#rf-scans-airtime-scan-quick-scan-and-radio-ais-sweep--2026-10-03). |
+| `wifi_caps2` | `0x2` (2) | `MONITOR_RF_SCAN` (frontend table 718429) | The Airtime view's "scan while serving" check. Claimed since 2026-10-03 alongside `0x80`; the device's share is the same forced sweep. |
+| `wifi_caps` | `0x10` (16) | `RF_SCAN` (frontend table 537871) → `supportSpectrumScan()` | The Airtime Scan button is hidden and `stat/spectrum-scan` skips the device (`if (hyfnq6.supportSpectrumScan())`). Claimed since 2026-10-03. No config key changed on the push that followed the claim (ledger diffed on AP2). |
 | `wifi_caps` | `0x4` / `0x8` | `supportBandsteering()` / `supportVapBasedBandsteering()` | The device-level `bandsteering.status`/`mode` block (the AP's own Band Steering setting) and its per-WLAN pairs are never emitted; without `0x8` one single-band WLAN switches the device's steering off. Claimed since 2026-09-28. |
 | `wifi_caps` | `0x20` (32) | `supportATFConfig()` | `atf.status`/`atf.mode` (Airtime Fairness) is never emitted. Claimed where mac80211's per-phy `airtime_flags` exists (`airtime.lua`). |
 | `wifi_caps` | `0x100000` | `supportWpaPpsk()` | A WLAN with Private Pre-Shared Keys, or UID IoT, is **skipped** ("PPSK is not supported … will be skipped"). Claimed where the ucode generator writes `vlanid=` and hostapd has VLAN support (`sysinfo.ppsk_supported`). |
 | `radio_caps2` | `0x1` | radio DTO `CVir()` | Every WPA3 WLAN is downgraded to WPA2 -- see the WPA3 section below. Claimed where hostapd has SAE. |
 | `radio_caps2` | `0x2` | radio DTO, FT-with-WPA3 (`ytajcagDggPuTaL()`) | On an SAE WLAN `wpa3_fast_roaming` is forced off, so `aaa.<n>.wpa3.ft.status` is always `disabled`; on a WPA3-only WLAN `fast_roaming_enabled` too, and no 802.11r goes out at all. Claimed alongside `0x1`. |
 | `radio_caps2` | `0x8` | radio DTO, OWE (`NoFWvUa()`) | An Enhanced Open WLAN is **not provisioned** ("WPA3-OWE cannot provision"); with OWE transition on it goes out as plain open. Claimed where `hostapd -vowe` passes and the ucode generator knows `owe_transition`. |
+| `wifi_caps` | `0x1` (VWIRE) | backend validator of `rest/device` (field `mesh_sta_vap_enabled`); AP config generator | **Confirmed live 2026-10-03 (AP2, 10.6.106, REST writes bisected over five masks).** Without it the mesh-connect flag is silently dropped (`rc: ok`, empty `data`, reads back `false`) — the UI's tick "reverts". With it the flag persists and the push gains the **uplink station VAP** (`usage=uplink`, `wds`/`vport` enabled, `vport-<mac>`) and `connectivity.uplink_*`. Not claimed: openUF has no WDS station. |
+| `wifi_caps` | `0x800` (MESHV3) | AP config generator | **Confirmed live 2026-10-03.** Together with `0x1` adds the `mesh.*` block (`status=enabled`, `version=3`, `essid`, `psk`, `serial1` while a parent is set) and the **downlink VAP** `vwire3` (`usage=downlink`, `vwire=enabled`, hidden WPA2-PSK), flag on or off. Alone it does nothing. Not claimed. |
+| `wifi_caps` | `0x80` (MESH) | — | **No observable effect** (2026-10-03): pushes with and without it were identical. |
 
 `wifi_caps2` is a **second, entirely separate** bitmask from `wifi_caps`. Since 2026-09-28
 openUF claims `wifi_caps` `0xC` (+`0x20`, +`0x100000` where the device-side probe passes),
@@ -1084,9 +1326,9 @@ openUF parses none of them. Claim both when the feature is built.
   - `radio_caps2` `0x4`: WPA3-Enterprise-192.
   - `radio_caps2` `0x400` and `wifi_caps2` `0x1`/`0x4000`/`0x8000`: MLO and Mesh-MLO.
   - `radio_caps` `0x20000`: `radio.<n>.hard_noisefloor.*` / sensitivity level, a QCA RX-sensitivity setting.
-  - `wifi_caps` `0x1`/`0x80`/`0x800`/`0x4000`/`0x8000`: vwire, mesh, meshv3, multi-vport and Element.
-  - `wifi_caps` `0x10` spectrum scan, `0x2000` "open hostapd", `0x40` `bga_filter`, `0x4000000` low-performance mode.
-  - `wifi_caps2` `0x4` Green AP, `0x10` ACS-DFS, `0x80` quick scan, `0x200` neighbour-in-scan, `0x20000` (an AP-group check, purpose unclear).
+  - `wifi_caps` `0x4000`/`0x8000`: multi-vport and Element. (`0x1`/`0x80`/`0x800` — vwire, mesh, meshv3 — moved to the gated table above on 2026-10-03; see § Wireless uplink.)
+  - `wifi_caps` `0x2000` "open hostapd", `0x40` `bga_filter`, `0x4000000` low-performance mode (`0x10` spectrum scan is claimed since 2026-10-03).
+  - `wifi_caps2` `0x4` Green AP, `0x10` ACS-DFS, `0x200` neighbour-in-scan, `0x20000` (an AP-group check, purpose unclear) (`0x80` quick scan and `0x2` monitor RF scan are claimed since 2026-10-03).
   - `fw_caps` `0x800000` Hotspot 2.0 (such a WLAN is skipped without it) and `0x20000000` RADIUS `filter_id`.
   - `fw2_caps` `0x80000` RadSec, `0x20` `port_table.mac_table_ipv6`, `0x80` device command retry.
 - **Multicast Suppressor** (`wifi_caps2` `0x400000` → `wireless.<n>.multicast.suppressor`):
@@ -1097,8 +1339,30 @@ openUF parses none of them. Claim both when the feature is built.
   `supportHideChWidth` (`0x10000`), `supportZeroHandoff` (`0x2`), `supportLockAp`
   (`0x1000000`), `supportsRoamTopologyStats` (`wifi_caps2` `0x2000`).
 
-The mesh bits (`wifi_caps` `0x80`/`0x800`) stay the subject of REVERSE-ENGINEERING.md's
-mesh experiment and are only ever claimed through `debug_caps`.
+The mesh bits (`wifi_caps` `0x1`/`0x800`) stay the subject of REVERSE-ENGINEERING.md's
+mesh investigation and are only ever claimed through `debug_caps`.
+
+#### The frontend's own names for the bits (Network app 10.6.106, `swai.*.js`, read 2026-10-03)
+
+The React bundle carries both tables as constants, which fixes the names the decompile could
+only infer. `wifi_caps`:
+
+```
+VWIRE 0x1 · ZERO_HANDOFF 0x2 · BANDSTEER 0x4 · BANDSTEER_PER_VAP 0x8 · RF_SCAN 0x10 ·
+AIRTIME_CONFIG 0x20 · BGA_FILTER 0x40 · MESH 0x80 · MIN_RSSI_STRICT_MODE 0x100 ·
+MULTIPLE_ACL_LIST 0x400 · MESHV3 0x800 · UNIFI_WIFI_CAP_RADIUS_MAC_AUTH 0x1000 ·
+HIDE_CH_WIDTH 0x10000 · STA_ONLY 0x2000000 · LOW_PERFORMANCE_MODE 0x4000000 · RF_SCAN_6G 0x8000000
+```
+
+`wifi_caps2`:
+
+```
+MLO 0x1 · MONITOR_RF_SCAN 0x2 · GREEN_AP 0x4 · DFS_BACKGROUND_SCAN 0x8 · ROAMING_ASSISTANT 0x20 ·
+QUICK_SCAN 0x80 · MESH_MLO_PARENT 0x4000 · MESH_MLO_CHILD 0x8000 · WIRELESS_UPLINK_ONLY 0x40000
+```
+
+The UI also treats a device as "wireless uplink only" when its model is a mesh/extender model
+or `wifi_caps2` has `WIRELESS_UPLINK_ONLY`.
 
 **The per-port VLAN validator** (`com.ubnt.ace.api.e.VVyiC`, reachable only once
 `hasQCASwitch()` is true):
@@ -1457,7 +1721,7 @@ them for measured values.
 | `spectrum_scanning` = `false` | Always false: scans are run synchronously inside the cmd handler, so the device is never "currently scanning" when a payload is built |
 | `lldp_table[].is_wired` = `true` | LLDP is inherently a wired-link protocol |
 | `model` / `platform` / `version` / `required_version` / `bootrom_version` | The emulated UniFi identity from `ufmodel/*.lua` — deliberately not the host hardware. This is the point of the project, not an accidental approximation |
-| `fw_caps` = `0x110`, `wifi_caps2` = `0x40` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
+| `fw_caps` = `0x110`, `wifi_caps` = `0x1C`(+`0x20`/`0x100000`/`0x801` by probe), `wifi_caps2` = `0xE2` | Claimed capability bits, each derived from the controller's own bytecode and confirmed live — see [Capability bitmasks](#capability-bitmasks). openUF claims only bits whose features it actually implements |
 | `ucihelper` `wps_device_name` / `ap_setup_locked` | Standards-based rather than Ubiquiti-derived — see the beacon row in the [feature matrix](#feature-matrix) |
 | ~~`usteer.lua`'s `USTEER_DEFAULTS`~~ | ✅ **Resolved upstream 2026-09-10.** Verified against the installed package (usteer 2025.10.04) on an Archer C5. `band_steering_threshold` is a real option — it is in the init script's own list of keys fed to `ubus call usteer set_config`. The named `local` section is read too: the loader does `config_foreach uci_usteer usteer`, which visits every section of type `usteer`, named or anonymous. `network` is read from `uci get usteer.@usteer[-1].network`, the last section of that type — openUF's — so both writes are load-bearing and correctly named. |
 
@@ -1831,8 +2095,14 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 46 | Enhanced Open (OWE) incl. transition | `radio_caps2` bit `0x8` → `wpa.key.1.mgmt=OWE` (+ `owe_devname` pair) → `encryption=owe`, `owe_transition=1` | ⚠️ Adopted 2026-09-28; upstream's lab wire capture only. No OWE BSS on any real AP |
 | 47 | Private Pre-Shared Keys | `wifi_caps` bit `0x100000` → `aaa.<n>.wpa.psk_file.<k>.psk`/`.vlanid`, `dynamic_vlan=1` → `wifi-station` + `wifi-vlan` sections | ⚠️ Adopted 2026-09-28; upstream's lab wire capture through to UCI. No VLAN-key client on any real AP |
 | 48 | FT on a WPA3-only WLAN | `radio_caps2` bit `0x2` | ⚠️ Adopted 2026-09-28; upstream's lab wire diff. An FT-SAE roam on a WPA3-only WLAN not verified on hardware |
-| 49 | Sibling-AP recognition | `vendor_elements` on every VAP → `scan_table[].is_unifi`/`.serialno` | ⚠️ Adopted 2026-09-28; upstream saw the flags clear on their two APs. AP1/AP2 not on this build yet. **AP2, 2026-09-28:** after the forced re-push `vendor_elements=dd0d026f556f5546 01 <MAC>` is in both hostapd configs and on all three VAPs in UCI; AP1 not yet on this build, so no `is_unifi` tag has been seen on the wire |
+| 49 | Sibling-AP recognition | `vendor_elements` on every VAP → `scan_table[].is_unifi`/`.serialno` | ⚠️ Adopted 2026-09-28; upstream saw the flags clear on their two APs. AP1/AP2 not on this build yet. **AP2, 2026-09-28:** after the forced re-push `vendor_elements=dd0d026f556f5546 01 <MAC>` is in both hostapd configs and on all three VAPs in UCI; AP1 not yet on this build, so no `is_unifi` tag has been seen on the wire. **✅ AP2 → AP1, 2026-10-03:** with both on the sibling-element build, AP2's `scan_radio_table` carries AP1's three BSSes with `is_unifi: true` and `serialno: <AP1 MAC>` (5 GHz ch 100 at −10 dBm, in 23 of 40 informs), and the controller's `stat/rogueap` (26 third-party rows) lists none of them — recognised, not flagged. (A device's own `stat/device` record never shows its scan table; look in `stat/rogueap`) |
 | 50 | WLAN Schedule | `wireless.<n>.schedule_<day>` (+ `fw_caps` `0x1000`/`0x400000` change the shape) | ❌ Not implemented; keys go to the unhandled ledger |
+| 51 | Wireless uplink / mesh | `wifi_caps` `0x1`+`0x800` → `wireless.<n>.usage=uplink\|downlink`, `wds=enabled`, `mesh.*` → `openuf_bh_dl_*` (hidden `wds 1` AP) / `openuf_bh_ul_*` (4addr `sta`, wired-first policy); reported back as `usage`-typed VAPs, `uplink` = the uplink VAP's name, the parent as its one station with `serialno` | ✅ **Verified end to end 2026-10-03** (AP2 cable pulled → joined AP1's downlink at −10 dBm, informed over the hop, VLAN-10 client reached its network; controller: AP2 `uplink.type=wireless`, `uplink_mac`=AP1, `is_mesh_v3`, `uplink_table`=[AP1], AP1 `wireless_downlink_macs`=[AP2]). Wire-return path verified 14:07 UTC (station disabled on the first heartbeat, controller back to the LLDP uplink). Multi-hop not yet exercised. Bits claimed by default on DSA boards |
+| 52 | Quick Scan (Radios → Quick Scan; Radio AI prescan) | `wifi_caps2` `0x80` → `cmd: quick-scan {scan-band: 0\|1\|2, scan-bw: 20\|40\|80\|160}`; device: `quickscan_scanning` + `radio_table[].spectrum_table`/`spectrum_table_time` + an `EVT_AP_QuickScanEvent` notification inform | ✅ **Verified live 2026-10-03** on AP2 against 10.6.106: the REST cmd arrived (`cmd: quick-scan` in the log), the controller's `quick_scan_state` went `in_progress` and back, the event stamped `spectrum_scan_timestamp` and `stat/spectrum-scan` carries the rows — see [RF scans](#rf-scans-airtime-scan-quick-scan-and-radio-ais-sweep--2026-10-03) |
+| 53 | Airtime Scan (Radios → Airtime) | `wifi_caps` `0x10` (RF_SCAN; the view also checks `wifi_caps2` `0x2` MONITOR_RF_SCAN) → `cmd: spectrum-scan`; device: `spectrum_scanning` + the same per-radio tables | ✅ Same handler and same live run (`cmd: spectrum-scan` arrived, every radio swept). The result view reads `stat/spectrum-scan`, never the device DTO (which strips the tables unless a scan is running) |
+| 54 | Radio AI neighbour sweep | `cmd: scan_band {band: ng\|na}` (the controller's own scheduler, `XbYOtjBEpjeHWlUU`; it sets `scanning` and reads the next inform's `scan_radio_table`) | ✅ Handled 2026-10-03: a forced sweep on the named band; the verb itself was captured on AP1 2026-10-02 |
+| 55 | Discovery requests (WiFiman Discovery, UniFi app, Device Discovery Tool) | UDP 10001 probes `01 00 00 00` / `02 08 00 00`, answered unicast with the announce TLVs under version 1 / command 0 and version 2 / command 9 | ✅ **Verified live 2026-10-03**: AP2 answered both probes (4 replies) after answering none; a UCG Ultra answers them identically — see [Discovery requests and WiFiman](#discovery-requests-and-wifiman--2026-10-03) |
+| 56 | WiFiman (Settings → System → WiFiman) | Console-side only: `mgmt.wifiman_enabled` is never pushed to an AP; the app reads `/v2/api/site/<site>/wifiman/<its own IP>` on the console | ✅ **Verified live 2026-10-03**: the console answered fully for a laptop connected through openUF's AP1 (channel, link rates, experience history, `uplink_devices` chain, `nearest_neighbors` from openUF's scans). Nothing to implement in the inform; the device-side gap was row 55 |
 
 ---
 

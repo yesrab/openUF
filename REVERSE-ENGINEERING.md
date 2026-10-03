@@ -35,7 +35,7 @@ Concretely, carried over from how the confirmed work was done:
 | Role | Address | Notes |
 |---|---|---|
 | Controller | UniFi Cloud Gateway Ultra | Network **10.6.101** as of 2026-09-06 (`unifi.version` in its own `system_cfg`; it was 10.4.57 on 2026-09-01). The pinned Docker baseline is still 10.4.57, so a bytecode finding from it needs a live re-check before it is trusted against this gateway |
-| AP1 | `192.168.1.22` (DHCP; was `.25` on 2026-09-01) | openUF on `jiorouter,ax6000-jidu6j01`, wired. Runs a custom OpenWrt SNAPSHOT image (r36016+4, kernel 6.18.44) whose package feed carries no `kmod-nft-bridge` / `kmod-sched-act-police`, so the Blocker's `meta` rule and the upload shaper are inert on it until the image is rebuilt with both. root has a password (not recorded here — `OPENUF_SSH_PASS` for `tools/deploy.sh`). Clock is UTC, AP2's is local |
+| AP1 | `192.168.1.22` (DHCP; was `.25` on 2026-09-01) | openUF on `jiorouter,ax6000-jidu6j01`, wired. Since 2026-10-03 an **official** OpenWrt SNAPSHOT from the firmware selector (r36662), running the installed package `openuf-0.0.3-r1` + `luci-app-openuf` from `/usr/lib/openuf` (the init prefers it over a dormant `/opt/openuf`), UCI-managed (`modelmap jiorouter-ax6000-jidu6101`). Since 2026-10-03 its `inform.lua` is hot-patched with the backhaul guard and it claims `wifi_caps 0x10082D` through `debug_caps`; dump armed via UCI. Root login is password-only (not recorded; the deploy script's `OPENUF_SSH_PASS` path, or an expect wrapper). **The dev machine is on AP1's 5 GHz WiFi** — never change AP1 and AP2 at the same time, and prefer AP2 |
 | AP2 | `192.168.1.147` (DHCP; was `.149` on 2026-09-06, `.151` on 2026-09-01) | openUF on `jiorouter,ax6000-jidu6101`, wired, `country_override = "PA"`. root has no password and dropbear accepts the blank login, so `ssh -o BatchMode=yes root@192.168.1.147` works with no helper. **The on-device test box** (2026-09-15): packages may be installed on it; AP1 runs a custom image and is not for testing. Its clock was **8 days 4 h slow** on 2026-09-15 with `sysntpd` running (backlog row 13) and was stepped by hand with an unjailed `ntpd -q`; ledger and dump timestamps before 13:22 UTC that day read "September 7" for that reason. `tcpdump-mini` is installed on it |
 
 Both APs present as `u6iw`. SSH credentials are deliberately **not** recorded here — this
@@ -155,11 +155,180 @@ Device shell is busybox ash: `grep -vc` prints `0` **and exits 1**, so
 
 ---
 
-## Investigation 1 — Mesh / wireless uplink  🔴 BLOCKED
+## Investigation 1 — Mesh / wireless uplink  ✅ WORKING (verified end to end 2026-10-03)
 
-**Status:** not implemented, and **not reachable by capture** in its current state. The
-blocker is identified and the next experiment is cheap. Deprioritised 2026-09-01 by
-choice, not by difficulty.
+**Status (2026-10-03, night): mesh works, end to end, and the controller agrees.** With the
+user running the two actions the agent could not (hot-patching AP1 and pulling AP2's cable):
+AP2 lost its wire, `backhaul.lua` enabled its 4-address station 20 s later, it joined AP1's
+hidden downlink (`phy1-sta0` → `7a:bb:c1:fe:3f:cb`, −10 dBm, HE160 4×4 at 4.8 Gbit/s both
+ways, `4addr: on`), kept `192.168.1.147` over the bridge, resumed informing over the hop
+(gateway at 1.5 ms), brought its own 5 GHz SSID back up on AP1's channel 100 (DFS was no
+obstacle), and a VLAN-10 IoT client behind it kept its `192.168.10.x` address and a
+satisfaction of 100. AP1 shows the per-station WDS netdev `phy1-ap1.sta1` in br-lan with
+AP2 and its clients learned behind it. The controller's record for AP2 now reads
+`uplink.type=wireless`, `uplink_mac`=AP1, `is_mesh_v3=true`, `uplink_table=[AP1]`, and the
+`wireless-links` view pairs the two. **What made the controller agree was its own code**:
+the matching Network package was downloaded from Ubiquiti, its jar decompiled, and the
+inform processor read — the contract is in PROTOCOL-VALIDATION § Wireless uplink; three
+plausible shapes had failed before that. Still open: multi-hop, and the downlink's child resolution on the parent (the
+controller logs "Can't resolve wireless mac" for our station MACs; cosmetic, the child's
+report carries the link).
+
+### Evidence — 2026-10-03, live, UCG Ultra / Network 10.6.106, AP2 only
+
+Tooling first, because it changed what was reachable: the user provisioned a UniFi OS
+**API key**. Sent as `X-API-KEY`, it is accepted by the legacy API (`stat/device`,
+`rest/device` PUT, `rest/setting`, `cmd/devmgr`) and by the Network app's static files, so
+the controller's device records, the REST write path and the frontend bundles were all
+readable with no browser session. The key is not recorded anywhere; ask for it.
+
+**1. The gate is `wifi_caps` `0x1` (VWIRE), and it gates the *backend*, not the UI.**
+The frontend's own constant table (`swai.*.js`) names the bits: `VWIRE:1, ZERO_HANDOFF:2,
+BANDSTEER:4, BANDSTEER_PER_VAP:8, RF_SCAN:16, AIRTIME_CONFIG:32, BGA_FILTER:64, MESH:128,
+MIN_RSSI_STRICT_MODE:256, MULTIPLE_ACL_LIST:1024, MESHV3:2048, UNIFI_WIFI_CAP_RADIUS_MAC_AUTH:4096,
+HIDE_CH_WIDTH:65536, STA_ONLY:33554432, LOW_PERFORMANCE_MODE:67108864, RF_SCAN_6G:134217728`
+(now in PROTOCOL-VALIDATION § Capability bitmasks). The mesh-connect checkbox saves
+`mesh_sta_vap_enabled` with `PUT rest/device/<_id>`; the controller answers `rc: ok` either
+way, but **persists the flag only when the device claims `0x1`** — otherwise the response
+carries an empty `data` and the next read says `false`, which is exactly the "tick reverts"
+symptom of 2026-09-01. Bisected on AP2 by claiming masks through `debug_caps` and writing
+the flag through the REST API after each restart (a control write of `snmp_contact`
+persisted every time):
+
+| `wifi_caps` claimed | flag persists |
+|---|---|
+| `0x1000AC` = shipped + MESH `0x80` | no |
+| `0x1008AC` = + MESH + MESHV3 `0x800` | no |
+| `0x1000AD` = + VWIRE `0x1` + MESH | **yes** |
+| `0x10002D` = + VWIRE only | **yes** |
+| `0x1008AD` = + VWIRE + MESH + MESHV3 | **yes** |
+
+**2. What each bit changes in the push** (eight `setparam`s diffed on AP2, then AP1's own):
+
+- **VWIRE `0x1` alone** → `connectivity.status=enabled`, `connectivity.uplink_eth=eth0`,
+  `connectivity.uplink_bridge=br0`; and, once the device's mesh flag is on, the **uplink
+  station**: a second virtual interface on the 5 GHz radio, `radio.2.virtual.<k>.mode=managed`,
+  `wireless.<n>.mode=managed usage=uplink wds=enabled vport=enabled hide_ssid=true`,
+  `ssid=vport-<own MAC, no colons>` (fxkr's 2015 capture had the same `vport-<SERIAL>`
+  naming), its `aaa.<n>.status=disabled`, plus `connectivity.uplink_wds=<that devname>`.
+- **VWIRE `0x1` + MESHV3 `0x800`** → additionally the `mesh` block — `mesh.status=enabled`,
+  `mesh.version=3`, `mesh.essid=vwire-<16 hex>` (the site's `connectivity.x_mesh_essid`,
+  22 chars), `mesh.psk=<32 chars>` (`connectivity.x_mesh_psk`), and `mesh.serial1=<MAC>`
+  only while a priority-1 parent is set — and the **downlink**: a third 5 GHz virtual
+  interface `vwire3`, `mode=master`, `wireless.<n>.mode=master usage=downlink wds=enabled
+  vwire=enabled hide_ssid=true`, `ssid=<mesh.essid>`, with a full `aaa.<n>` WPA2-PSK block
+  carrying the same PSK — the hidden network children join. **The downlink and the `mesh`
+  block come regardless of the device's own flag**: a wired, mesh-capable device is a
+  parent by default (AP2 with the flag off: `+80` lines vs wired, exactly these). Every new
+  devname is added to `bridge.1`, to the VLAN-10 bridge as `<dev>.10`, with `vlan.*` and
+  `netconf.*` rows (raw dev `up=disabled`, `.10` `up=enabled`).
+- **MESHV3 `0x800` without `0x1`** → nothing (identical to wired). **MESH `0x80`** → nothing,
+  with or without the others.
+- **The flag defaults to on.** The moment a device claims `0x1` the controller sets
+  `mesh_sta_vap_enabled: true` on its record by itself — both APs read `true` after
+  claiming, AP2 after an explicit `false` minutes earlier; the UI form's default
+  (`mesh_sta_vap_enabled ?? true`) is the same rule. So a freshly capable AP gets *both*
+  VAPs, as AP1 did.
+
+So UniFi mesh is a **4-address WDS station joining a hidden WPA2-PSK AP**, not 802.11s —
+the open question from 2026-09-01 is answered. The backhaul SSID and PSK are **site
+settings pushed per device**, not derived: `rest/setting` key `connectivity` holds
+`x_mesh_essid`/`x_mesh_psk` (and `element_adopt` holds the Element pair). `unifi.key`
+turned out to be none of `x_vwirekey`, `x_mesh_psk` or `x_element_psk` — still unknown.
+
+**3. The UI, from its code.** The device settings form (lazy chunks of the Network app)
+submits `mesh_sta_vap_enabled` via the REST PUT and, when a priority changed, the device
+command `set-priority-uplink` with `mac` and **`prefer1`** (`prefer2` optional) — the
+controller's own error names the field (`api.err.InvalidTarget`, "no priority 1 input")
+when it is missing; `unset-priority-uplink` clears it. `set-priority-uplink` persisted
+`mesh_uplink_1` on AP2 and triggered a push even while the flag was still `false`. The
+**uplink-priority dropdown is filled from the device's own `uplink_table`**: each entry
+must name a site device by `mac`, and carries `radio`, `channel`, `signal` (or `rssi`),
+optionally `mlo_mesh_supported`; entries for the same `mac` collapse into one option with
+per-radio `radioLinks`. An empty `uplink_table` is an empty dropdown. The site-level
+**Wireless Meshing** toggle is the `connectivity` setting (`enabled: true` here), checked
+at adoption via `adopt-info/<mac>` → `requires_enabling_meshing`.
+
+**4. What the controller does *not* take from the device, and what it already knows.**
+`uplink_table` and `vwire_table` sent in the inform (tried bare, then with `ap_mac`,
+`bssid`, `essid`, `type`, `up`) are **not** stored — the record kept `uplink_table: []`
+with the flag on and off. The controller builds the list itself, and it has the raw
+material: with `neighbour_scan_interval` on, AP2 reports **AP1 on both bands, tagged**
+(`is_unifi=true`, `serialno=78:bb:c1:fe:3f:c9`; 5 GHz ch 100 at −10 dBm in 23 of 40
+informs), and the controller's `stat/rogueap` (26 rows) lists **none** of AP1's BSSes —
+the sibling element is recognised on this fork's hardware (PROTOCOL-VALIDATION feature 49
+upgraded). Note for the next reader: a device's `scan_radio_table` never appears in its own
+`stat/device` record, only in `stat/rogueap` after filtering; two hours were lost reading
+the wrong place. With the child reporting a tagged parent and still an empty
+`uplink_table`, the one variable left is the **parent**: AP1 claims no vwire bit and runs
+no downlink VAP, and a parent candidate presumably has to be both.
+**Then AP1 was made capable too (16:08 UTC):** both APs claim `0x10082D`, both have the
+flag on, AP2 reports AP1 tagged on both bands — and both `uplink_table`s are still `[]`,
+`wireless-links` is `[]`. So "scan ∩ capable" is not the rule either. The remaining
+hypothesis is the obvious one: a candidate parent is a device whose **downlink VAP is on
+the air** — the child's scan has to contain the hidden `vwire-<site>` BSS, matched to the
+parent through the vendor element's serial or the parent's reported `vwire_vap_table`.
+Neither AP beacons it (the guard skips the downlink), so there is nothing to list. That
+test is the first implementation step, not a probe.
+
+**5. State left on both APs and how to undo it.** AP2 (`/opt/openuf/conf.lua`):
+`debug_caps = {wifi_caps = 0x10082D}`, `debug_payload_extra` with two synthetic tables,
+UCI `neighbour_scan_interval=90`; backup `conf.lua.pre-mesh-20261003`. AP1 (the running
+tree is the **package** at `/usr/lib/openuf`; `/opt/openuf` is a dormant tarball install):
+`inform.lua` replaced by this tree's copy with the guard (original kept as
+`inform.lua.pkg-0.0.3`; `apk fix openuf` or a reinstall also restores it), `conf.lua`
+`debug_caps = {wifi_caps = 0x10082D}` (backup `conf.lua.pre-mesh-20261003`), UCI
+`debug_dump_file=/tmp/openuf-dump.txt` + `debug_dump_requests=1`. The controller holds
+`mesh_sta_vap_enabled: true` for both (its own default) and no priority uplink. Undo, per
+AP, one at a time: `debug_caps = nil` (and on AP2 `debug_payload_extra = nil`), restart;
+then `PUT rest/device/<_id> {"mesh_sta_vap_enabled": false}` for each. The guard kept
+every push harmless: each AP still runs exactly its three SSIDs and hostapd's PIDs never
+changed through any of it.
+
+### What is still open, and the next steps
+
+**Built on 2026-10-03** (design below, kept for the reasoning): `openuf/backhaul.lua` plans
+the sections from the push, runs the wired-first uplink policy once per heartbeat
+(`inform._backhaul_tick`), and reports a wireless `uplink` object while associated;
+`ucihelper.backhaul_apply` writes `openuf_bh_dl_<radio>` (hidden `wds 1` AP, `psk2`,
+`network lan`) and `openuf_bh_ul_<radio>` (`sta`, `wds 1`, `disabled` unless the policy says
+wireless) after `wlan_clear` on every push; `get_vap_table` and `ap_ifnames` skip anything
+with `openuf_backhaul`, so the downlink is neither a reported VAP nor an l2guard target;
+`state.json` carries `backhaul_mode`, `backhaul_wired_port`, `backhaul_parent`. The policy
+reads the remembered uplink socket's `operstate` (a pulled cable reads `lowerlayerdown`, an
+admin-down port `down`; both are "no wire"), waits two heartbeats before enabling the
+station, and disables it on the first heartbeat with the wire back — never both uplinks at
+once. **Verified live on AP2 (parent half):** `iw dev` shows `phy1-ap1` with the mesh ESSID
+on radio1, `/var/run/hostapd-phy1.conf` has `bss=phy1-ap1`, `ignore_broadcast_ssid=1`,
+`wds_sta=1`; `bridge link` has it in br-lan; the inform's `vap_table` lists only the three
+user SSIDs; mt76 on mt7986 took the WDS AP without complaint. **Not verified:** a station
+joining it (needs a second device, i.e. AP1), the policy on a real cable pull, the `uplink`
+report's reception by the controller, `uplink_table` filling.
+
+**Done 2026-10-03 (user-run where the agent was refused):** AP1 hot-patched twice with
+`tools/hotpatch.sh --repush` (the init prefers the package tree, so deploy.sh cannot reach
+it); AP2's cable pulled at 12:56 UTC; association, DHCP continuity, informs, the VLAN client
+and the controller's wireless uplink all observed, the last after reading the controller's
+code (contract in PROTOCOL-VALIDATION). Remaining, in order of value:
+
+1. ✅ (14:07 UTC) **AP2's cable back in:** `backhaul: wired uplink back on wan -- disabling
+   the WDS station` on the first heartbeat, radio1 reloaded (ACS picked ch 36, both BSSes
+   back), the inform's `uplink` string gone, the controller back to "wired via UCG port 2"
+   with the gateway's LLDP listing AP2 again. The wired-first policy is verified both ways.
+2. **AP1 on the final build** (`sh tools/hotpatch.sh --repush 192.168.1.22`): its downlink
+   then reports the controller's devname and the kick guard applies to its children.
+3. **Retire the `debug_caps` claims** on both APs once the final build runs there: the mesh
+   bits are claimed by default on DSA boards now.
+4. **Downlink child resolution:** the controller cannot map our station MACs to devices (it
+   knows only Ubiquiti OUIs and `serialno`); harmless, but the parent's `downlink_table` stays
+   empty. A child could advertise its identity MAC in its association request, or the parent
+   could learn it from the sibling element — neither is built.
+5. **Multi-hop and parent preference**: a child that is also a parent is untested; the
+   station joins whichever downlink wpa_supplicant picks, `mesh.serial1` only names the
+   parent for reporting.
+
+3. **Adoption over a wireless uplink** is untested and separate: a factory-reset openUF
+   device has no backhaul credentials. Probably out of scope for a first version.
 
 ### The symptom
 
@@ -261,7 +430,7 @@ controller will not push mesh config until it believes mesh is possible, and it 
 believe that until openUF claims the capability. So *finding the gate* is step one, not
 step three, and it has to come from static analysis rather than from the wire.
 
-### Experiment plan (in order, cheapest first)
+### Experiment plan (in order, cheapest first) — ✅ done 2026-10-03, kept for the method
 
 **Step 0 — find the field the dropdown filters on. Start in the frontend, not the JVM.**
 The dropdown is rendered client-side, so its filter predicate is plain JS in the live
@@ -298,9 +467,9 @@ it.
 **Step 4 — implement.** `uplink` in the payload, sta-or-mesh mode in `ucihelper`, and the
 adopt-over-wireless bootstrap if it turns out to be separate.
 
-### Open questions
+### Open questions (as written 2026-09-01; the 2026-10-03 evidence above answers most)
 
-- Which bit — or which model-registry property — gates mesh-parent eligibility? `wifi_caps`
+- ~~Which bit~~ **Answered:** `wifi_caps` `0x1` (VWIRE) gates the flag; `0x800` (MESHV3) gates the `mesh` block and the downlink VAP; `0x80` does nothing. The dropdown is gated by the device-reported `uplink_table`, not by a bit. Original text: Which bit — or which model-registry property — gates mesh-parent eligibility? `wifi_caps`
   is entirely unexplored (it gates `supportBandsteering()`/`supportZeroHandoff()`, and
   openUF sends neither). `wifi_caps2`'s other bits are documented as gating "Mesh MLO
   parent/child" — but **MLO is WiFi 7**, so that is probably *not* classic wireless uplink.
@@ -331,6 +500,8 @@ adopt-over-wireless bootstrap if it turns out to be separate.
 
 ### Do not re-attempt
 
+- **Claiming `wifi_caps` `0x80` for anything.** It changed nothing in three diffed pushes (2026-10-03).
+- **Sending `uplink_table` or `vwire_table` in the inform expecting the controller to store them.** It does not, with any field set tried (2026-10-03).
 - **Waiting on the wire for mesh config while capabilities are unclaimed.** Measured:
   83/83 `noop` over 9 minutes with repeated Applies. Nothing arrives. Ever.
 - **Blaming RF or the scan table.** Both measured and ruled out above (−12 dBm, 13
@@ -366,12 +537,38 @@ no mesh topology in the UI, but the physical link is real. Three gotchas, all ve
 
 ---
 
-## Investigation 2 — RF scan trigger  🟡 GATED
+## Investigation 2 — RF scan trigger  ✅ IMPLEMENTED (Quick Scan, Airtime Scan, Radio AI sweep — verified live 2026-10-03)
 
-**Status:** the UniFi mobile app has an RF Environment "scan" action for an AP, and it
-does **not** reach the wire for an openUF device. Same shape as Investigation 1: the
-controller sends nothing, so the gate has to be found by static analysis or a REST probe,
-not by capture.
+**Resolution (2026-10-03).** All three verbs are handled and the result reaches the
+controller's Airtime view: `quick-scan` (`wifi_caps2` `0x80`, integer `scan-band`/
+`scan-bw`), `spectrum-scan` (`wifi_caps` `0x10`) and the controller's own `scan_band`.
+One forced sweep plus `iw survey dump` becomes `radio_table[].spectrum_table` rows at
+every width the band offers, `spectrum_table_time` is an age, `quickscan_scanning: false`
+on the next inform is the completion edge, and one `EVT_AP_QuickScanEvent` notification
+inform dates the sweep. The whole contract, the two mistakes made on the way (table only
+in `radio_table_stats`; noise dBm as "interference") and the live evidence are in
+PROTOCOL-VALIDATION.md § RF scans. What follows is the history.
+
+
+**Status:** the mobile app's RF-scan action **does** reach an openUF device now. AP1's
+unhandled ledger holds it, recorded 2026-10-02 21:30Z (controller 10.6.106), twice:
+
+```json
+{"_type":"cmd","cmd":"scan_band","band":"na","device_id":"…","_id":"…","time":…,"datetime":"2026-10-02T21:31:25Z","server_time_in_utc":"…"}
+```
+
+One argument, `band` (`na` here; `ng` is the other). The Network app's constant table has
+both device commands, `quick-scan` and `spectrum-scan`, and the device record carries
+`quick_scan_state: {in_progress, last_band, last_width}` and `quickscan_scanning` — this is
+the **Quick Scan**, whose gate is `wifi_caps2` `0x80` (`QUICK_SCAN`; `MONITOR_RF_SCAN` is
+`0x2`) per the same table. openUF claims neither, and the verb arrived anyway, so either the
+app does not check the bit or it checks something else; the 2026-09-06 run against 10.6.101
+saw nothing, which may simply be the version. Device side there is nothing yet: the `cmd`
+dispatcher logged it and the ledger kept the body. Next step is a handler — a sweep on the
+named band (the `11k-scan` machinery already does this per radio) reported back in
+`scan_radio_table`, and whatever `quick_scan_state` the controller expects (decompile or a
+further capture; `last_width` suggests the band's channel width is reported too). The
+original evidence and the REST-probe plan below stand as history.
 
 ### Evidence — 2026-09-06, live, UCG Ultra 10.6.101
 
@@ -717,13 +914,14 @@ review (session log); none started.
 | 19 | **WLAN Schedule** | Not implemented. The controller emits `wireless.<n>.schedule_<day>` keys for a scheduled WLAN regardless of any bit (they land in the unhandled ledger); `fw_caps` `0x1000` and `0x400000` change the shape to `schedule_<day>.<i>` and add `schedule_invert` (upstream's decompile, 2026-09-27). | Capture a scheduled WLAN's keys on AP2, then a cron/`wifi` toggle per block; claim both bits only when built. |
 | 20 | **Hardware check of the 2026-09-28 upstream adoptions** | Roaming Assistant, device-level Band Steering, Airtime Fairness, OWE, PPSK, the sibling-AP element, the reworked satisfaction score and `scan ap-force` all arrived from upstream with **their** evidence (AX3000T/Archer C5). None has run on the JioRouter boards. | On AP2 first: deploy, then (1) `cat /sys/kernel/debug/ieee80211/phy*/airtime_flags` and the controller's Airtime Fairness switch -- **read the controller's stored value before the first push**, upstream found `atf_enabled: false` waiting; (2) `uci get wireless.<section>.vendor_elements` and, once AP1 follows, whether each stops appearing as a rogue in Insights; (3) `ubus call usteer get_config` for `band_steering_interval` with the WLAN toggle off; (4) `logread \| grep roamassist` with a client walked between AP1 and AP2; (5) an OWE-transition and a PPSK test WLAN on AP2 only; (6) `iw dev phy0-ap0 scan ap-force` by hand, and the 11k-scan count in the log; (7) the Experience column against the previous build for the same clients. **AP2 done 2026-09-28** (build `d4c3460`, at `192.168.1.148` after a reboot): all 38 Lua files load under its Lua 5.1.5; every prerequisite present (ucode `nl80211`, `airtime_flags` on both phys, `hostapd -vowe` 0, `vlanid=` and `wpa_psk_file` strings); `iw dev phy1-ap0 scan ap-force` rc 0 on mt76; the wire claims `wifi_caps` 0x10002C, `wifi_caps2` 0x60, `radio_caps2` 0xB; the forced re-push (blank `cfgversion`, restart) put the sibling element in both hostapd configs, restarted usteer on `openuf_active` with the old threshold gone, rebuilt l2guard's three rules, 0 handler failures, nothing new in the ledger -- **and carried `atf.mode=disabled`, so AP2's airtime scheduler is now off until the device panel says On** (check 1 answered the hard way). Still owed: AP1 (its root password is not on file), the Environment tab once AP1 beacons too, a Roaming Assistant walk between the two, OWE/PPSK test WLANs, and the Experience score (no client was associated). |
 | 11 | **Discovery on multicast too** | jk-5 and fxkr both say a real AP sends the identical announce to `255.255.255.255` **and** `233.89.188.1`; openUF sends broadcast only, amd989/unifi-gateway multicast only (and is discovered fine). Matters only where broadcast does not reach the controller but multicast routing does. | One extra `sendto` in `announce.lua` with `ip-multicast-ttl` set. Trivial; low value. |
-| 2 | **`wifi_caps` / `wifi_caps2` full bit map** | **Mapped by upstream 2026-09-27** (full sweep of the controller's gates, PROTOCOL-VALIDATION.md § Capability bitmasks), and the feature bits are claimed here since 2026-09-28: `wifi_caps` `0x4`/`0x8`/`0x20`/`0x100000`, `wifi_caps2` `0x20`/`0x40`, `radio_caps2` `0x1`/`0x2`/`0x8`. Still unclaimed on purpose: the mesh bits (this file's mesh experiment), WLAN Schedule (`fw_caps` `0x1000`/`0x400000`, row 19), and everything with no OpenWrt equivalent. | Enumerate `hasWifiCapability*` call sites in `com.ubnt.data.uuvchZbWVhirD` and map each bit to the feature it gates. **This is the master key** — mesh, assisted roaming, band steering and quick scan all hang off it, so doing it once unblocks several features at a time. Highest leverage item in this file. |
+| 2 | **`wifi_caps` / `wifi_caps2` full bit map** | **Mapped by upstream 2026-09-27** (full sweep of the controller's gates, PROTOCOL-VALIDATION.md § Capability bitmasks), and the feature bits are claimed here since 2026-09-28: `wifi_caps` `0x4`/`0x8`/`0x20`/`0x100000` (+`0x1`/`0x800` mesh and `0x10` RF scan since 2026-10-03), `wifi_caps2` `0x20`/`0x40` (+`0x2`/`0x80` since 2026-10-03), `radio_caps2` `0x1`/`0x2`/`0x8`. Still unclaimed on purpose: the mesh bits (this file's mesh experiment), WLAN Schedule (`fw_caps` `0x1000`/`0x400000`, row 19), and everything with no OpenWrt equivalent. | Enumerate `hasWifiCapability*` call sites in `com.ubnt.data.uuvchZbWVhirD` and map each bit to the feature it gates. **This is the master key** — mesh, assisted roaming, band steering and quick scan all hang off it, so doing it once unblocks several features at a time. Highest leverage item in this file. |
 | 3 | **Per-chain RSSI** | Identified in an earlier session, never wired. `iw` exposes per-chain signal. | Find the controller-side field name, then read from `iw dev <if> station dump`. |
 | 4 | **Per-STA `noise`** | Same — available from `iw`/survey, not currently reported. | As above. |
 | 5 | **Expected throughput / `linkscore`** | Both currently report `0`. `iw` gives `expected throughput` per station. | Confirm whether the controller consumes it before implementing. |
-| 6 | **WiFiman** | Investigated and **closed**: it is a separate proprietary agent, not part of the inform protocol. Zero references in the repo, nothing on the wire. | Nothing. Do not re-investigate without new evidence. |
-| 7 | **AirView / spectrum scan trigger** | Handler implemented and exercised against real radios. The web UI of 10.4.57 had no trigger; the **mobile app has one**, and against 10.6.101 it sends the device nothing — see Investigation 2. | Investigation 2, step 0: the REST `spectrum-scan` probe. |
+| 6 | **WiFiman** | **Reopened and closed properly 2026-10-03.** The 09-06 verdict ("a separate proprietary agent") was wrong about the mechanism: WiFiman is console-side REST (`/v2/api/site/<site>/wifiman/<clientIp>`, `com.ubnt.service.wifiman.*`), keyed on the app's own IP, and it already answers fully for a client on an openUF AP. What the app could not show was the **AP itself** in its Discovery list: openUF never answered the UDP 10001 discovery probes a UCG Ultra answers. `announce.lua` now does (PROTOCOL-VALIDATION.md § Discovery requests and WiFiman). | Nothing on the inform side. If the app still shows a thin entry, compare its probe against the capture recipe in PROTOCOL-VALIDATION.md. |
+| 7 | **AirView / spectrum scan trigger** | **Done 2026-10-03.** The web UI's Airtime Scan is gated by `wifi_caps` `0x10` (now claimed) and sends `spectrum-scan`; the view reads `stat/spectrum-scan`, which strips nothing, while `stat/device` strips the tables unless a scan is running — the reason earlier probes looked empty. See Investigation 2. | — |
 | 21 | **Bluetooth setup via a USB adapter** | Parked by choice 2026-10-03, assessed in **Investigation 4**: app-driven setup of an *unadopted* device that hands over to the existing L3 adoption; protocol public from the Protect app (zerotypic/unifi-ble-client), AP specifics not; needs a small C daemon (libsodium crypto, raw mgmt + L2CAP ATT, no BlueZ) and a per-target package. Sensor bridging and beacons are out of scope. | Investigation 4, step 1: jadx the Network app for the U6IW service UUID, name prefix and `manage` shape. Nothing before that. |
+| 22 | **Quick Scan and `cmd: scan_band`** | **Done 2026-10-03.** Two different things: `scan_band {band}` is the controller's own Radio AI neighbour sweep (it sets `scanning`, reads the next `scan_radio_table`); the app's Quick Scan is `quick-scan {scan-band, scan-bw}` behind `wifi_caps2` `0x80`, with `quick_scan_state` written by the controller and `quickscan_scanning` reported by the device. Both handled; verified live on AP2. See Investigation 2. | — |
 
 ---
 
@@ -741,3 +939,11 @@ review (session log); none started.
 | 2026-09-28 | Upstream review and selective adoption, round three | jonasevcik/openUF had 26 commits since the last review (`12b4db0..08d0003`, 25–27 September, tag v0.9.3). The first seven were upstream taking this fork's 2026-09-15 work (`sysconf`, `l2guard`, the `noop` interval, the bootstrap re-lock guard, credited in their headers) -- checked for equivalence and left alone. Adopted, re-implemented in this tree's style with their tests: the sibling-AP vendor element and its nl80211/`ucode` reader (`scan_table[].is_unifi`/`serialno`), `\xNN` SSID decoding, Roaming Assistant (`roamassist.lua`, `wifi_caps2` 0x60, `openuf_roam_assist`, `roam_assist_diff_db`), the usteer off-switch fix (`band_steering_interval`, not the inert threshold), device-level Band Steering (`wifi_caps` 0xC, `bandsteering.*`), Airtime Fairness (`airtime.lua`, `wifi_caps` 0x20, `atf_enabled` in state, reapplied at start), Enhanced Open incl. transition (`radio_caps2` 0x8, `owe_supported`, `get_ifnames_for_vap`), FT with WPA3 (`radio_caps2` 0x2), Private Pre-Shared Keys (`wifi_caps` 0x100000, `ppsk_add`, `wifi-station`/`wifi-vlan`, `bss_ifname`), the three-term WiFi Experience estimate (`hostapd_sta_caps`, `tx_duration`, SNR), `_forget_controller` on `setdefault` and `reset-inform`, the once-a-minute l2guard VAP resync, `_force_scan` (`ap-force` + exit status) for both scan paths, the uninstall cron cleanup, the lab stubs, and upstream's full capability-gate sweep into PROTOCOL-VALIDATION.md. Kept ours: `debug_caps`, `state.lua`'s design, the function names, this CLAUDE.md. 844 tests pass (777 before). Deployed to AP2 the same day (build `d4c3460`; AP2 had rebooted onto `192.168.1.148`, and its clock was 11 days slow again -- stepped from the dev machine, `ntpd -q` does nothing there): backlog row 20 records the checks, including the controller's stored `atf.mode=disabled` taking effect on the first push. AP1 waits for its root password. |
 | 2026-09-21 | UAP-IW-HD identity; Archer A7 / C7 profile | `ufmodel/uhdiw.lua` added so a WiFi 5 board can present as a WiFi 5 in-wall with the same five sockets: model code and firmware from Ubiquiti's own catalog (`fw-update.ubnt.com/api/firmware-latest`, platform `UHDIW`, release v6.7.57+15670 published 2026-09-03), `buildtime`/`factoryver` marked cosmetic. `modelmap/archer-a7-v5.lua` written from the OpenWrt tree for the Archer A7 v5, C7 v4 and C7 v5 -- one `board.d` case arm for all three: tagged CPU port 0 on a single `eth0` trunk (the WDR3500 shape, `lan_cpueth = "eth0"`), WAN = physical 1 and LAN1..4 = 2..5 from both `02_network`'s labels and `01_leds`' port masks, `green:wps` as the LED no DTS alias drives, radio0 expected to be the 5 GHz ath10k (`phy0tpt`). Neither has touched hardware or a controller (backlog row 18; the identity is not to be tried on AP1/AP2). Tests: `tests/test_ufmodel.lua` loads every identity and pins UHDIW's shape, the A7 map's board truth is pinned in `test_modelmap.lua`, and the identity is driven through `build_json` and `announce.build_packet`. |
 | 2026-10-03 | Bluetooth setup over a USB adapter (assessment only) | Asked how a real AP's Bluetooth would play in openUF. Found Ubiquiti's two uses (Protect sensor bridging, out of scope; app setup of unadopted APs, worthwhile), a public reverse-engineering of the BLE protocol from the Protect app, and that it cannot be done in Lua or with OpenSSL (libsodium crypto, `AF_BLUETOOTH`) — so a C daemon and the first non-`all` package. **Parked by choice**; Investigation 4 and backlog row 21 hold the plan, gated on decompiling the Network app first. |
+| 2026-10-03 | Mesh / wireless uplink — status review | No experiment. Collected what moved since 09-01: the mesh bits are named by upstream's sweep (`wifi_caps` `0x1`/`0x80`/`0x800`/`0x4000`/`0x8000`), so step 2's go/no-go is runnable with `debug_caps = {wifi_caps = 0x1000AC}` on AP2; AP2's ledger holds the first `mesh-halt` **body** (bare envelope, 2026-09-29, the only unhandled `cmd` ever) ; `mesh.status`/`unifi.key` in all 6 full pushes. Written up as a status update in Investigation 1. AP2 is at `.147` again and its clock was four days slow after a reboot. |
+| 2026-10-03 | Mesh / wireless uplink — gate found, wire captured | With the user's UniFi API key the controller's records, REST write path and frontend bundles were readable. **Gate:** `wifi_caps` `0x1` VWIRE makes `mesh_sta_vap_enabled` persist (bisected over five masks; `0x80` MESH does nothing, `0x800` MESHV3 adds the `mesh.*` block and the downlink VAP). The UI's dropdown is the device's own `uplink_table`; the UI saves via `PUT rest/device` + `cmd/devmgr set-priority-uplink {prefer1}`. **First mesh push captured on AP2:** a 4addr WDS station `vport-<mac>` (`usage=uplink`) and a hidden WPA2 AP `vwire-<site>` (`usage=downlink`), `mesh.essid/psk/serial1/version=3`, `connectivity.uplink_*`. Parser guard added so neither is beaconed (unit-tested; deployed to AP2, hot-patched into AP1's package tree). Then both APs made capable (`0x10082D`): the controller turns the mesh flag on by itself, sends both VAPs to both, hostapd untouched on either. `uplink_table` still empty with both capable and tagged — the parent list most likely needs a downlink actually beaconing, i.e. implementation step one. A full mesh test is not yet possible; plan in Investigation 1. Also found: AP1's ledger holds the app's RF-scan verb `scan_band` (Investigation 2). |
+| 2026-10-03 | Mesh backhaul implemented | `backhaul.lua` + ucihelper/parser/state changes, 10 tests (872 pass). Deployed to AP2 and verified on the air: the push's downlink becomes a hidden `wds_sta=1` BSS on radio1 in br-lan, excluded from the VAP table and l2guard; the 4addr station is written disabled; the wired-first policy is unit-tested. Found and fixed an `and/or` false-to-nil bug in the policy before it reached a device. The two hardware proofs left (a parent on AP1, AP2's cable out) were refused to the agent by the permission classifier and are written up as the user's next two steps. Also: busybox on these boards has no `nohup`; `start-stop-daemon -S -b` is the way to detach. |
+| 2026-10-03 | Mesh — working end to end | User hot-patched AP1 (`tools/hotpatch.sh --repush`) and pulled AP2's cable: station up in 20 s, joined AP1's downlink at −10 dBm, address kept, informs over the hop, VLAN-10 client intact, AP2's 5 GHz back on ch 100. Controller still said "wired via port 2" until the matching Network 10.6.106 package was fetched from Ubiquiti and its inform processor decompiled (jadx, case-sensitive volume): `uplink` is a **string** naming the uplink VAP, the link is that VAP's one station (the parent's downlink BSS) resolved by **`serialno`**, the tables are controller-computed. Reporting rewritten to that contract: controller shows `uplink.type=wireless`, parent AP1, `uplink_table=[AP1]`, `wireless-links` paired. Mesh bits now claimed by default on DSA boards. |
+| 2026-10-03 | Mesh — wire back | Cable re-plugged at 14:07 UTC: the station was disabled on the first heartbeat, radio1 reloaded, AP2 informed wired again and the controller returned to the LLDP-derived port-2 uplink. Both directions of the uplink policy are now seen on hardware. AP1 hot-patched to the final build by the user; both APs claim `0x10082D`, AP2 with no override. |
+| 2026-10-03 | Mesh — the parent names its children | The controller could not resolve AP2's 4-address station behind AP1's downlink (no Ubiquiti OUI, no beacon to match): "Can't resolve wireless mac", empty `downlink_table`. Chosen fix: the parent sets the station's `serialno` from the bridge FDB behind that station's WDS netdev ∩ the sibling-AP set from its own scans (`backhaul.child_serialno`), refusing when two siblings share a netdev. On both trees; runs on whichever AP is the parent. | PROTOCOL-VALIDATION.md § The parent names its children |
+| 2026-10-03 | RF scan — contract decompiled and implemented | Quick Scan (`wifi_caps2` `0x80`, `quick-scan {scan-band int, scan-bw int}`), Airtime Scan (`wifi_caps` `0x10`, `spectrum-scan`) and Radio AI's `scan_band` all land in one sweep handler. Rows per 20 MHz channel per width, percentages, age not epoch, `quickscan_scanning` edge, and the `EVT_AP_QuickScanEvent` notification inform (`inform_as_notif`/`notif_reason: event`). Live on AP2: cmd received, state flipped, timestamp stamped, rows in `stat/spectrum-scan`. Two wrong turns fixed the same day: table only in `radio_table_stats` (the processor walks `radio_table`), and `stat/device` as the read path (it strips the tables). | PROTOCOL-VALIDATION.md § RF scans |
+| 2026-10-03 | WiFiman + discovery requests | WiFiman decompiled: console-side REST keyed on the app's IP; answers fully for a client on openUF's AP (queried with the API key). The AP-side gap: openUF never answered UDP 10001 discovery probes (`01 00 00 00`, `02 08 00 00`), which is what WiFiman's Discovery lists; a UCG Ultra answers both. `announce.lua` now listens and replies (v1 → version 1/cmd 0, v2 → version 2/cmd 9); AP2 answered four probes after the deploy. | PROTOCOL-VALIDATION.md § Discovery requests and WiFiman |

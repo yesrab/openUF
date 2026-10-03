@@ -65,6 +65,7 @@ local sysconf   = _require_sibling("sysconf")
 local l2guard   = _require_sibling("l2guard")
 local roamassist = _require_sibling("roamassist")
 local airtime   = _require_sibling("airtime")
+local backhaul  = _require_sibling("backhaul")
 
 local M = {}
 
@@ -89,6 +90,7 @@ M._sysconf    = sysconf
 M._l2guard    = l2guard
 M._roamassist = roamassist
 M._airtime    = airtime
+M._backhaul   = backhaul
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -141,6 +143,11 @@ local RRM_MAX_AGE = 30
 -- results, keyed by radio name. Ephemeral live data, same category as
 -- radio_stats()/sta_table() which are also recomputed rather than stored.
 M._spectrum_cache = {}
+
+-- In-memory only: one device event waiting to go out as a notification
+-- inform (see _post_notif), set by a finished sweep. Only the newest is
+-- kept -- the controller wants a timestamp from it, not every row.
+M._pending_notif = nil
 
 -- In-memory only: previous {rx_bytes, tx_bytes, time} sample per client MAC,
 -- used to delta-sample a throughput estimate the same way M._sysinfo's
@@ -1055,8 +1062,23 @@ function M.build_json(st, cfg, ufhw)
 					-- radio_table_stats reference).
 					local sscan = M._spectrum_cache[radio.name]
 					if sscan then
+						-- On the radio_table ENTRY as well as here: like
+						-- athstats above, the UAP inform processor (10.6.106,
+						-- iceUMDuewFNFLMOqti) walks the payload's radio_table
+						-- and copies spectrum_table/spectrum_table_time from
+						-- each radio into the stored radio_table_stats; a
+						-- table only in radio_table_stats is never read (the
+						-- Airtime view's stat/spectrum-scan stayed empty after
+						-- two live sweeps until this was added).
 						entry.spectrum_table      = sscan.table
-						entry.spectrum_table_time = sscan.table_time
+						radio.spectrum_table      = sscan.table
+						-- Seconds SINCE the sweep, not a timestamp: the
+						-- processor stores `now - value` as the sweep's epoch
+						-- and the view prints that as "N minutes ago"; an
+						-- epoch here read as "in 56 years".
+						local age = math.max(0, M._time() - (sscan.scanned_at or M._time()))
+						entry.spectrum_table_time = age
+						radio.spectrum_table_time = age
 					end
 					radio_table_stats[#radio_table_stats + 1] = entry
 					-- Keep the entry addressable so the VAP/station loop below
@@ -1212,8 +1234,17 @@ function M.build_json(st, cfg, ufhw)
 			--
 			-- An Enhanced Open transition VAP is two BSSes, the hidden OWE
 			-- one and the open one, and its clients are the union of both.
-			local ok_if, ifnames = pcall(ufuci.get_ifnames_for_vap,
-				vap.radio_name, vap.essid)
+			-- A backhaul entry names its own netdevs (ucihelper.get_vap_table):
+			-- the downlink shares its SSID with the uplink station on the same
+			-- radio, so a lookup by radio and SSID could land on either.
+			local ok_if, ifnames
+			if type(vap._ifnames) == "table" then
+				ok_if, ifnames = true, vap._ifnames
+				vap._ifnames = nil
+			else
+				ok_if, ifnames = pcall(ufuci.get_ifnames_for_vap,
+					vap.radio_name, vap.essid)
+			end
 			-- sta_ifname[i] is the hostapd BSS stas[i] is on, for the kick
 			-- and Roaming Assistant below. A private pre-shared key's VLAN
 			-- netdev lists its own stations but has no hostapd of its own,
@@ -1222,6 +1253,11 @@ function M.build_json(st, cfg, ufhw)
 			-- sta_caps: each station's association ceiling, read once per
 			-- hostapd BSS (a PPSK VLAN netdev's stations are its BSS's).
 			local stas, sta_ifname, sta_caps, caps_read = {}, {}, {}, {}
+			-- sta_dev[i]: the netdev stas[i] was dumped from. Same as the BSS
+			-- for a user VAP; for a mesh downlink it is the per-station WDS
+			-- netdev (<bss>.sta<N>), which is what the bridge learnt that
+			-- child's own addresses behind.
+			local sta_dev = {}
 			for _, ifname in ipairs(ok_if and ifnames or {}) do
 				local ok_sta, rv2 = pcall(M._sysinfo.sta_table, ifname)
 				if ok_sta then
@@ -1236,10 +1272,38 @@ function M.build_json(st, cfg, ufhw)
 					for _, sta in ipairs(rv2) do
 						stas[#stas + 1] = sta
 						sta_ifname[#stas] = bss
+						sta_dev[#stas] = ifname
 					end
 				end
 			end
 			vap.num_sta = #stas
+			-- The uplink VAP's one "station" is the parent's downlink BSS. The
+			-- controller resolves it to a device by the station's `serialno`
+			-- (its own fallbacks need a vwire-<MAC> essid or a Ubiquiti OUI),
+			-- so name the parent here: the controller's priority-1 choice, or
+			-- the sibling element of the BSS joined (backhaul.parent_for_bssid).
+			if vap.usage == "uplink" and M._backhaul and M._backhaul.parent_for_bssid then
+				for _, sta in ipairs(stas) do
+					local ok_p, parent = pcall(M._backhaul.parent_for_bssid, st, sta.mac,
+						sta_ifname[1] or (ifnames and ifnames[1]), M._sysinfo)
+					if ok_p and parent then sta.serialno = parent end
+				end
+			end
+			-- A downlink's stations are mesh children. The controller resolves
+			-- each to a device by the station's `serialno`, and its own fallbacks
+			-- (a scanned BSS with that MAC, or Ubiquiti's OUI arithmetic) cannot
+			-- know a 4-address station of a non-Ubiquiti board. The parent can:
+			-- the bridge learnt the child's identity MAC behind that station's
+			-- own WDS netdev, and the sibling element in this AP's scans says
+			-- which MACs are site APs (backhaul.child_serialno).
+			if vap.usage == "downlink" and M._backhaul and M._backhaul.child_serialno then
+				for i, sta in ipairs(stas) do
+					local ok_c, child = pcall(M._backhaul.child_serialno, sta_dev[i],
+						scan_radio_table, cfg, M._sysinfo)
+					if ok_c and child then sta.serialno = child end
+				end
+			end
+			local is_backhaul_vap = (vap.usage == "uplink" or vap.usage == "downlink")
 			-- Per-VAP traffic/retry counters ("Air Stats" in the controller
 			-- UI) -- confirmed real field names via the decompiled vap-stats
 			-- DTO (cVbZoFIZsWYaVCquTr$QCtdvLKOBb): rx_bytes/rx_packets/
@@ -1279,7 +1343,11 @@ function M.build_json(st, cfg, ufhw)
 				-- ucihelper.kick_station) -- no block, client can reassociate
 				-- immediately.
 				local minrssi_threshold = minrssi_threshold_by_radio[vap.radio_name]
-				if minrssi_threshold and sta.signal and sta.signal < minrssi_threshold then
+				-- Never on a backhaul VAP: the "station" of an uplink is the
+				-- parent itself, and a downlink's stations are mesh children.
+				if is_backhaul_vap then
+					-- counters only; no kick, no roaming assistance
+				elseif minrssi_threshold and sta.signal and sta.signal < minrssi_threshold then
 					pcall(ufuci.kick_station, ifname, sta.mac)
 				elseif vap.roam_assist_rssi and sta.signal then
 					roam_obs[#roam_obs + 1] = {
@@ -1377,6 +1445,10 @@ function M.build_json(st, cfg, ufhw)
 				end
 
 				sta_table[#sta_table + 1] = {
+					-- On an uplink VAP the one "station" is the parent's downlink
+					-- BSS; serialno names the parent device, which is how the
+					-- controller attributes the wireless uplink (nil otherwise).
+					serialno = sta.serialno,
 					active     = true,
 					mac        = sta.mac,
 					ap_mac     = mac_str,
@@ -1820,11 +1892,15 @@ function M.build_json(st, cfg, ufhw)
 	-- Device-level spectrum-scan status, aggregated across all radios'
 	-- cached results (see radio_table_stats loop above for the per-radio
 	-- spectrum_table/spectrum_table_time fields).
+	-- The controller ignores this top-level field: its own copy on the
+	-- device record is written (in ms) by the EVT_AP_QuickScanEvent
+	-- handler, never from the inform. Kept because the device schema has
+	-- it; what the views read is the per-radio spectrum_table_time above.
 	local spectrum_scan_timestamp = nil
 	for _, sscan in pairs(M._spectrum_cache) do
-		if sscan.scan_timestamp and
-		   (not spectrum_scan_timestamp or sscan.scan_timestamp > spectrum_scan_timestamp) then
-			spectrum_scan_timestamp = sscan.scan_timestamp
+		if sscan.scanned_at and
+		   (not spectrum_scan_timestamp or sscan.scanned_at > spectrum_scan_timestamp) then
+			spectrum_scan_timestamp = sscan.scanned_at
 		end
 	end
 
@@ -1911,9 +1987,22 @@ function M.build_json(st, cfg, ufhw)
 		-- features openUF does not implement (PROTOCOL-VALIDATION.md,
 		-- Capability bitmasks); debug_caps can still put any value on the
 		-- wire for an experiment.
+		-- Bits 0x1 (VWIRE) and 0x800 (MESHV3) are the wireless uplink: without
+		-- 0x1 the controller silently drops a device's mesh-connect flag, with
+		-- 0x1+0x800 its push carries the hidden WDS downlink and the 4-address
+		-- uplink station that backhaul.lua provisions (PROTOCOL-VALIDATION.md
+		-- § Wireless uplink; verified end to end 2026-10-03). Claimed only on
+		-- DSA boards: the per-VLAN bridges there ride `br-lan.<vid>`, which is
+		-- what carries a child's tagged traffic over the hop; a swconfig board's
+		-- VLAN bridges sit on the CPU port's sub-devices and would not.
+		-- Bit 0x10 (RF_SCAN) is the Airtime Scan: the frontend shows the
+		-- button only with it, and the device's share is the `spectrum-scan`
+		-- cmd below -- a forced sweep and the survey counters, which this
+		-- hardware does (PROTOCOL-VALIDATION.md § RF scans).
 		wifi_caps        = (dbg_caps and tonumber(dbg_caps.wifi_caps))
-			or (0xC + ((M._airtime and M._airtime.supported()) and 0x20 or 0)
-				+ ((M._sysinfo.ppsk_supported and M._sysinfo.ppsk_supported()) and 0x100000 or 0)),
+			or (0x1C + ((M._airtime and M._airtime.supported()) and 0x20 or 0)
+				+ ((M._sysinfo.ppsk_supported and M._sysinfo.ppsk_supported()) and 0x100000 or 0)
+				+ ((M._backhaul and not (cfg and cfg.vlan)) and 0x801 or 0)),
 		-- Bit 0x40 (64): Device.supportAdvertisingDeviceNameInBeacon() in the
 		-- decompiled controller is exactly hasWifiCapability2(64) -- i.e. bit
 		-- 6 of a SECOND capability bitmask, wifi_caps2, entirely separate
@@ -1931,10 +2020,17 @@ function M.build_json(st, cfg, ufhw)
 		-- (wireless.<n>.btm_disassoc.*), which openuf/roamassist.lua
 		-- implements. Decompiled from controller 10.6.101 (upstream).
 		--
+		-- Bit 0x80 (128): Device.supportQuickScan() -- the Quick Scan button
+		-- and the `quick-scan` cmd (one band, one width), and what makes
+		-- Radio AI's prescan ask this AP for a sweep. Bit 0x2 (2):
+		-- MONITOR_RF_SCAN, the Airtime view's "scan while serving" flag;
+		-- both are a forced sweep plus survey counters here, the same as
+		-- the Airtime Scan above (PROTOCOL-VALIDATION.md § RF scans).
+		--
 		-- No other bit is claimed: wifi_caps2 also gates real-hardware-only
 		-- features (Mesh MLO parent/child and others, see
 		-- PROTOCOL-VALIDATION.md) that openUF does not implement.
-		wifi_caps2       = (dbg_caps and tonumber(dbg_caps.wifi_caps2)) or 0x60,
+		wifi_caps2       = (dbg_caps and tonumber(dbg_caps.wifi_caps2)) or 0xE2,
 		-- Device-level (not per-radio -- see radio_table_stats above)
 		-- Device-level Experience: the mean of every connected client's own
 		-- satisfaction, across all VAPs. Same reasoning as the per-VAP copy
@@ -1945,6 +2041,13 @@ function M.build_json(st, cfg, ufhw)
 		satisfaction     = sat_count_all > 0
 			and math.floor(sat_sum_all / sat_count_all + 0.5) or nil,
 		spectrum_scanning       = false,
+		-- Both sweeps run inside the command's own dispatch, so by the time
+		-- the inform that follows a quick-scan goes out the result is already
+		-- in radio_table_stats. The controller set the device record's
+		-- quick_scan_state.in_progress when it sent the command; this false
+		-- is what flips it back and makes it push the fresh spectrum_table
+		-- to the open Airtime view (kDxteQiUX "quick scan just finished").
+		quickscan_scanning      = false,
 		spectrum_scan_timestamp = spectrum_scan_timestamp,
 		-- Real devices report this under the hyphenated key "system-stats"
 		-- with {cpu, mem, uptime} as percentage/uptime strings -- confirmed
@@ -1966,6 +2069,24 @@ function M.build_json(st, cfg, ufhw)
 		lldp_table       = arr(lldp_table),
 	}
 
+	-- Wireless uplink (backhaul.lua). The controller reads `uplink` as the NAME
+	-- of the uplink interface -- a string, "eth0" by default, "down" for an
+	-- isolated device -- and takes the link itself from the vap_table entry
+	-- of usage `uplink` whose `name` equals it: that VAP's one station is the
+	-- parent's downlink BSS, resolved to the parent device through the
+	-- station's `serialno` (decompiled from 10.6.106, PROTOCOL-VALIDATION.md
+	-- § Wireless uplink). A wired uplink is left to the default: the
+	-- controller then finds the if_table entry named eth0 and the gateway's
+	-- LLDP view, exactly as before. uplink_table, vwire_table and
+	-- vwire_vap_table are computed by the controller and ignored from here.
+	if M._backhaul and M._backhaul.uplink_report then
+		local ok_up, up = pcall(M._backhaul.uplink_report, st, cfg, M._ucihelper, M._sysinfo)
+		if ok_up and type(up) == "table" and type(up.name) == "string" then
+			payload.uplink = up.name
+			if up.bssid then payload.uplink_bssid = up.bssid end
+		end
+	end
+
 	-- conf.lua debug_payload_extra: research-only top-level fields merged in
 	-- verbatim (an `uplink` object, say, to see what shape the controller
 	-- accepts) -- same caveat, same log line at startup as debug_caps. A key
@@ -1983,12 +2104,6 @@ end
 
 -- Maps an OpenWrt htmode ("HT20", "HT40+", "VHT80", "HE160", ...) to a
 -- channel width in MHz. Falls back to 20 for unrecognized/missing modes.
-local function _width_from_htmode(htmode)
-	if type(htmode) ~= "string" then return 20 end
-	local n = htmode:match("(%d+)")
-	return n and tonumber(n) or 20
-end
-
 -- radio.<n>.ieee_mode: the controller's per-radio 802.11 mode + channel width,
 -- as a single madwifi/Ubiquiti-style compound token -- "11" + band ("ng"/"na")
 -- + PHY and width ("ht20", "ht40", "vht80", "he80", ...). CONFIRMED live
@@ -2347,6 +2462,9 @@ function M._parse_wifi_system_cfg(sys_raw)
 	end
 
 	local vap_table = {}
+	-- Mesh backhaul entries (see the is_station guard below), handed to
+	-- backhaul.plan(): {role = "downlink"|"uplink", radio, ssid, psk, devname}.
+	local backhaul_entries = {}
 	for _, idx in ipairs(sorted_indices(wireless)) do
 		local w = wireless[idx]
 		local a = aaa[idx] or {}
@@ -2354,6 +2472,40 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- Hoisted out of the security branch below because the WPA-Enterprise
 		-- check needs it before anything else is decided.
 		local akm = akm_of(a)
+
+		-- A mesh backhaul VAP, either side of it. Captured live on 2026-10-03
+		-- (AP2, UCG Ultra 10.6.106, REVERSE-ENGINEERING.md Investigation 1):
+		-- once a device may mesh, the push adds two entries on the 5 GHz
+		-- radio -- the DOWNLINK, `mode=master usage=downlink wds=enabled
+		-- vwire=enabled`, a hidden WPA2 AP named vwire-<site> carrying the
+		-- site's backhaul PSK for children to join; and the UPLINK,
+		-- `mode=managed usage=uplink wds=enabled vport=enabled`, a 4-address
+		-- station named vport-<mac> that joins a parent's downlink. Every
+		-- wired push carries mode=master / usage=user on each WLAN instead.
+		-- Everything this loop lets through is provisioned as an ordinary
+		-- ACCESS POINT, so without this guard the downlink would be
+		-- beaconed as a plain hidden SSID and the station as an AP carrying
+		-- the backhaul credentials. Both are skipped out loud until the mesh
+		-- work can provision them for what they are.
+		local is_station = (w.mode ~= nil and w.mode ~= "master")
+			or (w.usage ~= nil and w.usage ~= "user")
+		if is_station and w.ssid then
+			local role = (w.usage == "downlink" or (w.mode == "master" and w.usage ~= "uplink"))
+				and "downlink" or "uplink"
+			if w.parent then
+				backhaul_entries[#backhaul_entries + 1] = {
+					role    = role,
+					radio   = w.parent,
+					ssid    = w.ssid,
+					devname = w.devname,
+					psk     = a["wpa.psk"],   -- the downlink carries the site PSK; the uplink's aaa block is disabled
+					hidden  = _wire_bool(w.hide_ssid),
+				}
+			end
+			io.stderr:write(("inform: WLAN %q is the mesh backhaul %s (mode=%s usage=%s) -- "
+				.. "handled by backhaul.lua, not provisioned as an ordinary access point\n")
+				:format(w.ssid, role, tostring(w.mode), tostring(w.usage)))
+		end
 		local owe_transition = a.owe_devname ~= nil and owe_hidden_half[a.owe_devname] == true
 
 		-- WPA-Enterprise (802.1X, mgmt "WPA-EAP"). openUF cannot provision it:
@@ -2387,6 +2539,7 @@ function M._parse_wifi_system_cfg(sys_raw)
 		end
 
 		if w.ssid and w.parent and not is_enterprise and not radius_psk_only
+				and not is_station
 				and not (a.devname and owe_hidden_half[a.devname]) then
 			local security = "open"
 			-- Enhanced Open: the akm is the only marker. It carries no
@@ -2742,7 +2895,37 @@ function M._parse_wifi_system_cfg(sys_raw)
 		end
 	end
 
-	return radio_table, vap_table
+	return radio_table, vap_table, backhaul_entries
+end
+
+-- The `mesh` and `connectivity` blocks of a system_cfg (captured live
+-- 2026-10-03, PROTOCOL-VALIDATION.md § Wireless uplink). nil when the push
+-- carries no mesh.status at all; status false when it says disabled.
+--   mesh.status=enabled  mesh.version=3  mesh.essid=vwire-<16 hex>
+--   mesh.psk=<32 chars>  mesh.serial1=<parent MAC>  [mesh.serial2=...]
+--   connectivity.status=enabled  connectivity.uplink_eth=eth0
+--   connectivity.uplink_wds=ath4  connectivity.uplink_bridge=br0
+function M._parse_mesh_system_cfg(sys_raw)
+	if type(sys_raw) ~= "string" then return nil end
+	local mesh, conn, seen = {}, {}, false
+	for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
+		local k, v = line:match("^mesh%.([%w_]+)=(.*)$")
+		if k then
+			seen = true
+			if k == "status" then mesh.status = (v == "enabled")
+			elseif k == "version" then mesh.version = tonumber(v) or v
+			else mesh[k] = v end
+		else
+			local ck, cv = line:match("^connectivity%.([%w_]+)=(.*)$")
+			if ck then
+				if ck == "status" then conn.status = (cv == "enabled") else conn[ck] = cv end
+			end
+		end
+	end
+	if not seen then return nil end
+	if mesh.status == nil then mesh.status = false end
+	mesh.connectivity = conn
+	return mesh
 end
 
 -- Parse the device-level `bandsteering.*` block: the AP's own Band Steering
@@ -3001,6 +3184,8 @@ local RECOGNIZED_SYSTEM_CFG = {
 	-- Airtime Fairness (airtime.lua).
 	"^atf%.status$",
 	"^atf%.mode$",
+	"^mesh%.",           -- wireless uplink: backhaul SSID/PSK/parent (backhaul.lua)
+	"^connectivity%.",   -- wireless uplink: which netdevs are uplinks (policy in backhaul.lua)
 	"^qos%.vap%.%d+%.",  -- WiFi Speed Limit
 	"^netconf%.1%.",     -- IP Settings
 	"^route%.1%.gateway$",
@@ -3324,7 +3509,17 @@ function M.handle_response(json_str, st, cfg)
 			-- too (for the VLANs tagged SSIDs sit on), and scoping it inside
 			-- the wifi branch left that consumer reading a nil table -- an
 			-- empty trunk list that fails silently.
-			local radio_table, vap_table = M._parse_wifi_system_cfg(sys_raw)
+			local radio_table, vap_table, backhaul_entries = M._parse_wifi_system_cfg(sys_raw)
+			-- Mesh backhaul: the plan ucihelper.apply_config writes, or nil when the
+			-- push carries no enabled mesh block (the wired, non-meshing case).
+			local mesh_cfg = M._parse_mesh_system_cfg(sys_raw)
+			local backhaul_plan = nil
+			if M._backhaul and mesh_cfg then
+				local ok_bp, plan = pcall(M._backhaul.plan, mesh_cfg, backhaul_entries, cfg, st)
+				if ok_bp then backhaul_plan = plan end
+				local parent = (type(mesh_cfg.serial1) == "string") and mesh_cfg.serial1:lower() or ""
+				if st and st.backhaul_parent ~= parent then st.backhaul_parent = parent end
+			end
 
 			-- VLANs that a WIRED port is assigned to. Computed before the
 			-- WiFi pass because their L2 is the same bridge a tagged SSID
@@ -3356,7 +3551,8 @@ function M.handle_response(json_str, st, cfg)
 						cfg, {band_steering_active = steering_active,
 							roam_assist_active = roam_assist_active,
 							device_name = device_name, keep_vlans = port_vlans,
-							peer_ie = M._sysinfo.peer_ie_hex(st and st.mac)})
+							peer_ie = M._sysinfo.peer_ie_hex(st and st.mac),
+							backhaul = backhaul_plan})
 				end
 			end
 
@@ -3619,78 +3815,33 @@ function M.handle_response(json_str, st, cfg)
 				end
 			end
 		elseif cmd == "spectrum-scan" then
-			-- Trigger a scan per radio (sweeps every channel), then read back
-			-- per-channel survey data and build a spectrum_table entry per
-			-- radio, cached for the next build_json() call.
-			--
-			-- Field names (spectrum_table/spectrum_table_time/
-			-- spectrum_scan_timestamp/channel/center_freq/width/utilization/
-			-- interference) are confirmed against the real UniFi Network
-			-- Application's own Java bytecode (10.4.57's ace.jar/
-			-- internal-dependencies.jar constant pool -- see
-			-- PROTOCOL-VALIDATION.md's radio_table_stats reference), not
-			-- guessed. The exact numeric semantics of `width` and
-			-- `interference` are still a best-effort approximation (radio's
-			-- configured htmode, and raw noise-floor dBm, respectively) --
-			-- verify against a live controller capture before trusting the
-			-- values, not just the key names.
-			local ufuci = M._ucihelper
-			if ufuci and ufuci.get_radio_table then
-				local ok_r, radios = pcall(ufuci.get_radio_table)
-				if ok_r then
-					local now = os.time()
-					for _, radio in ipairs(radios) do
-						local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
-						if ok_if and ifname then
-							-- Survey counters are cumulative and exist
-							-- independently of the sweep, so sample them BEFORE
-							-- it as well: immediately after a scan the radio has
-							-- just come back from off-channel and the OPERATING
-							-- channel's noise reads as 0 -- confirmed on real
-							-- hardware, where the same channel reports 0 right
-							-- after the sweep and -106 dBm moments later. 0 dBm
-							-- is not a plausible noise floor, and this value is
-							-- reported to the controller as `interference`.
-							local pre_noise = {}
-							local ok_pre, pre_stats = pcall(M._sysinfo.radio_stats, ifname)
-							if ok_pre then
-								for _, s in ipairs(pre_stats) do
-									if s.freq and s.noise and s.noise ~= 0 then
-										pre_noise[s.freq] = s.noise
-									end
-								end
-							end
-							-- A refused sweep still leaves the operating
-							-- channel's survey, so the table is built either
-							-- way; _force_scan has logged the refusal.
-							M._force_scan(ufuci, ifname, "spectrum-scan")
-							local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
-							if ok_rs then
-								local width = _width_from_htmode(radio.ht)
-								local table_entries = {}
-								for _, s in ipairs(stats) do
-									local total = s.channel_time or 0
-									local busy  = s.channel_time_busy or 0
-									table_entries[#table_entries + 1] = {
-										channel     = M._sysinfo.channel_from_freq(s.freq),
-										center_freq = s.freq,
-										width       = width,
-										utilization = total > 0 and math.floor(busy * 100 / total) or 0,
-										-- Post-sweep 0 falls back to the
-										-- pre-sweep reading for that frequency.
-										interference = (s.noise ~= 0 and s.noise)
-											or pre_noise[s.freq] or 0,
-									}
-								end
-								M._spectrum_cache[radio.name] = {
-									table          = table_entries,
-									table_time     = now,
-									scan_timestamp = now,
-								}
-							end
-						end
-					end
-				end
+			-- Airtime Scan (Devices -> Radios; frontend gate wifi_caps 0x10):
+			-- every radio. The fresh tables ride the inform that follows.
+			M._spectrum_scan(cfg, nil, "spectrum-scan")
+		elseif cmd == "quick-scan" then
+			-- Quick Scan (frontend gate wifi_caps2 0x80, also Radio AI's
+			-- prescan): {"scan-band": 0|1|2, "scan-bw": 20|40|80|160}, the
+			-- controller's band index and the width in MHz, both integers
+			-- (com.ubnt.service.system.l, 10.6.106). One sweep gives every
+			-- width's rows, so scan-bw only needs to be a known one.
+			local band = M._scan_band_name(resp["scan-band"])
+			if band then
+				M._spectrum_scan(cfg, band, "quick-scan")
+			else
+				io.stderr:write("inform: quick-scan: unknown scan-band "
+					.. tostring(resp["scan-band"]) .. " -- nothing swept\n")
+			end
+		elseif cmd == "scan_band" then
+			-- Radio AI's neighbour sweep: {"cmd":"scan_band","band":"na"}.
+			-- The controller marks the device `scanning` and takes the next
+			-- inform's scan_radio_table, so a forced sweep on that band is
+			-- the whole job; the survey rows it leaves behind are a bonus.
+			local band = M._scan_band_name(resp.band)
+			if band then
+				M._spectrum_scan(cfg, band, "scan_band")
+			else
+				io.stderr:write("inform: scan_band: unknown band "
+					.. tostring(resp.band) .. " -- nothing swept\n")
 			end
 		else
 			-- Every other cmd is a no-op here, and its WHOLE body goes to
@@ -4154,6 +4305,14 @@ end
 -- when it rebuilt.
 M.L2GUARD_RESYNC_INTERVAL = 60
 M._l2guard_next = 0
+-- One heartbeat of the wireless-uplink policy (backhaul.lua): wired first,
+-- the WDS station only while the wired uplink socket has no carrier. A no-op
+-- on a device whose push carried no uplink station.
+function M._backhaul_tick(st, cfg)
+	if not (M._backhaul and M._backhaul.tick) then return nil end
+	return M._backhaul.tick(st, cfg, M._ucihelper, M._sysinfo, M._state)
+end
+
 function M._l2guard_resync(st)
 	local g = st and st.l2guard
 	if not (M._l2guard and type(g) == "table" and (g.bpdu or g.tagdrop)) then return false end
@@ -4203,6 +4362,162 @@ M.SCAN_REQUEST_MAX_AGE = 600
 -- sweeps that ran. The scan output itself is discarded (callers read the
 -- kernel's caches: `scan dump`, `survey dump`). Returns true when the sweep
 -- ran; logs and returns false when iw refused.
+-- The RF views' channel tables (airview bundle, 10.6.106) offer 20/40 MHz
+-- on 2.4 GHz and 20/40/80/160 on 5 GHz, and a row is read only under the
+-- tab whose width it names -- so one sweep is reported at every width.
+local SPECTRUM_WIDTHS = {ng = {20, 40}, na = {20, 40, 80, 160}}
+
+-- The controller's band index in a quick-scan ("scan-band") and the band
+-- word in a scan_band, as the band openUF's radios report (ucihelper's
+-- band_for_device: a 6 GHz radio reports "na" too). nil for anything else.
+function M._scan_band_name(v)
+	if v == 0 or v == "0" or v == "ng" then return "ng" end
+	if v == 1 or v == "1" or v == "na" then return "na" end
+	if v == 2 or v == "2" or v == "6e" then return "na" end
+	return nil
+end
+
+-- Centre of the <width> MHz block a 20 MHz channel belongs to. 5 GHz blocks
+-- are aligned from channel 36 (5180) and again from 149 (5745), which is
+-- why 149-177 at 160 MHz centres on 5815 and not on an extension of the
+-- lower run; 2.4 GHz pairs channels 1-7 upward and the rest downward.
+function M._block_center(freq, width)
+	if width <= 20 then return freq end
+	if freq < 3000 then
+		return (freq <= 2442) and (freq + 10) or (freq - 10)
+	end
+	local base = (freq >= 5745) and 5745 or 5180
+	local idx = math.floor((freq - base) / width)
+	return base + idx * width + (width - 20) / 2
+end
+
+-- Survey counters -> spectrum_table rows: one per 20 MHz channel per width
+-- its band offers. The view averages the rows of one width whose channel
+-- lies inside a block, so each row carries its own channel's figures.
+-- utilization is busy airtime in %, interference the busy time that was
+-- neither this radio's rx nor its tx (other energy on the channel) in %;
+-- both 0..100, which is what the bars and Radio AI's reader expect -- an
+-- earlier version put the noise floor in dBm here, a negative "percent".
+-- Channels the sweep never visited (no active time) are left out rather
+-- than reported as 0 %: the view marks a missing block "not available",
+-- a 0 would say "idle". Without rx/tx counters there is no interference
+-- figure and the field is omitted (the reducer skips an absent one).
+function M._spectrum_rows(stats)
+	local rows = {}
+	for _, s in ipairs(stats or {}) do
+		local total = tonumber(s.channel_time) or 0
+		local ch = s.freq and M._sysinfo.channel_from_freq(s.freq)
+		if total > 0 and ch then
+			local busy = tonumber(s.channel_time_busy) or 0
+			local function pct(v)
+				return math.max(0, math.min(100, math.floor(v * 100 / total + 0.5)))
+			end
+			local other = nil
+			if s.channel_time_rx or s.channel_time_tx then
+				other = pct(busy - (tonumber(s.channel_time_rx) or 0)
+					- (tonumber(s.channel_time_tx) or 0))
+			end
+			for _, w in ipairs(SPECTRUM_WIDTHS[s.freq < 3000 and "ng" or "na"]) do
+				rows[#rows + 1] = {
+					channel      = ch,
+					width        = w,
+					center_freq  = M._block_center(s.freq, w),
+					utilization  = pct(busy),
+					interference = other,
+				}
+			end
+		end
+	end
+	return rows
+end
+
+-- A device event (EVT_AP_*) is an inform of its own: the regular payload
+-- plus `inform_as_notif`, `notif_reason` ("event") and a `notif_payload`
+-- whose `event_string` names the handler. The controller's inform entry
+-- (devmgr.l, 10.6.106) takes that branch before any statistics processing
+-- -- the identity fields are read as usual, the tables are not -- and
+-- answers a bare noop. Posted right after the heartbeat that carried the
+-- sweep's table (_tick), from that heartbeat's own JSON so nothing is
+-- rebuilt. Returns true when the controller took it.
+function M._post_notif(st, cfg, json_str)
+	local notif = M._pending_notif
+	M._pending_notif = nil
+	if type(notif) ~= "table" then return false end
+	local ok, payload = pcall(cjson.decode, json_str)
+	if not ok or type(payload) ~= "table" then return false end
+	payload.inform_as_notif = true
+	payload.notif_reason    = "event"
+	payload.notif_payload   = notif
+	local ok_p, pkt = pcall(M.build_packet, M._fix_empty_arrays(cjson.encode(payload)), st)
+	if not ok_p then
+		io.stderr:write("inform: event " .. tostring(notif.event_string)
+			.. ": build_packet failed: " .. tostring(pkt) .. "\n")
+		return false
+	end
+	local body, err = M.http_post(st.inform_url, pkt)
+	if not body then
+		io.stderr:write("inform: event " .. tostring(notif.event_string)
+			.. " not delivered: " .. tostring(err) .. "\n")
+		return false
+	end
+	if cfg and cfg.config and cfg.config.debug_dump_requests then
+		M._debug_append(cfg, "TX", "notif " .. tostring(notif.event_string))
+	end
+	return true
+end
+
+-- One forced sweep per radio -- every radio, or those on `band` -- and the
+-- survey counters afterwards become that radio's spectrum_table (cached in
+-- M._spectrum_cache, reported by every build_json until the next sweep).
+-- Blocking, a few seconds per radio, which is the point: the inform that
+-- follows the command carries the result. A refused sweep still leaves the
+-- operating channel's survey, so the table is built either way (_force_scan
+-- has logged the refusal). Returns how many radios were swept.
+function M._spectrum_scan(cfg, band, who)
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return 0 end
+	local ok_r, radios = pcall(ufuci.get_radio_table, cfg and cfg.uap and cfg.uap.hwassign)
+	if not ok_r or type(radios) ~= "table" then return 0 end
+	local swept = 0
+	for _, radio in ipairs(radios) do
+		if band == nil or radio.radio == band then
+			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+			if ok_if and ifname then
+				M._force_scan(ufuci, ifname, who)
+				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
+				if ok_rs then
+					local rows = M._spectrum_rows(stats)
+					M._spectrum_cache[radio.name] = {
+						table      = rows,
+						scanned_at = M._time(),
+					}
+					-- The event the controller dates the sweep by. Its
+					-- EVT_AP_QuickScanEvent handler (devmgr.e.c, 10.6.106)
+					-- upserts the one row it carries and stamps the device
+					-- record's spectrum_scan_timestamp -- the Quick Scan
+					-- card's "last scan", and what Radio AI's prescan waits
+					-- for before it reads radio_table_stats. One row is
+					-- enough for that; the table itself rides the inform.
+					if rows[1] then
+						M._pending_notif = {
+							event_string = "EVT_AP_QuickScanEvent",
+							radio        = radio.radio,
+							radio_name   = radio.name,
+							channel      = rows[1].channel,
+							width        = rows[1].width,
+							center_freq  = rows[1].center_freq,
+							utilization  = rows[1].utilization,
+							interference = rows[1].interference or 0,
+						}
+					end
+					swept = swept + 1
+				end
+			end
+		end
+	end
+	return swept
+end
+
 function M._force_scan(ufuci, ifname, who)
 	local out = ufuci._popen("iw dev " .. ifname
 		.. " scan ap-force >/dev/null 2>&1 && echo scan-ok") or ""
@@ -4461,6 +4776,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- rides out on THIS inform rather than waiting for the next.
 	pcall(M._rrm_tick, cfg)
 	pcall(M._l2guard_resync, st)
+	pcall(M._backhaul_tick, st, cfg)
 
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
 	-- build_json opens a ucihelper lookup pass and closes it on its normal
@@ -4515,6 +4831,10 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- last noop named none.
 	ctx.interval = M._controller_interval or ctx.base_interval
 	pcall(M._write_status, st, {last_ok = M._time(), last_type = rtype})
+	-- A device event the last command left behind (a finished sweep) goes
+	-- out now, as its own notification inform, after the heartbeat that
+	-- carried the result it dates.
+	if M._pending_notif then pcall(M._post_notif, st, cfg, json_str) end
 	if applied then
 		-- The push ran `wifi reload`, which killed the RRM collector's
 		-- subscription; check it again on the very next heartbeat rather

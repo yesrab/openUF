@@ -124,6 +124,11 @@ nor a root password, `setup.sh` turns broadcasts **off**: the controller then tr
 device as L3-discovered and delivers the adoption key over the inform channel, needing no
 login. Override either way with `--l2-announce` / `--no-l2-announce`.
 
+The same daemon also answers the discovery **requests** other Ubiquiti tools send to UDP
+10001 (WiFiman's Discovery tab, the UniFi mobile app, the Device Discovery Tool), so the
+AP lists there with its model, name and firmware. `l2_announce = false` turns the
+broadcasts and the answers off together.
+
 **What the AP conversion changes.** All reversible, and all of it committed but not applied
 until the reboot:
 
@@ -1394,6 +1399,48 @@ Three things remove the marked cron block: `install.sh uninstall`, a controller 
 in place: those are sane settings for the board either way, and the originals stay stamped.
 The same two resets tear the `openuf_l2guard` table down and drop a controller-set inform
 interval.
+
+## 6b. Wireless uplink (mesh backhaul)
+
+UniFi's mesh is a 4-address WDS link, not 802.11s: a parent beacons a hidden WPA2-PSK
+network named `vwire-<site>` with a site-wide key, and a child joins it with a 4-address
+station, so the link is a transparent L2 pipe and VLAN tags ride along. The controller
+describes both ends in a meshing device's push (PROTOCOL-VALIDATION § Wireless uplink),
+and openUF turns them into two `wifi-iface` sections on the 5 GHz radio:
+
+| Section | What it is | When it is up |
+|---|---|---|
+| `openuf_bh_dl_<radio>` | the **downlink**: a hidden AP, `wds 1`, `psk2`, in `lan` | whenever the push carries it (a wired mesh-capable AP is a parent by default) |
+| `openuf_bh_ul_<radio>` | the **uplink**: a `sta`, `wds 1`, same SSID and key, in `lan` | only while the wired uplink socket has no link |
+
+Both are rewritten on every push like the user SSIDs, neither is reported as a VAP, and the
+downlink is kept out of the L2 hardening rules (a child's tagged frames and BPDUs cross it by
+design). The per-VLAN bridges need nothing extra on a DSA board: `br-lan.<vid>` sits on top
+of `br-lan`, which is where both backhaul netdevs land.
+
+**The uplink policy** (`backhaul.lua`, one decision per heartbeat) is wired-first. openUF
+remembers which socket the gateway was last seen behind (`state.json`
+`backhaul_wired_port`). When that socket's link goes away for two heartbeats the station is
+enabled and the radio reloads; while the station is enabled the AP SSIDs on that radio start
+only once it has joined a parent, on the parent's channel — the behaviour of a real mesh
+child. The moment the socket's link is back the station is disabled again. The two uplinks
+are never up together: with STP off in every UniFi push, that would be a bridge loop. The
+mode in effect is `state.json` `backhaul_mode` (`wired`/`wireless`), and `logread` says
+`backhaul: wired uplink lost on <port> -- enabling the WDS station` and the reverse.
+
+While on the wireless uplink the inform reports what the controller actually reads
+(PROTOCOL-VALIDATION § Wireless uplink): `uplink` is the uplink VAP's name, the uplink
+VAP is a `vap_table` entry of usage `uplink` whose one station is the parent's downlink BSS
+tagged with the parent's MAC, and the downlink is an entry of usage `downlink` listing the
+children. The controller then shows the wireless uplink, the parent, the signal and rates,
+and the topology hop; the parent lists the child as a wireless downlink.
+
+**What you need for it:** nothing on a DSA board — openUF claims `wifi_caps` `0x1`/`0x800`
+there, the controller turns the device's mesh-connect flag on by itself, and the push
+carries both entries. On a swconfig board the bits are not claimed: its VLAN bridges sit on
+the CPU port's sub-devices and a child's tagged traffic would not reach them. A parent on a
+DFS channel worked in the lab (channel 100); if a child never associates, check
+`iw dev phy1-sta0 info` says `4addr: on` and compare the two sections' keys.
 
 ## 7. LLDP topology
 

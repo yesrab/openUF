@@ -1651,22 +1651,29 @@ return {
 	{
 		name = "inform json: radio_table_stats includes spectrum_table when cached from a prior spectrum-scan cmd",
 		fn = function()
+			local swept_at = inform._time() - 111
 			inform._spectrum_cache = {
 				radio0 = {
-					table = { { channel = 6, center_freq = 2437, width = 20, utilization = 37, interference = -95 } },
-					table_time = 111,
-					scan_timestamp = 222,
+					table = { { channel = 6, center_freq = 2437, width = 20, utilization = 37, interference = 7 } },
+					scanned_at = swept_at,
 				},
 			}
 			local d = build({with_uci = true, with_clients = true})
 			local rts = d.radio_table_stats[1]
-			-- spectrum_scanning/spectrum_scan_timestamp are device-level
-			-- (top-level payload) fields, not per-radio.
+			-- spectrum_scanning/quickscan_scanning/spectrum_scan_timestamp are
+			-- device-level (top-level payload) fields, not per-radio.
 			assert_eq(d.spectrum_scanning, false, "spectrum_scanning false once results are cached")
-			assert_eq(d.spectrum_scan_timestamp, 222, "spectrum_scan_timestamp from cache")
-			assert_eq(rts.spectrum_table_time, 111, "spectrum_table_time from cache")
+			assert_eq(d.quickscan_scanning, false, "a quick-scan finishes inside its own dispatch: never in progress at inform time")
+			assert_eq(d.spectrum_scan_timestamp, swept_at, "spectrum_scan_timestamp is the newest sweep's time")
+			assert_true(rts.spectrum_table_time >= 111 and rts.spectrum_table_time <= 113,
+				"spectrum_table_time is the AGE of the sweep in seconds (controller stores now - value), got " .. tostring(rts.spectrum_table_time))
 			assert_eq(#rts.spectrum_table, 1, "one spectrum_table entry")
 			assert_eq(rts.spectrum_table[1].channel, 6, "spectrum_table entry channel")
+			-- The controller reads the table off the radio_table ENTRY (it
+			-- walks payload.radio_table, like athstats), so it rides there too.
+			local rt = d.radio_table[1]
+			assert_eq(#rt.spectrum_table, 1, "the same table on the radio_table entry")
+			assert_eq(rt.spectrum_table_time, rts.spectrum_table_time, "and the same age")
 			inform._spectrum_cache = {}
 		end
 	},
@@ -1677,6 +1684,7 @@ return {
 			local d = build({with_uci = true, with_clients = true})
 			assert_true(d.radio_table_stats[1].spectrum_table == nil,
 				"no spectrum_table until a spectrum-scan cmd has run")
+			assert_true(d.radio_table[1].spectrum_table == nil, "nor on the radio_table entry")
 			assert_true(d.spectrum_scan_timestamp == nil,
 				"no spectrum_scan_timestamp until a spectrum-scan cmd has run")
 		end
@@ -1892,7 +1900,7 @@ return {
 		end
 	},
 	{
-		name = "inform json: wifi_caps2 claims exactly advertise-name (0x40) and assisted roaming (0x20)",
+		name = "inform json: wifi_caps2 claims exactly advertise-name (0x40), assisted roaming (0x20), quick scan (0x80) and monitor RF scan (0x2)",
 		fn = function()
 			-- Confirmed via decompiling the controller: Device.
 			-- supportAdvertisingDeviceNameInBeacon() is hasWifiCapability2(64)
@@ -1903,7 +1911,7 @@ return {
 			-- (Roaming Assistant). No other bit is claimed (see
 			-- PROTOCOL-VALIDATION.md for the ones this device does not implement).
 			local d = build()
-			assert_eq(d.wifi_caps2, 0x60, "wifi_caps2 is exactly 0x40|0x20")
+			assert_eq(d.wifi_caps2, 0xE2, "wifi_caps2 is exactly 0x40|0x20|0x80|0x2")
 		end
 	},
 	{
@@ -1927,13 +1935,24 @@ return {
 			local d4 = build()
 			inform._airtime.supported = o
 			inform._sysinfo._ppsk_supported_cache = o_ppsk
-			assert_eq(d.wifi_caps, 0xC, "wifi_caps is exactly 0x4|0x8")
+			-- 0x1 (VWIRE) + 0x800 (MESHV3): the wireless uplink, claimed by
+			-- default on a DSA board (cfg.vlan absent, as here: cfg is nil).
+			assert_eq(d.wifi_caps, 0x1C + 0x801, "wifi_caps is 0x4|0x8|0x10 plus the mesh bits 0x1|0x800")
 			-- supportATFConfig() is hasWifiCapability(32): the atf.* block.
-			assert_eq(d2.wifi_caps, 0x2C, "plus 0x20 where airtime_flags can be switched")
+			assert_eq(d2.wifi_caps, 0x3C + 0x801, "plus 0x20 where airtime_flags can be switched")
 			-- supportWpaPpsk() is hasWifiCapability(0x100000): without it a
 			-- WLAN with Private Pre-Shared Keys is skipped entirely.
-			assert_eq(d3.wifi_caps, 0x10002C, "plus 0x100000 where hostapd can do per-key VLANs")
-			assert_eq(d4.wifi_caps, 0x10000C, "PPSK does not depend on airtime")
+			assert_eq(d3.wifi_caps, 0x10003C + 0x801, "plus 0x100000 where hostapd can do per-key VLANs")
+			-- A swconfig board (cfg.vlan present) does not claim the mesh bits:
+			-- its VLAN bridges would not carry a child's tagged traffic.
+			inform._sysinfo._ppsk_supported_cache = false
+			local st_sw = {authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap"}
+			local sw = cjson.decode(inform.build_json(st_sw, {vlan = {device = "switch0", ports = {}}}, ufhw))
+			assert_eq(sw.wifi_caps, 0x1C, "swconfig: no mesh bits")
+			inform._sysinfo._ppsk_supported_cache = o_ppsk
+			assert_eq(d4.wifi_caps, 0x10001C + 0x801, "PPSK does not depend on airtime")
 		end
 	},
 	{
@@ -2538,8 +2557,8 @@ return {
 				ip = "192.168.1.100", hostname = "testap"}
 			local d = cjson.decode(inform.build_json(st, {config = {}}, ufhw))
 			assert_eq(d.fw_caps, 0x110, "shipped fw_caps without an override")
-			assert_eq(d.wifi_caps2, 0x60, "shipped wifi_caps2 without an override")
-			assert_eq(d.wifi_caps, 0xC, "shipped wifi_caps without an override")
+			assert_eq(d.wifi_caps2, 0xE2, "shipped wifi_caps2 without an override")
+			assert_eq(d.wifi_caps, 0x1C + 0x801, "shipped wifi_caps without an override (mesh bits by default on a DSA board)")
 			d = cjson.decode(inform.build_json(st,
 				{config = {debug_caps = {wifi_caps = 0x2, wifi_caps2 = 0x41}}}, ufhw))
 			inform._airtime.supported = o

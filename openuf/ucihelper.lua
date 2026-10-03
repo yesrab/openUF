@@ -1825,6 +1825,20 @@ function M.apply_config(resp, cfg, opts)
 	-- switchvlan.lua already reconciles its own switch_vlan sections this way.
 	M.prune_vlan_networks(wanted_vlans)
 
+	-- The mesh backhaul (backhaul.lua): the hidden WDS downlink AP and/or the
+	-- 4-address uplink station the push described. wlan_clear() above removed
+	-- the previous copies (openuf_ prefix), so this is a rewrite every push;
+	-- the station's disabled flag follows the uplink policy's persisted mode.
+	if opts and opts.backhaul then
+		if opts.backhaul.downlink and opts.peer_ie then
+			opts.backhaul.downlink.vendor_elements = opts.peer_ie
+		end
+		local ok_bh, err_bh = pcall(M.backhaul_apply, opts.backhaul)
+		if not ok_bh then
+			io.stderr:write("ucihelper: backhaul sections not written: " .. tostring(err_bh) .. "\n")
+		end
+	end
+
 	-- Hand-configured (non-openuf_) SSIDs: disable or restore them per
 	-- conf.lua's use_only_unifi_wlan. Runs after the vap loop so it sees the
 	-- final section set, and before the reload so both land in one restart.
@@ -2142,7 +2156,14 @@ function M.ap_ifnames()
 		local ifaces = type(entry) == "table" and entry.interfaces or nil
 		for _, i in ipairs(type(ifaces) == "table" and ifaces or {}) do
 			local mode = type(i.config) == "table" and i.config.mode or nil
-			if type(i.ifname) == "string" and i.ifname ~= "" and (mode == nil or mode == "ap") then
+			-- The mesh backhaul (openuf_bh_* sections, `wds`): a downlink AP carries
+			-- children's VLAN-tagged frames and BPDUs by design, so it stays out of
+			-- the client-facing rule sets (l2guard) built from this list.
+			local is_backhaul = (type(i.section) == "string"
+					and i.section:sub(1, #M.BACKHAUL_PREFIX) == M.BACKHAUL_PREFIX)
+				or (type(i.config) == "table"
+					and (i.config.wds == true or i.config.wds == 1 or i.config.wds == "1"))
+			if type(i.ifname) == "string" and i.ifname ~= "" and (mode == nil or mode == "ap") and not is_backhaul then
 				out[#out + 1] = i.ifname
 				out[#out + 1] = owe_transition_ifname(i)
 				vlan_ifnames(i, out)
@@ -2234,6 +2255,159 @@ function M.kick_station(ifname, mac)
 	return true
 end
 
+-- === Mesh backhaul sections (wireless uplink / downlink) =====================
+--
+-- Written by apply_config from backhaul.plan()'s result. Both carry the openuf_
+-- prefix so wlan_clear() rewrites them on every push, plus `openuf_backhaul`
+-- (downlink|uplink) so get_vap_table() and ap_ifnames() leave them alone.
+--
+-- Downlink: the hidden WPA2-PSK AP children join, `wds 1` so a 4-address
+-- station is accepted and its per-station netdev lands in the AP's bridge
+-- (hostapd wds_sta=1 -- wifi-scripts mac80211.sh:556). Tagged frames from a
+-- child surface in br-lan and reach the per-VLAN bridges through the same
+-- `br-lan.<vid>` sub-devices the wired uplink uses, so no extra plumbing.
+-- Uplink: the 4-address station (mac80211.sh:973, `4addr`), bridged into lan
+-- like a port. Disabled unless the policy says the wire is gone: a station on
+-- a radio makes its AP BSSes start disabled until it associates
+-- (mac80211.sh:560), and a wired child with the station up is a bridge loop.
+M.BACKHAUL_PREFIX    = OPENUF_PREFIX .. "bh_"
+M.BACKHAUL_DL_PREFIX = OPENUF_PREFIX .. "bh_dl_"
+M.BACKHAUL_UL_PREFIX = OPENUF_PREFIX .. "bh_ul_"
+
+local function bh_section_name(prefix, radio)
+	return prefix .. (tostring(radio):gsub("[^%w_]", "_"))
+end
+
+local function valid_mac(s)
+	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
+end
+
+-- bh = {downlink = {radio, ssid, key, network?} | nil,
+--       uplink   = {radio, ssid, key, bssid?, enabled, network?} | nil}
+-- Returns the list of section names written.
+function M.backhaul_apply(bh)
+	if type(bh) ~= "table" then return {} end
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	local written = {}
+	local dl = bh.downlink
+	if type(dl) == "table" and dl.radio and dl.ssid and type(dl.key) == "string" and #dl.key >= 8 then
+		local s = bh_section_name(M.BACKHAUL_DL_PREFIX, dl.radio)
+		cursor:set("wireless", s, "wifi-iface")
+		cursor:set("wireless", s, "device", dl.radio)
+		cursor:set("wireless", s, "mode", "ap")
+		cursor:set("wireless", s, "ssid", dl.ssid)
+		cursor:set("wireless", s, "hidden", "1")
+		cursor:set("wireless", s, "encryption", "psk2")
+		cursor:set("wireless", s, "key", dl.key)
+		cursor:set("wireless", s, "wds", "1")
+		cursor:set("wireless", s, "network", dl.network or "lan")
+		cursor:set("wireless", s, "ieee80211w", "0")
+		cursor:set("wireless", s, "isolate", "0")
+		-- The sibling element every openUF VAP beacons (sysinfo.peer_ie_hex): it
+		-- is how a child's scan recognises this downlink as a site AP's.
+		if type(dl.vendor_elements) == "string" and dl.vendor_elements ~= "" then
+			cursor:set("wireless", s, "vendor_elements", dl.vendor_elements)
+		end
+		if type(dl.devname) == "string" and dl.devname:match("^[%w_%.%-]+$") then
+			cursor:set("wireless", s, "openuf_devname", dl.devname)
+		end
+		cursor:set("wireless", s, "openuf_backhaul", "downlink")
+		written[#written + 1] = s
+	end
+	local ul = bh.uplink
+	if type(ul) == "table" and ul.radio and ul.ssid and type(ul.key) == "string" and #ul.key >= 8 then
+		local s = bh_section_name(M.BACKHAUL_UL_PREFIX, ul.radio)
+		cursor:set("wireless", s, "wifi-iface")
+		cursor:set("wireless", s, "device", ul.radio)
+		cursor:set("wireless", s, "mode", "sta")
+		cursor:set("wireless", s, "wds", "1")
+		cursor:set("wireless", s, "ssid", ul.ssid)
+		cursor:set("wireless", s, "encryption", "psk2")
+		cursor:set("wireless", s, "key", ul.key)
+		cursor:set("wireless", s, "network", ul.network or "lan")
+		if valid_mac(ul.bssid) then cursor:set("wireless", s, "bssid", ul.bssid) end
+		-- The station's own name on the wire (vport-<mac>), reported as the
+		-- uplink VAP's essid; the SSID it joins is the mesh one above.
+		if type(ul.vport) == "string" and ul.vport ~= "" then
+			cursor:set("wireless", s, "openuf_vport_essid", ul.vport)
+		end
+		if type(ul.devname) == "string" and ul.devname:match("^[%w_%.%-]+$") then
+			cursor:set("wireless", s, "openuf_devname", ul.devname)
+		end
+		cursor:set("wireless", s, "disabled", ul.enabled and "0" or "1")
+		cursor:set("wireless", s, "openuf_backhaul", "uplink")
+		written[#written + 1] = s
+	end
+	cursor:commit("wireless")
+	return written
+end
+
+-- Every downlink AP section: {name, radio, ssid}.
+function M.backhaul_downlink_sections()
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	local out = {}
+	cursor:foreach("wireless", "wifi-iface", function(s)
+		local name = s[".name"]
+		if name and s.openuf_backhaul == "downlink" then
+			out[#out + 1] = {name = name, radio = s.device, ssid = s.ssid, devname = s.openuf_devname}
+		end
+	end)
+	return out
+end
+
+-- Every uplink station section: {name, radio, ssid, disabled (bool)}.
+function M.backhaul_uplink_sections()
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	local out = {}
+	cursor:foreach("wireless", "wifi-iface", function(s)
+		local name = s[".name"]
+		if name and s.openuf_backhaul == "uplink" then
+			out[#out + 1] = {name = name, radio = s.device, ssid = s.ssid,
+				disabled = (s.disabled == "1"), devname = s.openuf_devname}
+		end
+	end)
+	return out
+end
+
+-- Flip every uplink station section; one `wifi reload` when anything changed
+-- (netifd restarts only the radio whose config changed). Returns true if so.
+function M.backhaul_set_uplink_enabled(enabled)
+	local uci = get_uci()
+	local cursor = uci.cursor()
+	local changed = false
+	for _, s in ipairs(M.backhaul_uplink_sections()) do
+		local want = enabled and "0" or "1"
+		if (s.disabled and "1" or "0") ~= want then
+			cursor:set("wireless", s.name, "disabled", want)
+			changed = true
+		end
+	end
+	if changed then
+		cursor:commit("wireless")
+		M._run_cmd("wifi reload")
+	end
+	return changed
+end
+
+-- The live netdev of a wifi-iface section, from `ubus call network.wireless
+-- status` (each interface entry names its `section`). nil when not up.
+function M.ifname_for_section(section)
+	if type(section) ~= "string" then return nil end
+	local status = wireless_status()
+	if type(status) ~= "table" then return nil end
+	for _, radio in pairs(status) do
+		for _, i in ipairs(type(radio) == "table" and radio.interfaces or {}) do
+			if i.section == section and type(i.ifname) == "string" and i.ifname ~= "" then
+				return i.ifname
+			end
+		end
+	end
+	return nil
+end
+
 -- Return a table of VAP (virtual AP) info for the inform payload.
 function M.get_vap_table()
 	local uci = get_uci()
@@ -2259,6 +2433,66 @@ function M.get_vap_table()
 		-- A disabled vap that IS openUF-managed stays in the report: that is
 		-- how a WLAN the controller itself disabled keeps showing up as
 		-- disabled rather than vanishing.
+		-- A mesh backhaul section (openuf_bh_*) is reported the way the
+		-- controller's VAP processor expects (decompiled 10.6.106): a vap_table
+		-- entry whose `usage` is `uplink` or `downlink`, named with the
+		-- controller's own devname (ath4 / vwire3), essid = the site mesh
+		-- essid, `up` + a non-zero `channel` (or it is dropped), `state`
+		-- RUN/INIT, `bssid` = the interface's own address. The UPLINK's
+		-- sta_table must hold exactly the parent's downlink BSS, which is what
+		-- `iw station dump` on a station interface lists -- so the station's
+		-- netdev IS handed to the dump. The DOWNLINK's stations are the
+		-- 4-address children, which hostapd parks on per-station netdevs
+		-- <ifname>.sta<N>; those are handed to the dump too. See backhaul.lua.
+		if s.openuf_backhaul then
+			local radio = radio_by_name[s.device]
+			local rec = {
+				-- The controller named these in its push (ath4 for the station,
+				-- vwire3 for the downlink, and connectivity.uplink_wds=ath4); report
+				-- them under those names so it can tie the pieces together.
+				name          = s.openuf_devname or s[".name"],
+				essid         = s.ssid,
+				radio         = radio and radio.radio,
+				radio_name    = s.device,
+				encryption    = s.encryption,
+				disabled      = (s.disabled == "1"),
+				bssid         = "00:00:00:00:00:00",
+				channel       = radio and radio.channel,
+				tx_power      = radio and radio.tx_power,
+				usage         = s.openuf_backhaul,
+				hidden        = true,
+				up            = false,
+				state         = "INIT",
+				_ifnames      = {},
+			}
+			local ifname = M.ifname_for_section(s[".name"])
+			if ifname and ifname:match("^[%w%-%._]+$") then
+				if s.openuf_backhaul == "downlink" then
+					rec._ifnames[1] = ifname
+					local info = M._popen("iw dev " .. ifname .. " info") or ""
+					rec.bssid = info:match("addr (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)") or rec.bssid
+					rec.mac = rec.bssid
+					rec.up, rec.state = true, "RUN"
+					for dev in (M._popen("ls /sys/class/net") or ""):gmatch("%S+") do
+						if dev:sub(1, #ifname + 4) == ifname .. ".sta" then
+							rec._ifnames[#rec._ifnames + 1] = dev
+						end
+					end
+				else
+					rec._ifnames[1] = ifname
+					local link = M._popen("iw dev " .. ifname .. " link") or ""
+					local joined = link:match("Connected to (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+					if joined then rec.up, rec.state = true, "RUN" end
+					-- the station's own address: the VAP's "bssid", and what the
+					-- parent's downlink lists as a connected station
+					local info = M._popen("iw dev " .. ifname .. " info") or ""
+					local own = info:match("addr (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+					if own then rec.bssid, rec.mac = own, own end
+				end
+			end
+			vaps[#vaps + 1] = rec
+			return
+		end
 		if s.disabled == "1" and not s.openuf_wlanconf_id then return end
 		-- Only access points are VAPs. A mesh point or a station interface
 		-- (the 802.11s backhaul REVERSE-ENGINEERING.md's mesh fallback adds,

@@ -1,9 +1,16 @@
 --[[
-	Ubiquiti L2 discovery broadcaster (UDP port 10001).
+	Ubiquiti L2 discovery (UDP port 10001).
 
-	Sends a TLV-encoded announce packet to 255.255.255.255 every 10 seconds.
-	This makes the device visible in UniFi Discover / UBNT-Discovery before
-	and after adoption.
+	Sends a TLV-encoded announce packet to 255.255.255.255 every 10 seconds,
+	which is how the controller sees an unadopted device, and ANSWERS the
+	discovery requests other Ubiquiti tools send -- the four-byte probes
+	`01 00 00 00` (v1) and `02 08 00 00` (v2) that WiFiman's Discovery tab,
+	the UniFi mobile app and the Ubiquiti Device Discovery Tool broadcast,
+	replied to unicast from port 10001 the way a UCG Ultra does (captured
+	2026-10-03: it answers v1 with version 1 / command 0 and v2 with
+	version 2 / command 9, the same TLVs in both). openUF only ever
+	broadcast, so those tools listed a bare host with no model, name or
+	firmware next to it -- "no extra info" where a real AP shows all three.
 
 	Can be loaded as a module (returns M) or run as a standalone script.
 	When run as a script, call M.run(cfg) at the bottom of this file.
@@ -57,7 +64,14 @@ local function make_blob_17_1a(adopted)
 	}
 end
 
--- Build a complete announce packet as a Lua binary string.
+-- Packet headers: version byte, command byte. ANNOUNCE is the unsolicited
+-- broadcast; the other two answer the matching discovery request.
+M.HDR_ANNOUNCE = {0x02, 0x06}
+M.HDR_REPLY_V1 = {0x01, 0x00}
+M.HDR_REPLY_V2 = {0x02, 0x09}
+
+-- Build a complete announce packet as a Lua binary string. `hdr` is one of
+-- the headers above (default ANNOUNCE); the TLVs are the same whichever.
 --
 -- cfg fields:
 --   mac          {byte, ...}  6-element table of MAC bytes
@@ -71,9 +85,10 @@ end
 --   version_suffix string     appended after fw_ver in verbose/short strings
 --   uptime       number       seconds since boot
 --   counter      number       monotonically increasing send counter
-function M.build_packet(cfg)
+function M.build_packet(cfg, hdr)
+	hdr = hdr or M.HDR_ANNOUNCE
 	-- Outer packet: 2-byte header + 2-byte length field (filled in at end)
-	local packet = {0x02, 0x06, 0x00, 0x00}
+	local packet = {hdr[1], hdr[2], 0x00, 0x00}
 	local w
 
 	-- 0x02: IP address (MAC + IP concatenated)
@@ -153,6 +168,20 @@ function M.build_packet(cfg)
 		out[#out + 1] = string.char(byte)
 	end
 	return table.concat(out)
+end
+
+-- The reply a received datagram deserves, or nil for anything that is not
+-- a discovery request: our own broadcast echoed back, another AP's announce,
+-- a controller's reply, noise. A request is exactly four bytes -- version,
+-- command, and a zero length -- with version 1 command 0 or version 2
+-- command 8 (0x08 is "request"; the UCG's answer carries 0x09).
+function M.reply_for(data, cfg)
+	if type(data) ~= "string" or #data ~= 4 then return nil end
+	local ver, cmd = data:byte(1), data:byte(2)
+	if data:byte(3) ~= 0 or data:byte(4) ~= 0 then return nil end
+	if ver == 0x01 and cmd == 0x00 then return M.build_packet(cfg, M.HDR_REPLY_V1) end
+	if ver == 0x02 and cmd == 0x08 then return M.build_packet(cfg, M.HDR_REPLY_V2) end
+	return nil
 end
 
 -- Read MAC address from sysfs for the given interface.
@@ -357,6 +386,21 @@ function M.run(cfg)
 	-- crash (seen on a JIDU6101, OpenWrt 25.12.5). A failed sendto is logged
 	-- and simply retried next tick.
 
+	-- The listener: a second socket ON port 10001, where the requests
+	-- arrive (broadcast to 255.255.255.255:10001, or unicast to this
+	-- device). reuseaddr, so a restart does not wait out TIME_WAIT-ish
+	-- leftovers and nothing else on the box is expected on the port. If
+	-- the bind fails the loop runs as before -- broadcasting only -- and
+	-- says so once rather than crashing out of procd's respawn budget.
+	local udpl = socket.udp()
+	udpl:setoption("reuseaddr", true)
+	local bound, berr = udpl:setsockname("*", M.PORT)
+	if not bound then
+		io.stderr:write("announce: cannot listen on udp/" .. M.PORT .. " ("
+			.. tostring(berr) .. ") -- discovery requests will go unanswered\n")
+		udpl = nil
+	end
+
 	local counter  = cfg.counter or 0
 	local interval = cfg.interval or 10
 
@@ -372,7 +416,38 @@ function M.run(cfg)
 		if not ok then
 			io.stderr:write("announce: send failed: " .. tostring(err) .. "\n")
 		end
+		M._serve_requests(udpl, cfg, interval, socket)
+	end
+end
+
+-- Wait out one interval on the listener, answering every discovery request
+-- that arrives meanwhile (from port 10001, to the asker's own address and
+-- port, as a real device does). Our own broadcast comes back through this
+-- socket too; reply_for() returns nil for it. With no listener this is the
+-- plain sleep the loop always had.
+function M._serve_requests(udpl, cfg, interval, socket)
+	if not udpl then
 		socket.select(nil, nil, interval)
+		return
+	end
+	local deadline = socket.gettime() + interval
+	while true do
+		local remaining = deadline - socket.gettime()
+		if remaining <= 0 then return end
+		local readable = socket.select({udpl}, nil, remaining)
+		if readable and readable[1] then
+			local data, ip, port = udpl:receivefrom()
+			if data then
+				local reply = M.reply_for(data, cfg)
+				if reply then
+					local sent, serr = udpl:sendto(reply, ip, port)
+					if not sent then
+						io.stderr:write("announce: reply to " .. tostring(ip) .. ":"
+							.. tostring(port) .. " failed: " .. tostring(serr) .. "\n")
+					end
+				end
+			end
+		end
 	end
 end
 
