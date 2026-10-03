@@ -1045,6 +1045,92 @@ return {
 		end
 	},
 	{
+		name = "inform json: on 5 GHz an unaggregated frame costs 250 us, so a clean HE80 client is not Poor",
+		fn = function()
+			-- AP1, 2026-10-03: a MacBook at -43 dBm, HE80 2x2, MCS 11 down /
+			-- MCS 8 up, 2.6 % retries, 782 bytes and 266 us per frame (small
+			-- interactive frames, one PPDU each) scored 49 "Poor" under the
+			-- 2.4 GHz per-frame figure, next to an iPhone aggregating ~30
+			-- frames a PPDU (38 us each) at 97. Replayed here against both
+			-- figures.
+			inform._sta_stats_cache = {}
+			local orig_time, orig_5g = inform._time, inform.SAT_FRAME_OVERHEAD_US_5G
+			local t = 1000
+			inform._time = function() return t end
+			local st = {
+				authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
+				ip = "192.168.1.100", hostname = "testap",
+			}
+			-- hostapd's words for that MacBook, verbatim.
+			local HE80_2SS = "66:76:5b:ed:8c:a2\nflags=[AUTH][ASSOC][AUTHORIZED][WMM][MFP][HT][VHT][HE]\n" ..
+				"rx_vht_mcs_map=fffa\ntx_vht_mcs_map=fffa\n" ..
+				"he_capab=010808000080443002801d039f08000c00fafffaff391cc7711c07\n" ..
+				"vht_caps_info=0x0f817832\nht_caps_info=0x006f\n"
+			local c = {tx_packets = 5000, tx_bytes = 5000 * 782, tx_duration = 5000 * 266, rx_packets = 100}
+			local function inform_once()
+				inform._ucihelper = {
+					get_radio_table = function()
+						return {{ name = "radio0", radio = "na", channel = 52, ht = "HE80", tx_power = "23",
+							disabled = false, builtin_antenna = true, builtin_ant_gain = 3, max_txpower = 23 }}
+					end,
+					get_vap_table = function()
+						return {{ name = "openuf_test", essid = "test", radio = "na", radio_name = "radio0",
+							encryption = "psk2", disabled = false, bssid = "aa:bb:cc:00:00:01",
+							channel = 52, tx_power = "23", usage = "user" }}
+					end,
+					get_ifname_for_radio = function(radio) if radio == "radio0" then return "wlan0" end return nil end,
+					get_ifnames_for_vap = function(radio, ssid)
+						if radio == "radio0" and ssid == "test" then return {"wlan0"} end
+						return {}
+					end,
+				}
+				inform._sysinfo._phy_info_cache = {}
+				inform._sysinfo._run_cmd = function(cmd)
+					if cmd:find("station dump") then
+						return "Station 66:76:5b:ed:8c:a2 (on wlan0)\n" ..
+							"\tsignal:  \t-43 [-48, -51, -45, -52] dBm\n" ..
+							"\ttx packets:\t" .. c.tx_packets .. "\n" ..
+							"\ttx bytes:\t" .. c.tx_bytes .. "\n" ..
+							"\trx packets:\t" .. c.rx_packets .. "\n" ..
+							"\ttx bitrate:\t1200.9 MBit/s 80MHz HE-MCS 11 HE-NSS 2 HE-GI 0 HE-DCM 0\n" ..
+							"\ttx duration:\t" .. c.tx_duration .. " us\n" ..
+							"\trx bitrate:\t864.8 MBit/s 80MHz HE-MCS 8 HE-NSS 2 HE-GI 0 HE-DCM 0\n"
+					end
+					if cmd:find("all_sta", 1, true) then return HE80_2SS end
+					if cmd:find("survey dump") then
+						return "Survey data from wlan0\n\tfrequency:\t5260 MHz [in use]\n\tnoise:\t-91 dBm\n"
+					end
+					if cmd:find("dev wlan0 info") then return fixture("iw_dev_info_5g.txt") end
+					if cmd:find("phy phy0 info") then return fixture("iw_phy_info_5g.txt") end
+					return ""
+				end
+				t = t + 10
+				local d = cjson.decode(inform.build_json(st, nil, ufhw))
+				local s = d.vap_table[1].sta_table[1]
+				c.tx_packets, c.tx_bytes = c.tx_packets + 34, c.tx_bytes + 34 * 782
+				c.tx_duration, c.rx_packets = c.tx_duration + 34 * 266, c.rx_packets + 25
+				return s.satisfaction, s
+			end
+			local ok, err = pcall(function()
+				local first, s = inform_once()
+				assert_eq(s.tx_mcs, 11, "HE rate parsed")
+				assert_eq(s.radio, "na", "a 5 GHz station")
+				assert_eq(first, 100, "first inform: no airtime window and no uplink sample yet; SNR 48 dB and MCS 11 of 11")
+				assert_eq(inform_once(), 90, "second: airtime (250 + 782*8/1161) / 266 = 96 %, uplink MCS 8 of 11 at half weight = 90 -> Excellent, not Poor")
+				-- The same frames judged by the 2.4 GHz figure: the live bug.
+				inform._sta_stats_cache = {}
+				inform.SAT_FRAME_OVERHEAD_US_5G = inform.SAT_FRAME_OVERHEAD_US
+				inform_once()
+				assert_eq(inform_once(), 43, "with 110 us a frame the same client is 43: Poor for the price of its PHY's preamble")
+			end)
+			inform._time, inform.SAT_FRAME_OVERHEAD_US_5G = orig_time, orig_5g
+			inform._sta_stats_cache = {}
+			inject_ucihelper()
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform json: satisfaction takes the worst of downlink airtime, uplink rate and SNR",
 		fn = function()
 			-- Per-frame figures measured on hardware 2026-09-27 (office 2.4 GHz,

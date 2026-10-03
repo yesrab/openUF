@@ -171,9 +171,20 @@ M.SAT_AIRTIME_MIN_PKTS = 20
 --   near-idle client's odd frame (seen on hardware: a speaker sending 1-15
 --   frames per 10 s, some at VHT MCS 2 among MCS 9) isn't its uplink;
 M.SAT_UPLINK_MIN_PKTS = 20
--- * the ideal fixed cost of one frame on air (preamble, SIFS, ACK, backoff),
---   measured as ~110 us for small frames of clean 2.4 GHz clients;
-M.SAT_FRAME_OVERHEAD_US = 110
+-- * the ideal fixed cost of one frame on air -- preamble, SIFS, the
+--   BlockAck, backoff, and on the wide 5 GHz channels the RTS/CTS the
+--   driver adds -- as mt76's per-station tx duration counts it. Measured:
+--   ~110 us for small frames of clean 2.4 GHz HT clients (2026-09-27), and
+--   266 us per unaggregated frame for a -43 dBm HE80 2x2 client at MCS 11
+--   with 2.6 % retries on 5 GHz (AP1, 2026-10-03) -- a link with nothing
+--   wrong with it, which the 2.4 GHz figure scored 49 "Poor" while its
+--   neighbour, aggregating ~30 frames per PPDU, scored 97 at 38 us a frame.
+--   The fixed cost is what an unaggregated frame costs on that PHY, not a
+--   verdict on the link, so it is per band; the realme that does have a
+--   bad link (MCS 4, 32 % retries, 454 us per 1.2 kB frame on 2.4 GHz)
+--   still scores Poor under the 2.4 GHz figure;
+M.SAT_FRAME_OVERHEAD_US    = 110   -- 2.4 GHz ("ng")
+M.SAT_FRAME_OVERHEAD_US_5G = 250   -- 5 GHz ("na"; 6 GHz radios report "na" too)
 -- * the noise floor is taken as at least this: drivers report floors no
 --   receiver achieves (ath10k -106, ath9k -107), which would inflate SNR.
 M.SAT_NOISE_FLOOR_MIN = -95
@@ -579,9 +590,16 @@ end
 -- frame plus the payload at ceil_mbps) as a percentage of the actual,
 -- capped at 100. Aggregated traffic beats the per-frame cost and caps out,
 -- so the term only bites on links that spend airtime they shouldn't.
-local function airtime_pct(pkts, bytes, dur_us, ceil_mbps)
+-- The fixed per-frame cost for a station's band ("ng"/"na"), see the
+-- SAT_FRAME_OVERHEAD_US pair above.
+local function frame_overhead_us(band)
+	if band == "na" then return M.SAT_FRAME_OVERHEAD_US_5G end
+	return M.SAT_FRAME_OVERHEAD_US
+end
+
+local function airtime_pct(pkts, bytes, dur_us, ceil_mbps, overhead_us)
 	if not ceil_mbps or dur_us <= 0 then return nil end
-	local ideal = pkts * M.SAT_FRAME_OVERHEAD_US + bytes * 8 / ceil_mbps
+	local ideal = pkts * (overhead_us or M.SAT_FRAME_OVERHEAD_US) + bytes * 8 / ceil_mbps
 	local pct = ideal * 100 / dur_us
 	if pct > 100 then pct = 100 end
 	return pct
@@ -1415,7 +1433,7 @@ function M.build_json(st, cfg, ufhw)
 					air_pkts, air_bytes, air_dur = tp, tb, td
 				elseif tp - air_pkts >= M.SAT_AIRTIME_MIN_PKTS then
 					air_ewma = ewma(air_ewma, airtime_pct(tp - air_pkts, tb - air_bytes,
-						td - air_dur, ceil_mbps))
+						td - air_dur, ceil_mbps, frame_overhead_us(vap.radio)))
 					air_pkts, air_bytes, air_dur = tp, tb, td
 				end
 				-- Coverage: SNR, noise floored at SAT_NOISE_FLOOR_MIN.
