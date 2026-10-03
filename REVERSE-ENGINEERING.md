@@ -547,6 +547,156 @@ back to the timed sleep and logs once.
 
 ---
 
+## Investigation 4 — Bluetooth setup over a USB adapter  ⚪ PARKED (by choice)
+
+**Status:** assessed 2026-10-03, nothing built. Not a pressing need, so parked; this section
+exists so the next session starts at step 1 of the plan rather than at the research. Nothing
+in this tree or in the three reference repos (amd989/unifi-gateway, jk-5, fxkr) mentions
+Bluetooth at all — it is a new track, outside the inform protocol.
+
+### What Bluetooth is for on a real UniFi AP
+
+Public evidence, read 2026-10-03:
+
+- Ubiquiti's help article *Bluetooth APs in UniFi Network* names exactly two uses: adopting
+  and keeping connected **Protect All-in-One Sensors** (up to 7 UP-Senses per AP; the U6
+  In-Wall is on the list), and **Device Setup** — "your UniFi Network mobile app can detect the
+  Bluetooth signal of *unadopted* UniFi APs, allowing you to instantly set them up with the
+  tap of a button".
+- The U6-IW datasheet lists "Management interfaces: Ethernet and Bluetooth". A U6IW identity
+  with a Bluetooth radio is therefore consistent with the real device.
+- There is **no beacon / iBeacon feature** in UniFi Network. The Purple.ai article that claims
+  one is generic boilerplate ("the option might be named differently"), and no `ble.*` or
+  `bluetooth.*` key has ever appeared in a push here (the unhandled ledger is clean).
+
+**What it would buy openUF:** the one thing that still needs a shell today. An openUF device
+at a site with no local controller needs someone to SSH in and run `set-inform`; over
+Bluetooth the installer taps the device in the app, the app hands it the inform target, the
+device sends its first inform, and the **existing L3 adoption path** (authkey delivered in
+the first `mgmt_cfg` while unadopted — PROTOCOL-VALIDATION) finishes the job. The controller
+never learns how the inform URL got there, so nothing changes in its view after adoption.
+Sensor bridging is **out of scope**: it needs a Protect console and the AP acting as a BLE
+central relaying sensor data — same category as USG/USW emulation.
+
+### What is already public
+
+[zerotypic/unifi-ble-client](https://github.com/zerotypic/unifi-ble-client) reverse
+engineered Ubiquiti's shared BLE library (`com.ubnt.ble.*`; the class names still say
+AmpliFi) out of the UniFi **Protect** Android app v1.15.0 and drove a G3 Instant camera with
+it. Its `doc/protocol.md` is the spec; the transport and crypto layers are fully described:
+
+```
+service UUID            per model (G3 Instant: 0c430d0c-00ef-4367-bc6f-ca7c51e6b61f; U6IW: unknown)
+read  (notify)          d587c47f-ac6e-4388-a31c-e6cd380ba043        device -> host
+write (with response)   9280f26c-a56f-43ea-b769-d5d732e1ac67        host -> device
+discovery               BT name prefix per model + the service UUID in the advertisement
+
+packet   2-byte length | crypto_secretbox_easy( 2-byte seq | 1-byte proto | data )
+         nonce = seq (2 bytes) + 22 zero bytes; both sides start from a hard-coded DEFAULT_KEY
+auth     proto 0, msgpack ["DHPK", false, 32-byte X25519 pubkey]  then  ["AUTH", "DH"]
+         shared key = BLAKE2b-256( scalarmult || host_pub || device_pub )   (libsodium generichash)
+api      proto 3, header part (JSON, zlib) + body part (JSON); HTTP-shaped {requestId, method, path}
+         GET  /api/1.2/ap        wifi scan list (a camera thing)
+         POST /api/1.2/manage    {"mgmt":{"hosts":[…],"protocol":"http","token":"…"},"wifi":{…}}
+```
+
+Caveats on that source: it is Protect-era (2020-ish), the per-model service UUID and name
+prefix for any **AP** are not in it, the code mentions an alternative `"SRP"` auth type it
+never saw used, and the MTU bug it works around is the camera firmware's, not something to
+replicate.
+
+### What it changes in openUF
+
+- **Not a Lua module.** Lua on OpenWrt cannot open an `AF_BLUETOOTH` socket, and the crypto
+  is libsodium's: XSalsa20-Poly1305, X25519, BLAKE2b with a 32-byte output. OpenSSL has no
+  Salsa at all, and BLAKE2b-256 is a *different hash* from a truncated `blake2b512` (the
+  output length is in the parameter block), which `lua-openssl` could not express anyway. So:
+  a small C daemon, call it `openuf-bled`.
+- **No BlueZ.** `bluez-daemon` in the feed depends on glib2, dbus, libical, readline and
+  ncurses — the end of the 16 MB boards. Serve GATT without `bluetoothd`: the kernel mgmt
+  socket (power, LE, connectable, add-advertising) plus an L2CAP socket bound to the ATT
+  channel (CID 4), handling MTU exchange, Read-by-Group/Read-by-Type/Find-Information for
+  discovery, Write Request and Handle Value Notification. bleno and PayPal's `gatt` did
+  exactly this. Kernel side is only `kmod-bluetooth` + `kmod-btusb`.
+- **Crypto with no OpenSSL involvement:** link the feed's `libsodium` (1.0.20), or vendor
+  TweetNaCl plus the reference BLAKE2b — a few hundred lines, zero package dependencies.
+  msgpack is needed for two fixed messages only (hand-roll it); JSON from libubox's blobmsg,
+  which every device has; zlib is in base.
+- **Handover costs nothing new.** On a valid `manage` the daemon runs the existing
+  `syswrapper.sh set-inform <url>`; the inform loop is untouched. The daemon reads `adopted`
+  from `state.json` and advertises **only while unadopted** — the mirror of the rule that the
+  `mgmt_cfg` authkey is accepted only while unadopted.
+- **Config and UI:** one main option (`ble_setup`), on automatically when
+  `/sys/class/bluetooth/hci0` exists, plus a LuCI toggle and a status line. The modelmap stays
+  untouched (a dongle is not board truth). The ufmodel probably stays untouched too — whether a
+  real U6IW reports a Bluetooth field in its inform is unknown and is a 30-minute grep of the
+  controller jar (PROTOCOL-VALIDATION → "Decompiling the controller").
+- **Packaging stops being arch-independent.** Both packages are `PKGARCH:=all` today; a C
+  daemon is the first per-target artefact. Keep it its own package (`openuf-ble`, depending on
+  `kmod-bluetooth` and `kmod-btusb`) so the base stays `all`, and grow the release matrix to
+  the targets shipped for.
+- **Hardware fit:** USB exists on the JioRouter boards (`&ssusb` is `okay` in the common
+  dtsi), the Archer C5 v1, A7/C7, WR1043ND v2 and WDR3500; **none on the AX3000T**. OpenWrt
+  builds `btusb` with Realtek and MediaTek firmware loading **on** and Broadcom **off**, so:
+  CSR 4.0 dongles (no firmware; beware the fake CSR clones with broken LE, the kernel has a
+  quirk list) or RTL8761B with the `rtl8761b-firmware` package. Keep the dongle off a USB 3
+  port next to the 2.4 GHz antennas.
+- **Security model is the unadopted-device model, nothing better.** `DEFAULT_KEY` is public,
+  so the Diffie-Hellman exchange is encrypted but **unauthenticated**: anyone in range with
+  the app can point an unadopted device at their controller — exactly the trust level of
+  `ubnt`/`ubnt` SSH on an unadopted real AP. Rules for the daemon: accept `manage` only while
+  unadopted, serve no other endpoint, never put a PSK or an authkey on the air, go silent the
+  moment the device is adopted.
+
+### Plan (in order, cheapest first)
+
+1. **Decompile the UniFi Network Android app** (`com.ubnt.easyunifi`) with jadx and confirm
+   its Bluetooth client is the same library. Pull the AP entries: Bluetooth name prefix and
+   service UUID for U6IW (and the other ufmodels), the AP-shaped `manage` payload, any
+   device-info `GET` the app issues before offering adoption, and whether `"SRP"` is used for
+   APs now. **This is the gate: nothing is built until it passes.**
+2. **Build the daemon against AP2 with a dongle** — it has USB, 140 MB of flash, and the feed
+   has an on-device `gcc`, so no SDK is needed for the dev loop. The real app is the oracle,
+   the way the controller is for inform: is the device listed → does auth complete → does
+   `manage` land and `set-inform` fire.
+3. **Watch the handover end to end** on the UCG Ultra: first inform → authkey in `mgmt_cfg`
+   → Connected. Then the factory-reset round trip (`reset-inform` must make it advertise
+   again).
+4. **Integrate and document:** init script (start only with an adapter and the option on),
+   LuCI toggle, a README row, a USAGE section, and the evidence into PROTOCOL-VALIDATION under
+   the confirmed-live rule.
+
+### Open questions
+
+- What `mgmt.token` means to a **Network** controller. In the camera flow it is a Protect
+  NVR token the app fetched from the console; for an AP it may be nothing openUF needs, or the
+  thing that lets the controller skip the "pending adoption" click. Step 1 answers it.
+- How `hosts` + `protocol` become an inform URL (port 8080? `/inform` path implied?).
+- Does a real AP keep advertising after adoption (with an "adopted" flag), or stop? The help
+  article says *unadopted*; stopping is the safe default until a real one is observed.
+- Does the app take the AP's identity MAC from the API or from the BD_ADDR? A dongle's address
+  has nothing to do with `lan_cpueth`'s MAC.
+- Does a real U6IW's inform carry a Bluetooth field the controller shows anywhere?
+
+### Do not
+
+- Reach for `bluez-daemon`/`bluetoothd`, even "just to prototype": its dependency set does
+  not fit the reference boards and the raw-socket path is the proven one anyway.
+- Try to do the crypto in Lua or through OpenSSL — see above, it is not a matter of effort.
+- Buy Broadcom USB dongles for this; OpenWrt's `btusb` has their firmware patching off.
+- Claim any capability bit for this. Nothing on the inform side is involved.
+- Write a line of the daemon before step 1 has confirmed the Network app's protocol.
+
+**Sources:** [Bluetooth APs in UniFi Network](https://help.ui.com/hc/en-us/articles/10000263945111-Bluetooth-APs-in-UniFi-Network) ·
+[U6-IW datasheet](https://dl.ui.com/ds/u6-iw_ds) ·
+[zerotypic/unifi-ble-client](https://github.com/zerotypic/unifi-ble-client) and its
+[protocol.md](https://github.com/zerotypic/unifi-ble-client/blob/main/doc/protocol.md) ·
+[Purple.ai "Configure BLE on Ubiquiti Networks APs"](https://support.purple.ai/hc/en-gb/articles/12802080728989-Configure-BLE-on-Ubiquiti-Networks-APs) (ruled out) ·
+OpenWrt `package/kernel/linux/modules/bluetooth.mk`, `packages/utils/bluez/Makefile`,
+`packages/libs/libsodium/Makefile` (local checkouts, read 2026-10-03).
+
+---
+
 ## Backlog — other unimplemented surfaces
 
 Ordered by (value ÷ effort). Rows 8–11 were added on 2026-09-15 from the reference-material
@@ -573,6 +723,7 @@ review (session log); none started.
 | 5 | **Expected throughput / `linkscore`** | Both currently report `0`. `iw` gives `expected throughput` per station. | Confirm whether the controller consumes it before implementing. |
 | 6 | **WiFiman** | Investigated and **closed**: it is a separate proprietary agent, not part of the inform protocol. Zero references in the repo, nothing on the wire. | Nothing. Do not re-investigate without new evidence. |
 | 7 | **AirView / spectrum scan trigger** | Handler implemented and exercised against real radios. The web UI of 10.4.57 had no trigger; the **mobile app has one**, and against 10.6.101 it sends the device nothing — see Investigation 2. | Investigation 2, step 0: the REST `spectrum-scan` probe. |
+| 21 | **Bluetooth setup via a USB adapter** | Parked by choice 2026-10-03, assessed in **Investigation 4**: app-driven setup of an *unadopted* device that hands over to the existing L3 adoption; protocol public from the Protect app (zerotypic/unifi-ble-client), AP specifics not; needs a small C daemon (libsodium crypto, raw mgmt + L2CAP ATT, no BlueZ) and a per-target package. Sensor bridging and beacons are out of scope. | Investigation 4, step 1: jadx the Network app for the U6IW service UUID, name prefix and `manage` shape. Nothing before that. |
 
 ---
 
@@ -589,3 +740,4 @@ review (session log); none started.
 | 2026-09-15 | Reference-material review; unhandled ledger; `interval` | The three reference repos from README (amd989/unifi-gateway, jk-5, fxkr) were cloned beside this tree and read end to end. The two READMEs are behind PROTOCOL-VALIDATION.md on every point they cover; unifi-gateway is a UGW3 emulator, so most of its payload is N/A here. What came out of it, ranked: a STUN channel (`stun_url` is in every `mgmt_cfg`, openUF has no reference to it -- Investigation 3 below), a persistent ledger of unhandled surfaces (done today: `unhandled.lua`), Guest Hotspot (`guest_token` in fxkr's real capture, `selfrun_guest_mode=pass` in our own `mgmt_cfg`), DHCP option 43 discovery, honouring the `noop` `interval` (done today), multicast discovery alongside broadcast, a `User-Agent`, and fxkr's 2015 UAP payload as the historical wireless-uplink shape (`vap_table[].usage="uplink"`, `essid="vport-<serial>"`, top-level `uplink` string, `isolated`) -- added to Investigation 1's open questions. Not worth doing: snappy, speed-test, the gateway-only tables, jk-5's TLV `0x14`. Deployed to AP2 the same day (v0.8.0-17, no re-adoption) and a forced re-push filled the ledger with 79 rows in one cycle -- among them six surfaces nobody had noticed in a year of captures: the controller-scheduled nightly `syswrapper.sh 11k-scan` cron job, `ntpclient.*` servers and `system.timezone`, a pushed SSH user with an MD5-crypt hash (`users.*`/`sshd.*`), ten `ebtables` hardening rules, a top-level `mesh.status` block and a 32-hex `unifi.key` that is neither the authkey nor a PSK, `blocked_sta` on every `setparam`, and `live_update: false` on every `noop` (backlog rows 12–17). The STUN probe (`tools/stun-probe.lua`) went out with it: no reply from `192.168.1.1:3478` to a bare Binding Request (Investigation 3). AP2's clock turned out to be 8 days slow and was stepped by hand. Second batch the same day, on the user's go-ahead: backlog rows 12, 13 and 15 implemented as `sysconf.lua` (timezone, NTP, cron with the `11k-scan` verb) and `l2guard.lua` (the ebtables block as nft on the VAPs), deployed to AP2 and verified on a forced re-push -- crontab block written and crond up, `system.ntp.server` moved to the four `ubnt.pool.ntp.org` hosts with the OpenWrt pool stamped, `bridge openuf_l2guard` live on `phy0-ap0`/`phy0-ap1`/`phy1-ap0`, a hand-run `syswrapper.sh 11k-scan` consumed within one heartbeat and the next payload carrying 26 `scan_table` rows. The dropped-key report fell from 124 to 99 key shapes. Row 14 (the pushed SSH user) deferred for a design pass. 770 tests. The user's Apply on a WiFi setting then closed Investigation 3 (nothing on UDP 3478, see there) and a 30 s stay on the RF stats page left `live_update` at `false` while `interval` rose to 16–19 s and was followed (row 17; the first live proof that honouring it matters); the block/unblock and guest-WLAN clicks are pending as experiments B and C in "How to resume", with the dump left armed on AP2 for them. |
 | 2026-09-28 | Upstream review and selective adoption, round three | jonasevcik/openUF had 26 commits since the last review (`12b4db0..08d0003`, 25–27 September, tag v0.9.3). The first seven were upstream taking this fork's 2026-09-15 work (`sysconf`, `l2guard`, the `noop` interval, the bootstrap re-lock guard, credited in their headers) -- checked for equivalence and left alone. Adopted, re-implemented in this tree's style with their tests: the sibling-AP vendor element and its nl80211/`ucode` reader (`scan_table[].is_unifi`/`serialno`), `\xNN` SSID decoding, Roaming Assistant (`roamassist.lua`, `wifi_caps2` 0x60, `openuf_roam_assist`, `roam_assist_diff_db`), the usteer off-switch fix (`band_steering_interval`, not the inert threshold), device-level Band Steering (`wifi_caps` 0xC, `bandsteering.*`), Airtime Fairness (`airtime.lua`, `wifi_caps` 0x20, `atf_enabled` in state, reapplied at start), Enhanced Open incl. transition (`radio_caps2` 0x8, `owe_supported`, `get_ifnames_for_vap`), FT with WPA3 (`radio_caps2` 0x2), Private Pre-Shared Keys (`wifi_caps` 0x100000, `ppsk_add`, `wifi-station`/`wifi-vlan`, `bss_ifname`), the three-term WiFi Experience estimate (`hostapd_sta_caps`, `tx_duration`, SNR), `_forget_controller` on `setdefault` and `reset-inform`, the once-a-minute l2guard VAP resync, `_force_scan` (`ap-force` + exit status) for both scan paths, the uninstall cron cleanup, the lab stubs, and upstream's full capability-gate sweep into PROTOCOL-VALIDATION.md. Kept ours: `debug_caps`, `state.lua`'s design, the function names, this CLAUDE.md. 844 tests pass (777 before). Deployed to AP2 the same day (build `d4c3460`; AP2 had rebooted onto `192.168.1.148`, and its clock was 11 days slow again -- stepped from the dev machine, `ntpd -q` does nothing there): backlog row 20 records the checks, including the controller's stored `atf.mode=disabled` taking effect on the first push. AP1 waits for its root password. |
 | 2026-09-21 | UAP-IW-HD identity; Archer A7 / C7 profile | `ufmodel/uhdiw.lua` added so a WiFi 5 board can present as a WiFi 5 in-wall with the same five sockets: model code and firmware from Ubiquiti's own catalog (`fw-update.ubnt.com/api/firmware-latest`, platform `UHDIW`, release v6.7.57+15670 published 2026-09-03), `buildtime`/`factoryver` marked cosmetic. `modelmap/archer-a7-v5.lua` written from the OpenWrt tree for the Archer A7 v5, C7 v4 and C7 v5 -- one `board.d` case arm for all three: tagged CPU port 0 on a single `eth0` trunk (the WDR3500 shape, `lan_cpueth = "eth0"`), WAN = physical 1 and LAN1..4 = 2..5 from both `02_network`'s labels and `01_leds`' port masks, `green:wps` as the LED no DTS alias drives, radio0 expected to be the 5 GHz ath10k (`phy0tpt`). Neither has touched hardware or a controller (backlog row 18; the identity is not to be tried on AP1/AP2). Tests: `tests/test_ufmodel.lua` loads every identity and pins UHDIW's shape, the A7 map's board truth is pinned in `test_modelmap.lua`, and the identity is driven through `build_json` and `announce.build_packet`. |
+| 2026-10-03 | Bluetooth setup over a USB adapter (assessment only) | Asked how a real AP's Bluetooth would play in openUF. Found Ubiquiti's two uses (Protect sensor bridging, out of scope; app setup of unadopted APs, worthwhile), a public reverse-engineering of the BLE protocol from the Protect app, and that it cannot be done in Lua or with OpenSSL (libsodium crypto, `AF_BLUETOOTH`) — so a C daemon and the first non-`all` package. **Parked by choice**; Investigation 4 and backlog row 21 hold the plan, gated on decompiling the Network app first. |
