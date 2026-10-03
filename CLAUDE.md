@@ -29,13 +29,21 @@ eval $(luarocks path --local) && lua tests/run_tests.lua
 sh tools/simulate.sh --adopt          # needs pycryptodome, luasocket, lua-cjson
 
 # Release tarball; --verify proves the comment-stripped tree is bytecode-identical
-# to the source and still passes the suite
+# to the source and still passes the suite. Run it in the same shell as the
+# luarocks eval above: without LUA_PATH the suite step fails on lua-cjson and
+# --verify reports a false failure.
 sh tools/dist.sh --verify
 
 # Push this tree to adopted APs: builds with --verify, then runs the on-device updater
 # on each (backup → install keeping conf.lua → restart → wait for an inform → roll back)
 sh tools/deploy.sh --check <ap-ip>...   # read-only: what each AP runs
 sh tools/deploy.sh <ap-ip>...           # OPENUF_SSH_PASS=... for a password-protected root
+
+# Put this tree onto an AP's RUNNING prefix -- the package's /usr/lib/openuf or
+# install.sh's /opt/openuf, whichever holds inform.lua -- with .pre-hotpatch backups,
+# the init script included when it differs. deploy.sh only ever updates /opt/openuf,
+# which on a device that also has the package installed is the dormant copy.
+sh tools/hotpatch.sh [--repush] <ap-ip>  # --repush blanks cfgversion for a full config push
 
 # Shell syntax — BOTH, every time (see "Shell code" below)
 bash -n setup.sh && dash -n setup.sh
@@ -692,6 +700,46 @@ factory reset.
   carries no RADIUS server, port or secret.
 
 ---
+
+## Upstream: jonasevcik/openUF is inspiration, not a parent
+
+This repository began as a fork of https://github.com/jonasevcik/openUF and was
+**detached from the GitHub fork network on 2026-10-03**. It is a standalone repository:
+there is no Sync-fork button, no ahead/behind count, no cross-repo compare view, and
+upstream's commits no longer appear as shared history on GitHub. Do not write "this fork"
+in the docs any more. Upstream stays reachable as a plain git remote:
+
+```sh
+git remote -v                                    # expect `upstream` -> jonasevcik/openUF
+git remote add upstream https://github.com/jonasevcik/openUF.git   # if a fresh clone lacks it
+git fetch upstream                               # ALWAYS first -- nothing else refreshes it
+git log --oneline 08d0003..upstream/main         # what has not been reviewed yet
+```
+
+**The sync is a selective re-implementation, never a merge.** Keep ours where ours is
+stronger; where theirs is better, re-implement it in this tree's style, with their tests,
+and label their hardware evidence as theirs (upstream runs a Xiaomi AX3000T and an Archer
+C5; this tree's lab is a JioRouter AX6000, DSA, `lan_cpueth = "br-lan"`). Upstream also takes
+work from here (their 2026-09-25 commits were our 09-15 sysconf/l2guard/interval work,
+credited to this repo), so diff before assuming a commit is new.
+
+- **Last review point: `08d0003` (upstream v0.9.3), sync 3 on 2026-09-28.** Earlier: the
+  fork point `677f732`; sync 1 (2026-09-06) to `d7d7e21`; sync 2 (2026-09-13) to `12b4db0`.
+  Each sync is a row in REVERSE-ENGINEERING.md's session log and an "Adopted from upstream,
+  <date>" section in PROTOCOL-VALIDATION.md -- update both, and move this line.
+- **Mechanics that worked in sync 3:** `git add -A` first, then per commit
+  `git show --format= <c> -- openuf/ tests/ | git apply --3way` (the fetch puts their blobs
+  in our object store, so most hunks apply and conflicts are small); copy wholesale any file
+  that is byte-identical to the last sync point; run `eval $(luarocks path --local)` before
+  both the suite and `sh tools/dist.sh --verify`; use `sh -c` for word-split loops (zsh does
+  not split an unquoted variable -- the same trap bites `jadx $list`, hand it `$(cat list)`).
+- **Fixtures** in both trees use RFC 7042 MACs (`00:00:5e:00:53:xx`) and RFC 5737 addresses
+  (`192.0.2.x`). Pre-commit scan: `git diff --cached -U0 | grep "^+" | grep -nE
+  "192\.168\.|([0-9a-f]{2}:){5}[0-9a-f]{2}"` -- `192.168.1.100` "testap" and `11:22:33`-style
+  MACs are long-standing test placeholders, not lab values.
+- **Nothing from the lab goes into this file or the docs**: no device passwords, no API keys,
+  no controller credentials. REVERSE-ENGINEERING.md's lab table carries the addresses and
+  roles; secrets are asked for each session.
 
 ## File map
 

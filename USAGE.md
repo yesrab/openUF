@@ -589,7 +589,7 @@ the LAN to a guessed socket. Two more DSA differences:
   nftables keeps nothing across a reboot.
 
   ⚠️ All of the above is upstream's work, verified on a Xiaomi AX3000T against a UCG Ultra.
-  The JioRouter boards' mt7531 is the same driver family, but this fork has not exercised
+  The JioRouter boards' mt7531 is the same driver family, but this tree has not exercised
   per-port VLAN on them yet.
 
 The modelmap sets:
@@ -1503,7 +1503,7 @@ the AX3000T, whose map names `wan`).
 `ucihelper.ensure_bridge_identity` runs once at daemon start and pins the bridge's
 `macaddr` to `lan_cpueth`'s MAC when — and only when — the two differ, so identity, LLDP
 and management traffic all agree, the way they do on a real UniFi AP. Boards where they
-already match are untouched and no reload is issued — that includes this fork's JioRouter
+already match are untouched and no reload is issued — that includes this tree's JioRouter
 maps, whose `lan_cpueth` *is* `br-lan`. It logs what it pinned; adoption is keyed on
 `lan_cpueth`'s MAC, which it never changes.
 
