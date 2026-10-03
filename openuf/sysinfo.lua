@@ -840,6 +840,34 @@ function M._phy_info(phy)
 	return text, caps
 end
 
+-- The radio's usable frequencies, from the Frequencies block of the cached
+-- `iw phy phyN info` ("* 5180.0 MHz [36] (30.0 dBm) (radar detection)"; a
+-- "(disabled)" one is left out), in list order as {freq, channel, passive}.
+-- `passive` marks a channel the radio may only listen on (no IR / radar),
+-- where a scan dwells ~110 ms instead of ~40. nil when the phy cannot be
+-- read; the sweep then runs in one go, as it always did.
+function M.phy_frequencies(ifname)
+	if not ifname then return nil end
+	local dev_info = M._run_cmd("iw dev " .. ifname .. " info") or ""
+	local phy = dev_info:match("wiphy%s+(%d+)")
+	if not phy then return nil end
+	local text = M._phy_info(phy)
+	if not text or text == "" then return nil end
+	local out = {}
+	for line in text:gmatch("[^\n]+") do
+		local freq, ch, rest = line:match("^%s*%*%s+(%d+)%.?%d*%s+MHz%s+%[(%d+)%]%s*(.*)$")
+		if freq and not rest:find("disabled", 1, true) then
+			out[#out + 1] = {
+				freq    = tonumber(freq),
+				channel = tonumber(ch),
+				passive = (rest:find("no IR", 1, true) or rest:find("radar", 1, true)) ~= nil,
+			}
+		end
+	end
+	if #out == 0 then return nil end
+	return out
+end
+
 function M.radio_caps(ifname)
 	if not ifname then return {} end
 	local dev_info = M._run_cmd("iw dev " .. ifname .. " info")

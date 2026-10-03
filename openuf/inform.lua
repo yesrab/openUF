@@ -149,6 +149,24 @@ M._spectrum_cache = {}
 -- kept -- the controller wants a timestamp from it, not every row.
 M._pending_notif = nil
 
+-- Sweeps in progress, oldest first: {radio, ifname, who, freqs, next}.
+-- A sweep is the whole band's channel list cut into chunks of
+-- SCAN_CHUNK_CHANNELS, ONE chunk per heartbeat (_scan_job_tick), because a
+-- sweep in one go is what emptied the house of clients on 2026-10-03: on an
+-- AP radio mac80211 stops beaconing for the whole off-channel run, 25
+-- channels at 40-110 ms each is ~3 s of silence, every client gave the AP
+-- up and roamed -- and the controller's Radio AI asks every AP at once, both
+-- bands, so there was nowhere to roam to ("Quick Scan kicks everyone off and
+-- we can't join for a while"). Four channels are at most ~0.45 s of silence
+-- (four passive dwells), under what clients forgive. Measured 2026-10-03 on
+-- mt7986: ~600 ms of wall time per channel where the radio also carries a
+-- station (mac80211 returns to the operating channel in between), 2.7 s for
+-- the whole 5 GHz band where it does not. The controller is built for this:
+-- its Radio AI prescan polls for 180 s, takes rows as they arrive and waits
+-- for two quiet rounds, and a quick-scan's in_progress has a 10-minute fuse.
+M._scan_jobs = {}
+M.SCAN_CHUNK_CHANNELS = 4
+
 -- In-memory only: previous {rx_bytes, tx_bytes, time} sample per client MAC,
 -- used to delta-sample a throughput estimate the same way M._sysinfo's
 -- cpu_percent() delta-samples /proc/stat between calls (first sample for a
@@ -2058,14 +2076,16 @@ function M.build_json(st, cfg, ufhw)
 		-- column says "No Clients" only when that is actually true.
 		satisfaction     = sat_count_all > 0
 			and math.floor(sat_sum_all / sat_count_all + 0.5) or nil,
-		spectrum_scanning       = false,
-		-- Both sweeps run inside the command's own dispatch, so by the time
-		-- the inform that follows a quick-scan goes out the result is already
-		-- in radio_table_stats. The controller set the device record's
-		-- quick_scan_state.in_progress when it sent the command; this false
-		-- is what flips it back and makes it push the fresh spectrum_table
-		-- to the open Airtime view (kDxteQiUX "quick scan just finished").
-		quickscan_scanning      = false,
+		-- True while that command's sweep still has chunks to run (see
+		-- M._scan_jobs). The controller set the record's
+		-- quick_scan_state.in_progress when it sent the quick-scan; the
+		-- first false after it is what flips that back and pushes the fresh
+		-- spectrum_table to the open Airtime view (kDxteQiUX "quick scan
+		-- just finished"); the view does the same on spectrum_scanning's
+		-- true -> false edge. A Radio AI sweep (scan_band) and the
+		-- controller's 11k-scan are tracked by its own `scanning` flag.
+		spectrum_scanning       = M._scan_job_active("spectrum-scan"),
+		quickscan_scanning      = M._scan_job_active("quick-scan"),
 		spectrum_scan_timestamp = spectrum_scan_timestamp,
 		-- Real devices report this under the hyphenated key "system-stats"
 		-- with {cpu, mem, uptime} as percentage/uptime strings -- confirmed
@@ -4496,71 +4516,139 @@ function M._spectrum_scan(cfg, band, who)
 	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return 0 end
 	local ok_r, radios = pcall(ufuci.get_radio_table, cfg and cfg.uap and cfg.uap.hwassign)
 	if not ok_r or type(radios) ~= "table" then return 0 end
-	local swept = 0
+	local queued = 0
 	for _, radio in ipairs(radios) do
 		if band == nil or radio.radio == band then
 			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
 			if ok_if and ifname then
-				M._force_scan(ufuci, ifname, who)
-				local ok_rs, stats = pcall(M._sysinfo.radio_stats, ifname)
-				if ok_rs then
-					local rows = M._spectrum_rows(stats)
-					M._spectrum_cache[radio.name] = {
-						table      = rows,
-						scanned_at = M._time(),
-					}
-					-- The event the controller dates the sweep by. Its
-					-- EVT_AP_QuickScanEvent handler (devmgr.e.c, 10.6.106)
-					-- upserts the one row it carries and stamps the device
-					-- record's spectrum_scan_timestamp -- the Quick Scan
-					-- card's "last scan", and what Radio AI's prescan waits
-					-- for before it reads radio_table_stats. One row is
-					-- enough for that; the table itself rides the inform.
-					if rows[1] then
-						M._pending_notif = {
-							event_string = "EVT_AP_QuickScanEvent",
-							radio        = radio.radio,
-							radio_name   = radio.name,
-							channel      = rows[1].channel,
-							width        = rows[1].width,
-							center_freq  = rows[1].center_freq,
-							utilization  = rows[1].utilization,
-							interference = rows[1].interference or 0,
-						}
+				-- One job per radio. The same kind of sweep asked again while
+				-- its job is still running is already being done: keep the job
+				-- and its progress (a neighbour_scan_interval shorter than the
+				-- sweep -- 90 s on AP2, 2026-10-03 -- otherwise restarted the
+				-- 5 GHz sweep every time and it never got past its first
+				-- chunk). A DIFFERENT kind replaces the job where it stands:
+				-- a Quick Scan is not made to wait behind the nightly sweep.
+				local slot = nil
+				for i, job in ipairs(M._scan_jobs) do
+					if job.radio.name == radio.name then slot = i; break end
+				end
+				if slot and M._scan_jobs[slot].who == who then
+					queued = queued + 1
+				else
+					local freqs = nil
+					if M._sysinfo and M._sysinfo.phy_frequencies then
+						local ok_f, f = pcall(M._sysinfo.phy_frequencies, ifname)
+						if ok_f and type(f) == "table" and #f > 0 then freqs = f end
 					end
-					swept = swept + 1
+					local job = {radio = radio, ifname = ifname, who = who, freqs = freqs, next = 1}
+					if slot then M._scan_jobs[slot] = job else M._scan_jobs[#M._scan_jobs + 1] = job end
+					queued = queued + 1
 				end
 			end
 		end
 	end
-	return swept
+	return queued
 end
 
-function M._force_scan(ufuci, ifname, who)
+-- True while a sweep of that kind ("quick-scan", "spectrum-scan", ...) is
+-- still queued or running.
+function M._scan_job_active(who)
+	for _, job in ipairs(M._scan_jobs) do
+		if job.who == who then return true end
+	end
+	return false
+end
+
+-- One heartbeat's share of the oldest sweep: the next SCAN_CHUNK_CHANNELS
+-- channels of its list (or the whole band when the list could not be read),
+-- then the survey counters become the radio's spectrum_table so far, and --
+-- for the two commands the controller dates by it -- an EVT_AP_QuickScanEvent
+-- carrying one row of this chunk is queued (_post_notif). The controller's
+-- handler upserts that row and stamps the record's spectrum_scan_timestamp,
+-- which is the Quick Scan card's "last scan" and what Radio AI's prescan
+-- watches as the rows come in; the table itself rides every inform. The job
+-- is dropped after its last chunk. Returns true when a chunk ran.
+function M._scan_job_tick()
+	local job = M._scan_jobs[1]
+	if not job then return false end
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci._popen) then
+		table.remove(M._scan_jobs, 1)
+		return false
+	end
+	local chunk = nil
+	if job.freqs then
+		chunk = {}
+		local last = math.min(job.next + M.SCAN_CHUNK_CHANNELS - 1, #job.freqs)
+		for i = job.next, last do chunk[#chunk + 1] = job.freqs[i].freq end
+		job.next = last + 1
+	end
+	M._force_scan(ufuci, job.ifname, job.who, chunk)
+	io.stderr:write(string.format("inform: %s: swept %s on %s (%d channel(s) left)\n", tostring(job.who),
+		chunk and (#chunk .. " channel(s)") or "the whole band", tostring(job.ifname),
+		job.freqs and math.max(0, #job.freqs - job.next + 1) or 0))
+	local ok_rs, stats = pcall(M._sysinfo.radio_stats, job.ifname)
+	if ok_rs then
+		local rows = M._spectrum_rows(stats)
+		M._spectrum_cache[job.radio.name] = {table = rows, scanned_at = M._time()}
+		if job.who == "quick-scan" or job.who == "spectrum-scan" then
+			local pick = nil
+			if chunk and M._sysinfo.channel_from_freq then
+				local want = {}
+				for _, f in ipairs(chunk) do
+					local ch = M._sysinfo.channel_from_freq(f)
+					if ch then want[ch] = true end
+				end
+				for _, r in ipairs(rows) do
+					if want[r.channel] and r.width == 20 then pick = r; break end
+				end
+			end
+			pick = pick or rows[1]
+			if pick then
+				M._pending_notif = {
+					event_string = "EVT_AP_QuickScanEvent",
+					radio        = job.radio.radio,
+					radio_name   = job.radio.name,
+					channel      = pick.channel,
+					width        = pick.width,
+					center_freq  = pick.center_freq,
+					utilization  = pick.utilization,
+					interference = pick.interference or 0,
+				}
+			end
+		end
+	end
+	if not job.freqs or job.next > #job.freqs then
+		table.remove(M._scan_jobs, 1)
+	end
+	return true
+end
+
+function M._force_scan(ufuci, ifname, who, freqs)
+	-- `freq ...` limits the sweep to those channels (one chunk of a job);
+	-- without it the whole band, as the 11k path always did.
+	local extra = ""
+	if type(freqs) == "table" and #freqs > 0 then
+		local list = {}
+		for _, f in ipairs(freqs) do
+			local n = tonumber(f)
+			if n then list[#list + 1] = tostring(math.floor(n)) end
+		end
+		if #list > 0 then extra = " freq " .. table.concat(list, " ") end
+	end
 	local out = ufuci._popen("iw dev " .. ifname
-		.. " scan ap-force >/dev/null 2>&1 && echo scan-ok") or ""
+		.. " scan ap-force" .. extra .. " >/dev/null 2>&1 && echo scan-ok") or ""
 	if out:find("scan-ok", 1, true) then return true end
 	io.stderr:write("inform: " .. who .. ": iw refused to scan " .. ifname .. "\n")
 	return false
 end
 
--- A forced sweep on every reported radio (the modelmap's hwassign, as
--- build_json uses). Blocking, a few seconds per radio -- which is the point:
--- build_json runs next and its `scan dump` then carries the fresh results.
--- Returns how many sweeps actually ran, not how many were asked for.
+-- A sweep of every reported radio (the modelmap's hwassign, as build_json
+-- uses), queued in chunks like every other sweep (M._scan_jobs): the
+-- `scan dump` fills in over the following heartbeats instead of all at once
+-- after three seconds of radio silence. Returns how many radios were queued.
 function M._scan_all_radios(cfg)
-	local ufuci = M._ucihelper
-	if not (ufuci and ufuci.get_radio_table and ufuci.get_ifname_for_radio) then return 0 end
-	local ok_r, radios = pcall(ufuci.get_radio_table, cfg and cfg.uap and cfg.uap.hwassign)
-	if not ok_r or type(radios) ~= "table" then return 0 end
-	local issued = 0
-	for _, radio in ipairs(radios) do
-		local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
-		if ok_if and ifname and M._force_scan(ufuci, ifname, "11k-scan") then
-			issued = issued + 1
-		end
-	end
-	return issued
+	return M._spectrum_scan(cfg, nil, "11k-scan")
 end
 
 -- True when a fresh 11k-scan request was waiting; the file is removed
@@ -4592,6 +4680,10 @@ function M._maybe_scan_neighbours(cfg, ctx)
 	-- boot, and a restart must not cost every client a stall.
 	if not ctx.last_scan then ctx.last_scan = now; return false end
 	if now - ctx.last_scan < every then return false end
+	-- A sweep still in its chunks is not started over: the interval counts
+	-- from the start of one sweep to the start of the next, and a sweep
+	-- takes ~11 heartbeats across two radios. Checked again next heartbeat.
+	if M._scan_job_active("11k-scan") then return false end
 	ctx.last_scan = now
 	return M._scan_all_radios(cfg) > 0
 end
@@ -4790,6 +4882,9 @@ function M._tick(st, cfg, ufhw, ctx)
 
 	ctx.last_mtime = M._reload_if_changed(st, cfg, ctx.last_mtime)
 	M._maybe_scan_neighbours(cfg, ctx)
+	-- One chunk of whatever sweep is queued (a command's, or the 11k-scan's),
+	-- before build_json so this inform carries what it found.
+	pcall(M._scan_job_tick)
 	-- Before build_json, so anything a client reported since the last cycle
 	-- rides out on THIS inform rather than waiting for the next.
 	pcall(M._rrm_tick, cfg)

@@ -2649,15 +2649,16 @@ return {
 		end
 	},
 	{
-		name = "inform packet: handle_response cmd spectrum-scan reports every width's rows from the survey dump",
+		name = "inform packet: handle_response cmd spectrum-scan queues a sweep; the heartbeat runs it and reports every width's rows",
 		fn = function()
 			local st = sample_state()
 			-- Save/restore everything this test stubs: these are module-level
 			-- seams, and leaking them would make any later build_json/
 			-- radio_stats test silently run against this test's fixtures.
 			local orig_uci, orig_stats = inform._ucihelper, inform._sysinfo.radio_stats
-			local orig_cache = inform._spectrum_cache
-			inform._spectrum_cache = {}
+			local orig_cache, orig_freqs = inform._spectrum_cache, inform._sysinfo.phy_frequencies
+			inform._spectrum_cache, inform._scan_jobs, inform._pending_notif = {}, {}, nil
+			inform._sysinfo.phy_frequencies = function() return nil end  -- no list: one sweep
 			local popens = {}
 			inform._ucihelper = {
 				get_radio_table = function()
@@ -2680,9 +2681,24 @@ return {
 			local ok, err = pcall(function()
 				local result = inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
 				assert_true(result, "re-inform immediately after executing a command")
+				-- The command only queues: nothing has gone on the air yet.
+				assert_eq(#popens, 0, "no sweep inside the dispatch -- a sweep in one go silenced the radio for seconds")
+				assert_eq(#inform._scan_jobs, 1, "one job for the one radio")
+				assert_true(inform._scan_job_active("spectrum-scan"), "spectrum_scanning reads true meanwhile")
+				assert_false(inform._scan_job_active("quick-scan"), "but not quickscan_scanning")
+				-- The heartbeat runs it.
+				assert_true(inform._scan_job_tick(), "a chunk ran")
+				assert_eq(#popens, 1, "one sweep")
+				-- Forced: ap-force guards against a driver that refuses to
+				-- scan on a beaconing AP (ours do not; see inform._force_scan),
+				-- and its exit status is what is judged. No channel list could
+				-- be read, so it is the whole band, as the 11k path always was.
+				assert_contains(popens[1], "iw dev wlan0 scan ap-force >/dev/null", "forced, whole band")
+				assert_eq(#inform._scan_jobs, 0, "a whole-band sweep is one chunk: job done")
+				assert_false(inform._scan_job_active("spectrum-scan"), "and the flag drops")
 
 				local cached = inform._spectrum_cache.radio0
-				assert_true(cached ~= nil, "spectrum-scan cmd populates _spectrum_cache for the radio")
+				assert_true(cached ~= nil, "the sweep populates _spectrum_cache for the radio")
 				assert_true(cached.scanned_at ~= nil, "the sweep's time is kept, for the age the payload reports")
 				assert_eq(#cached.table, 4, "two measured channels x the two 2.4 GHz widths; the unvisited one is left out")
 				local r20, r40 = cached.table[1], cached.table[2]
@@ -2695,14 +2711,19 @@ return {
 				assert_eq(r40.center_freq, 2447, "channel 6 pairs upward (HT40+): centre 2447")
 				assert_eq(r40.utilization, 37, "the row carries its own channel's figures; the view averages a block")
 				assert_eq(cached.table[3].channel, 1, "the second measured channel")
-				-- One sweep, forced: ap-force guards against a driver that
-				-- refuses to scan on a beaconing AP (ours do not; see
-				-- inform._force_scan), and its exit status is what is judged.
-				assert_eq(#popens, 1, "one sweep")
-				assert_contains(popens[1], "iw dev wlan0 scan ap-force", "forced")
+				-- The event the controller dates the sweep by.
+				local ev = inform._pending_notif
+				assert_true(ev ~= nil, "a finished chunk queues one EVT_AP_QuickScanEvent")
+				assert_eq(ev.event_string, "EVT_AP_QuickScanEvent", "the handler's name")
+				assert_eq(ev.radio .. "/" .. ev.radio_name, "ng/radio0", "the radio")
+				assert_eq(ev.channel .. "/" .. ev.width, "6/20", "one 20 MHz row")
+				assert_eq(ev.utilization, 37, "its utilization")
+				assert_eq(ev.interference, 7, "its interference")
+				assert_false(inform._scan_job_tick(), "queue drained: nothing more to run")
 			end)
 			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
-			inform._spectrum_cache = orig_cache
+			inform._spectrum_cache, inform._sysinfo.phy_frequencies = orig_cache, orig_freqs
+			inform._scan_jobs, inform._pending_notif = {}, nil
 			if not ok then error(err, 0) end
 		end
 	},
@@ -2711,8 +2732,9 @@ return {
 		fn = function()
 			local st = sample_state()
 			local orig_uci, orig_stats = inform._ucihelper, inform._sysinfo.radio_stats
-			local orig_cache, orig_stderr = inform._spectrum_cache, io.stderr
-			inform._spectrum_cache = {}
+			local orig_cache, orig_stderr, orig_freqs = inform._spectrum_cache, io.stderr, inform._sysinfo.phy_frequencies
+			inform._spectrum_cache, inform._scan_jobs, inform._pending_notif = {}, {}, nil
+			inform._sysinfo.phy_frequencies = function() return nil end
 			local logged = {}
 			io.stderr = {write = function(_, ...)
 				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
@@ -2725,10 +2747,14 @@ return {
 			inform._sysinfo.radio_stats = function()
 				return { { freq = 2437, noise = -95, channel_time = 100, channel_time_busy = 10 } }
 			end
-			local ok, err = pcall(inform.handle_response, '{"_type":"cmd","cmd":"spectrum-scan"}', st)
+			local ok, err = pcall(function()
+				assert_true(inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st), "re-informs")
+				assert_true(inform._scan_job_tick(), "the chunk ran")
+			end)
 			local cached = inform._spectrum_cache.radio0
 			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
-			inform._spectrum_cache, io.stderr = orig_cache, orig_stderr
+			inform._spectrum_cache, io.stderr, inform._sysinfo.phy_frequencies = orig_cache, orig_stderr, orig_freqs
+			inform._scan_jobs, inform._pending_notif = {}, nil
 			assert_true(ok, tostring(err))
 			assert_contains(table.concat(logged), "spectrum-scan: iw refused to scan wlan0",
 				"the refusal is visible, not silent")
@@ -2742,8 +2768,9 @@ return {
 		fn = function()
 			local st = sample_state()
 			local orig_uci, orig_stats = inform._ucihelper, inform._sysinfo.radio_stats
-			local orig_cache, orig_stderr = inform._spectrum_cache, io.stderr
-			inform._spectrum_cache = {}
+			local orig_cache, orig_stderr, orig_freqs = inform._spectrum_cache, io.stderr, inform._sysinfo.phy_frequencies
+			inform._spectrum_cache, inform._scan_jobs, inform._pending_notif = {}, {}, nil
+			inform._sysinfo.phy_frequencies = function() return nil end
 			local logged, popens = {}, {}
 			io.stderr = {write = function(_, ...)
 				for _, v in ipairs({...}) do logged[#logged + 1] = tostring(v) end
@@ -2770,10 +2797,15 @@ return {
 			local ok, err = pcall(function()
 				-- The controller's own encoding: band index 1 = 5 GHz, width in MHz.
 				assert_true(inform.handle_response('{"_type":"cmd","cmd":"quick-scan","scan-band":1,"scan-bw":80}', st),
-					"re-inform right after the sweep")
+					"re-inform right after queueing")
+				assert_eq(#inform._scan_jobs, 1, "one job")
+				assert_eq(inform._scan_jobs[1].ifname, "wlan1", "for the 5 GHz radio only")
+				assert_true(inform._scan_job_active("quick-scan"), "quickscan_scanning true meanwhile")
+				assert_true(inform._scan_job_tick(), "swept")
 				assert_eq(#popens, 1, "one sweep")
 				assert_contains(popens[1], "iw dev wlan1 scan ap-force", "on the 5 GHz radio only")
 				assert_nil(inform._spectrum_cache.radio0, "the 2.4 GHz radio was not touched")
+				assert_false(inform._scan_job_active("quick-scan"), "done: the flag drops")
 				local t = inform._spectrum_cache.radio1.table
 				assert_eq(#t, 8, "two channels x the four 5 GHz widths")
 				local centres = {}
@@ -2793,32 +2825,130 @@ return {
 				assert_eq(upper[160], 5815, "149 @160: 149-177 block")
 				assert_eq(t[1].utilization, 30, "busy 300/1000")
 				assert_eq(t[1].interference, 15, "(300-100-50)/1000")
+				local ev = inform._pending_notif
+				assert_true(ev ~= nil and ev.radio_name == "radio1", "the quick-scan's event names its radio")
+				assert_eq(ev.channel .. "/" .. ev.width, "36/20", "one row of the sweep")
+				inform._pending_notif = nil
 
-				-- Radio AI's own verb names the band in words.
+				-- Radio AI's own verb names the band in words; it is tracked by
+				-- the controller's `scanning` flag and gets no event.
 				assert_true(inform.handle_response('{"_type":"cmd","cmd":"scan_band","band":"ng"}', st), "re-inform")
+				assert_true(inform._scan_job_tick(), "swept")
 				assert_eq(#popens, 2, "a second sweep")
 				assert_contains(popens[2], "iw dev wlan0 scan ap-force", "on the 2.4 GHz radio")
 				assert_eq(#inform._spectrum_cache.radio0.table, 2, "its survey at both 2.4 GHz widths")
-
-				-- The sweep leaves the event the controller dates it by.
-				local ev = inform._pending_notif
-				assert_true(ev ~= nil, "a finished sweep queues one EVT_AP_QuickScanEvent")
-				assert_eq(ev.event_string, "EVT_AP_QuickScanEvent", "the handler's name")
-				assert_eq(ev.radio .. "/" .. ev.radio_name, "ng/radio0", "the radio the last sweep ran on")
-				assert_eq(ev.channel, 6, "one row: its channel")
-				assert_eq(ev.width, 20, "its width")
-				assert_eq(ev.center_freq, 2437, "its block centre")
-				assert_eq(ev.utilization, 10, "its utilization")
-				assert_eq(ev.interference, 8, "its interference")
-				inform._pending_notif = nil
+				assert_nil(inform._pending_notif, "no event for a Radio AI neighbour sweep")
 
 				-- A band this device cannot map sweeps nothing and says so.
 				assert_true(inform.handle_response('{"_type":"cmd","cmd":"quick-scan","scan-band":7,"scan-bw":20}', st), "still re-informs")
-				assert_eq(#popens, 2, "no sweep for an unknown band")
+				assert_eq(#inform._scan_jobs, 0, "no job for an unknown band")
 				assert_contains(table.concat(logged), "quick-scan: unknown scan-band 7", "logged")
 			end)
 			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
-			inform._spectrum_cache, io.stderr = orig_cache, orig_stderr
+			inform._spectrum_cache, io.stderr, inform._sysinfo.phy_frequencies = orig_cache, orig_stderr, orig_freqs
+			inform._scan_jobs, inform._pending_notif = {}, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: a sweep runs in chunks of SCAN_CHUNK_CHANNELS, one per heartbeat, with an event per chunk",
+		fn = function()
+			-- 2026-10-03: a Quick Scan from Channel AI emptied the house -- a
+			-- 25-channel sweep in one go is ~3 s without beacons on an AP radio,
+			-- every client gave up, and Radio AI had asked every AP at once.
+			local st = sample_state()
+			local orig_uci, orig_stats = inform._ucihelper, inform._sysinfo.radio_stats
+			local orig_cache, orig_freqs = inform._spectrum_cache, inform._sysinfo.phy_frequencies
+			inform._spectrum_cache, inform._scan_jobs, inform._pending_notif = {}, {}, nil
+			local popens, visited = {}, {}
+			inform._ucihelper = {
+				get_radio_table = function()
+					return {
+						{ name = "radio0", radio = "ng", channel = "6",  ht = "HT40" },
+						{ name = "radio1", radio = "na", channel = "36", ht = "HE160" },
+					}
+				end,
+				get_ifname_for_radio = function(name) return name == "radio0" and "wlan0" or "wlan1" end,
+				-- The sweep marks its channels visited, as the real survey would.
+				_popen = function(cmd)
+					popens[#popens + 1] = cmd
+					for f in cmd:gmatch("%d%d%d%d") do visited[tonumber(f)] = true end
+					return "scan-ok\n"
+				end,
+			}
+			-- A 5 GHz list of ten channels (the lower run plus two DFS), 2.4 GHz three.
+			inform._sysinfo.phy_frequencies = function(ifname)
+				if ifname == "wlan1" then
+					local out = {}
+					for _, f in ipairs({5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520}) do
+						out[#out + 1] = {freq = f, channel = (f - 5000) / 5, passive = f >= 5260}
+					end
+					return out
+				end
+				return {{freq = 2412, channel = 1}, {freq = 2437, channel = 6}, {freq = 2462, channel = 11}}
+			end
+			-- Only visited channels have counters, as a real survey would.
+			inform._sysinfo.radio_stats = function()
+				local out = {}
+				for f in pairs(visited) do
+					out[#out + 1] = { freq = f, channel_time = 1000, channel_time_busy = 100 + (f % 7),
+						channel_time_rx = 10, channel_time_tx = 10 }
+				end
+				table.sort(out, function(a, b) return a.freq < b.freq end)
+				return out
+			end
+			local ok, err = pcall(function()
+				inform.handle_response('{"_type":"cmd","cmd":"quick-scan","scan-band":1,"scan-bw":80}', st)
+				assert_eq(#inform._scan_jobs, 1, "queued")
+				assert_eq(#inform._scan_jobs[1].freqs, 10, "with the radio's channel list")
+				assert_true(inform._scan_job_tick(), "chunk 1")
+				assert_eq(#popens, 1, "one iw call")
+				assert_contains(popens[1], "iw dev wlan1 scan ap-force freq 5180 5200 5220 5240 >/dev/null", "the first four channels only")
+				assert_true(inform._scan_job_active("quick-scan"), "still in progress")
+				local ev = inform._pending_notif
+				assert_true(ev ~= nil and ev.radio_name == "radio1" and ev.channel == 36, "an event from the first chunk")
+				assert_true(inform._scan_job_tick(), "chunk 2")
+				assert_contains(popens[2], "freq 5260 5280 5300 5320 >/dev/null", "the next four")
+				ev = inform._pending_notif
+				assert_true(ev ~= nil, "an event per chunk, so the controller's prescan sees rows arriving")
+				assert_eq(ev.width, 20, "a 20 MHz row")
+				assert_true(ev.channel == 52 or ev.channel == 56 or ev.channel == 60 or ev.channel == 64,
+					"from THIS chunk, got channel " .. tostring(ev.channel))
+				assert_true(inform._scan_job_tick(), "chunk 3")
+				assert_contains(popens[3], "freq 5500 5520 >/dev/null", "the last two")
+				assert_eq(#inform._scan_jobs, 0, "job finished after its last chunk")
+				assert_false(inform._scan_job_active("quick-scan"), "quickscan_scanning drops: the controller's completion edge")
+				assert_false(inform._scan_job_tick(), "nothing left")
+				assert_eq(#inform._spectrum_cache.radio1.table, 10 * 4, "every visited channel at every width")
+
+				-- An Airtime Scan queues both radios; they run one after the other.
+				-- The same sweep asked again keeps a running job's progress; a
+				-- different kind replaces the job where it stands.
+				inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
+				assert_eq(#inform._scan_jobs, 2, "both radios queued")
+				assert_eq(inform._scan_jobs[1].ifname .. "," .. inform._scan_jobs[2].ifname, "wlan0,wlan1", "radio order")
+				assert_true(inform._scan_job_tick(), "radio0's one chunk")
+				assert_true(inform._scan_job_tick(), "radio1 chunk 1")
+				assert_eq(inform._scan_jobs[1].next, 5, "radio1 is four channels in")
+				inform.handle_response('{"_type":"cmd","cmd":"spectrum-scan"}', st)
+				assert_eq(#inform._scan_jobs, 2, "asked again: radio0 re-queued behind, radio1 kept")
+				assert_eq(inform._scan_jobs[1].ifname, "wlan1", "radio1 still first")
+				assert_eq(inform._scan_jobs[1].next, 5, "and not restarted -- a 90 s interval used to restart the 5 GHz sweep forever")
+				inform.handle_response('{"_type":"cmd","cmd":"quick-scan","scan-band":1,"scan-bw":20}', st)
+				assert_eq(#inform._scan_jobs, 2, "a different kind for radio1 replaces its job")
+				assert_eq(inform._scan_jobs[1].who .. "@" .. inform._scan_jobs[1].next, "quick-scan@1", "in place, from the top")
+				assert_true(inform._scan_job_active("spectrum-scan") and inform._scan_job_active("quick-scan"), "both flags up")
+				local before = #popens
+				for _ = 1, 3 do inform._scan_job_tick() end
+				assert_eq(#popens, before + 3, "radio1's three chunks")
+				assert_false(inform._scan_job_active("quick-scan"), "quick-scan done")
+				assert_true(inform._scan_job_tick(), "then radio0 again")
+				assert_contains(popens[#popens], "iw dev wlan0 scan ap-force freq 2412 2437 2462 >/dev/null", "its three channels in one chunk")
+				assert_eq(#inform._scan_jobs, 0, "all done")
+			end)
+			inform._ucihelper, inform._sysinfo.radio_stats = orig_uci, orig_stats
+			inform._spectrum_cache, inform._sysinfo.phy_frequencies = orig_cache, orig_freqs
+			inform._scan_jobs, inform._pending_notif = {}, nil
 			if not ok then error(err, 0) end
 		end
 	},
@@ -3358,6 +3488,10 @@ return {
 		fn = function()
 			with_tick_env(function()
 				local cmds = {}
+				local o_stats, o_freqs = inform._sysinfo.radio_stats, inform._sysinfo.phy_frequencies
+				inform._sysinfo.radio_stats = function() return {} end
+				inform._sysinfo.phy_frequencies = function() return nil end
+				inform._scan_jobs = {}
 				inform._ucihelper = {
 					get_radio_table = function() return {{name = "radio0"}, {name = "radio1"}} end,
 					get_ifname_for_radio = function(r)
@@ -3377,13 +3511,31 @@ return {
 				t = 1299
 				assert_false(inform._maybe_scan_neighbours(cfg, ctx), "not before the interval")
 				t = 1300
-				assert_true(inform._maybe_scan_neighbours(cfg, ctx), "scans once the interval is up")
-				assert_eq(#cmds, 2, "one scan per radio")
+				assert_true(inform._maybe_scan_neighbours(cfg, ctx), "queues a sweep once the interval is up")
+				assert_eq(#cmds, 0, "nothing on the air yet: sweeps run in chunks, one per heartbeat")
+				assert_eq(#inform._scan_jobs, 2, "one job per radio")
+				assert_true(inform._scan_job_tick(), "first heartbeat: radio0")
+				assert_true(inform._scan_job_tick(), "second: radio1")
+				assert_eq(#cmds, 2, "one sweep per radio")
 				assert_contains(cmds[1], "iw dev phy0-ap0 scan ap-force", "the same forced sweep the spectrum-scan cmd uses")
 				assert_contains(cmds[2], "iw dev phy1-ap0 scan ap-force", "on the second radio too")
+				assert_false(inform._scan_job_tick(), "queue drained")
 				t = 1301
 				assert_false(inform._maybe_scan_neighbours(cfg, ctx), "and then waits again")
 				assert_eq(#cmds, 2, "no extra scans")
+				-- An interval shorter than the sweep does not start it over.
+				t = 1600
+				assert_true(inform._maybe_scan_neighbours(cfg, ctx), "next sweep queued")
+				assert_true(inform._scan_job_tick(), "radio0 swept")
+				t = 1900
+				assert_false(inform._maybe_scan_neighbours(cfg, ctx), "radio1 still queued: not restarted")
+				assert_eq(#inform._scan_jobs, 1, "one job left")
+				assert_true(inform._scan_job_tick(), "radio1 swept")
+				t = 1910
+				assert_true(inform._maybe_scan_neighbours(cfg, ctx), "sweep over and the interval long past: the next one starts")
+				inform._scan_jobs = {}
+				inform._sysinfo.radio_stats, inform._sysinfo.phy_frequencies = o_stats, o_freqs
+				inform._scan_jobs = {}
 			end)
 		end
 	},
@@ -4429,6 +4581,10 @@ return {
 		fn = function()
 			local FILE = "/tmp/openuf_test_scan_request"
 			local o_file, o_uci, o_time = inform.SCAN_REQUEST_FILE, inform._ucihelper, inform._time
+			local o_stats, o_freqs = inform._sysinfo.radio_stats, inform._sysinfo.phy_frequencies
+			inform._sysinfo.radio_stats = function() return {} end
+			inform._sysinfo.phy_frequencies = function() return nil end
+			inform._scan_jobs = {}
 			inform.SCAN_REQUEST_FILE = FILE
 			local cmds = {}
 			inform._ucihelper = {
@@ -4444,7 +4600,11 @@ return {
 				write_request(1700000000 - 30)
 				local ctx = {}
 				local out = with_stderr(function()
-					assert_true(inform._maybe_scan_neighbours({config = {neighbour_scan_interval = 0}}, ctx), "scanned")
+					assert_true(inform._maybe_scan_neighbours({config = {neighbour_scan_interval = 0}}, ctx), "queued")
+					-- The sweeps run on the heartbeats that follow, one radio each.
+					assert_true(inform._scan_job_tick(), "radio0")
+					assert_true(inform._scan_job_tick(), "radio1")
+					assert_false(inform._scan_job_tick(), "drained")
 				end)
 				assert_eq(#cmds, 2, "one scan per radio")
 				assert_contains(cmds[1], "iw dev phy0-ap0 scan ap-force", "radio0, forced")
@@ -4452,7 +4612,8 @@ return {
 				assert_nil(io.open(FILE, "r"), "request consumed")
 				assert_contains(out, "11k-scan requested", "logged")
 				assert_contains(out, "11k-scan: iw refused to scan phy1-ap0", "the refused sweep is visible")
-				assert_eq(inform._scan_all_radios({}), 1, "only the sweep iw accepted is counted")
+				assert_eq(inform._scan_all_radios({}), 2, "both radios queued (a refusal shows at sweep time, not here)")
+				inform._scan_jobs = {}
 				for _ = 3, #cmds do table.remove(cmds) end
 				-- Stale request: consumed, ignored, nothing issued.
 				write_request(1700000000 - 3600)
@@ -4466,6 +4627,8 @@ return {
 				assert_false(inform._maybe_scan_neighbours({config = {neighbour_scan_interval = 0}}, ctx), "quiet")
 			end)
 			inform.SCAN_REQUEST_FILE, inform._ucihelper, inform._time = o_file, o_uci, o_time
+			inform._sysinfo.radio_stats, inform._sysinfo.phy_frequencies = o_stats, o_freqs
+			inform._scan_jobs = {}
 			os.remove(FILE)
 			if not ok then error(err, 0) end
 		end

@@ -842,7 +842,7 @@ keeps its shipped value; `wifi_caps` is not sent at all unless overridden), and
 `debug_payload_extra = {uplink = {…}}` merges extra top-level fields into every
 payload verbatim. The daemon shouts at startup while either is set.
 
-`neighbour_scan_interval` — seconds between `iw dev <if> scan` on each radio; `0`
+`neighbour_scan_interval` — seconds between `iw dev <if> scan` on each radio; `0` Every sweep openUF runs — this one, the controller's nightly `11k-scan`, an Airtime or Quick Scan — goes in four-channel chunks, one per heartbeat, so the radio is never silent for more than ~0.5 s; `logread | grep swept` shows the chunks. A sweep of both radios takes about eleven heartbeats, and one still running is not started over, so an interval shorter than that (AP2 had 90) just means back-to-back sweeps.
 (default) never scans. The Environment view is fed from the kernel's cached BSS list,
 which forgets a network about 30 s after it was last seen, and the controller drops
 anything with `age >= 30` on top — and nothing else in openUF scans, so after the

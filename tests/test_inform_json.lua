@@ -1749,7 +1749,13 @@ return {
 			-- spectrum_scanning/quickscan_scanning/spectrum_scan_timestamp are
 			-- device-level (top-level payload) fields, not per-radio.
 			assert_eq(d.spectrum_scanning, false, "spectrum_scanning false once results are cached")
-			assert_eq(d.quickscan_scanning, false, "a quick-scan finishes inside its own dispatch: never in progress at inform time")
+			assert_eq(d.quickscan_scanning, false, "no sweep queued: not in progress")
+			-- A queued sweep is reported for as long as it has chunks left.
+			inform._scan_jobs = {{who = "quick-scan", radio = {name = "radio0", radio = "ng"}, ifname = "wlan0", next = 1}}
+			local d2 = build({with_uci = true, with_clients = true})
+			assert_eq(d2.quickscan_scanning, true, "a quick-scan in progress")
+			assert_eq(d2.spectrum_scanning, false, "is not an Airtime Scan")
+			inform._scan_jobs = {}
 			assert_eq(d.spectrum_scan_timestamp, swept_at, "spectrum_scan_timestamp is the newest sweep's time")
 			assert_true(rts.spectrum_table_time >= 111 and rts.spectrum_table_time <= 113,
 				"spectrum_table_time is the AGE of the sweep in seconds (controller stores now - value), got " .. tostring(rts.spectrum_table_time))

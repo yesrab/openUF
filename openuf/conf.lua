@@ -135,8 +135,10 @@ config = {
 	-- radio), 0 = never. The Environment view is fed from the kernel's cached
 	-- BSS list, which forgets a network ~30 s after it was last seen -- and
 	-- nothing else in openUF ever scans, so the view drains to empty after
-	-- boot. A scan takes the radio off-channel briefly (clients see a short
-	-- stall), which is why this is off unless you turn it on; 300 is sane.
+	-- boot. A sweep runs in four-channel chunks, one per heartbeat, so the
+	-- radio is never off the air for more than ~0.5 s at a time (a whole-band
+	-- sweep in one go dropped every client); still, it is off unless you turn
+	-- it on; 300 is sane.
 	neighbour_scan_interval = 0,
 
 	-- Client-assisted RF environment enrichment (802.11k beacon reports) --

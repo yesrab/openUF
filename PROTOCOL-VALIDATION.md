@@ -1214,6 +1214,28 @@ left the stat empty, which is how that mistake was found.
 The DTO (`stat/device`) strips `spectrum_table` from `radio_table_stats` unless a quick
 scan is in progress, by design; `stat/spectrum-scan/<mac>` is the read path.
 
+**A sweep in one go empties the room — found live, fixed the same evening.** The first
+handler ran `iw dev <ap> scan ap-force` over the whole band inside the command's dispatch.
+On an AP radio mac80211 stops beaconing for the entire off-channel run; 25 channels at
+40–110 ms each is ~3 s of silence (2.7 s measured on this board), every client declared the
+AP gone and roamed — and Radio AI's prescan asks every eligible AP at once, per band, so a
+Quick Scan from the Channel AI page had the MacBook and the iPhone falling off AP1's 5 GHz
+onto AP2's 2.4 GHz while that radio was being swept too ("kicks everyone off and we can't
+join for a while", with the hostapd `AP-STA-DISCONNECTED` storm to match). Measured on
+mt7986 with `iw ... scan ap-force freq <list>`: ~600 ms of wall time per channel where the
+radio also carries an associated station (mac80211 returns to the operating channel between
+channels, so AP2's own uplink never dropped), straight through where it does not; no
+`SET_SCAN_DWELL` support. So every sweep — `quick-scan`, `spectrum-scan`, `scan_band` and
+the controller's nightly `11k-scan` — is now a **job**: the radio's channel list (from the
+cached `iw phy` dump, `sysinfo.phy_frequencies`) cut into chunks of four, one chunk per
+heartbeat (`_scan_job_tick`), at most ~0.45 s without beacons (four passive dwells), with
+the rows rebuilt and one `EVT_AP_QuickScanEvent` posted after each chunk so the
+controller's prescan — which polls for 180 s, takes rows as they arrive and stops after
+two quiet rounds — sees progress rather than a 90-second gap. `quickscan_scanning` /
+`spectrum_scanning` stay true until the last chunk, which is the completion edge the UI
+and the in_progress flag want; the quick-scan's own fuse is ten minutes. Where the channel
+list cannot be read the job is one whole-band chunk, the old behaviour.
+
 **Still approximate.** `interference` as "busy minus own rx/tx" counts other BSSs' traffic
 as interference, which a real AP's hardware spectral scan would not. The survey counters
 are cumulative since boot for the operating channel and a few ms for the others, so the

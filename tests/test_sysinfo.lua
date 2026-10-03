@@ -1941,4 +1941,37 @@ return {
 			sysinfo._read_file = orig_rf
 		end
 	},
+	{
+		name = "sysinfo: phy_frequencies() lists the radio's usable channels with their passive flag, from the cached phy dump",
+		fn = function()
+			with_fixtures({}, {
+				["dev wlan0 info"] = fixture("iw_dev_info.txt"),
+				["phy phy0 info"]  = fixture("iw_phy_info_5g.txt"),
+			}, function()
+				local f = sysinfo.phy_frequencies("wlan0")
+				assert_true(f ~= nil, "a list")
+				assert_eq(#f, 9, "every frequency line of the fixture (none disabled)")
+				assert_eq(f[1].freq .. "/" .. f[1].channel, "5180/36", "first entry")
+				assert_false(f[1].passive, "36 is an active channel")
+				assert_eq(f[5].channel, 52, "fifth is channel 52")
+				assert_true(f[5].passive, "radar detection: passive dwell")
+				assert_nil(sysinfo.phy_frequencies(nil), "no interface: nil")
+			end)
+			with_fixtures({}, {["dev wlan0 info"] = "Interface wlan0\n\ttype AP\n"}, function()
+				assert_nil(sysinfo.phy_frequencies("wlan0"), "no wiphy line: nil, the caller sweeps whole-band")
+			end)
+			-- The device's own spelling ("5180.0 MHz") and a disabled channel.
+			with_fixtures({}, {
+				["dev wlan0 info"] = fixture("iw_dev_info.txt"),
+				["phy phy0 info"]  = "Wiphy phy0\n\tBand 2:\n\t\tFrequencies:\n" ..
+					"\t\t\t* 5745.0 MHz [149] (30.0 dBm)\n\t\t\t* 5765.0 MHz [153] (30.0 dBm) (no IR)\n" ..
+					"\t\t\t* 5845.0 MHz [169] (disabled)\n",
+			}, function()
+				local f = sysinfo.phy_frequencies("wlan0")
+				assert_eq(#f, 2, "the disabled one is left out")
+				assert_eq(f[1].freq, 5745, "decimal MHz parsed")
+				assert_true(f[2].passive, "no IR: passive")
+			end)
+		end
+	},
 }
