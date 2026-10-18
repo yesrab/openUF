@@ -178,11 +178,15 @@ function softwareBlock(s) {
 		E('td', { 'class': 'td' }, build),
 		E('td', { 'class': 'td' }, _('802.11k/v, which every network from the controller uses; band steering, roaming assistant'))
 	]));
+	// openuf-crypto is a virtual name: say which package provides it and
+	// what the daemon actually loads (the native module on the TLS library
+	// hostapd uses, or lua-openssl).
+	const c = d.crypto || {};
 	for (const p of arr(d.packages))
 		t.appendChild(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td' }, p.pkg),
+			E('td', { 'class': 'td' }, (p.pkg == 'openuf-crypto' && c.installed) ? c.installed : p.pkg),
 			E('td', { 'class': 'td' }, p.required ? _('mandatory') : _('optional')),
-			E('td', { 'class': 'td' }, installed(p.present, p.required)),
+			E('td', { 'class': 'td' }, installed(p.present, p.required, (p.pkg == 'openuf-crypto' && p.present) ? c.backend : null)),
 			E('td', { 'class': 'td' }, p.unlocks)
 		]));
 	const parts = [ t ];

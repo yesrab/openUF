@@ -284,4 +284,141 @@ return {
 			if not ok then error(err, 0) end
 		end
 	},
+	{
+		-- The native module is the first backend crypto.lua looks for. A stub
+		-- stands in for it here so the dispatch is pinned without the .so:
+		-- every primitive must go through it (with the key as 16 raw bytes,
+		-- the CBC buffer already padded, the AAD never dropped), gcm_available
+		-- must say yes, and its nil,"auth" must become the error every caller
+		-- of aes_gcm_decrypt already expects.
+		name = "crypto: openuf_crypto is preferred over lua-openssl and drives every primitive",
+		fn = function()
+			local calls = {}
+			local stub = {
+				backend = function() return "stubtls", "0.0" end,
+				aes_cbc = function(enc, key, iv, data)
+					calls[#calls + 1] = {"cbc", enc, #key, #iv, #data}
+					return "C" .. data   -- any bytes; the decrypt stub strips them
+				end,
+				aes_gcm_encrypt = function(key, iv, pt, aad)
+					calls[#calls + 1] = {"gcm_enc", #key, #iv, pt, aad}
+					return "ct:" .. pt, string.rep("T", 16)
+				end,
+				aes_gcm_decrypt = function(key, iv, ct, tag, aad)
+					calls[#calls + 1] = {"gcm_dec", #key, #iv, ct, #tag, aad}
+					if aad == "bad" then return nil, "auth" end
+					return ct:sub(4)
+				end,
+			}
+			local had_loaded, had_pre = package.loaded.openuf_crypto, package.preload.openuf_crypto
+			local had_ossl = package.loaded.openssl
+			package.loaded.openuf_crypto = stub
+			local ok, err = pcall(function()
+				local c = dofile("openuf/crypto.lua")
+				assert_true(c.gcm_available(), "GCM is available through the native module")
+				assert_eq(c.backend(), "openuf_crypto (stubtls 0.0)", "backend() names it")
+
+				-- CBC: crypto.lua pads, the module sees a block-aligned buffer.
+				c.aes_cbc_encrypt(c.DEFAULT_KEY, FIXED_IV, "short")
+				assert_eq(calls[1][1], "cbc", "CBC went to the module")
+				assert_eq(calls[1][2], true, "encrypt flag")
+				assert_eq(calls[1][3], 16, "key handed over as 16 raw bytes")
+				assert_eq(calls[1][5], 16, "5 bytes PKCS#7-padded to one block before the module")
+
+				-- GCM: AAD and the 16-byte IV reach the module untouched.
+				local aad = string.rep("\1", 40)
+				local ct, tag = c.aes_gcm_encrypt(c.DEFAULT_KEY, FIXED_IV, "body", aad)
+				assert_eq(ct, "ct:body", "ciphertext is the module's")
+				assert_eq(#tag, 16, "tag is the module's")
+				assert_eq(calls[2][3], 16, "the full 16-byte IV, not a 12-byte nonce")
+				assert_eq(calls[2][5], aad, "AAD passed through")
+				assert_eq(c.aes_gcm_decrypt(c.DEFAULT_KEY, FIXED_IV, ct, tag, aad), "body", "decrypt round-trips")
+				assert_error(function() c.aes_gcm_decrypt(c.DEFAULT_KEY, FIXED_IV, ct, tag, "bad") end,
+					"the module's nil,\"auth\" raises the established error")
+				local ok2, e2 = pcall(c.aes_gcm_decrypt, c.DEFAULT_KEY, FIXED_IV, ct, tag, "bad")
+				assert_false(ok2, "raised")
+				assert_contains(tostring(e2), "authentication tag verification failed", "same message as the lua-openssl path")
+			end)
+			package.loaded.openuf_crypto, package.preload.openuf_crypto = had_loaded, had_pre
+			package.loaded.openssl = had_ossl
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- The daemons' cwd is on package.path, so a stray file called
+		-- openuf_crypto.lua would answer require(). Only a table with all
+		-- three primitives is trusted; anything else falls through to the
+		-- next backend exactly as if the module were absent.
+		name = "crypto: an openuf_crypto without the three primitives is ignored, never trusted",
+		fn = function()
+			local had_loaded = package.loaded.openuf_crypto
+			package.loaded.openuf_crypto = { aes_cbc = function() end }   -- no GCM
+			local ok, err = pcall(function()
+				local c = dofile("openuf/crypto.lua")
+				assert_neq(c.backend():sub(1, 13), "openuf_crypto", "not reported as the backend")
+				-- Whatever else is installed here, CBC still works (the CLI
+				-- fallback at worst), and never through the half module.
+				local pt = "fallback path!!!"
+				local ct = c.aes_cbc_encrypt(c.DEFAULT_KEY, FIXED_IV, pt)
+				assert_eq(c.aes_cbc_decrypt(c.DEFAULT_KEY, FIXED_IV, ct), pt, "CBC through a real backend")
+			end)
+			package.loaded.openuf_crypto = had_loaded
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- The built module, when the test host has one on LUA_CPATH (the CI
+		-- job builds it against mbedtls, wolfssl and openssl in turn and runs
+		-- the suite with each; package/openuf-crypto/host-build.sh does the
+		-- same on a dev machine). OPENUF_REQUIRE_NATIVE=1 makes its absence a
+		-- failure so that job can never silently test nothing.
+		name = "crypto: the built openuf_crypto module matches the NIST CBC and pycryptodome GCM vectors",
+		fn = function()
+			local ok, native = pcall(require, "openuf_crypto")
+			if not ok or type(native) ~= "table" or type(native.aes_gcm_encrypt) ~= "function" then
+				if os.getenv("OPENUF_REQUIRE_NATIVE") == "1" then
+					error("OPENUF_REQUIRE_NATIVE=1 but openuf_crypto is not loadable: " .. tostring(native))
+				end
+				print("SKIP  native module vectors (no openuf_crypto.so on LUA_CPATH -- sh package/openuf-crypto/host-build.sh)")
+				return
+			end
+			local name, ver = native.backend()
+			assert_eq(type(name), "string", "backend name")
+			assert_eq(type(ver), "string", "backend version")
+			assert_true(name == "mbedtls" or name == "wolfssl" or name == "openssl", "a known library: " .. name)
+
+			-- NIST SP 800-38A F.2.1, one block, raw CBC (no padding here).
+			local key = crypto.hex_to_bin(NIST_KEY)
+			assert_bytes_eq(native.aes_cbc(true, key, NIST_IV, NIST_PT), NIST_CT, "NIST AES-128-CBC block")
+			assert_bytes_eq(native.aes_cbc(false, key, NIST_IV, NIST_CT), NIST_PT, "and back")
+			assert_error(function() native.aes_cbc(true, key, NIST_IV, "not a block") end,
+				"an unaligned CBC buffer is refused, not padded silently")
+			assert_error(function() native.aes_cbc(true, "short", NIST_IV, NIST_PT) end,
+				"a key that is not 16 bytes is refused")
+
+			-- The pycryptodome vector: 16-byte IV (not GCM's 12-byte default),
+			-- 40-byte AAD (the TNBU header), the exact shape of a real inform.
+			local gkey = crypto.hex_to_bin("000102030405060708090a0b0c0d0e0f")
+			local giv  = crypto.hex_to_bin("101112131415161718191a1b1c1d1e1f")
+			local aad_b = {}
+			for i = 0, 39 do aad_b[#aad_b + 1] = string.char(i) end
+			local aad = table.concat(aad_b)
+			local pt  = '{"_type":"state","probe":42}'
+			local ct, tag = native.aes_gcm_encrypt(gkey, giv, pt, aad)
+			assert_bytes_eq(ct, crypto.hex_to_bin("bebca8c204c241aaec3ab0f6c05b4af5d9df50ed0264c2da93b2b5eb"),
+				"GCM ciphertext matches pycryptodome")
+			assert_bytes_eq(tag, crypto.hex_to_bin("245b6d60f69b94d3d94bc4e46ac809a7"), "GCM tag matches pycryptodome")
+			assert_eq(native.aes_gcm_decrypt(gkey, giv, ct, tag, aad), pt, "decrypt recovers the plaintext")
+			local r, why = native.aes_gcm_decrypt(gkey, giv, ct, tag, string.rep("\2", 40))
+			assert_nil(r, "wrong AAD: no plaintext")
+			assert_eq(why, "auth", "wrong AAD: nil, \"auth\"")
+			r, why = native.aes_gcm_decrypt(gkey, giv, ct, string.rep("\0", 16), aad)
+			assert_nil(r, "wrong tag: no plaintext")
+			assert_eq(why, "auth", "wrong tag: nil, \"auth\"")
+			-- An empty AAD is the same as none; an empty plaintext is legal.
+			local ct0, tag0 = native.aes_gcm_encrypt(gkey, giv, "", nil)
+			assert_eq(ct0, "", "empty plaintext, empty ciphertext")
+			assert_eq(native.aes_gcm_decrypt(gkey, giv, ct0, tag0, ""), "", "and it authenticates")
+		end
+	},
 }

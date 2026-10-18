@@ -620,7 +620,19 @@ factory reset.
   multicast are not sent any more; a test that expects them is wrong.
 - **AES-GCM is mandatory for adoption.** UniFi 10.4.57 will not finish provisioning a
   device that has never sent a genuine GCM inform; a CBC-only device sticks at "Adopting"
-  forever. Needs a GCM-capable `lua-openssl`; the `openssl` CLI fallback is CBC-only.
+  forever. Needs `openuf_crypto` (package/openuf-crypto, preferred) or a GCM-capable
+  `lua-openssl`; the `openssl` CLI fallback is CBC-only. `crypto.lua` tries them in that
+  order and `crypto.backend()` names the winner (logged at daemon start).
+- **`openuf-crypto` is ONE C source built three times** (`-DOPENUF_CRYPTO_MBEDTLS` /
+  `_WOLFSSL` / `_OPENSSL`), packaged as variants that all PROVIDE `openuf-crypto`, plus a
+  code-free `openuf-crypto-luaossl` that depends on `lua-openssl` for targets with no
+  native build. The variant must match hostapd's TLS library or the box carries two;
+  `openuf deps --install` aligns it (`--crypto` overrides, `--wpad` implies it) and never
+  removes a working provider for one the feed does not have (`tools/test-deps.sh`). The
+  module does raw CBC (PKCS#7 stays in `crypto.lua`) and returns `nil, "auth"` on a GCM tag
+  mismatch, never the unauthenticated bytes. Test it under a real Lua 5.1:
+  `sh package/openuf-crypto/host-build.sh all`, then `LUA_CPATH="build/host/<lib>/?.so;;"
+  OPENUF_REQUIRE_NATIVE=1 lua5.1 tests/run_tests.lua` (CI does all three libraries).
 - **`openuf_` is a UCI section name, not an SSID filter.** Sections are
   `openuf_<radio>_<sanitized ssid>`; the broadcast SSID is exactly what the controller
   sent, and every pushed WLAN is provisioned whatever it is called. The prefix only marks
@@ -709,9 +721,10 @@ factory reset.
   non-numeric falls back to 1.
 - **VLAN ids must be below the switch's VLAN table size** (16 on some boards) — netifd has
   no `vid` option, so the id doubles as the table slot.
-- **8 MB flash is not enough** from a stock image: `lua-openssl` pulls in `libopenssl3`
-  (~4.35 MB installed) and a stock 8 MB build leaves ~1.6 MB of overlay. Needs a custom
-  image with the crypto in squashfs, or extroot.
+- **8 MB flash is not enough** from a stock image *with `lua-openssl`*: it pulls in
+  `libopenssl3` (~4.35 MB installed) and a stock 8 MB build leaves ~1.6 MB of overlay.
+  A native `openuf-crypto-mbedtls` build for the target is the way out (untried on an
+  8 MB board so far); otherwise a custom image with the crypto in squashfs, or extroot.
 - **A UCI section name may contain only `[A-Za-z0-9_]`, and libuci discards anything else
   silently** (`set` and `commit` both return true). `wlan_add` sanitizes with `[^%w_]` and
   appends a hash of the original SSID when it had to change anything; the test mocks refuse
@@ -841,7 +854,8 @@ openuf/
   modelmap/*.lua    hardware profiles          ufmodel/*.lua  UniFi identities
   inform.lua        TNBU inform loop, response dispatch, payload assembly (the core)
   announce.lua      L2 UDP discovery broadcasts (port 10001)
-  crypto.lua        AES-128-CBC/GCM            inflate.lua  pure-Lua zlib inflate
+  crypto.lua        AES-128-CBC/GCM over openuf_crypto | lua-openssl | luacrypto | CLI
+                    inflate.lua  pure-Lua zlib inflate
   ucihelper.lua     all wireless UCI writes (VAPs, radios, VLAN networks)
   sysinfo.lua       /proc, iw, swconfig and bridge-fdb parsing; the per-payload lookup
                     pass and the 300 s uplink cache; the nft MAC-tap reader
@@ -891,7 +905,8 @@ openuf/
                     (/usr/sbin/openuf-deps, `openuf deps`: what openUF needs
                     installed as JSON, and the basic-to-full wpad swap)
   etc/init.d/openuf procd service: announce + inform instances; finds either prefix
-package/            the OpenWrt feed: openuf (net/) and luci-app-openuf (see PACKAGING.md)
+package/            the OpenWrt feed: openuf (net/), openuf-crypto (the AES module, one C
+                    source per TLS library) and luci-app-openuf (see PACKAGING.md)
 setup.sh            guided installer: AP conversion + deps + install
 install.sh          file/service install and dependency resolution
 update.sh           on-device updater (installed as openuf-update): backup, install keeping

@@ -187,7 +187,14 @@ jobs:
           ARCH: ${{ matrix.sdk }}
           FEEDNAME: openuf
           FEED_DIR: ${{ github.workspace }}/package
-          PACKAGES: openuf luci-app-openuf
+          # openuf-crypto is per-architecture, unlike the other two: this
+          # x86_64 SDK builds its x86_64 variants (proving all three compile
+          # against the SDK's libraries) and the architecture-independent
+          # openuf-crypto-luaossl, which is what makes the openuf package
+          # installable from this release on any target. Native builds for
+          # a router's own architecture come from a feed build for that
+          # target (PACKAGING.md, "The AES module").
+          PACKAGES: openuf openuf-crypto luci-app-openuf
           NO_REFRESH_CHECK: true
           # The action's init-script check runs `git diff` inside the mounted
           # feed directory, which is not a git repository in the container
@@ -211,6 +218,12 @@ jobs:
         run: |
           mkdir -p out
           find bin -type f \( -name 'openuf*.ipk' -o -name 'openuf*.apk' -o -name 'luci-app-openuf*.ipk' -o -name 'luci-app-openuf*.apk' \) -exec cp -v {} out/ \;
+          # The x86_64 native variants only help an x86_64 box; ship them
+          # under an unmistakable name rather than not at all.
+          for f in out/openuf-crypto-mbedtls* out/openuf-crypto-wolfssl* out/openuf-crypto-openssl*; do
+            [ -e "$f" ] || continue
+            case "$f" in *x86_64*) ;; *) mv -v "$f" "${f%.*}_x86_64.${f##*.}" ;; esac
+          done
           ls -l out
       - uses: actions/upload-artifact@v4
         with:

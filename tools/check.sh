@@ -43,10 +43,16 @@ else
 	info "lua require('zlib') absent — using in-tree inflate (no package needed)"
 fi
 
-if lua -e "require('openssl')" 2>/dev/null; then
-	ok "lua require('openssl')"
+# AES-GCM for the inform channel: openUF's own module on the TLS library the
+# box already has (openuf-crypto-mbedtls / -wolfssl / -openssl), or the
+# lua-openssl binding it replaces. Either one will do; the openssl CLI
+# fallback is CBC-only and the controller never finishes adoption on it.
+if lua -e "require('openuf_crypto')" 2>/dev/null; then
+	ok "lua require('openuf_crypto') ($(lua -e "local c = require('openuf_crypto'); io.write((c.backend()))" 2>/dev/null))"
+elif lua -e "require('openssl')" 2>/dev/null; then
+	ok "lua require('openssl') (lua-openssl; openuf-crypto-<lib> is the smaller choice)"
 else
-	fail "lua require('openssl') — install: apk add lua-openssl"
+	fail "no AES-GCM backend — install: openuf deps --install (openuf-crypto-mbedtls, or the variant matching hostapd), or apk add lua-openssl"
 fi
 
 if lua -e "require('socket')" 2>/dev/null; then

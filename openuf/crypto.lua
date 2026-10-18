@@ -2,12 +2,21 @@
 	AES-128-CBC and AES-128-GCM wrappers.
 
 	Backend selection (in priority order):
-	  1. lua-openssl (require "openssl") — preferred. apk package "lua-openssl"
-	     on OpenWrt 25.12+. In-process, supports both CBC and GCM.
-	  2. luacrypto  (require "crypto")   — legacy. Only on older OpenWrt where the
+	  0. openuf_crypto (require "openuf_crypto") -- preferred. openUF's own C
+	     module (package/openuf-crypto, one source built against whichever TLS
+	     library the box already has: the openuf-crypto-mbedtls, -wolfssl and
+	     -openssl packages). A few KB on top of a library hostapd already
+	     loads, instead of lua-openssl's libopenssl3 at 4.9 MB of flash. The
+	     same two primitives: CBC without padding (PKCS#7 is done here, as for
+	     lua-openssl) and GCM with AAD and a 16-byte IV. In-process.
+	  1. lua-openssl (require "openssl") -- apk package "lua-openssl" on
+	     OpenWrt 25.12+. In-process, supports both CBC and GCM. Still what a
+	     tarball install gets when no openuf-crypto package is reachable.
+	  2. luacrypto  (require "crypto")   -- legacy. Only on older OpenWrt where the
 	     "luacrypto" package still exists (dropped from the 25.12 feeds).
-	  3. openssl(1) CLI                  — last resort when neither binding is
+	  3. openssl(1) CLI                  -- last resort when no binding is
 	     present. CBC only; GCM is unavailable on this path.
+	M.backend() names the one in use, for `openuf deps`, the probe and LuCI.
 
 	All keys and IVs are passed as 32-char hex strings (16 raw bytes).
 	Plaintext and ciphertext are Lua binary strings.
@@ -80,9 +89,19 @@ end
 -- loaded a second copy of it into package.loaded for the life of the process.
 -- package.path is emptied for that one require. The shape check stays as a
 -- belt: this module's own table has no `encrypt`.
-local _ossl_ok,   _ossl    = pcall(require, "openssl")
+--
+-- openuf_crypto is looked for first. The shape check matters here too: the
+-- daemons' cwd is on package.path, so a stray openuf_crypto.lua would load
+-- in its place; only a table carrying all three primitives is trusted.
+local _native_ok, _native = pcall(require, "openuf_crypto")
+_native_ok = _native_ok and type(_native) == "table"
+	and type(_native.aes_cbc) == "function"
+	and type(_native.aes_gcm_encrypt) == "function"
+	and type(_native.aes_gcm_decrypt) == "function"
+local _ossl_ok, _ossl = false, nil
+if not _native_ok then _ossl_ok, _ossl = pcall(require, "openssl") end
 local _crypto_ok, _lcrypto = false, nil
-if not _ossl_ok then
+if not _native_ok and not _ossl_ok then
 	local path = package.path
 	package.path = ""
 	_crypto_ok, _lcrypto = pcall(require, "crypto")
@@ -136,7 +155,10 @@ end
 function M.aes_cbc_encrypt(key_hex, iv, plaintext)
 	local padded = pkcs7_pad(plaintext, 16)
 	local key = M.hex_to_bin(key_hex)
-	if _ossl_ok then
+	if _native_ok then
+		-- Raw CBC over the block-aligned, already padded buffer.
+		return _native.aes_cbc(true, key, iv, padded)
+	elseif _ossl_ok then
 		-- lua-openssl: pad ourselves (padding(false)) so the wire format matches
 		-- the controller, which PKCS#7-pads then encrypts with no extra padding.
 		local ctx = _ossl.cipher.get("aes-128-cbc"):new(true, key, iv)
@@ -168,7 +190,9 @@ end
 -- returns: plaintext binary string (PKCS#7 stripped)
 function M.aes_cbc_decrypt(key_hex, iv, ciphertext)
 	local key = M.hex_to_bin(key_hex)
-	if _ossl_ok then
+	if _native_ok then
+		return pkcs7_unpad(_native.aes_cbc(false, key, iv, ciphertext))
+	elseif _ossl_ok then
 		local ctx = _ossl.cipher.get("aes-128-cbc"):new(false, key, iv)
 		ctx:padding(false)
 		return pkcs7_unpad(ctx:update(ciphertext) .. ctx:final())
@@ -190,7 +214,10 @@ end
 -- Returns: ciphertext (binary string), auth_tag (16-byte binary string)
 function M.aes_gcm_encrypt(key_hex, iv, plaintext, aad)
 	local key = M.hex_to_bin(key_hex)
-	if _ossl_ok then
+	if _native_ok then
+		-- Takes the IV with its length, so the 16-byte TNBU IV needs no ctrl.
+		return _native.aes_gcm_encrypt(key, iv, plaintext, aad or "")
+	elseif _ossl_ok then
 		-- The TNBU IV field is 16 bytes; OpenSSL GCM defaults to a 12-byte
 		-- nonce, so SET_IVLEN must precede init to accept the full IV.
 		local C   = _ossl.cipher
@@ -221,7 +248,14 @@ end
 -- Raises an error if authentication tag verification fails
 function M.aes_gcm_decrypt(key_hex, iv, ciphertext, tag, aad)
 	local key = M.hex_to_bin(key_hex)
-	if _ossl_ok then
+	if _native_ok then
+		-- nil, "auth" on a tag mismatch: the module never returns the
+		-- unauthenticated bytes, and the error here is the one every caller
+		-- already expects from the lua-openssl path.
+		local pt = _native.aes_gcm_decrypt(key, iv, ciphertext, tag, aad or "")
+		if not pt then error("aes_gcm_decrypt: authentication tag verification failed") end
+		return pt
+	elseif _ossl_ok then
 		local C   = _ossl.cipher
 		local ctx = C.get("aes-128-gcm"):decrypt_new()
 		ctx:ctrl(C.EVP_CTRL_GCM_SET_IVLEN, #iv)
@@ -248,8 +282,27 @@ end
 
 -- Returns true if GCM is supported by the available backend
 function M.gcm_available()
-	return (_ossl_ok and _ossl.cipher ~= nil)
+	return _native_ok
+		or (_ossl_ok and _ossl.cipher ~= nil)
 		or (_crypto_ok and _lcrypto.aead ~= nil)
+end
+
+-- The backend in use, as one short string for `openuf deps --check`, the
+-- probe and the LuCI overview: "openuf_crypto (mbedtls 3.6.7)",
+-- "lua-openssl", "luacrypto" or "openssl-cli (CBC only)".
+function M.backend()
+	if _native_ok then
+		local ok, name, ver = pcall(_native.backend)
+		if ok and name then
+			return "openuf_crypto (" .. tostring(name) .. (ver and (" " .. tostring(ver)) or "") .. ")"
+		end
+		return "openuf_crypto"
+	elseif _ossl_ok then
+		return "lua-openssl"
+	elseif _crypto_ok then
+		return "luacrypto"
+	end
+	return "openssl-cli (CBC only)"
 end
 
 return M

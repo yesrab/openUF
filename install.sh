@@ -42,6 +42,34 @@ else
 	pkg_add()       { return 1; }
 fi
 
+# The in-process AES-GCM openUF's inform channel needs. Preferred: the
+# openuf-crypto variant built on the TLS library this box already carries
+# (hostapd's), so no second library lands on the flash; then lua-openssl
+# (libopenssl3, ~4.9 MB) when the feeds have no such variant. Present already
+# when either module file exists, whatever the package database says.
+aes_present() { [ -e /usr/lib/lua/openuf_crypto.so ] || [ -e /usr/lib/lua/openssl.so ]; }
+aes_lib() {
+	for p in wpad-mesh-mbedtls wpad-mbedtls wpad-basic-mbedtls hostapd-mbedtls hostapd-basic-mbedtls; do
+		pkg_installed "$p" && { echo mbedtls; return; }
+	done
+	for p in wpad-mesh-wolfssl wpad-wolfssl wpad-basic-wolfssl hostapd-wolfssl hostapd-basic-wolfssl; do
+		pkg_installed "$p" && { echo wolfssl; return; }
+	done
+	for p in wpad-mesh-openssl wpad-openssl wpad-basic-openssl hostapd-openssl hostapd-basic-openssl; do
+		pkg_installed "$p" && { echo openssl; return; }
+	done
+	if ls /usr/lib/libmbedtls.so* >/dev/null 2>&1; then echo mbedtls
+	elif ls /usr/lib/libwolfssl.so* >/dev/null 2>&1; then echo wolfssl
+	elif ls /usr/lib/libcrypto.so* >/dev/null 2>&1; then echo openssl
+	else echo mbedtls
+	fi
+}
+aes_install() {   # quiet: callers report
+	aes_present && return 0
+	pkg_add "openuf-crypto-$(aes_lib)" >/dev/null 2>&1 && aes_present && return 0
+	pkg_add lua-openssl >/dev/null 2>&1 && aes_present
+}
+
 # ── Options ─────────────────────────────────────────────────────────────────
 # The action comes first; anything after it is a flag. An unknown flag is an
 # error rather than ignored -- a mistyped --bootstrap-adopt used to install
@@ -238,8 +266,9 @@ case "$ACTION" in
 		# baked into the firmware image (the only way to fit them on a small
 		# board), so a present package is silently fine.
 		#
-		# lua-openssl provides AES-128-CBC/GCM (luacrypto was dropped from the
-		# feeds) and is effectively mandatory: the controller will not finish
+		# AES-128-CBC/GCM (aes_install above: openuf-crypto-<lib> on the TLS
+		# library already present, else lua-openssl) is effectively mandatory:
+		# the controller will not finish
 		# provisioning a device that has never sent a genuine GCM inform. There
 		# is no Lua zlib binding in 25.12, so inform-response decompression is
 		# handled in-tree by openuf/inflate.lua and needs no package.
@@ -256,7 +285,13 @@ case "$ACTION" in
 		# this package was installed, at which point the very next config push
 		# created every VAP.
 		MISSING=""
-		for pkg in lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw; do
+		if ! aes_install; then
+			echo "WARNING: no AES-GCM module could be installed"
+			echo "  Install by hand: $PKG_CMD openuf-crypto-$(aes_lib)  (or lua-openssl)"
+			echo "  Without one, adoption cannot complete (the controller requires a"
+			echo "  genuine AES-128-GCM inform)."
+		fi
+		for pkg in lua lua-cjson luasocket luabitop libuci-lua iw; do
 			if ! pkg_installed "$pkg"; then
 				MISSING="$MISSING $pkg"
 			fi
@@ -266,8 +301,6 @@ case "$ACTION" in
 			pkg_add $MISSING || {
 				echo "WARNING: failed to install:$MISSING"
 				echo "  Install them by hand with: $PKG_CMD$MISSING"
-				echo "  Without lua-openssl in particular, adoption cannot complete"
-				echo "  (the controller requires a genuine AES-128-GCM inform)."
 			}
 		fi
 

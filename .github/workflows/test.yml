@@ -27,6 +27,35 @@ jobs:
       - name: Run tests
         run: OPENUF_REQUIRE_GCM=1 lua5.1 tests/run_tests.lua
 
+  native-crypto:
+    name: openuf_crypto on ${{ matrix.backend }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [mbedtls, wolfssl, openssl]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua 5.1 and the ${{ matrix.backend }} headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y lua5.1 liblua5.1-dev lua-bitop luarocks openssl
+          case "${{ matrix.backend }}" in
+            mbedtls) sudo apt-get install -y libmbedtls-dev ;;
+            wolfssl) sudo apt-get install -y libwolfssl-dev ;;
+            openssl) sudo apt-get install -y libssl-dev ;;
+          esac
+          sudo luarocks --lua-version 5.1 install lua-cjson LUA_INCDIR=/usr/include/lua5.1
+      - name: Build the module
+        run: sh package/openuf-crypto/host-build.sh ${{ matrix.backend }}
+      # The whole suite with the native module as the only GCM backend (no
+      # lua-openssl here): REQUIRE_NATIVE fails the run if it did not load,
+      # REQUIRE_GCM if GCM coverage went missing.
+      - name: Run the suite on it
+        run: |
+          LUA_CPATH="build/host/${{ matrix.backend }}/?.so;;" OPENUF_REQUIRE_NATIVE=1 \
+            OPENUF_REQUIRE_GCM=1 lua5.1 tests/run_tests.lua
+
   simulate:
     name: End-to-end adoption simulation
     runs-on: ubuntu-latest
@@ -95,3 +124,7 @@ jobs:
           dash -n install.sh
           dash -n update.sh
           dash -n tools/deploy.sh
+          bash -n openuf/hook/openuf-deps.sh && dash -n openuf/hook/openuf-deps.sh
+          bash -n package/openuf-crypto/host-build.sh && dash -n package/openuf-crypto/host-build.sh
+      - name: openuf-deps picks the crypto variant that matches hostapd
+        run: sh tools/test-deps.sh

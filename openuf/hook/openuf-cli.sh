@@ -9,7 +9,7 @@
 #   openuf start|stop|restart   the procd service
 #   openuf probe status|presets|discover|export
 #                               JSON for the web UI (hook/probe.lua)
-#   openuf deps --check | --install [--wpad mbedtls|openssl|wolfssl]
+#   openuf deps --check | --install [--wpad LIB] [--crypto LIB|luaossl]
 #                               what openUF needs installed, and the swap of a
 #                               basic wpad for a full one (hook/openuf-deps.sh)
 #

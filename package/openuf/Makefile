@@ -32,7 +32,7 @@ define Package/openuf
   SUBMENU:=Wireless
   TITLE:=UniFi access point emulation
   URL:=https://github.com/yesrab/openUF
-  DEPENDS:=+lua +luabitop +lua-cjson +luasocket +lua-openssl +libuci-lua +iw \
+  DEPENDS:=+lua +luabitop +lua-cjson +luasocket +openuf-crypto +libuci-lua +iw \
 	+lldpd +ip-bridge +hostapd-utils +usteer +nftables +kmod-nft-bridge \
 	+tc-tiny +kmod-ifb +kmod-sched-act-police
   PKGARCH:=all
@@ -53,6 +53,13 @@ define Package/openuf/description
   build", so `openuf deps --install` -- also a button on the LuCI
   overview -- replaces the basic build with the full one of the same
   crypto library; the service refuses to start until then.
+
+  The inform channel's AES comes from openuf-crypto, a small module built
+  on the TLS library the box already has: openuf-crypto-mbedtls (the
+  default, as OpenWrt's hostapd is), -wolfssl or -openssl. `openuf deps
+  --install` picks the one matching the installed hostapd, so no second
+  TLS library lands on the flash; openuf-crypto-luaossl (lua-openssl)
+  stands in on a target without a native build.
 endef
 
 define Package/openuf/conffiles

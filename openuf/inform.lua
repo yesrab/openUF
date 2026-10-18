@@ -5823,6 +5823,10 @@ function M.run(cfg, ufhw)
 	M._populate_net_info(st, cfg)
 	M._warn_identity_change(prev_mac, st, cfg)
 	M._warn_missing_uci()
+	-- Which AES implementation this process ended up with: the native
+	-- openuf_crypto module on the box's TLS library, lua-openssl, or the
+	-- CBC-only CLI fallback a controller never finishes adoption on.
+	pcall(function() io.stderr:write("inform: crypto backend: " .. crypto.backend() .. "\n") end)
 	-- Identity and reported address must come off the same netdev. openUF
 	-- takes the MAC from lan_cpueth and the IP from the bridge that port is
 	-- enslaved to, which only agree when the two share a MAC -- true on every

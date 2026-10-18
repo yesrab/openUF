@@ -335,6 +335,34 @@ else
 	die "neither apk nor opkg found; cannot install dependencies."
 fi
 
+# The in-process AES-GCM openUF's inform channel needs. Preferred: the
+# openuf-crypto variant built on the TLS library this box already carries
+# (hostapd's), so no second library lands on the flash; then lua-openssl
+# (libopenssl3, ~4.9 MB) when the feeds have no such variant. Present already
+# when either module file exists, whatever the package database says.
+aes_present() { [ -e /usr/lib/lua/openuf_crypto.so ] || [ -e /usr/lib/lua/openssl.so ]; }
+aes_lib() {
+	for p in wpad-mesh-mbedtls wpad-mbedtls wpad-basic-mbedtls hostapd-mbedtls hostapd-basic-mbedtls; do
+		pkg_installed "$p" && { echo mbedtls; return; }
+	done
+	for p in wpad-mesh-wolfssl wpad-wolfssl wpad-basic-wolfssl hostapd-wolfssl hostapd-basic-wolfssl; do
+		pkg_installed "$p" && { echo wolfssl; return; }
+	done
+	for p in wpad-mesh-openssl wpad-openssl wpad-basic-openssl hostapd-openssl hostapd-basic-openssl; do
+		pkg_installed "$p" && { echo openssl; return; }
+	done
+	if ls /usr/lib/libmbedtls.so* >/dev/null 2>&1; then echo mbedtls
+	elif ls /usr/lib/libwolfssl.so* >/dev/null 2>&1; then echo wolfssl
+	elif ls /usr/lib/libcrypto.so* >/dev/null 2>&1; then echo openssl
+	else echo mbedtls
+	fi
+}
+aes_install() {   # quiet: callers report
+	aes_present && return 0
+	pkg_add "openuf-crypto-$(aes_lib)" >/dev/null 2>&1 && aes_present && return 0
+	pkg_add lua-openssl >/dev/null 2>&1 && aes_present
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase 0b — probe the device
 # ═══════════════════════════════════════════════════════════════════════════
@@ -416,9 +444,10 @@ FREE_KB=$(df -k /overlay 2>/dev/null | awk 'NR==2 {print $4}')
 [ -n "$FREE_KB" ] || FREE_KB=$(df -k / 2>/dev/null | awk 'NR==2 {print $4}')
 say "  free space ${FREE_KB:-?} KB on /overlay"
 if [ -n "$FREE_KB" ] && [ "$FREE_KB" -lt 2000 ]; then
-	warn "under 2 MB free. lua-openssl alone pulls in libopenssl3 (~4.35 MB"
-	warn "installed) and adoption cannot complete without AES-GCM. Expect the"
-	warn "package step to fail; bake the crypto into a custom image instead."
+	warn "under 2 MB free. Where the feeds have no openuf-crypto-<lib> for this"
+	warn "device, the fallback lua-openssl pulls in libopenssl3 (~4.35 MB) and"
+	warn "adoption cannot complete without AES-GCM. Expect the package step to"
+	warn "fail then; bake the crypto into a custom image instead."
 fi
 
 ALREADY_INSTALLED=0
@@ -807,9 +836,10 @@ pkg_update || warn "index refresh failed; installs below may not resolve"
 # REQUIRED. Two of these decide whether openUF works at all rather than
 # merely working less well:
 #
-#   lua-openssl   AES-128-GCM. UniFi 10.4.57 will not finish provisioning a
-#                 device that has never sent a genuine GCM inform, and the
-#                 openssl CLI fallback is CBC-only.
+#   AES-GCM       openuf-crypto-<lib> on the TLS library hostapd already uses,
+#                 else lua-openssl (aes_install). UniFi 10.4.57 will not finish
+#                 provisioning a device that has never sent a genuine GCM
+#                 inform, and the openssl CLI fallback is CBC-only.
 #   libuci-lua    require("uci"), which every wireless read and write goes
 #                 through. Without it the device still adopts and still reports
 #                 ports and statistics -- but radio_table goes out EMPTY, so the
@@ -818,7 +848,7 @@ pkg_update || warn "index refresh failed; installs below may not resolve"
 #                 ucihelper call is pcall-wrapped, so this is checked here and
 #                 shouted about at daemon startup rather than left to be
 #                 discovered by a day of debugging.
-REQUIRED="lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw"
+REQUIRED="lua lua-cjson luasocket luabitop libuci-lua iw"
 # OPTIONAL. Each absence silently disables exactly one feature -- provisioning
 # still reports success while the feature does nothing -- so they go in when
 # they fit rather than being merely mentioned.
@@ -839,6 +869,15 @@ if [ -d /sys/bus/platform/devices/leds ] \
 fi
 case "$INFORM_URL" in https*) OPTIONAL="$OPTIONAL luasec" ;; esac
 
+if aes_present; then
+	ok "AES-GCM module present"
+elif aes_install; then
+	ok "AES-GCM module installed ($( [ -e /usr/lib/lua/openuf_crypto.so ] && echo "openuf-crypto-$(aes_lib)" || echo lua-openssl))"
+else
+	die "no AES-GCM module could be installed (tried openuf-crypto-$(aes_lib), then lua-openssl).
+       Fix the package feeds (or free up flash) and re-run: without it the
+       controller will never finish adoption."
+fi
 MISSING=""
 for p in $REQUIRED; do pkg_installed "$p" || MISSING="$MISSING $p"; done
 if [ -n "$MISSING" ]; then
@@ -848,8 +887,7 @@ if [ -n "$MISSING" ]; then
 	for p in $MISSING; do pkg_installed "$p" || STILL="$STILL $p"; done
 	if [ -n "$STILL" ]; then
 		die "these are required and could not be installed:$STILL
-       Fix the package feeds (or free up flash) and re-run. Without
-       lua-openssl in particular the controller will never finish adoption."
+       Fix the package feeds (or free up flash) and re-run."
 	fi
 	ok "required packages installed"
 else

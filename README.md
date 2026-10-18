@@ -101,12 +101,16 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 ## Supported hardware
 
 A dual-band OpenWrt device with **at least 16 MB flash**, and roughly **5 MB free on
-`/overlay`** after the stock image.  8 MB is not enough: the AES-GCM backend
-(`lua-openssl`) pulls in `libopenssl3` at ~4.35 MB, and adoption cannot complete without
-GCM — a stock 8 MB build leaves only ~1.6 MB of overlay, which no crypto backend fits in
-(`openssl-util` and `luaossl` depend on the same library).  Measured on a TL-WDR3500 v1,
-which is 3.2 MB short and therefore **cannot run openUF from a stock image** — it needs
-USB extroot or a custom build with the crypto baked into squashfs.  Known-working:
+`/overlay`** after the stock image when the AES-GCM backend is `lua-openssl`, which pulls
+in `libopenssl3` at ~4.35 MB; adoption cannot complete without GCM.  The **`openuf-crypto`**
+package removes most of that: one small C module built on the TLS library hostapd
+already uses (`openuf-crypto-mbedtls`, OpenWrt's default, or `-wolfssl` / `-openssl`),
+so no second library lands on the flash.  `openuf deps --install` picks the variant that
+matches the installed hostapd, and falls back to `lua-openssl` only where no native build
+is available for the device.  Until a native build exists for your target, plan for the
+`lua-openssl` figures: a stock 8 MB build leaves only ~1.6 MB of overlay, and a TL-WDR3500
+v1, measured, is 3.2 MB short — it needs USB extroot, a custom image with the crypto in
+squashfs, or a native `openuf-crypto` build for ath79.  Known-working:
 
 - **TP-Link Archer C5 v1** (dual-band 802.11n/ac) — use `modelmap/archer-c5-v1.lua`.
   **The reference device**: install, adoption, the WiFi config push, live clients and the
@@ -284,7 +288,8 @@ point it at a different fork, branch, or a checkout already on the device.
 ```sh
 # 1. SSH into the OpenWrt device, install dependencies (OpenWrt 25.12+ uses apk)
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny kmod-ifb kmod-sched-act-police wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables kmod-nft-bridge hostapd-utils usteer ip-bridge tc-tiny kmod-ifb kmod-sched-act-police wpad-mbedtls
+# (lua-openssl: or openuf-crypto-mbedtls from an openUF feed build, ~4 MB smaller)
 
 # 2. Download and install (no git client or scp needed). This is the source
 #    tree; install.sh comment-strips it on the way in. A tagged release

@@ -29,7 +29,7 @@ as a button. `install.sh` and `setup.sh` run the swap themselves.
 
 ```sh
 apk update
-apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-wolfssl
+apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftables hostapd-utils usteer ip-bridge tc-tiny wpad-mbedtls
 ```
 
 | Package | Purpose |
@@ -37,7 +37,7 @@ apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftable
 | `lua` | Lua 5.1 runtime |
 | `lua-cjson` | Fast JSON encode/decode |
 | `luasocket` | TCP client for HTTP POST to controller |
-| `lua-openssl` | AES-128-CBC **and AES-128-GCM** (replaces `luacrypto`, which was dropped from the 25.12 feeds). Effectively mandatory — see the GCM note below |
+| `openuf-crypto-mbedtls` (or `-wolfssl`, `-openssl`), else `lua-openssl` | AES-128-CBC **and AES-128-GCM**. Effectively mandatory — see the GCM note below. `openuf-crypto` is openUF's own module on the TLS library hostapd already uses (a few KB; the variant must match hostapd's library, which `openuf deps --install` sees to). `lua-openssl` does the same job through `libopenssl3`, ~4.35 MB, and is what a box gets when the feeds carry no native build for it. Either works; `tools/check.sh` and the daemon's startup line name the one in use |
 | `luabitop` | bit operations for Lua 5.1 |
 | `libuci-lua` | `require("uci")` — **every** wireless read and write goes through it (`ucihelper.lua`, `switchvlan.lua`, `usteer.lua`). Not pulled in by `lua`. Its absence is openUF's most invisible failure: the device adopts, reports its ports and statistics and looks perfectly healthy, but `radio_table` goes out **empty**, so the controller has no radio to provision a WLAN onto and not one pushed SSID is ever created. Confirmed on real hardware — four pushed WLANs, zero UCI sections, nothing logged. `openuf` now shouts about it at startup and `tools/check.sh` tests for it |
 | `iw` | Radio and station statistics |
@@ -51,7 +51,7 @@ apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftable
 | `hostapd-utils` | `hostapd_cli` — immediate deauth of a just-blocked wireless client, client kick (Roaming Assistance) and Minimum RSSI enforcement |
 | `tc-tiny` | `tc` — WiFi Speed Limit (`openuf/shaper.lua`). Busybox has no `tc`; without it the limit is recorded in UCI and never enforced |
 | `usteer` | Band Steering (Behavior Controls) — ubus-based client-steering daemon, driven by `openuf/usteer.lua`. Roaming Assistant needs it too, for its view of which AP hears a client how loudly |
-| `wpad-wolfssl` (or `wpad-openssl`, `wpad-mbedtls`, `wpad`) | Full hostapd build with 802.11k/v support — required for BSS Transition and Band Steering. Any of the full builds will do; `wpad-basic-*` lacks `bss_transition` entirely and errors with "unknown configuration item 'bss_transition'" |
+| `wpad-mbedtls` (or `wpad-wolfssl`, `wpad-openssl`, `wpad`) | Full hostapd build with 802.11k/v support — required for BSS Transition and Band Steering. Any of the full builds will do; `wpad-basic-*` lacks `bss_transition` entirely and errors with "unknown configuration item 'bss_transition'" |
 
 `install.sh install` installs all of the above automatically when missing, so a
 manual `apk add` is only needed if you're not using the installer. It treats any
@@ -62,9 +62,9 @@ it for `wpad-wolfssl` and bouncing every SSID on the device for no gain.
 > **AES-GCM is required for adoption.** UniFi Network Application 10.4.57 will
 > not finish provisioning a device until it has received a genuine
 > AES-128-GCM-encrypted inform; a device that can only do CBC stays stuck at
-> "Adopting" indefinitely. openUF's GCM support needs a `lua-openssl` build with
-> AEAD/GCM available — the `openssl-util` CLI fallback above is CBC-only and will
-> not get you adopted. See PROTOCOL-VALIDATION.md's "The GCM provisioning gate".
+> "Adopting" indefinitely. openUF's GCM support needs `openuf-crypto-*` or a
+> `lua-openssl` build with AEAD/GCM available — the `openssl-util` CLI fallback
+> above is CBC-only and will not get you adopted. See PROTOCOL-VALIDATION.md's "The GCM provisioning gate".
 
 There is no Lua zlib binding in the OpenWrt 25.12 feeds. openUF therefore sends
 inform payloads uncompressed and decompresses zlib-compressed controller
@@ -1585,9 +1585,9 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Device doesn't appear in UniFi Discover | `announce.lua` not running, or UDP port 10001 blocked |
 | Controller shows device as "Disconnected" | `inform.lua` not running, or wrong `inform_url` |
 | Adoption fails with SSH error | SSH not reachable from controller, or root password not set — run `passwd root` on the device, or reinstall with `--bootstrap-adopt` |
-| Device stays stuck at "Adopting" forever | No AES-GCM backend — `lua-openssl` missing or built without AEAD support. The CLI `openssl-util` fallback is CBC-only and will not work (see § 1) |
+| Device stays stuck at "Adopting" forever | No AES-GCM backend — neither `openuf-crypto-*` nor `lua-openssl` installed (`logread | grep 'crypto backend'` names what the daemon loaded). The CLI `openssl-util` fallback is CBC-only and will not work (see § 1) |
 | Controller rejects device ("firmware incompatible") | Adjust `fw.ver` in `ufmodel/u6iw.lua` |
-| hostapd fails: "unknown configuration item 'bss_transition'" | A `wpad-basic-*` build is installed — replace it with `apk add wpad-wolfssl` |
+| hostapd fails: "unknown configuration item 'bss_transition'" | A `wpad-basic-*` build is installed — run `openuf deps --install`, or `apk del wpad-basic-mbedtls && apk add wpad-mbedtls` |
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
 | Clients are steered 2.4 → 5 GHz with Band Steering off | `ubus call usteer get_config` must show `band_steering_interval: 0`. Any other value means usteer's default applies, and it steers. openUF writes the 0 on the next WiFi config push. Force Provision if it is missing |
 | Log says `device Band Steering mode "equal" is not supported` | The AP's own Band Steering is set to Balance. usteer can only balance by rejecting associations, so openUF does not map it. Use Prefer 5G or the per-WLAN toggle |

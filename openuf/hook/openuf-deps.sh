@@ -6,16 +6,22 @@
 #       JSON, changing nothing:
 #         {"wpad":{"installed":"wpad-basic-mbedtls","full":false,
 #                  "suggested":"wpad-mbedtls","choices":["wpad-mbedtls",...]},
+#          "crypto":{"backend":"openuf_crypto (mbedtls 3.6.7)",
+#                    "installed":"openuf-crypto-mbedtls",
+#                    "suggested":"openuf-crypto-mbedtls","choices":[...]},
 #          "packages":[{"pkg":"nftables","present":true,"required":false,
 #                       "unlocks":"..."},...],
 #          "missing":["kmod-nft-bridge"],"ok":false}
-#   openuf-deps --install [--wpad mbedtls|openssl|wolfssl] [--only-wpad]
-#       Installs the missing packages, then replaces a basic wpad/hostapd
-#       with a full build -- the same crypto library the basic one used, so
-#       no second TLS library lands on the flash, unless --wpad names
-#       another -- brings the radios back up on the new build and restarts
-#       openUF so it re-probes what hostapd can do. The radios are down for
-#       about ten seconds in between: run this over a cable, not over WiFi.
+#   openuf-deps --install [--wpad LIB] [--crypto LIB|luaossl] [--only-wpad]
+#       LIB is mbedtls, openssl or wolfssl. Installs the missing packages,
+#       then replaces a basic wpad/hostapd with a full build -- the same
+#       crypto library the basic one used, so no second TLS library lands
+#       on the flash, unless --wpad names another -- brings the radios back
+#       up on the new build and restarts openUF so it re-probes what hostapd
+#       can do. The radios are down for about ten seconds in between: run
+#       this over a cable, not over WiFi. The AES module for the inform
+#       channel (openuf-crypto-*) follows the same library unless --crypto
+#       names another; luaossl means the lua-openssl binding instead.
 #       Exit status 0 once the device has everything.
 #
 # Why the wpad swap is a command and not a package dependency. Any full
@@ -35,22 +41,27 @@ set -u
 
 HOSTAPD=${OPENUF_HOSTAPD:-/usr/sbin/hostapd}   # overridable by the tests only
 MODDIR=${OPENUF_MODDIR:-/lib/modules}
+LUADIR=${OPENUF_LUADIR:-/usr/lib/lua}
+LIBDIR=${OPENUF_LIBDIR:-/usr/lib}
 
 if command -v apk >/dev/null 2>&1; then
 	PKG_ADD="apk add"
 	pkg_installed() { apk info -e "$1" >/dev/null 2>&1; }
+	pkg_available() { apk list "$1" 2>/dev/null | grep -q "^$1-[0-9]"; }
 	pkg_add()       { apk add "$@"; }
 	pkg_del()       { apk del "$@"; }
 	pkg_update()    { apk update; }
 elif command -v opkg >/dev/null 2>&1; then
 	PKG_ADD="opkg install"
 	pkg_installed() { opkg list-installed "$1" 2>/dev/null | grep -q "^$1 "; }
+	pkg_available() { opkg list "$1" 2>/dev/null | grep -q "^$1 "; }
 	pkg_add()       { opkg install "$@"; }
 	pkg_del()       { opkg remove "$@"; }
 	pkg_update()    { opkg update; }
 else
 	PKG_ADD="(no package manager: neither apk nor opkg)"
 	pkg_installed() { return 1; }
+	pkg_available() { return 1; }
 	pkg_add()       { echo "no package manager found (neither apk nor opkg)" >&2; return 1; }
 	pkg_del()       { return 1; }
 	pkg_update()    { return 1; }
@@ -71,7 +82,7 @@ PACKAGES='lua|cmd:lua|yes|the Lua the daemon runs on
 luabitop|file:/usr/lib/lua/bit.so|yes|bit operations
 lua-cjson|file:/usr/lib/lua/cjson.so|yes|JSON
 luasocket|file:/usr/lib/lua/socket/core.so|yes|the inform channel to the controller
-lua-openssl|file:/usr/lib/lua/openssl.so|yes|AES-GCM, without which adoption never completes
+openuf-crypto|crypto|yes|AES-128-GCM for the inform channel, without which adoption never completes
 libuci-lua|file:/usr/lib/lua/uci.so|yes|every wireless read and write
 iw|cmd:iw|yes|radio and client statistics
 lldpd|cmd:lldpd|no|topology: the parent device shown in the controller
@@ -96,6 +107,9 @@ present() {   # present <evidence>
 		cmd:*)  have_cmd "${1#cmd:}" ;;
 		file:*) [ -e "${1#file:}" ] ;;
 		kmod:*) ls "$MODDIR"/*/"${1#kmod:}".ko >/dev/null 2>&1 ;;
+		# Any in-process AES-GCM: the native module (openuf-crypto-*) or the
+		# lua-openssl binding it replaces. crypto.lua takes either.
+		crypto) [ -e "$LUADIR/openuf_crypto.so" ] || [ -e "$LUADIR/openssl.so" ] ;;
 		*)      return 1 ;;
 	esac
 }
@@ -146,17 +160,101 @@ crypto_of() {
 
 # The full build to put in place of $1 (possibly empty): hostapd-* for a
 # device that has hostapd-* rather than wpad-*, the same crypto library as
-# the basic build so no second TLS library is installed, and openssl when
-# there is none to match -- lua-openssl already needs libopenssl, so it is
-# the one library every openUF device has.
+# the basic build so no second TLS library is installed, and when there is
+# no build to match, whichever library the box already carries (tls_lib):
+# mbedtls, OpenWrt's own default, when it carries none. (It used to be
+# openssl, back when lua-openssl made libopenssl the one library every
+# openUF device had; openuf-crypto ended that.)
 full_for() {   # full_for <installed> <requested library or empty>
 	lib=$2
 	[ -n "$lib" ] || lib=$(crypto_of "$1")
-	[ -n "$lib" ] || lib=openssl
+	[ -n "$lib" ] || lib=$(tls_lib)
 	case "$1" in
 		hostapd*) printf 'hostapd-%s' "$lib" ;;
 		*)        printf 'wpad-%s' "$lib" ;;
 	esac
+}
+
+# ── the AES module ──────────────────────────────────────────────────────────
+# openuf-crypto is a virtual name four packages provide: the native module
+# built on mbedtls, wolfssl or openssl, and openuf-crypto-luaossl, which only
+# pulls in the lua-openssl binding for a target the feed ships no native
+# build for. The package manager settles the name on its own (apk by
+# provider priority, mbedtls first; opkg by whichever it finds first), so the
+# job here is to make the choice follow hostapd: the library already on the
+# flash, never a second one for a 20 KB module.
+CRYPTO_VARIANTS="openuf-crypto-mbedtls openuf-crypto-wolfssl openuf-crypto-openssl openuf-crypto-luaossl"
+
+crypto_installed() {   # the package name, or nothing and status 1
+	for p in $CRYPTO_VARIANTS; do
+		if pkg_installed "$p"; then printf '%s' "$p"; return 0; fi
+	done
+	return 1
+}
+
+# The TLS library this box already carries: what hostapd's package name
+# says, else whichever library file is there (mbedtls first, OpenWrt's own
+# default), else mbedtls.
+tls_lib() {
+	lib=$(crypto_of "$(wpad_installed)")
+	if [ -z "$lib" ]; then
+		if ls "$LIBDIR"/libmbedtls.so* >/dev/null 2>&1; then lib=mbedtls
+		elif ls "$LIBDIR"/libwolfssl.so* >/dev/null 2>&1; then lib=wolfssl
+		elif ls "$LIBDIR"/libcrypto.so* >/dev/null 2>&1; then lib=openssl
+		else lib=mbedtls
+		fi
+	fi
+	printf '%s' "$lib"
+}
+
+crypto_for() {   # crypto_for <library, luaossl, or empty> -> package name
+	lib=$1
+	[ -n "$lib" ] || lib=$(tls_lib)
+	printf 'openuf-crypto-%s' "$lib"
+}
+
+# What crypto.lua picks on this box right now, in its own words. crypto.lua
+# lives one directory above this script's (either install prefix); empty
+# when it cannot be run.
+crypto_backend() {
+	self=$(readlink -f "$0" 2>/dev/null) || self=$0
+	dir=${OPENUF_DIR:-$(dirname "$self")/..}
+	[ -f "$dir/crypto.lua" ] || return 1
+	( cd "$dir" 2>/dev/null && lua -e 'local ok, c = pcall(dofile, "crypto.lua")
+		if ok and type(c) == "table" and c.backend then io.write(c.backend()) end' 2>/dev/null )
+}
+
+# Put the right provider in place. Never leaves the box without one: the
+# installed variant is removed only once its replacement is known to be in
+# the feeds, and put back if the replacement fails to install.
+install_crypto() {   # install_crypto <library, luaossl, or empty>
+	want=$(crypto_for "$1")
+	cur=$(crypto_installed) || cur=""
+	if [ "$cur" = "$want" ]; then
+		say "  $want already installed"
+		return 0
+	fi
+	if pkg_available "$want"; then
+		if [ -n "$cur" ]; then
+			say "replacing $cur with $want"
+			pkg_del "$cur" >/dev/null 2>&1 || warn "could not remove $cur; trying to install $want over it"
+		fi
+		if add_one "$want"; then return 0; fi
+		if [ -n "$cur" ] && pkg_add "$cur" >/dev/null 2>&1; then warn "$cur put back"; fi
+		return 1
+	fi
+	if [ -n "$cur" ]; then
+		say "  no $want in the feeds for this device; keeping $cur"
+		return 0
+	fi
+	# Nothing native for this target: the shim, then the binding itself.
+	for p in openuf-crypto-luaossl lua-openssl; do
+		if add_one "$p"; then
+			warn "no $want in the feeds for this device; $p installed instead (lua-openssl: 4.9 MB with libopenssl3)"
+			return 0
+		fi
+	done
+	return 1
 }
 
 # ── --check ─────────────────────────────────────────────────────────────────
@@ -173,6 +271,12 @@ check() {
 	printf '{"wpad":{"installed":%s,"full":%s,"suggested":"%s","choices":["%s-mbedtls","%s-openssl","%s-wolfssl"]},' \
 		"$( [ -n "$cur" ] && printf '"%s"' "$(json_str "$cur")" || printf null )" \
 		"$full" "$suggested" "$base" "$base" "$base"
+	cb=$(crypto_backend) || cb=""
+	ccur=$(crypto_installed) || ccur=""
+	printf '"crypto":{"backend":%s,"installed":%s,"suggested":"%s","choices":["openuf-crypto-mbedtls","openuf-crypto-openssl","openuf-crypto-wolfssl","openuf-crypto-luaossl"]},' \
+		"$( [ -n "$cb" ] && printf '"%s"' "$(json_str "$cb")" || printf null )" \
+		"$( [ -n "$ccur" ] && printf '"%s"' "$(json_str "$ccur")" || printf null )" \
+		"$(crypto_for "")"
 	printf '"packages":['
 	first=1
 	while IFS='|' read -r name how req unlocks; do
@@ -210,20 +314,32 @@ add_one() {   # add_one <package>
 	return 1
 }
 
-install() {   # install <only-wpad 0|1> <library or empty>
-	only_wpad=$1; lib=$2
+install() {   # install <only-wpad 0|1> <library or empty> <crypto library or empty>
+	only_wpad=$1; lib=$2; clib=$3
 	changed=0
 	missing=""
 	[ "$only_wpad" = 1 ] || missing=$(missing_packages)
-	if [ -n "$missing" ] || ! hostapd_full; then
+	if [ -n "$missing" ] || [ -n "$clib" ] || ! hostapd_full; then
 		pkg_update >/dev/null 2>&1 || warn "package index refresh failed; installs below may not resolve"
 	fi
 	if [ "$only_wpad" != 1 ]; then
 		if [ -n "$missing" ]; then
 			say "installing: $missing"
-			for p in $missing; do add_one "$p" && changed=1; done
+			for p in $missing; do
+				case "$p" in
+					# A virtual name: pick the variant, do not let the
+					# package manager pick one for us.
+					openuf-crypto) install_crypto "$clib" && changed=1 ;;
+					*)             add_one "$p" && changed=1 ;;
+				esac
+			done
 		else
 			say "every package openUF uses is installed"
+		fi
+		# An explicit --crypto (or the library --wpad named) is honoured
+		# even when a provider is already there.
+		if [ -n "$clib" ] && [ "$(crypto_installed)" != "$(crypto_for "$clib")" ]; then
+			install_crypto "$clib" && changed=1
 		fi
 	fi
 	if hostapd_full; then
@@ -258,6 +374,20 @@ install() {   # install <only-wpad 0|1> <library or empty>
 		[ -x /etc/init.d/wpad ] && /etc/init.d/wpad restart >/dev/null 2>&1
 		if wifi up >/dev/null 2>&1; then say "  radios brought up on the new build"; fi
 	fi
+	# The AES module follows hostapd's library whenever the feeds carry that
+	# variant, so a box never keeps a second TLS library for it. Only when
+	# nothing named a library: an explicit choice was applied above.
+	if [ "$only_wpad" != 1 ] && [ -z "$clib" ]; then
+		want=$(crypto_for "")
+		cur=$(crypto_installed) || cur=""
+		if [ -n "$cur" ] && [ "$cur" != "$want" ]; then
+			pkg_update >/dev/null 2>&1
+			if pkg_available "$want"; then
+				say "the AES module ($cur) does not match hostapd's library; aligning"
+				install_crypto "" && changed=1
+			fi
+		fi
+	fi
 	if [ "$changed" = 1 ] && [ -x /etc/init.d/openuf ]; then
 		# The capability bits openUF claims are probed once, at start.
 		if /etc/init.d/openuf restart >/dev/null 2>&1; then say "openUF restarted"; fi
@@ -271,7 +401,7 @@ install() {   # install <only-wpad 0|1> <library or empty>
 }
 
 # ── main ────────────────────────────────────────────────────────────────────
-MODE=""; LIB=""; ONLY_WPAD=0
+MODE=""; LIB=""; CRYPTO_LIB=""; ONLY_WPAD=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--check)     MODE=check ;;
@@ -285,13 +415,23 @@ while [ $# -gt 0 ]; do
 				*) die "--wpad: mbedtls, openssl or wolfssl, not '$1'" ;;
 			esac
 			;;
-		-h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		--crypto)
+			shift; [ $# -gt 0 ] || die "--crypto needs a value: mbedtls, openssl, wolfssl or luaossl"
+			case "$1" in
+				mbedtls|openssl|wolfssl|luaossl) CRYPTO_LIB=$1 ;;
+				openuf-crypto-mbedtls|openuf-crypto-openssl|openuf-crypto-wolfssl|openuf-crypto-luaossl) CRYPTO_LIB=${1#openuf-crypto-} ;;
+				*) die "--crypto: mbedtls, openssl, wolfssl or luaossl, not '$1'" ;;
+			esac
+			;;
+		-h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*) die "unknown option: $1" ;;
 	esac
 	shift
 done
+# The AES module follows the library --wpad named unless --crypto says otherwise.
+[ -n "$CRYPTO_LIB" ] || CRYPTO_LIB=$LIB
 case "$MODE" in
 	check)   check ;;
-	install) [ "$(id -u)" = 0 ] || die "must run as root"; install "$ONLY_WPAD" "$LIB" ;;
-	*)       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+	install) [ "$(id -u)" = 0 ] || die "must run as root"; install "$ONLY_WPAD" "$LIB" "$CRYPTO_LIB" ;;
+	*)       sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
