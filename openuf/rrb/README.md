@@ -25,6 +25,12 @@ against upstream stays readable. The changes:
   for that, as a check.
 - `check` prints the version first.
 
+Both daemon changes were offered to upstream as a pull request on 2026-10-25
+(from the fork `yesrab/unifi-openwrt-roaming`, branch `feature/openUFHook`), in
+the same form minus this header and the version line: `option wait '0'` and
+`option peers_file`. Once merged there, the next re-vendoring carries only the
+header and the version line as local differences.
+
 The standalone setup tool (`rrb-unifi-setup`) is not vendored: `install`,
 `apply`, `uninstall` and `confirm` are openUF's job here, and its `collect`,
 `verify` and `peers` live on as `openuf rrb collect|verify|peers`
