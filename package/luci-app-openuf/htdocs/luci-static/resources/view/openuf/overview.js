@@ -114,19 +114,19 @@ function deviceBlock(s) {
 // openUF refuses to start until a full build is there; the button below
 // runs `openuf deps --install`, which does the swap and installs whatever
 // else is missing. Rendered once, outside the polled block (see render()).
-function installButton(w, missing, th, r) {
+function installButton(w, missing, th, r) {   // r: the declared services
 	const swap = (w.full === false);
 	const choices = arr(w.choices);
 	const select = E('select', { 'class': 'cbi-input-select' },
 		choices.map(c => E('option', { 'value': c, 'selected': (c == w.suggested) ? '' : null }, c)));
-	const startRrb = !!(r && r.installed && r.enabled && !r.running && !arr(r.missing).length);
+	const startSvc = arr(r).some(x => x.enabled && !x.running);
 	let label;
 	if (swap)
 		label = missing.length ? _('Replace hostapd with the full build and install the missing packages') : _('Replace hostapd with the full build');
 	else if (missing.length)
 		label = _('Install the missing packages');
-	else if (startRrb)
-		label = _('Start the 802.11r translator');
+	else if (startSvc)
+		label = _('Start the plugin services');
 	else
 		label = _('Install the Halo theme');
 	const btn = E('button', { 'class': 'btn cbi-button cbi-button-positive', 'click': function() {
@@ -210,33 +210,45 @@ function softwareBlock(s) {
 			E('td', { 'class': 'td' }, _('The Halo look for LuCI, matching the device page; installed only on devices with flash to spare'))
 		]));
 	}
-	// The 802.11r translator for genuine UniFi access points: part of openUF
-	// (the openuf-rrb service), so the row is about its state, not about a
-	// package; what it needs from the feeds is in the package rows above.
-	const r = d.rrb_unifi;
-	if (r) {
+	// Plugins (plugins.lua): the built-in ones with their switch on and the
+	// listed third-party ones, from the probe, with whatever their status()
+	// reports, rendered as it comes (no plugin-specific code here). The
+	// services they declare come from openuf deps, which enables them.
+	for (const pl of arr(s.plugins)) {
 		let state;
-		if (!r.installed)
-			state = E('span', { 'class': 'label warning' }, _('no: the openuf-rrb service is missing (reinstall openUF)'));
-		else if (!r.enabled)
-			state = E('span', { 'class': 'label' }, _('switched off (openuf.rrb.enabled)'));
-		else if (arr(r.missing).length)
-			state = E('span', { 'class': 'label warning' }, _('waiting for %s').format(arr(r.missing).join(', ')));
-		else {
-			const bits = [];
-			if (r.version) bits.push(r.version);
-			bits.push(r.running ? _('running') : _('not running'));
-			bits.push(r.veth ? _('veth up') : _('veth not yet: created on the first push with an FT WiFi network'));
-			state = installed(r.running, false, bits.join(', '));
-		}
-		const peers = (r.learned > 0 || r.listed > 0)
-			? _('; UniFi access points known: %d heard on the LAN, %d listed by hand').format(r.learned || 0, r.listed || 0)
-			: _('; no UniFi access point heard on the LAN yet (they announce every client that joins them)');
+		if (pl.loaded)
+			state = installed(true, false, pl.builtin ? _('built in') : _('api %d').format(pl.api || 0));
+		else if (pl.reason === 'off')
+			state = E('span', { 'class': 'label' }, _('switched off'));
+		else
+			state = E('span', { 'class': 'label warning' }, pl.reason || _('not loaded'));
+		const bits = [];
+		if (pl.status && typeof pl.status === 'object')
+			for (const [k, v] of Object.entries(pl.status))
+				bits.push(k + ': ' + (typeof v === 'boolean' ? (v ? _('yes') : _('no')) : String(v)));
+		if (pl.status_error)
+			bits.push(_('status failed: %s').format(pl.status_error));
+		const hooks = arr(pl.hooks).length ? _('hooks: %s').format(arr(pl.hooks).join(', ')) : '';
 		t.appendChild(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td' }, 'openuf-rrb'),
+			E('td', { 'class': 'td' }, _('plugin %s').format(pl.name)),
 			E('td', { 'class': 'td' }, _('optional')),
 			E('td', { 'class': 'td' }, state),
-			E('td', { 'class': 'td' }, _('Fast roaming (802.11r) between this device and genuine UniFi access points: converts hostapd\'s inter-AP key exchange to UniFi\'s framing, and learns which UniFi access points are on the LAN') + peers)
+			E('td', { 'class': 'td' }, [ hooks, bits.length ? E('br') : '', bits.join('; ') ])
+		]));
+	}
+	for (const sv of arr(d.services)) {
+		let state;
+		if (sv.running)
+			state = installed(true, false, _('running'));
+		else if (sv.enabled)
+			state = E('span', { 'class': 'label notice' }, _('enabled, not running: the install button starts it'));
+		else
+			state = E('span', { 'class': 'label warning' }, _('not enabled'));
+		t.appendChild(E('tr', { 'class': 'tr' }, [
+			E('td', { 'class': 'td' }, _('service %s').format(sv.name)),
+			E('td', { 'class': 'td' }, _('optional')),
+			E('td', { 'class': 'td' }, state),
+			E('td', { 'class': 'td' }, _('Declared by the %s plugin').format(sv.plugin))
 		]));
 	}
 	const parts = [ t ];
@@ -244,8 +256,9 @@ function softwareBlock(s) {
 		parts.push(E('p', {}, _('openUF will not start with a basic hostapd build: it rejects the 802.11v option every network from the controller carries and takes the radio down with it. The full build of the same crypto library is suggested, so nothing else on the device changes and no extra flash is used.')));
 	if (missing.length)
 		parts.push(E('p', {}, _('A missing mandatory package stops openUF from running; a missing optional one leaves that feature off. Everything is installed from the OpenWrt package repository, so the device needs internet access for this.')));
-	if (w.full === false || missing.length || (th && th.wanted) || (r && r.installed && r.enabled && !r.running && !arr(r.missing).length))
-		parts.push(installButton(w, missing, th, r));
+	const svcs = arr(d.services);
+	if (w.full === false || missing.length || (th && th.wanted) || svcs.some(x => x.enabled && !x.running))
+		parts.push(installButton(w, missing, th, svcs));
 	return E('div', {}, parts);
 }
 

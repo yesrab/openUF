@@ -806,7 +806,8 @@ reads nothing else, so what it shows is what the daemon would run.
 config = {
     use_only_unifi_wlan = true,  -- disable non-openuf_ SSIDs during provisioning
     keep_wlan_sections  = {},    -- AP sections that option must leave alone (see below)
-    unifi_ft_interop = true,     -- 802.11r with genuine UniFi APs; needs the rrb-unifi translator to do anything there, see § 6
+    unifi_ft_interop = true,     -- 802.11r with genuine UniFi APs (the built-in rrb plugin), see § 6
+    plugins = {},                -- third-party plugins, see "Plugins" below
     inform_url  = "http://unifi:8080/inform",   -- first-boot URL; state.json's wins once set
     state_file  = "/etc/openuf/state.json",     -- honoured by inform, announce and syswrapper
     l2_announce = true,          -- see below
@@ -983,6 +984,84 @@ hand. Names the temporary SSH bootstrap account (see § SSH prerequisite below)
 that `inform.lua` should lock/unlock as the device's adopted state changes.
 
 ---
+
+### Plugins
+
+A plugin extends openUF without living in it. The shape is jonasevcik/openUF's
+(`feature/plugin-hooks`, api 1), kept as it is so a plugin written for upstream runs here
+unchanged, plus optional hooks this tree needed for its own 802.11r translator, which is
+the first built-in plugin (`openuf/plugins/rrb.lua`). **Third-party plugins are unsupported
+by openUF**, and a plugin is Lua running as root with the same trust as `conf.lua`: openUF
+does not sandbox it. List only code you have read.
+
+```lua
+config = { plugins = {"myplugin"} }   -- conf.lua; the default {} loads nothing
+```
+
+or, on a UCI-managed device, `list plugin 'myplugin'` in `openuf.main` (the LuCI settings
+page has the list). `/etc/openuf/plugins/myplugin.lua` is loaded only when it is named (a
+file in the directory is never enough), and `/etc/openuf/` is already in the sysupgrade
+keep list.
+
+```lua
+return {
+    name = "myplugin",
+    api  = 1,                              -- another number: refused, with a log line
+    vap_options = function(extra, vap, ctx)        -- upstream's hook, per WLAN
+        extra.mobility_domain = "abcd"             -- override a built-in option
+        extra.hostapd_bss_options = {"ft_iface=vft0"}   -- a UCI list
+        extra.reassociation_deadline = ctx.DELETE  -- remove an option
+    end,
+    -- everything below is optional, and this tree's
+    radio_options = function(extra, radio, ctx) extra.beacon_int = "200" end,
+    before_push   = function(ctx, push) end,       -- push.vaps, push.radios
+    after_push    = function(ctx, push) end,       -- after the wifi reload
+    tick          = function(ctx) end,             -- every heartbeat
+    on_boot       = function(ctx) end,             -- daemon start: rebuild kernel state
+    on_forget     = function(ctx) end,             -- the controller was forgotten
+    status        = function(ctx) return {ok = true} end,   -- for the LuCI pages
+    packages = {{pkg = "kmod-veth", evidence = "kmod:veth", unlocks = "..."}},
+    services = {"my-daemon"},                      -- procd services openuf deps enables
+    nft_tables = {"bridge mytable"},               -- what on_forget leaves clean
+}
+```
+
+`vap_options` runs once per WLAN and radio on each controller push, after every built-in
+option is in `extra` and before it is written; `radio_options` likewise per radio after
+`rf_config`, with `extra` starting empty. `vap` is a copy of the parsed controller WLAN
+without its passphrase (`ssid`, `radio`, `iapp_key`, `fast_roaming_enabled`, ...). `ctx`
+has upstream's `DELETE`, `bssid(radio, ssid)`, `cursor()` (a UCI cursor), `read_file(path)`
+and `log(msg)`, and here also `exists(path)`, `run(cmd)`, `reload_network()`, `util`
+(`bit`, `is_mac`, `valid_ifname`, `read_file`, `sha1`), `store` (a table kept for this
+plugin in `state.json` under `plugins.<name>`, so it survives restarts and reboots) and
+`repush()`, which asks the controller for the full config again by forgetting `cfgversion`;
+openUF grants that at most once every ten minutes across all plugins and only on an adopted
+AP, since a push reloads the WLANs' BSSes.
+
+openUF keeps the push safe from plugins (upstream's rules):
+
+- A plugin that is missing, does not load, has another `api`, raises, or returns a bad edit
+  is logged (`logread | grep "openuf: plugin"`) and skipped; the push goes on. A hook that
+  raises is logged and skipped; a `tick` over a second is logged.
+- An edit is all or nothing per WLAN. Option names must be `[A-Za-z0-9_]+`; `device`,
+  `mode`, `ssid`, `encryption`, `network`, `key` and every `openuf_*` stamp are reserved on
+  a WLAN, and `type`, `path`, `phy`, `band`, `hwmode`, `disabled`, `channel`, `htmode`,
+  `txpower`, `country` on a radio.
+- Built-in plugins run first, then the list in its order; a later one sees an earlier one's
+  edits. A plugin is loaded once per process; editing it takes `/etc/init.d/openuf restart`.
+- Capability bits (`wifi_caps` and friends) and the inform payload are not reachable: a
+  plugin must never claim what the device cannot honour.
+- UCI options need no teardown: the `openuf_` sections are rebuilt on every push, so
+  removing a plugin drops its options with the next push, and openUF asks for that push
+  itself when the set of enabled plugins changes (it keeps a fingerprint in `state.json`).
+  What a plugin leaves elsewhere, in `/etc/config/network`, in nft or as a daemon, is its
+  `on_forget`'s job, which runs after openUF's own teardown so a netdev that carried a
+  WLAN's key exchange goes last.
+
+A built-in plugin is not listed in `plugins`: it has its own switch (`rrb` follows
+`unifi_ft_interop`) and ships in the tree. The packages and services a plugin declares show
+up in `openuf deps --check` and are installed and started by `openuf deps --install`; the
+LuCI overview lists every plugin with what its `status()` reports.
 
 ## 4. Adoption flow
 

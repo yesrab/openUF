@@ -448,9 +448,9 @@ factory reset.
 commit and every change, each marked `// openUF:` in the file) runs as `/etc/init.d/openuf-rrb`,
 which `install.sh` copies from `openuf/etc/init.d/` and enables after openUF's own service.
 Its packages, `ucode-mod-socket` and `kmod-veth`, are two more `try_optional`s. The veth pair
-is NOT the installer's business: `ucihelper.ensure_ft_veth` writes it into `/etc/config/network`
-on the first config push that carries an FT WLAN, and `install.sh uninstall` and
-`ucihelper.forget` remove it. Fixes to the daemon come from
+is NOT the installer's business: `plugins/rrb.lua`'s `before_push` writes it into
+`/etc/config/network` on the first config push that carries an FT WLAN, and `install.sh
+uninstall` and the plugin's `on_forget` remove it. Fixes to the daemon come from
 https://github.com/d-malinowski/unifi-openwrt-roaming (the local clone
 `../unifi-openwrt-roaming` has it as `upstream`), never from a fork of it.
 
@@ -766,13 +766,24 @@ https://github.com/d-malinowski/unifi-openwrt-roaming (the local clone
 - **hostapd is pointed at the translator's veth only while something forwards it.**
   `ftinterop.ft_iface` writes `hostapd_bss_options 'ft_iface=vft0'` only when the `openuf-rrb`
   service is installed, `openuf.rrb.enabled` is not `0`, and the netdev exists, and
-  `ucihelper.ensure_ft_veth` creates the pair only under the same conditions: a veth nobody
+  `plugins/rrb.lua` (`before_push`) creates the pair only under the same conditions: a veth nobody
   forwards would swallow every RRB frame, openUF-to-openUF key pulls included, and the symptom
   would be "FT silently falls back to a full handshake" on every roam. The daemon's own changes
   (waiting instead of exiting, the peers file) are marked `// openUF:` in a file whose upstream
   is d-malinowski's repository, not this one: keep them small and re-applicable. The whole
   repository is GPL-3.0-or-later since 2026-10-25 because of it; NOTICE carries the MIT notice
   for jonasevcik's original work, which MIT requires to travel with the code.
+- **Plugins are hooks, not a sandbox, and the hooks never reach the protocol.** `plugins.lua`
+  keeps jonasevcik's `api = 1` contract byte for byte (a plugin written for upstream must run
+  here) and adds optional hooks; a plugin may not touch capability bits or the inform payload,
+  its WLAN edits are all-or-nothing with the identity and `openuf_*` options reserved, and
+  every hook is pcall'd. A built-in (`plugins/<name>.lua`, named in `BUILTIN`) loads when its
+  own `enabled(cfg)` says so, never through the `plugins` list; `rrb` is the proof of the
+  hooks, so a change to them is a change to `rrb` first. `ctx.repush()` is rate-limited in
+  `inform.lua` (`PLUGIN_REPUSH_GAP`), never by the plugin, and `_plugins_tick` asks for a push
+  itself when the fingerprint of enabled plugins moves. `ctx.store` is `st.plugins[name]`,
+  which round-trips through `state.save`. `on_forget` runs after `ucihelper.forget`, so a
+  plugin's netdev outlives the WLANs that used it by exactly one wifi reload.
 - **Two kernel modules are not implied by their packages.** `kmod-nft-bridge` for the
   Multicast/Broadcast Blocker's `meta` rule (everything else in that table builds without
   it, so the control looks enabled and filters nothing) and `kmod-sched-act-police` for the
@@ -982,6 +993,15 @@ openuf/
                     names the upstream commit and the `// openUF:` changes), run as
                     etc/init.d/openuf-rrb; learns the UniFi APs on the LAN into
                     /var/run/openuf/rrb-peers.json for ftinterop.lua
+  plugins.lua       the plugin loader: jonasevcik's api-1 `vap_options` contract kept
+                    as is (an upstream plugin runs here), plus this tree's optional hooks
+                    (radio_options, before/after_push, tick, on_boot, on_forget, status,
+                    declared packages/services/nft_tables), ctx.store (state.json
+                    plugins.<name>) and ctx.repush() (rate-limited in inform.lua)
+  plugins/rrb.lua   the first built-in plugin: the translator's veth (before_push), the
+                    FT options (vap_options -> ftinterop.apply), the daemon restart
+                    (after_push), peer learning (tick), teardown (on_forget); enabled by
+                    unifi_ft_interop, never by the plugins list
   etc/init.d/openuf procd service: announce + inform instances; finds either prefix
 package/            the OpenWrt feed: openuf (net/), luci-app-openuf (the LuCI pages, the device
                     page htdocs/openuf/ and its gate root/usr/share/ucode/openuf/gate.uc) and

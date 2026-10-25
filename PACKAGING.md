@@ -67,6 +67,11 @@ openuf/uciconf.lua                /etc/config/openuf -> the `dev`/`config` table
   uci-defaults nor a postinst touches the network. Fixes come from
   https://github.com/d-malinowski/unifi-openwrt-roaming (see `openuf/rrb/README.md`), re-applied
   with the `// openUF:` changes.
+- **Plugins ship in `openuf/plugins/`** (2026-10-25), installed to `/usr/lib/openuf/plugins/`;
+  third-party ones live in `/etc/openuf/plugins/` (the sysupgrade keep list already has
+  `/etc/openuf/`) and are named in `openuf.main` as `list plugin`. `openuf deps` learns their
+  packages and services from `openuf probe plugin-deps`, so the package's `DEPENDS` carries
+  only what the built-in ones need (`ucode-mod-socket`, `kmod-veth` for `rrb`).
 
 | Topic | Decision | Why |
 |---|---|---|

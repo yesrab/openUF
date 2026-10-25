@@ -2242,6 +2242,27 @@ truncated the table on the device (every `--check` printed `PACKAGES: parameter 
 the rows are reworded. Not checked here, for want of a UniFi AP: a roam, a real UBNT_ROAM
 announcement reaching the peers file, and `openuf rrb collect`/`verify` against a UAP.
 
+**Plugin hooks, 2026-10-25 (later again).** jonasevcik proposed, in the PR thread, that the
+interop live outside openUF behind a plugin hook (`feature/plugin-hooks`, `26ad689`: an
+allowlist in `conf.lua`, `/etc/openuf/plugins/<name>.lua` with `api = 1` and
+`vap_options(extra, vap, ctx)`, guarded edits), and d-malinowski agreed to ship his module as
+such a plugin. This tree took the hook as it is, so that plugin will run here unchanged, and
+added the optional hooks its own translator integration had needed (`before_push`,
+`after_push`, `tick`, `on_boot`, `on_forget`, `radio_options`, `status`, declared packages and
+services, a persisted store, a rate-limited re-push), then moved the `rrb` integration out of
+`ucihelper` and `inform` onto those hooks as the first built-in plugin (`openuf/plugins/rrb.lua`).
+Upstream's seven tests pass unchanged; the rrb tests pass through the plugin path. **Checked in
+the QEMU VM the same day**: `openuf probe plugin-deps` listed the two packages and the service
+the plugin declares, `openuf deps --check` reported `openuf-rrb` enabled and running, `openuf
+probe status` carried the plugin row with its `status()`; a config push driven through
+`ucihelper.apply_config` with a store holding one learned peer wrote `openuf_radio0_corp` with
+that peer and the wildcards in `r0kh`/`r1kh`, `ft_psk_generate_local 0`, `mobility_domain 5de5`
+and `hostapd_bss_options ft_iface=vft0`, the plugin's `before_push` created the veth sections
+and `vft0`, hostapd's running config carried `ft_iface=vft0` after the generated `ft_iface=br-lan`
+with the `0x88b7` socket on `vft0`, and the daemon reported the BSS served and `check OK`;
+`ucihelper.forget` followed by the plugin's `on_forget` removed the WLAN, the three network
+sections and the veth, cleared the store, and the daemon went back to waiting for the pair.
+
 Not adopted as-is: nothing from the commit was left out. Two of this tree's choices differ in
 emphasis rather than behaviour. The `nasid` log line says hostapd's default covers a push with
 no BSSID yet, where theirs reads as a gap. And the raw `hostapd_bss_options 'ft_iface=vft0'`

@@ -107,6 +107,8 @@ define Package/openuf/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(LN) ../lib/openuf/hook/openuf-convert.sh $(1)/usr/sbin/openuf-convert
 	$(LN) ../lib/openuf/hook/openuf-deps.sh $(1)/usr/sbin/openuf-deps
+	$(INSTALL_DIR) $(1)/usr/lib/openuf/plugins
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/openuf/plugins/*.lua $(1)/usr/lib/openuf/plugins/
 	$(INSTALL_DIR) $(1)/usr/lib/openuf/rrb
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/openuf/rrb/rrb-unifi.uc $(1)/usr/lib/openuf/rrb/
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/openuf/rrb/README.md $(1)/usr/lib/openuf/rrb/

@@ -8,6 +8,10 @@
 
 local ftinterop = dofile("openuf/ftinterop.lua")
 local ucihelper = dofile("openuf/ucihelper.lua")
+-- The rrb plugin resolves ftinterop through package.loaded first (as the
+-- daemon registers its modules), so the plugin and these tests share one
+-- instance and one set of seams.
+package.loaded["openuf.ftinterop"] = ftinterop
 
 local KEY   = "00112233445566778899aabbccddeeff"
 local PEER1 = "00:00:5e:00:53:21"
@@ -276,19 +280,23 @@ return {
 		end
 	},
 	{
-		name = "ftinterop: apply_config creates the veth, writes the peers and restarts the translator only when on",
+		name = "rrb plugin: a push creates the veth, writes the key holders from the store and restarts the service",
 		fn = function()
+			local plugins = dofile("openuf/plugins.lua")
 			local db = {openuf = {rrb = {[".type"] = "rrb", peer = {PEER1 .. ",00005e005321"}}}}
 			local cursor = rw_cursor(db)
 			local orig = {uci = ucihelper._uci, popen = ucihelper._popen,
 				read = ucihelper._read_file, run = ucihelper._run_cmd,
 				bcf = ucihelper._bcfilter, shaper = ucihelper._shaper,
-				fti = ucihelper._ftinterop, vap = ucihelper.get_ifname_for_vap}
+				pl = ucihelper._plugins, vap = ucihelper.get_ifname_for_vap,
+				plog = plugins._log}
 			local function restore()
 				ucihelper._uci, ucihelper._popen = orig.uci, orig.popen
 				ucihelper._read_file, ucihelper._run_cmd = orig.read, orig.run
 				ucihelper._bcfilter, ucihelper._shaper = orig.bcf, orig.shaper
-				ucihelper._ftinterop, ucihelper.get_ifname_for_vap = orig.fti, orig.vap
+				ucihelper._plugins, ucihelper.get_ifname_for_vap = orig.pl, orig.vap
+				plugins._log = orig.plog
+				plugins._reset()
 				ucihelper._phy_caps_cache = nil
 				ucihelper._phy_caps_unstable_until = nil
 				ucihelper._phy_caps_read_at = nil
@@ -299,8 +307,10 @@ return {
 			ucihelper._phy_caps_cache = nil
 			ucihelper._uci = {cursor = function() return cursor end}
 			ucihelper._popen = function() return "" end
+			plugins._log = function() end
+			plugins._reset()
 			-- The veth exists only once the network has been reloaded with
-			-- the sections ensure_ft_veth wrote.
+			-- the sections the plugin wrote.
 			local veth_up = false
 			local cmds = {}
 			ucihelper._read_file = function(path)
@@ -318,7 +328,7 @@ return {
 			end
 			ucihelper._bcfilter = {reconcile = function() end}
 			ucihelper._shaper = {reconcile = function() end}
-			ucihelper._ftinterop = ftinterop
+			ucihelper._plugins = plugins
 			ucihelper.get_ifname_for_vap = function(radio)
 				return radio == "radio0" and "phy0-ap0" or nil
 			end
@@ -330,13 +340,16 @@ return {
 				for i, c in ipairs(cmds) do if c == text then return i end end
 				return nil
 			end
+			-- inform's store: the plugin's table in state.json
+			local st = {plugins = {rrb = {peers = {[HEARD] = "5de5", [OTHER] = "aaaa"}}}}
+			local function store(name) st.plugins[name] = st.plugins[name] or {}; return st.plugins[name] end
+			local on = {config = {unifi_ft_interop = true}}
 			local ok, err = pcall(function()
 				with_ftinterop({vft0 = true, [INSTALLED] = true}, function()
-					ucihelper.apply_config(resp, {config = {unifi_ft_interop = true}},
-						{rrb_peers = {[HEARD] = "5de5", [OTHER] = "aaaa"}})
+					ucihelper.apply_config(resp, on, {plugin_store = store})
 					-- the veth pair, as netifd sections, before the VAPs
 					local dev = db.network and db.network.openuf_ftveth
-					assert_not_nil(dev, "veth device section written")
+					assert_not_nil(dev, "veth device section written by before_push")
 					assert_eq(dev[".type"], "device", "a config device")
 					assert_eq(dev.type, "veth", "of type veth")
 					assert_eq(dev.name, "vft0", "hostapd's end")
@@ -346,7 +359,7 @@ return {
 					local reload = index_of("/etc/init.d/network reload 2>/dev/null")
 					local wifi = index_of("wifi reload")
 					assert_true(reload and wifi and reload < wifi, "network reloaded before the wifi reload")
-					-- the section
+					-- the section, through vap_options
 					local s = db.wireless.openuf_radio0_corp
 					assert_eq(s.ieee80211r, "1", "FT on")
 					assert_eq(s.mobility_domain, "5de5", "UniFi mobility domain")
@@ -355,33 +368,34 @@ return {
 					assert_nil(s.reassociation_deadline, "OpenWrt's default deadline")
 					assert_eq(#s.r0kh, 3, "hand peer + learned peer on this WLAN + wildcard")
 					assert_eq(s.r0kh[1], PEER1 .. ",00005e005321," .. KEY, "the hand peer")
-					assert_eq(s.r0kh[2], HEARD .. ",00005e005331," .. KEY, "the learned peer")
+					assert_eq(s.r0kh[2], HEARD .. ",00005e005331," .. KEY, "the learned peer, from the store")
 					assert_eq(s.hostapd_bss_options[1], "ft_iface=vft0", "veth")
-					-- the daemon derives its BSSes at start: restarted after
-					-- the reload that wrote them, and only then
+					-- after_push: the daemon derives its BSSes at start
 					local restart = index_of("/etc/init.d/openuf-rrb restart")
 					assert_not_nil(restart, "openuf-rrb restarted")
 					assert_true(restart > wifi, "after the wifi reload")
 
 					-- a second push: the veth exists, no network reload needed
 					cmds = {}
-					ucihelper.apply_config(resp, {config = {unifi_ft_interop = true}}, {})
+					ucihelper.apply_config(resp, on, {plugin_store = store})
 					assert_nil(index_of("/etc/init.d/network reload 2>/dev/null"), "veth present: no reload")
-					assert_eq(#db.wireless.openuf_radio0_corp.r0kh, 2, "hand peer + wildcard without learned ones")
 
-					-- forget takes the veth pair with everything else
+					-- forget: ucihelper's own, then the plugin's on_forget takes the veth
 					cmds = {}
 					ucihelper.forget()
+					assert_not_nil(db.network.openuf_ftveth, "forget alone leaves the veth (the hook does it)")
+					plugins.run_hook("on_forget", on, ucihelper.plugin_env({plugin_store = store}))
 					assert_nil(db.network.openuf_ftveth, "veth device section removed")
 					assert_nil(db.network.openuf_ftlink, "and its interfaces")
 					assert_nil(db.network.openuf_ftpeer, "both")
-					assert_not_nil(index_of("/etc/init.d/network reload 2>/dev/null"), "network reloaded")
+					assert_not_nil(index_of("/etc/init.d/network reload 2>/dev/null"), "network reloaded for it")
+					assert_nil(st.plugins.rrb.peers, "the learned peers are forgotten with the controller")
 
 					-- off: nothing of this
 					db.wireless = nil
 					veth_up = false
 					cmds = {}
-					ucihelper.apply_config(resp, {config = {}}, {rrb_peers = {[HEARD] = "5de5"}})
+					ucihelper.apply_config(resp, {config = {}}, {plugin_store = store})
 					s = db.wireless.openuf_radio0_corp
 					assert_eq(s.mobility_domain, ucihelper.derive_mobility_domain("corp"),
 						"off: openUF's own mobility domain")
@@ -389,7 +403,7 @@ return {
 					assert_nil(s.ft_psk_generate_local, "off: left to OpenWrt")
 					assert_nil(s.nasid, "off: no nasid")
 					assert_nil(s.hostapd_bss_options, "off: no ft_iface")
-					assert_eq(#s.r0kh, 1, "off: wildcard only, learned peers unused")
+					assert_eq(#s.r0kh, 1, "off: wildcard only")
 					assert_nil(db.network.openuf_ftveth, "off: no veth")
 					for _, c in ipairs(cmds) do
 						assert_neq(c, "/etc/init.d/openuf-rrb restart", "off: the translator is left alone")
@@ -401,54 +415,42 @@ return {
 		end
 	},
 	{
-		name = "ftinterop: inform keeps the peers the daemon heard and re-pushes once per gap",
+		name = "rrb plugin: the tick keeps the peers the daemon heard in its store and asks for one re-push",
 		fn = function()
-			dofile("openuf/lib/lib.lua")
-			local inform = dofile("openuf/inform.lua")
-			local fti = inform._ftinterop
-			assert_not_nil(fti, "inform loads ftinterop")
-			local saved = 0
-			local orig_state, orig_time, orig_read = inform._state, inform._time, fti._read_file
-			inform._state = {save = function() saved = saved + 1 end}
-			local now = 1000
-			inform._time = function() return now end
+			local rrb = dofile("openuf/plugins/rrb.lua")
 			local peers_json = PEERS_JSON
-			fti._read_file = function(path)
-				if path == fti.PEERS_FILE then return peers_json end
-				return nil
-			end
-			local ok, err = pcall(function()
-				local cfg = {config = {unifi_ft_interop = true}}
-				local st = {adopted = true, cfgversion = "abc"}
-				assert_nil(inform._rrb_peers_tick(st, {config = {}}), "off: nothing")
-				assert_eq(inform._rrb_peers_tick(st, cfg), "repush", "new peers on an adopted AP")
-				assert_eq(st.rrb_peers[HEARD], "5de5", "kept with its domain")
-				assert_eq(st.rrb_peers[OTHER], "aaaa", "every domain is kept; the push filters per WLAN")
-				assert_nil(st.rrb_peers["00:00:5e:00:53:33"], "a sighting without a domain is not a peer yet")
-				assert_eq(st.cfgversion, "", "cfgversion forgotten: the controller pushes again")
-				assert_eq(saved, 1, "state saved")
-				-- the controller pushed; the same file brings nothing new
-				st.cfgversion = "def"
-				assert_nil(inform._rrb_peers_tick(st, cfg), "nothing new")
-				assert_eq(st.cfgversion, "def", "untouched")
-				-- a new peer inside the gap is kept but not re-pushed yet
-				peers_json = PEERS_JSON:gsub("}}$", '},"00:00:5e:00:53:34":{"md":"5de5","seen":1100,"via":"roam"}}')
-				now = 1300
-				assert_eq(inform._rrb_peers_tick(st, cfg), "learned", "inside the re-push gap")
-				assert_eq(st.cfgversion, "def", "no re-push yet")
-				assert_eq(st.rrb_peers["00:00:5e:00:53:34"], "5de5", "but kept")
-				-- the domain of a known sighting arrives after the gap
-				peers_json = peers_json:gsub('"00:00:5e:00:53:33":{"md":null', '"00:00:5e:00:53:33":{"md":"5de5"')
-				now = 1000 + inform.RRB_PEERS_REPUSH_GAP
-				assert_eq(inform._rrb_peers_tick(st, cfg), "repush", "after the gap")
-				assert_eq(st.cfgversion, "", "forgotten again")
-				-- not adopted: kept, never re-pushed
-				local st2 = {adopted = false}
-				assert_eq(inform._rrb_peers_tick(st2, cfg), "learned", "unadopted: kept only")
-				assert_nil(st2.cfgversion, "nothing to forget")
+			local logged, asked, answer = {}, 0, true
+			local ctx = {
+				store = {},
+				read_file = function(path) if path == ftinterop.PEERS_FILE then return peers_json end end,
+				log = function(msg) logged[#logged + 1] = msg end,
+				repush = function() asked = asked + 1; return answer end,
+			}
+			assert_eq(rrb.tick(ctx), "repush", "new peers: a re-push is asked for")
+			assert_eq(ctx.store.peers[HEARD], "5de5", "kept with its domain")
+			assert_eq(ctx.store.peers[OTHER], "aaaa", "every domain is kept; the push filters per WLAN")
+			assert_nil(ctx.store.peers["00:00:5e:00:53:33"], "a sighting without a domain is not a peer yet")
+			assert_eq(asked, 1, "asked once")
+			assert_nil(rrb.tick(ctx), "the same file brings nothing new")
+			assert_eq(asked, 1, "not asked again")
+			-- openUF refuses the re-push inside its gap: the peer is still kept
+			peers_json = PEERS_JSON:gsub("}}$", '},"00:00:5e:00:53:34":{"md":"5de5","seen":1100,"via":"roam"}}')
+			answer = false
+			assert_eq(rrb.tick(ctx), "learned", "kept, no re-push granted")
+			assert_eq(ctx.store.peers["00:00:5e:00:53:34"], "5de5", "but kept")
+			assert_true(#logged >= 2, "each learning is logged")
+			-- no store (a caller without state): nothing happens
+			assert_nil(rrb.tick({read_file = ctx.read_file, log = ctx.log}), "no store -> nil")
+			-- status for the UI
+			with_ftinterop({vft0 = true, [INSTALLED] = true, peers = PEERS_JSON}, function()
+				local st = rrb.status({store = ctx.store, read_file = ftinterop._read_file,
+					cursor = function() return ro_cursor({}) end, util = dofile("openuf/util.lua")})
+				assert_true(st.installed and st.active and st.veth, "installed, active, veth up")
+				assert_eq(st.ft_iface, "vft0", "names")
+				assert_eq(st.peers, 3, "peers in the store")
+				assert_eq(st.heard, 3, "sightings in the daemon's file")
 			end)
-			inform._state, inform._time, fti._read_file = orig_state, orig_time, orig_read
-			if not ok then error(err, 0) end
 		end
 	},
+
 }

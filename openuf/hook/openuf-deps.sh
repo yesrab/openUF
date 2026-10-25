@@ -9,9 +9,8 @@
 #          "packages":[{"pkg":"nftables","present":true,"required":false,
 #                       "unlocks":"..."},...],
 #          "missing":["kmod-nft-bridge"],"ok":false,
-#          "rrb_unifi":{"installed":true,"version":"1.3+openuf.1","enabled":true,
-#                       "veth":true,"running":true,"learned":2,"listed":0,
-#                       "missing":[]},
+#          "services":[{"name":"openuf-rrb","plugin":"rrb","enabled":true,
+#                       "running":true}],
 #          "theme":{"package":"luci-theme-halo","installed":false,"luci":true,
 #                   "free_kb":5120,"min_free_kb":4096,"wanted":true}}
 #   openuf-deps --install [--wpad mbedtls|openssl|wolfssl] [--only-wpad] [--no-theme]
@@ -21,10 +20,11 @@
 #       another -- brings the radios back up on the new build and restarts
 #       openUF so it re-probes what hostapd can do. The radios are down for
 #       about ten seconds in between: run this over a cable, not over WiFi.
-#       The 802.11r translator for genuine UniFi APs ships with openUF
-#       (rrb/rrb-unifi.uc, the openuf-rrb service); what it needs from the
-#       feeds, ucode-mod-socket and kmod-veth, is two of the optional
-#       packages above, and its service is enabled and started here.
+#       Plugins (plugins.lua) declare packages and services: the packages
+#       join the table above (`openuf probe plugin-deps` lists them), and
+#       the services are enabled and started here. The 802.11r translator
+#       (plugins/rrb.lua) declares ucode-mod-socket, kmod-veth and
+#       openuf-rrb that way.
 #       Exit status 0 once the device has everything. The Halo LuCI theme
 #       (luci-theme-halo, the look openUF's device page shares) comes along
 #       only where LuCI is installed and the flash has room to spare; it is
@@ -100,9 +100,7 @@ nftables|cmd:nft|no|client blocking, multicast/broadcast blocker, L2 hardening
 kmod-nft-bridge|kmod:nft_meta_bridge|no|the blocker and L2 hardening rules
 tc-tiny|cmd:tc|no|WiFi speed limit
 kmod-ifb|kmod:ifb|no|the upload half of the WiFi speed limit, queued
-kmod-sched-act-police|kmod:act_police|no|the upload half of the WiFi speed limit, policed when there is no IFB
-ucode-mod-socket|file:/usr/lib/ucode/socket.so|no|802.11r roaming with genuine UniFi APs: raw packet sockets for the translator
-kmod-veth|kmod:veth|no|802.11r roaming with genuine UniFi APs: the veth pair that carries the key exchange to the translator'
+kmod-sched-act-police|kmod:act_police|no|the upload half of the WiFi speed limit, policed when there is no IFB'
 
 # rpcd and cgi-io run with a short PATH; look where OpenWrt puts things.
 have_cmd() {
@@ -225,63 +223,61 @@ install_theme() {
 	add_one "$THEME_PKG"
 }
 
-# ── the 802.11r translator (rrb/, the openuf-rrb service) ──────────────────
-# Shipped with openUF: rrb/rrb-unifi.uc (d-malinowski's rrb-unifi, vendored;
-# rrb/README.md) run by /etc/init.d/openuf-rrb. What it needs from the feeds
-# is in PACKAGES: ucode-mod-socket for its raw sockets, kmod-veth for the
-# pair hostapd's ft_iface moves onto. The service is enabled here and starts
-# idle; openUF creates the veth and points hostapd at it on the first config
-# push that carries an FT WLAN (ucihelper.ensure_ft_veth, ftinterop.lua).
-RRB_INIT=${OPENUF_RRB_INIT:-/etc/init.d/openuf-rrb}
-RRB_PEERS=${OPENUF_RRB_PEERS:-/var/run/openuf/rrb-peers.json}
-RRB_UCI=${OPENUF_RRB_UCI:-/etc/config/openuf}
-
+# ── plugins ─────────────────────────────────────────────────────────────────
+# A plugin (plugins.lua; the built-in rrb is the 802.11r translator for
+# genuine UniFi APs) declares the packages it needs and the procd services it
+# runs. `openuf probe plugin-deps` prints them, one per line, in this table's
+# own format for packages (name|evidence|no|what it unlocks (plugin X)) and
+# as service|NAME|PLUGIN for services. The packages are appended to PACKAGES
+# once, so `--check` and `--install` treat them like every other optional
+# one; the services are enabled and started by install.
 openuf_dir() {
 	for d in /usr/lib/openuf /opt/openuf; do
 		[ -f "$d/inform.lua" ] && { printf '%s' "$d"; return 0; }
 	done
 	return 1
 }
-rrb_daemon()    { d=$(openuf_dir) && [ -f "$d/rrb/rrb-unifi.uc" ] && printf '%s' "$d/rrb/rrb-unifi.uc"; }
-rrb_installed() { [ -n "$(rrb_daemon)" ] && [ -f "$RRB_INIT" ]; }
-rrb_version()   { f=$(rrb_daemon) && sed -n "s/^const VERSION = '\([^']*\)'.*/\1/p" "$f" | head -1; }
-# One option of the rrb section, read off the file (uci may be off rpcd's PATH).
-rrb_opt()       { sed -n "s/^[[:space:]]*option $1 '\{0,1\}\([^' ]*\)'\{0,1\}.*/\1/p" "$RRB_UCI" 2>/dev/null | head -1; }
-rrb_enabled()   { [ "$(rrb_opt enabled)" != 0 ]; }
-rrb_ft_iface()  { _n=$(rrb_opt ft_iface); printf '%s' "${_n:-vft0}"; }
-rrb_veth()      { [ -e "/sys/class/net/$(rrb_ft_iface)/ifindex" ]; }
-rrb_running()   { [ -x "$RRB_INIT" ] && "$RRB_INIT" running >/dev/null 2>&1; }
-rrb_learned()   { _n=$(grep -o '"[0-9a-f][0-9a-f]:[0-9a-f:]*":{' "$RRB_PEERS" 2>/dev/null | wc -l | tr -d ' '); printf '%s' "${_n:-0}"; }
-rrb_listed()    { _n=$(grep -c "^[[:space:]]*list peer " "$RRB_UCI" 2>/dev/null); printf '%s' "${_n:-0}"; }
-rrb_missing_packages() {
-	out=""
-	for m in $(missing_packages); do
-		case "$m" in ucode-mod-socket|kmod-veth) out="$out $m" ;; esac
-	done
-	printf '%s' "${out# }"
+
+PLUGIN_DEPS=""
+if d=$(openuf_dir) && have_cmd lua; then
+	PLUGIN_DEPS=$(cd "$d" && lua hook/probe.lua plugin-deps 2>/dev/null)
+fi
+while IFS='|' read -r name how req unlocks; do
+	[ -n "$name" ] || continue
+	[ "$name" = service ] && continue
+	case "$PACKAGES" in
+		*"$name|"*) ;;   # already in the table
+		*) PACKAGES="$PACKAGES
+$name|$how|$req|$unlocks" ;;
+	esac
+done <<PD
+$PLUGIN_DEPS
+PD
+
+plugin_services() {   # lines: NAME PLUGIN
+	printf '%s\n' "$PLUGIN_DEPS" | sed -n 's/^service|\([^|]*\)|\(.*\)$/\1 \2/p'
 }
 
-# Enable and start the service once its packages are there. Status 0 when it
-# runs (or is switched off by openuf.rrb.enabled); never fatal to a caller.
-start_rrb() {
-	rrb_installed || { warn "the translator service is not installed (reinstall openUF)"; return 1; }
-	if ! rrb_enabled; then
-		say "  the 802.11r translator is switched off (openuf.rrb.enabled 0)"
-		return 0
-	fi
-	if [ -n "$(rrb_missing_packages)" ]; then
-		warn "the 802.11r translator needs $(rrb_missing_packages); not started"
-		return 1
-	fi
-	"$RRB_INIT" enable >/dev/null 2>&1
-	if rrb_running; then
-		say "  the 802.11r translator (openuf-rrb $(rrb_version)) is running"
-	elif "$RRB_INIT" start >/dev/null 2>&1; then
-		say "  the 802.11r translator (openuf-rrb $(rrb_version)) started; it waits for an FT WLAN on its veth"
-	else
-		warn "openuf-rrb did not start: $RRB_INIT start"
-		return 1
-	fi
+service_running() { [ -x "/etc/init.d/$1" ] && "/etc/init.d/$1" running >/dev/null 2>&1; }
+service_enabled() { [ -x "/etc/init.d/$1" ] && "/etc/init.d/$1" enabled >/dev/null 2>&1; }
+
+# Enable and start every service a plugin declares. Never fatal to a caller.
+start_plugin_services() {
+	plugin_services | while read -r svc plug; do
+		[ -n "$svc" ] || continue
+		if [ ! -x "/etc/init.d/$svc" ]; then
+			warn "plugin $plug: its service /etc/init.d/$svc is not installed"
+			continue
+		fi
+		"/etc/init.d/$svc" enable >/dev/null 2>&1
+		if service_running "$svc"; then
+			say "  $svc (plugin $plug) is running"
+		elif "/etc/init.d/$svc" start >/dev/null 2>&1; then
+			say "  $svc (plugin $plug) started"
+		else
+			warn "$svc (plugin $plug) did not start: /etc/init.d/$svc start"
+		fi
+	done
 	return 0
 }
 
@@ -319,20 +315,17 @@ PKGS
 		printf '"%s"' "$m"
 	done
 	printf '],"ok":%s,' "$( [ "$full" = true ] && [ -z "$(missing_packages)" ] && printf true || printf false )"
-	if rrb_installed; then ri=true; else ri=false; fi
-	if rrb_enabled; then re=true; else re=false; fi
-	if rrb_veth; then rv=true; else rv=false; fi
-	if rrb_running; then rr=true; else rr=false; fi
-	rver=$(rrb_version)
-	printf '"rrb_unifi":{"installed":%s,"version":%s,"enabled":%s,"veth":%s,"running":%s,"learned":%s,"listed":%s,"missing":[' \
-		"$ri" "$( [ -n "$rver" ] && printf '"%s"' "$(json_str "$rver")" || printf null )" "$re" "$rv" "$rr" "$(rrb_learned)" "$(rrb_listed)"
+	printf '"services":['
 	first=1
-	for m in $(rrb_missing_packages); do
+	plugin_services | while read -r svc plug; do
+		[ -n "$svc" ] || continue
+		if service_enabled "$svc"; then e=true; else e=false; fi
+		if service_running "$svc"; then r=true; else r=false; fi
 		[ "$first" = 1 ] || printf ','
 		first=0
-		printf '"%s"' "$m"
+		printf '{"name":"%s","plugin":"%s","enabled":%s,"running":%s}' "$(json_str "$svc")" "$(json_str "$plug")" "$e" "$r"
 	done
-	printf ']},'
+	printf '],'
 	if luci_present; then l=true; else l=false; fi
 	if theme_present; then t=true; else t=false; fi
 	if theme_wanted; then w=true; else w=false; fi
@@ -406,8 +399,8 @@ install() {   # install <only-wpad 0|1> <library or empty> <theme 0|1>
 		[ -x /etc/init.d/wpad ] && /etc/init.d/wpad restart >/dev/null 2>&1
 		if wifi up >/dev/null 2>&1; then say "  radios brought up on the new build"; fi
 	fi
-	# The 802.11r translator's service, once its two packages are in.
-	[ "$only_wpad" = 1 ] || start_rrb || true
+	# The services the plugins declare, once their packages are in.
+	[ "$only_wpad" = 1 ] || start_plugin_services
 	if [ "$changed" = 1 ] && [ -x /etc/init.d/openuf ]; then
 		# The capability bits openUF claims are probed once, at start.
 		if /etc/init.d/openuf restart >/dev/null 2>&1; then say "openUF restarted"; fi

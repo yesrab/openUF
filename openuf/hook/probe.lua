@@ -241,6 +241,7 @@ function M.describe(dev, config, opts)
 		-- An explicit boolean: a conf.lua from before the option has nil, which
 		-- the daemon runs as off, and the LuCI pages seed UCI from this value.
 		unifi_ft_interop = c.unifi_ft_interop == true,
+		plugins = c.plugins,
 		neighbour_scan_interval = c.neighbour_scan_interval,
 		rrm_enrichment = c.rrm_enrichment, rrm_request_interval = c.rrm_request_interval,
 		roam_assist_diff_db = c.roam_assist_diff_db, country_override = c.country_override,
@@ -252,6 +253,7 @@ function M.describe(dev, config, opts)
 
 	local state_file = c.state_file or "/etc/openuf/state.json"
 	out.state  = read_state(state_file)
+	out.plugins = M._plugins_status(c, out.state)
 	out.health = parse_health(M._read_file(M._status_file))
 	out.ledger = {file = c.unhandled_file or "/etc/openuf/unhandled.json",
 		entries = ledger_size(c.unhandled_file or "/etc/openuf/unhandled.json")}
@@ -263,6 +265,56 @@ function M.describe(dev, config, opts)
 	end
 	out.wlans = wlans
 	return out
+end
+
+-- The plugins (plugins.lua): built in and listed, their load state and what
+-- their status() reports. The daemons' seams are not here, so the ctx gets a
+-- UCI cursor when libuci-lua is present and a read-only view of each
+-- plugin's store from state.json. nil when plugins.lua cannot be loaded.
+function M._plugins_status(c, st)
+	local ok, pl = pcall(function()
+		return (loadfile("plugins.lua") or loadfile("openuf/plugins.lua"))()
+	end)
+	if not ok or type(pl) ~= "table" then return nil end
+	local cfg = {config = c or {}}
+	local okc, uci = pcall(require, "uci")
+	local env = {
+		cursor    = okc and function() return uci.cursor() end or nil,
+		read_file = M._read_file,
+		store     = function(name)
+			return (st and type(st.plugins) == "table" and st.plugins[name]) or {}
+		end,
+	}
+	local ok2, res = pcall(pl.status, cfg, env)
+	return ok2 and res or nil
+end
+
+-- What the enabled plugins declare, for hook/openuf-deps.sh: one line per
+-- package in its PACKAGES format (name|evidence|no|what it unlocks (plugin X))
+-- and service|NAME|PLUGIN per service. Loads the configuration the daemons'
+-- way; prints nothing when it cannot.
+function M.plugin_deps()
+	local ok = pcall(dofile, "conf.lua")
+	if ok then pcall(function() dofile("uciconf.lua").apply() end) end
+	local cfg = {config = config or {}}
+	local okp, pl = pcall(function()
+		return (loadfile("plugins.lua") or loadfile("openuf/plugins.lua"))()
+	end)
+	if not okp or type(pl) ~= "table" then return {} end
+	local lines = {}
+	for _, pk in ipairs(pl.declared(cfg, "packages")) do
+		if type(pk.pkg) == "string" and pk.pkg:match("^[%w%-%._]+$")
+			and type(pk.evidence) == "string" and not pk.evidence:find("|", 1, true) then
+			lines[#lines + 1] = pk.pkg .. "|" .. pk.evidence .. "|no|"
+				.. tostring(pk.unlocks or ""):gsub("|", "/") .. " (plugin " .. pk.plugin .. ")"
+		end
+	end
+	for _, sv in ipairs(pl.declared(cfg, "services")) do
+		if type(sv.name) == "string" and sv.name:match("^[%w%-%._]+$") then
+			lines[#lines + 1] = "service|" .. sv.name .. "|" .. sv.plugin
+		end
+	end
+	return lines
 end
 
 -- Load the configuration the daemons' way and describe it. Only ever called
@@ -698,10 +750,16 @@ end
 
 if not OPENUF_TEST_MODE and arg and arg[0] and arg[0]:match("probe%.lua$") then
 	local what = arg[1]
+	if what == "plugin-deps" then
+		-- plain lines for the shell, not JSON
+		local ok, lines = pcall(M.plugin_deps)
+		if ok then for _, l in ipairs(lines) do print(l) end end
+		os.exit(ok and 0 or 1)
+	end
 	local fn = (what == "status" and M.status) or (what == "presets" and M.presets)
 		or (what == "discover" and M.discover) or (what == "export" and M.export)
 	if not fn then
-		io.stderr:write("usage: openuf probe status|presets|discover|export\n")
+		io.stderr:write("usage: openuf probe status|presets|discover|export|plugin-deps\n")
 		os.exit(2)
 	end
 	local ok, cjson = pcall(require, "cjson")

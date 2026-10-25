@@ -63,6 +63,8 @@ function seedFromStatus(status) {
 			uci.set('openuf', 'main', k, c[k] ? '1' : '0');
 	if (arr(c.keep_wlan_sections).length)
 		uci.set('openuf', 'main', 'keep_wlan_section', c.keep_wlan_sections);
+	if (arr(c.plugins).length)
+		uci.set('openuf', 'main', 'plugin', c.plugins);
 }
 
 // The custom profile starts from what the board says about itself (the
@@ -319,6 +321,10 @@ return view.extend({
 		o = s.taboption('features', form.DynamicList, 'keep_wlan_section', _('Hand-made WiFi networks to keep on air'),
 			_('OpenWrt wireless section names (for example default_radio0) that stay enabled even with the option above ticked.'));
 		o.depends('use_only_unifi_wlan', '1');
+		o.datatype = 'uciname';
+
+		o = s.taboption('features', form.DynamicList, 'plugin', _('Third-party plugins'),
+			_('Names of plugins in /etc/openuf/plugins (one per line, without .lua). A plugin runs as root with the same trust as the configuration file: list only code you have read. The built-in ones have their own switches.'));
 		o.datatype = 'uciname';
 
 		o = s.taboption('features', form.Flag, 'unifi_ft_interop', _('Fast roaming with genuine UniFi access points'),

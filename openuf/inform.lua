@@ -60,7 +60,7 @@ local wlansched = _require_sibling("wlansched")
 local stun      = _require_sibling("stun")
 local shaper    = _require_sibling("shaper")
 local rrbguard  = _require_sibling("rrbguard")
-local ftinterop = _require_sibling("ftinterop")
+local plugins   = _require_sibling("plugins")
 
 local M = {}
 local util = package.loaded["openuf.util"]
@@ -100,7 +100,7 @@ M._assoctrack = assoctrack
 M._satisfaction = satisfaction
 M._stun      = stun
 M._rrbguard  = rrbguard
-M._ftinterop = ftinterop
+M._plugins   = plugins
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -3764,7 +3764,8 @@ function M.handle_response(json_str, st, cfg)
 							device_name = device_name, keep_vlans = port_vlans,
 							peer_ie = M._sysinfo.peer_ie_hex(st and st.mac),
 							backhaul = backhaul_plan,
-							rrb_peers = st and st.rrb_peers})
+							plugin_store = M._plugin_store(st),
+							plugin_repush = M._plugin_repush(st)})
 					M._deny_reloaded()   -- apply_config ran `wifi reload`
 				end
 			end
@@ -4501,6 +4502,11 @@ function M._forget_controller(prev, cfg)
 	if M._ucihelper and M._ucihelper.forget then
 		pcall(M._ucihelper.forget)
 		M._deny_reloaded()   -- forget ran `wifi reload`
+	end
+	-- Plugins' teardown, after the WLANs are gone (a plugin's netdev may have
+	-- carried a WLAN's key exchange until this moment).
+	if M._plugins then
+		pcall(M._plugins.run_hook, "on_forget", cfg, M._plugin_env(prev.plugins and prev or {}))
 	end
 	if M._l2guard then pcall(M._l2guard.reconcile, nil, {}) end
 	if M._sysconf then pcall(M._sysconf.apply_cron, {enabled = false, jobs = {}}) end
@@ -5302,46 +5308,72 @@ function M._rrbguard_tick()
 	return g.tick(now, hour)
 end
 
--- ─── UniFi peers the translator heard (ftinterop.lua, rrb/rrb-unifi.uc) ────
+-- ─── Plugins (plugins.lua) ─────────────────────────────────────────────────
 
--- Every heartbeat: the openuf-rrb daemon records each UniFi BSSID it hears on
--- the LAN, with the mobility domain once a roam announcement verified with
--- that WLAN's key names it (its peers file). A BSSID with a domain is a key
--- holder for that WLAN: it goes into st.rrb_peers (state.json, so a reboot
--- keeps it) and, on an adopted AP, cfgversion is forgotten so the controller
--- pushes the full config again and apply_config writes the new r0kh/r1kh
--- lines. At most one such re-push every RRB_PEERS_REPUSH_GAP, since a push
--- reloads the FT WLANs' BSSes. Returns nil (nothing new), "learned" (kept,
--- no re-push yet) or "repush".
-M.RRB_PEERS_REPUSH_GAP = 600
-M._rrb_peers_next_repush = 0
-function M._rrb_peers_tick(st, cfg)
-	if not (st and cfg and cfg.config and cfg.config.unifi_ft_interop) then return nil end
-	local fti = M._ftinterop
-	if not (fti and fti.learned) then return nil end
-	local learned = fti.learned(fti._read_file)
-	if #learned == 0 then return nil end
-	st.rrb_peers = st.rrb_peers or {}
-	local new = {}
-	for _, p in ipairs(learned) do
-		if p.md and st.rrb_peers[p.bssid] ~= p.md then
-			st.rrb_peers[p.bssid] = p.md
-			new[#new + 1] = p.bssid .. " (" .. p.md .. ")"
+-- What a plugin keeps across restarts and reboots: its own table under
+-- st.plugins[name], saved with the rest of state.json (state.save writes the
+-- whole table). Handed to apply_config and the hooks as ctx.store.
+function M._plugin_store(st)
+	return function(name)
+		if not st then return {} end
+		st.plugins = st.plugins or {}
+		st.plugins[name] = st.plugins[name] or {}
+		return st.plugins[name]
+	end
+end
+
+-- A plugin's request for the controller's full config again (its key holders
+-- changed, say): cfgversion is forgotten so the next inform's mismatch makes
+-- the controller push, the way tools/hotpatch.sh --repush does. Rate-limited
+-- here, not by the plugin, since a push reloads the WLANs' BSSes: at most one
+-- every PLUGIN_REPUSH_GAP across all plugins, and only on an adopted AP.
+-- Returns true when it was done.
+M.PLUGIN_REPUSH_GAP = 600
+M._plugin_next_repush = 0
+function M._plugin_repush(st)
+	return function(name)
+		if not (st and st.adopted) then return false end
+		local now = M._time()
+		if now < M._plugin_next_repush then return false end
+		st.cfgversion = ""
+		M._plugin_next_repush = now + M.PLUGIN_REPUSH_GAP
+		M._state.save(st)
+		io.stderr:write("openuf: plugin " .. tostring(name) .. ": cfgversion forgotten, "
+			.. "the controller pushes the full config again\n")
+		return true
+	end
+end
+
+-- The env every hook outside apply_config gets (ucihelper.plugin_env builds
+-- the same shape from its seams for the push).
+function M._plugin_env(st)
+	local ufuci = M._ucihelper
+	if ufuci and ufuci.plugin_env then
+		return ufuci.plugin_env({plugin_store = M._plugin_store(st),
+			plugin_repush = M._plugin_repush(st)})
+	end
+	return {store = M._plugin_store(st), repush = M._plugin_repush(st)}
+end
+
+-- Every heartbeat: each plugin's tick, and the set of plugins that would run
+-- compared with what state.json remembers. Enabling or removing a plugin
+-- therefore takes effect on the next push openUF asks for, not on a Force
+-- Provision (a plugin's options are rebuilt from scratch on every push).
+function M._plugins_tick(st, cfg)
+	local pl = M._plugins
+	if not (pl and st) then return nil end
+	local fp = pl.fingerprint(cfg)
+	if st.plugins_fp ~= fp then
+		local changed = st.plugins_fp ~= nil
+		st.plugins_fp = fp
+		if changed then
+			io.stderr:write("openuf: the set of plugins changed (" .. (fp ~= "" and fp or "none") .. ")\n")
+			if not M._plugin_repush(st)(nil) then M._state.save(st) end
+		else
+			M._state.save(st)
 		end
 	end
-	if #new == 0 then return nil end
-	io.stderr:write("openuf: rrb: UniFi peer(s) learned: " .. table.concat(new, ", ") .. "\n")
-	local now = M._time()
-	if st.adopted and now >= M._rrb_peers_next_repush then
-		st.cfgversion = ""
-		M._rrb_peers_next_repush = now + M.RRB_PEERS_REPUSH_GAP
-		M._state.save(st)
-		io.stderr:write("openuf: rrb: cfgversion forgotten so the controller pushes the "
-			.. "full config again; the new peer(s) become key holders then\n")
-		return "repush"
-	end
-	M._state.save(st)
-	return "learned"
+	return pl.run_hook("tick", cfg, M._plugin_env(st))
 end
 
 -- ─── WiFi Blackout Schedule ─────────────────────────────────────────────────
@@ -5850,7 +5882,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	pcall(M._block_resync, st)
 	pcall(M._sched_resync, st)
 	pcall(M._rrbguard_tick)
-	pcall(M._rrb_peers_tick, st, cfg)
+	pcall(M._plugins_tick, st, cfg)
 
 	local ok_b, json_str = pcall(M.build_json, st, cfg, ufhw)
 	-- The cycle's ucihelper pass, opened above, ends here whether or not
@@ -6042,6 +6074,9 @@ function M.run(cfg, ufhw)
 		M._led.set_enabled(cfg and cfg.led, st.led_enabled)
 	end
 	M._reapply_airtime(st)
+	-- Plugins rebuild whatever kernel state of theirs a reboot discarded, the
+	-- same discipline as everything above.
+	if M._plugins then pcall(M._plugins.run_hook, "on_boot", cfg, M._plugin_env(st)) end
 	-- Per-port byte counters are a switch-driver setting that some boards ship
 	-- switched off; without it every socket reports 0 B in the Ports view.
 	if M._switchvlan then pcall(M._switchvlan.enable_mib_polling, cfg) end

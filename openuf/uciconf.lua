@@ -36,6 +36,7 @@
 	      option modelmap 'auto'          option ufmodel 'auto'
 	      option inform_url '...'         option use_only_unifi_wlan '1'
 	      list keep_wlan_section 'x'      option l2_announce '1'
+	      list plugin 'name'              (third-party plugins, USAGE "Plugins")
 	      option neighbour_scan_interval '0'
 	      option rrm_enrichment '1'       option rrm_request_interval '600'
 	      option roam_assist_diff_db '8'  option country_override ''
@@ -190,6 +191,11 @@ local function build_config(main, defaults)
 	end
 	if main.keep_wlan_section ~= nil then
 		cfg.keep_wlan_sections = to_list(main.keep_wlan_section)
+	end
+	-- Third-party plugins (plugins.lua): `list plugin 'name'`, the same
+	-- allowlist conf.lua's `plugins = {}` is.
+	if main.plugin ~= nil then
+		cfg.plugins = to_list(main.plugin)
 	end
 	return cfg
 end
