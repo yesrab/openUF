@@ -65,6 +65,30 @@ register_shell() {
 	echo "$1" >> "$SHELLS"
 }
 
+# /etc/shadow is never edited in place: the new contents go to a temp file
+# beside it and are renamed over it (rename(2) is atomic), so a reader never
+# sees half a file and a failed write leaves the old one. Under busybox's
+# `lock` where the image has it, so two runs cannot interleave.
+SHADOW_LOCK=/var/lock/openuf-shadow.lock
+shadow_lock()   { command -v lock >/dev/null 2>&1 && lock "$SHADOW_LOCK"; return 0; }
+shadow_unlock() { command -v lock >/dev/null 2>&1 && lock -u "$SHADOW_LOCK"; return 0; }
+# stdin -> /etc/shadow. An empty result (a failed sed) is refused.
+shadow_replace() {
+	_t="/etc/shadow.openuf.$$"
+	( umask 077; cat > "$_t" ) && [ -s "$_t" ] && mv -f "$_t" /etc/shadow \
+		|| { rm -f "$_t"; echo "openuf-bootstrap: /etc/shadow not updated" >&2; return 1; }
+}
+shadow_append() {
+	shadow_lock
+	{
+		cat /etc/shadow
+		# A last line without its newline would swallow the entry.
+		[ -s /etc/shadow ] && [ -n "$(tail -c1 /etc/shadow)" ] && echo
+		echo "$1"
+	} | shadow_replace
+	shadow_unlock
+}
+
 if grep -q '^ubnt:' /etc/passwd 2>/dev/null; then
 	# Whatever shell the account has (a file install's is under /opt/openuf):
 	# every account made before 2026-10-25 is missing from /etc/shells, and
@@ -96,7 +120,7 @@ chmod +x "$SHELL_"
 echo "ubnt:x:$UID_:$GID:openuf bootstrap adoption:$STATE_DIR:$SHELL_" >> /etc/passwd
 # Locked ("!") until a hash is in: an image without the openssl CLI used to
 # get an EMPTY hash here, which is an account with no password at all.
-echo "ubnt:!:::::::" >> /etc/shadow
+shadow_append "ubnt:!:::::::"
 register_shell "$SHELL_"
 
 # The hash, from whatever the image has: the openssl CLI (openssl-util);
@@ -104,7 +128,7 @@ register_shell "$SHELL_"
 # taken the terminal away (with a tty it would ask there); uhttpd's -m, the
 # md5 crypt LuCI uses for its own HTTP passwords. Any of them beats a locked
 # account, and a locked account beats an open one.
-set_hash() { sed -i "s|^ubnt:[^:]*:|ubnt:$1:|" /etc/shadow; }
+set_hash() { shadow_lock; sed "s|^ubnt:[^:]*:|ubnt:$1:|" /etc/shadow | shadow_replace; shadow_unlock; }
 HASHED=0
 if command -v openssl >/dev/null 2>&1; then
 	_h=$(openssl passwd -6 ubnt 2>/dev/null)
@@ -127,7 +151,9 @@ chmod g+w "$STATE_DIR"
 # existing file for writing needs permission on the file itself.
 [ -f "$STATE_DIR/state.json" ] || : > "$STATE_DIR/state.json"
 chgrp "$GID" "$STATE_DIR/state.json"
-chmod 664 "$STATE_DIR/state.json"
+# 660, not 664: the authkey stays off world read. (state.save replaces the
+# file by rename, so later copies take the writer's umask.)
+chmod 660 "$STATE_DIR/state.json"
 
 # Tell the daemon the account exists, so it locks and unlocks it with the
 # adoption state: in UCI where UCI is in charge (a `main` section), else in
