@@ -333,9 +333,11 @@ return {
 	{
 		name = "assoctrack: ensure_table installs only when the table is missing",
 		fn = function()
-			local o = at._exec
+			local o, op = at._exec, at._popen
 			local cmds = {}
+			at._shape_checked = nil
 			at._exec = function(cmd) cmds[#cmds + 1] = cmd; return 0 end  -- Lua 5.1 shape
+			at._popen = function() return "\t\ttype ether_addr\n\t\tsize 4096\n" end
 			local ok1 = at.ensure_table()
 			at._exec = function(cmd)
 				cmds[#cmds + 1] = cmd
@@ -344,11 +346,33 @@ return {
 			end
 			local before = #cmds
 			local ok2 = at.ensure_table()
-			at._exec = o
+			at._exec, at._popen = o, op
 			assert_true(ok1, "present")
 			assert_eq(before, 1, "present: only listed, never rebuilt (that would empty the sets)")
 			assert_true(ok2, "installed")
 			assert_true(cmds[#cmds]:find("^nft %-f ") ~= nil, "missing: loaded from a script")
+		end
+	},
+	{
+		-- Lab: after an upgrade the running table still showed `size 65535`
+		-- (the kernel default) on every set, because a present table was kept.
+		name = "assoctrack: ensure_table rebuilds an older table without the size cap, once",
+		fn = function()
+			local o, op = at._exec, at._popen
+			local cmds, lists = {}, 0
+			at._shape_checked = nil
+			at._exec = function(cmd) cmds[#cmds + 1] = cmd; return 0 end
+			at._popen = function() lists = lists + 1; return "\t\ttype ether_addr\n\t\tsize 65535\n" end
+			local ok1 = at.ensure_table()
+			local after1 = #cmds
+			local ok2 = at.ensure_table()
+			at._exec, at._popen = o, op
+			assert_true(ok1, "rebuilt")
+			assert_eq(after1, 2, "listed, then loaded")
+			assert_true(cmds[2]:find("^nft %-f ") ~= nil, "old shape: loaded from a script")
+			assert_true(ok2, "present")
+			assert_eq(#cmds, 3, "second call only lists: the shape is checked once per process")
+			assert_eq(lists, 1, "set listed once")
 		end
 	},
 	{
