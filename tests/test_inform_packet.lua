@@ -401,6 +401,18 @@ return {
 		end
 	},
 	{
+		name = "inform packet: setparam ignores an inform_url that is not an http(s) URL",
+		fn = function()
+			local st = sample_state({inform_url = "http://192.0.2.10:8080/inform"})
+			local out = with_stderr(function()
+				inform.handle_response('{"_type":"setparam","mgmt_cfg":"inform_url=unifi:8080\\n"}', st)
+				inform.handle_response('{"_type":"setparam","mgmt_cfg":"inform_url=http://x/a b\\n"}', st)
+			end)
+			assert_eq(st.inform_url, "http://192.0.2.10:8080/inform", "the working URL is kept")
+			assert_contains(out, "not an http(s) URL", "and the refusal is logged")
+		end
+	},
+	{
 		name = "inform packet: handle_response setparam does NOT update inform_url from mgmt_url",
 		fn = function()
 			-- Confirmed live against a real controller (2026-07-14): mgmt_url is

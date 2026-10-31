@@ -4575,7 +4575,14 @@ function M.handle_response(json_str, st, cfg)
 						-- the very next routine setparam cycle after adoption,
 						-- breaking the inform loop for good (http-only builds have
 						-- no luasec, so switching to that https URL is fatal).
-						if v ~= "" then st.inform_url = v end
+						-- An http(s) URL only, as syswrapper set-inform checks:
+						-- anything else would end the inform loop on the next tick.
+						if v ~= "" and v:match("^https?://%S+$") then
+							st.inform_url = v
+						elseif v ~= "" then
+							io.stderr:write(("inform: mgmt_cfg inform_url %q is not an http(s) URL -- kept %s\n")
+								:format(v, tostring(st.inform_url)))
+						end
 					elseif k == "capability" then
 						-- "notif,notif-assoc-stat" from every 10.x controller:
 						-- the request for per-connection STA_ASSOC_TRACKER
