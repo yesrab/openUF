@@ -51,6 +51,11 @@ M.NFT_TABLE  = M.NFT_FAMILY .. " " .. M.NFT_NAME
 -- reference the parser subtracts `expires` from.
 M.SET_TIMEOUT = 120
 
+-- Element cap per set. Without one a dynamic set grows with every source MAC
+-- the bridge forwards (spoofed ones included) for as long as the timeout
+-- keeps them; when full, `add` simply adds nothing and the frame passes.
+M.SET_SIZE = 4096
+
 -- How long a station has after association to finish the handshake.
 M.AUTH_WINDOW = 10
 -- How long a station has after authorization to show DHCP/DNS evidence.
@@ -75,7 +80,8 @@ function M.nft_script()
 	}
 	for _, s in ipairs(M.SETS) do
 		lines[#lines + 1] = string.format(
-			"  set %s { type ether_addr; flags dynamic,timeout; timeout %ds; counter; }", s, t)
+			"  set %s { type ether_addr; flags dynamic,timeout; timeout %ds; size %d; counter; }",
+			s, t, M.SET_SIZE)
 	end
 	local rules = {
 		-- Client -> server: the station asked for a lease.

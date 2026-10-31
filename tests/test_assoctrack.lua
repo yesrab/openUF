@@ -138,8 +138,8 @@ return {
 			assert_true(s:find("^table bridge openuf_assoc\ndelete table bridge openuf_assoc\n") ~= nil,
 				"create-delete-create: a re-run replaces instead of appending rules")
 			for _, name in ipairs(at.SETS) do
-				assert_true(s:find("set " .. name .. " { type ether_addr; flags dynamic,timeout; timeout 120s; counter; }", 1, true) ~= nil,
-					name .. " is a timed, counting dynamic set")
+				assert_true(s:find("set " .. name .. " { type ether_addr; flags dynamic,timeout; timeout 120s; size 4096; counter; }", 1, true) ~= nil,
+					name .. " is a timed, counting, bounded dynamic set")
 			end
 			-- `add`, never `update`: update refreshes the element and the
 			-- first-seen time would be lost.
