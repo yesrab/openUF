@@ -5343,6 +5343,10 @@ end
 
 -- ─── HTTP POST ───────────────────────────────────────────────────────────────
 
+-- Largest inform response read, headers included. A full config push is tens
+-- of KB; this leaves wide room and still stops a runaway peer.
+M.HTTP_MAX_RESPONSE = 2 * 1024 * 1024
+
 -- POST a binary payload to the inform URL.
 -- Returns the raw response body or nil, error_msg.
 function M.http_post(url, body)
@@ -5409,11 +5413,18 @@ function M.http_post(url, body)
 	-- always smaller than one read, so the body lives entirely in that `partial`
 	-- third value — it must be captured or every response is silently lost
 	-- ("HTTP nil") and adoption never completes.
-	local response = {}
+	-- Bounded: a peer that never stops sending would otherwise grow this
+	-- until the AP runs out of memory.
+	local response, got = {}, 0
 	while true do
 		local chunk, recv_err, partial = tcp:receive(4096)
 		if chunk then
 			response[#response + 1] = chunk
+			got = got + #chunk
+			if got > M.HTTP_MAX_RESPONSE then
+				tcp:close()
+				return nil, ("response over %d bytes -- dropped"):format(M.HTTP_MAX_RESPONSE)
+			end
 		else
 			if partial and #partial > 0 then
 				response[#response + 1] = partial

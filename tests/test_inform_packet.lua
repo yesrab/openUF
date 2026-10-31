@@ -7276,6 +7276,31 @@ return {
 		end
 	},
 	{
+		name = "inform: http_post stops reading a response past HTTP_MAX_RESPONSE",
+		fn = function()
+			local o_sock, o_max, o_hp = package.loaded.socket, inform.HTTP_MAX_RESPONSE, inform._http_post
+			local reads, closed = 0, false
+			local tcp = {
+				settimeout = function() end, connect = function() return 1 end,
+				send = function() return 1 end, close = function() closed = true end,
+				receive = function(_, n)
+					reads = reads + 1
+					if reads > 1000 then return nil, "closed", "" end  -- safety stop for the old code
+					return ("x"):rep(n)
+				end,
+			}
+			package.loaded.socket = {tcp = function() return tcp end}
+			inform.HTTP_MAX_RESPONSE, inform._http_post = 16384, nil
+			local ok, resp, err = pcall(inform.http_post, "http://192.0.2.10:8080/inform", "body")
+			package.loaded.socket, inform.HTTP_MAX_RESPONSE, inform._http_post = o_sock, o_max, o_hp
+			assert_true(ok, tostring(resp))
+			assert_nil(resp, "no body for an oversized response")
+			assert_contains(tostring(err), "over 16384 bytes", "said why")
+			assert_true(reads <= 5, "stopped reading once over the cap")
+			assert_true(closed, "and closed the socket")
+		end
+	},
+	{
 		-- A roam report spoils with delay; a funnel event does not. Roams go
 		-- first, and a failed roam POST stops the funnel too (the controller
 		-- is not answering).
