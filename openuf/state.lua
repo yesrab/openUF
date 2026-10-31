@@ -197,6 +197,12 @@ function M.load()
 	-- Security invariant: never use a custom key when not adopted
 	if not st.adopted then
 		st.authkey = M.DEFAULT_KEY
+	elseif not st.authkey:match("^%x+$") or #st.authkey ~= 32 then
+		-- An AES-128 key is 32 hex digits; anything else cannot encrypt an
+		-- inform. Said out loud: the controller will see a key it never gave.
+		io.stderr:write("state: " .. M._state_file .. " authkey is not 32 hex digits -- "
+			.. "using the default key; the device will need adopting again\n")
+		st.authkey = M.DEFAULT_KEY
 	end
 
 	return st

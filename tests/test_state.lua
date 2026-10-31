@@ -82,6 +82,25 @@ return {
 		end
 	},
 	{
+		name = "state: load refuses an authkey that is not 32 hex digits, and says so",
+		fn = function()
+			with_tmp(function()
+				for _, bad in ipairs({"aabbcc", "zzbbccddeeff00112233445566778899",
+				                      "aabbccddeeff00112233445566778899aa"}) do
+					state.save({authkey = bad, adopted = true, cfgversion = "v1",
+						inform_url = "http://unifi:8080/inform"})
+					local real, buf = io.stderr, {}
+					io.stderr = {write = function(_, s) buf[#buf + 1] = s end}
+					local ok, loaded = pcall(state.load)
+					io.stderr = real
+					assert_true(ok, tostring(loaded))
+					assert_eq(loaded.authkey, state.DEFAULT_KEY, "default key instead of " .. bad)
+					assert_true(table.concat(buf):find("not 32 hex", 1, true) ~= nil, "logged for " .. bad)
+				end
+			end)
+		end
+	},
+	{
 		name = "state: reset sets adopted=false and clears authkey",
 		fn = function()
 			with_tmp(function()
