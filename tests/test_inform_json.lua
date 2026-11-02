@@ -702,6 +702,10 @@ return {
 				inform._inform_ip_cache = nil
 				local d = build({st = {inform_url = "http://192.0.2.7:8080/inform"}})
 				assert_eq(d.inform_ip, "192.0.2.7", "inform_ip in build_json")
+				-- Beside it, the shortest heartbeat this device runs: exactly 1,
+				-- the value the Network app's client panel needs from the
+				-- uplink AP before it draws the live dBm graph.
+				assert_eq(d.inform_min_interval, 1, "inform_min_interval in build_json")
 			end)
 			inform._dns_toip, inform._time = real_dns, real_time
 			inform._inform_ip_cache = nil

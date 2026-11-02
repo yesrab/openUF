@@ -508,7 +508,9 @@ at startup. `install.sh uninstall` still removes both.
   The ledger redacts by field NAME (`psk`, `passphrase`, `authkey`, `token`, `*key`...), so
   never hand it a payload whose secret sits under an innocent name, and never name a
   payload field of your own `*_key` (the first version did, and redacted its own sample).
-  The `noop`'s `interval` is honoured (clamped 5–300 s); `_tick` re-reads it every cycle.
+  The `noop`'s `interval` is honoured (clamped 1–300 s since 2026-11-03: a watched device
+  that reports `inform_min_interval: 1`, as `build_json` does, is asked for 1 s heartbeats);
+  `_tick` re-reads it every cycle.
 - **`syswrapper.sh 11k-scan` does not scan. It leaves a dated request file** (`/tmp/openuf-
   scan-request`) that the daemon's `_maybe_scan_neighbours` consumes on the next heartbeat,
   ignoring anything older than ten minutes. Every sweep goes through `_force_scan`

@@ -1937,6 +1937,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 |---|---|
 | Device doesn't appear in UniFi Discover | `announce.lua` not running, or UDP port 10001 blocked |
 | Controller shows device as "Disconnected" | `inform.lua` not running, or wrong `inform_url` |
+| The AP informs once a second (and its load rises) while someone has a client or device panel open | Expected since 2026-11-03: the inform reports `inform_min_interval: 1` and the controller asks a watched device for 1 s heartbeats -- that is what draws the client panel's live dBm graph. It stops when the panel closes |
 | Controller shows the device's IP as `0.0.0.0` although it has one | A build before 2026-10-26 read the address once at startup; on a DHCP-managed AP the service can start before the lease arrives (seen on both lab APs after a fresh install). `/etc/init.d/openuf restart` re-reads it; current builds re-read it every heartbeat |
 | Adoption fails with SSH error | SSH not reachable from controller, or root password not set — run `passwd root` on the device, or reinstall with `--bootstrap-adopt` |
 | Mobile app or controller asks for root credentials ("advanced adoption") although the `ubnt` account exists | `logread` shows `User 'ubnt' has invalid shell, rejected`: the account's forced shell is not in `/etc/shells`, which dropbear checks before the password. Run `openuf bootstrap-account`, or `sh install.sh install --bootstrap-adopt` on a file install — both register it for an existing account |

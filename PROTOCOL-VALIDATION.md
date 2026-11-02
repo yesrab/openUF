@@ -610,7 +610,7 @@ The complete set, per `InformServlet`: `noop`, `setparam`, `cmd`, `upgrade`, `re
 
 | `_type` | Shape | Notes |
 |---|---|---|
-| `noop` | `{"_type":"noop","interval":…,"live_update":false,"include_blocks":[],"server_time_in_utc":"…"}` | Steady state. `interval` is the cadence the controller wants -- `10` normally, but **not constant**: on 2026-09-15 the UCG Ultra answered with 16–19 for two stretches of a minute or two while the RF stats page was open in the UI, then went back to 10. Honoured since that day (clamped to 5–300 s, back to the device's 10 s when absent) -- openUF used to discard it, so its informs would have kept arriving every 10 s against the controller's wish. `live_update` has only ever been observed `false` (row 17 in REVERSE-ENGINEERING.md's backlog); `include_blocks` see block-sta below. |
+| `noop` | `{"_type":"noop","interval":…,"live_update":false,"include_blocks":[],"server_time_in_utc":"…"}` | Steady state. `interval` is the cadence the controller wants -- `10` normally, but **not constant**: on 2026-09-15 the UCG Ultra answered with 16–19 for two stretches of a minute or two while the RF stats page was open in the UI, then went back to 10. Honoured since that day (clamped to 5–300 s then, 1–300 s since 2026-11-03; back to the device's 10 s when absent) -- openUF used to discard it, so its informs would have kept arriving every 10 s against the controller's wish. The 16–19 s are the controller's device-count-based background cadence; a **watched** device (a device or client panel open in a UI session) is answered with the `inform_min_interval` its own inform reports instead -- see "Live statistics" under `sta_table[]`. `live_update` has only ever been observed `false` (row 17 in REVERSE-ENGINEERING.md's backlog), and 10.6.109's decompile says why: true only for a gateway (usg2 capability bit 16) on a watched site, so since 2026-11-03 it is a named field in `KNOWN_TOP_FIELDS` rather than a ledger entry; `include_blocks` see block-sta below. |
 | `setparam` | `{"_type":"setparam","mgmt_cfg":"…","system_cfg":"…","server_time_in_utc":"…"}` | Both configs are flat `key=value` blobs. See [system_cfg](#system_cfg-the-real-config-channel). |
 | `cmd` | `{"_type":"cmd","cmd":"…","mac":"…","device_id":"…",…}` | See command table below. |
 | `upgrade` | `{"_type":"upgrade","version":"6.8.2.15592","md5sum":"…","url":"http://fw-download.ubnt.com/…"}` | Fire-and-forget, sent exactly once; no retry, no confirmation expected. |
@@ -865,6 +865,69 @@ strands the interface if no DHCP server can grant a fresh lease. `netconfig.appl
 therefore only called when `st.ip_mode == "static"` already, i.e. when genuinely reverting our
 own prior static push; first contact and steady-state reaffirmations are a no-op, matching how
 real hardware's continuously-running DHCP client needs no manual re-invocation.
+
+#### What a static push does on a genuine AP, and what openUF does with the same bytes (read 2026-11-03)
+
+Read off the controller's config writer (10.6.109, `com.ubnt.service.config.RngEFIxepjqE` and
+`config.ubntconf.kIOTHWZbBOoNY`, decompiled) and the UAP-AC-HD 6.8.2 firmware image (`sbin/ubntbox`,
+`usr/etc/syswrapper.sh`, `usr/etc/udhcpc/udhcpc`), not off a capture -- so the shape of a *static*
+push is known without one having been pushed here:
+
+| Controller writes | Static | DHCP |
+|---|---|---|
+| `netconf.<n>` for the management device (`br0` on an AP, first in the list, so `1`) | `status=enabled devname=br0 ip=<ip> autoip.status=disabled netmask=<mask> promisc=… up=enabled` | the same line with `ip=0.0.0.0` and no `netmask` |
+| `dhcpc.status` | `enabled` | `enabled` |
+| `dhcpc.1` | **absent** | `status=enabled devname=br0` |
+| `route.1` | `status=enabled devname=br0 ip=0.0.0.0 gateway=<gw>` | absent |
+| `route.status` | `enabled` | `enabled` |
+| `resolv.nameserver.1` / `.2` | `.ip=<dns1>` / `<dns2>` when set, else `.status=disabled` | `.status=disabled`, both |
+| `resolv.search` | `<dnssuffix>` when set | — |
+| `resolv.host.1.name` | the device's name, both modes | |
+
+The controller's own record is `config_network = {type: "static"|"dhcp", ip, netmask, gateway, dns1,
+dns2, dnssuffix}`; a static record with no `ip` is written as `192.168.1.20`. So the absent `dhcpc.1`
+is the whole DHCP-vs-static signal, exactly what `_parse_net_system_cfg` keys on, and `netconf.1` is
+the management bridge on an AP (a VLAN'd AP keeps it at `1`, see `switch.*` below).
+
+What the firmware then does (`mcad` writes `/tmp/system.cfg` and calls `syswrapper.sh apply-config`):
+
+1. `ubntconf -c /tmp/system.cfg -p /tmp/running.cfg -d /tmp/apply.sh` diffs the new file against the
+   running one and emits a shell script when every changed property has a fast-apply handler;
+   `netconf.`, `dhcpc.`, `route.` and `resolv.` all have one, so an IP change never restarts the whole
+   stack (`/usr/etc/rc.d/rc restart` is the fallback for a property without a handler).
+2. That script removes the `udhcpc -f -i br0 -V ubnt …` respawn line from `/etc/inittab`, `init -q`,
+   and **kills the DHCP client** by its pid file; sets the address on the bridge; `route add default
+   gw <gw>`; writes `/etc/resolv.conf` from `resolv.nameserver.*` and the search domain; sets the
+   kernel hostname from `resolv.host.1.name`.
+3. `set_cfg_save` marks the config dirty and the next save writes it to flash (`cfgmtd -w -p /etc
+   /tmp/system.cfg`); at boot `rc start` copies it to `/tmp/running.cfg` and the same handlers apply
+   it, so the static address is up before any daemon is.
+4. `mca-ctrl -t notify-bg-provision-done` → an inform from the new address; the controller reads the
+   inform's `ip` and `inform_ip`.
+
+Reverting to DHCP is the inverse: `dhcpc.1` comes back, the respawn line returns to inittab with the
+hostname (`-h <resolv.host.1.name>`, so the lease carries the controller's name for the AP), and the
+hook script does `ifconfig`, `route add default gw`, `resolv.conf`, and reads DHCP option 43 for the
+controller address (`unifi_addr` / `unifi_controller` → `mca-cli-op set-inform`) while unadopted.
+
+openUF against that -- same bytes, different mechanism:
+
+| | Genuine AP | openUF (`netconfig.lua`, `_parse_net_system_cfg`) |
+|---|---|---|
+| Keys read | as above | `netconf.1.ip`/`.netmask`, `route.1.gateway`, `dhcpc.1.status`, `resolv.nameserver.<k>.ip`, `resolv.host.1.name` (WPS name only) -- the same signal, so a static push parses as the firmware would |
+| Address | `ifconfig br0 <ip> netmask <mask>` | `ip addr flush` + `ip addr add <ip>/<prefix>` on `lan_cpueth` |
+| Gateway | `route add default gw` | `ip route replace default via` |
+| DNS | `/etc/resolv.conf` rewritten | the same file, static path only |
+| DHCP client | **stopped**, not restarted until the `dhcpc.1` line returns | **left running**: netifd's `udhcpc` for `lan` keeps renewing the old lease. Nothing re-adds the address while the lease is unchanged, but a rebind to a new address, an `ifup lan`, or a reload that touches `lan` puts the DHCP address and its default route back beside the static one |
+| Persistence | flash (`cfgmtd`), applied by the init scripts at boot | `state.json` (`ip_mode`, `static_*`), re-applied by `_reapply_static_ip` when the daemon starts -- after netifd has already run DHCP, and racing a lease that lands later |
+| Hostname / DHCP `-h` | both follow the controller's name | not set |
+| `resolv.search` | honoured | not read |
+| Revert to DHCP | DHCP client respawned | `ip addr flush` + one-shot `udhcpc -n -q`; netifd's client is still there to renew |
+
+The OpenWrt-native equivalent of what the firmware does is `network.lan.proto=static` with
+`ipaddr`/`netmask`/`gateway`/`dns` in `/etc/config/network` and `ifup lan` (netifd stops its own
+DHCP client, the setting survives reboots and sysupgrade's config keep), and `proto=dhcp` + `ifup
+lan` to revert. Not done: an assessment, not a change -- validation row 74.
 
 ### `switch.*` — per-port VLAN
 
@@ -1557,6 +1620,8 @@ Nested, **not** a flat top-level `user_table`.
 | `signal`, `rssi` | Both the same value; `iw` exposes no separately-measured RSSI |
 | `rx_bytes`, `tx_bytes`, `rx_packets`, `tx_packets` | **Raw cumulative counters.** The vapInformProcessor computes its own `tx_bytes-d`/`rx_bytes-d`/`bytes-d`/`bytes-r` deltas server-side keyed by `time_delta` — never send a pre-computed rate here. |
 | `tx_rate`, `rx_rate` | **Kbps** (`iw` reports Mbit/s, so ×1000) |
+| `rate_imbalance` | **Not a wire field: the controller derives it** (`com.ubnt.service.wifi.UQKIrjV`, 10.6.109): `(rx_rate − tx_rate) / max(rx_rate, tx_rate) × 100`; the client panel's "AP/Client Signal Balance" reads Good at \|x\| ≤ 40, Poor above. Nothing to send; the row needs both rates non-zero |
+| `is_mlo`, `mld_mac`, `mlo_details[]` | Wi-Fi 7 multi-link clients only: one `{mac, channel, channel_width, radio, radio_name, radio_proto, rx_bytes, rx_packets, rx_rate, tx_bytes, tx_packets, tx_rate, rssi, signal, tx_mcs_index, noise, mimo}` per link, rendered as the per-band cards under the client panel (Signal Balance, Rx Rate, Tx Rate each). Shown only when `is_mlo`; a non-MLO client on a genuine AP has none either. Not sent -- no MLO here |
 | `uptime`, `idletime` | `iw`'s "connected time" / "inactive time", both in seconds |
 | **`tx_mcs`**, `rx_mcs` | Not `tx_mcs_index` (that name is only the ucore-message JSON name for a different internal event). Absent for legacy pre-11n rates. |
 | `nss` | Read directly by the controller, no derivation |
@@ -1609,6 +1674,37 @@ straight passthrough — `com.ubnt.service.l.e.AcrQJeJCScLn`:
 `tx_mcs`, `ccq`, `noise`, `nss` as **plain data**; the controller computes nothing itself beyond
 a running `satisfaction_avg` accumulator. Real AP firmware computes it on-device with a
 proprietary formula. Sending nothing renders as "No Experience", correctly.
+
+### Live statistics: `inform_min_interval`, the watched cadence, and the client panel's dBm graph
+
+Two screenshots of a genuine U7 Pro's client panel (2026-11-02) show a live dBm graph under the
+Signal / WiFi Standard / Live Throughput strip that openUF's clients never had. The gate is in the
+Network app's bundle (`59460.*.js`, 10.6.109): the graph component renders only when the client's
+**uplink AP** record has `min_inform_interval_seconds === 1`; the strip above it renders regardless.
+Where that field comes from, traced through the decompiled controller:
+
+- The inform payload carries `inform_min_interval` (an integer; UAP-AC-HD 6.8.2's `mcad` has the
+  key). The inform processor (`devmgr.l.mMObEXELV`) stores it on the device record as
+  `min_inform_interval_seconds`; the device API exposes `supports_live_updates` = (it is 1).
+- The noop's `interval` is chosen by the inform-interval service (`devmgr.l.c.vFiJoQiuQjMZUx`): a
+  WiFiman device gets 1; a device nobody is looking at gets the device-count-based background
+  cadence (the 16–19 s seen on 2026-09-15); a **watched** device -- some UI session has its device
+  panel or one of its clients' panels open, `watched` on the record with a timeout -- gets its own
+  `min_inform_interval_seconds`, which defaults per device type when the inform names none
+  (`uap` 10, `udm`/`uxg` 1, `uble` 120). The result is floored at the device's minimum
+  (`setLimitedNextIntervalSeconds`), so a device reporting a *higher* value slows the controller down.
+- So the graph needs two things from the AP: report `1`, and actually inform once a second while
+  watched. The graph's points are the station's `signal` from each inform; the UI interpolates
+  between them, so the 1 s heartbeat is what makes it a trace rather than a staircase.
+
+openUF since 2026-11-03: `build_json` sends `inform_min_interval = 1` and `_sane_interval` accepts 1
+(the floor was 5). Cost, measured in the armsr QEMU VM with no stations: `build_json` +
+`build_packet` 37 ms on average, 125 ms worst over 30 cycles -- load that exists only while a panel
+is open, bounded by one heartbeat per second. A real board is slower. **Confirmed on AP1 on
+2026-11-03**: hotpatched with this tree, the graph appeared under Signal for one of its clients
+-- validation row 73. Nothing else in the screenshots is a wire gap: "AP/Client Signal
+Balance" is controller-derived from `tx_rate`/`rx_rate`, and the per-band cards are MLO-only (both
+in the `sta_table[]` table above).
 
 ### `port_table[]` entry
 
@@ -2421,6 +2517,8 @@ through the real UI with the resulting wire payload captured or the effect verif
 | 70 | Real UniFi AP as a sibling | vendor element `00:15:6d` type 1, TLV `0x81` = serialno → `is_unifi`/`serialno` | ⚠️ Adopted 2026-10-18; upstream saw a neighbour's current-firmware AP. No UniFi AP on this site |
 | 71 | Hygiene from upstream's audit | `bridge openuf_usteer` (usteerd's sync kept off the VAPs), `l2guard.reconcile_hairpin`, one `nft -f` transaction per table, mt76 counter underflow read as 0, two random 11k-scan times (the firmware's own spread, kept), `util.lua` sysfs reads, per-cycle garbage collection. Not taken, by decision: the LLDP and sibling-tag caches and the hourly beacon requests -- reports here follow reality on the next heartbeat | ⚠️ Adopted 2026-10-18; all of it upstream's evidence (both their boards). Not measured on a JioRouter |
 | 72 | 802.11r with genuine UniFi APs (`unifi_ft_interop`) | UniFi's mobility domain (first two bytes of SHA1("salt" .. SSID padded to 32)), `ft_psk_generate_local 0`, `nasid` = BSSID, per-peer `r0kh`/`r1kh` from `/etc/config/rrb-unifi` plus the wildcards, `hostapd_bss_options 'ft_iface=vft0'` when the veth exists; the external rrb-unifi translator reframes the RRB frames | ⚠️ Adopted 2026-10-25 from d-malinowski/openUF; their hardware evidence only (BT Home Hub 5A ↔ U7 Lite, FT-PSK, both directions). On by default for new installations (the user's decision; d-malinowski ships it off); set to `0` the section is byte-identical to before. ✅ The install path (`openuf deps --install --only-rrb-unifi` from the fork, veth, service) and the hostapd side (BSS up with the option set, the `0x88b7` socket on `vft0`, `rrb-unifi check OK`) proven in the 25.12.6 QEMU VM on 2026-10-25. **The roam against a UniFi AP is not run here: the lab has none** (REVERSE-ENGINEERING.md backlog row 25) |
+| 73 | Live statistics (the client panel's dBm graph) | inform `inform_min_interval: 1` → device record `min_inform_interval_seconds` / `supports_live_updates`; the noop's `interval` becomes 1 while the device is watched | ⚠️ Implemented 2026-11-03 from the 10.6.109 decompile and a U7 Pro screenshot: the field rides every inform, the clamp accepts 1, the heartbeat cost measured in the VM (37 ms avg, 125 ms worst, no clients). ✅ Confirmed on AP1 2026-11-03 (`tools/hotpatch.sh`, package install): the graph appeared on a client's panel. The AP's load during a watched minute not yet looked at |
+| 74 | IP Settings: what a genuine AP does with the same push | `netconf.1` / `dhcpc.1` / `route.1` / `resolv.*` (controller writer decompiled, firmware fast-apply read) | 🔍 Assessment only, no change: the bytes openUF keys on are the ones the controller writes for static (`dhcpc.1` absent) and DHCP (`ip=0.0.0.0`, `dhcpc.1` present). The mechanism differs: the firmware stops its DHCP client and persists to flash; openUF leaves netifd's client running and re-applies from `state.json` at start. UCI `proto=static` + `ifup lan` would close it -- see the IP-settings section |
 
 ---
 

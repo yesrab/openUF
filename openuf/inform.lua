@@ -2364,6 +2364,20 @@ function M.build_json(st, cfg, ufhw)
 		connect_request_ip   = stun_ip,
 		connect_request_port = stun_port,
 		inform_ip            = M._inform_ip(st.inform_url),
+		-- The shortest heartbeat this device will run, in seconds. Real APs
+		-- send it (`inform_min_interval` is in UAP-AC-HD 6.8.2's mcad); the
+		-- controller (10.6.109, decompiled) stores it on the device record as
+		-- `min_inform_interval_seconds`, exposes `supports_live_updates`
+		-- (== 1), and while a UI session watches the device -- a device or
+		-- client panel open -- the noop's `interval` becomes this value
+		-- instead of the type default (10 for a UAP). The Network app draws
+		-- the client panel's live dBm graph only when the uplink AP reports
+		-- exactly 1. _sane_interval accepts 1 since 2026-11-03 for the same
+		-- reason. Cost: build_json + build_packet measured 37 ms on average,
+		-- 125 ms worst, in the armsr test VM with no clients (2026-11-03);
+		-- a real board is slower, and it only runs at 1 s while watched
+		-- (see PROTOCOL-VALIDATION.md, "Live statistics").
+		inform_min_interval  = 1,
 		["system-stats"] = {
 			cpu    = tostring(cpu_pct),
 			mem    = tostring(mem_pct),
@@ -4205,9 +4219,13 @@ end
 -- and amd989/unifi-gateway both adopt it; openUF ran a fixed 10 s and threw
 -- the field away. Clamped, because pre-adoption responses arrive in plain
 -- HTTP under the well-known key: a forged noop must not be able to make the
--- device hammer the controller or go quiet for an hour. nil (no field, or
--- not a number) means "back to the default".
-M.INTERVAL_MIN = 5
+-- device go quiet for an hour. The floor is 1 s, not the 5 s it was until
+-- 2026-11-03: that is what the controller sends a watched device whose
+-- inform carries `inform_min_interval: 1` (build_json does, as real APs
+-- do), and a forged noop can at most ask for the cadence the firmware
+-- itself runs while someone looks at it. nil (no field, or not a number)
+-- means "back to the default".
+M.INTERVAL_MIN = 1
 M.INTERVAL_MAX = 300
 M._controller_interval = nil
 
@@ -4232,7 +4250,12 @@ local KNOWN_TYPES = {
 }
 local KNOWN_TOP_FIELDS = {
 	noop     = {_type = true, interval = true, include_blocks = true,
-	            server_time_in_utc = true},
+	            server_time_in_utc = true,
+	            -- Controller 10.6.109 (decompiled) puts it on every noop:
+	            -- true only for a gateway with usg2 capability bit 16 on a
+	            -- watched site, so always false here. Named so the ledger
+	            -- does not record a field no AP can act on.
+	            live_update = true},
 	setparam = {_type = true, mgmt_cfg = true, system_cfg = true,
 	            server_time_in_utc = true, include_blocks = true, cfgversion = true},
 }

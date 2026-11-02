@@ -6190,7 +6190,9 @@ return {
 				inform._http_post = function() return response('{"_type":"noop","interval":30}', st) end
 				assert_eq(inform._tick(st, nil, nil, ctx), 30, "the controller's 30 s is adopted")
 				inform._http_post = function() return response('{"_type":"noop","interval":1}', st) end
-				assert_eq(inform._tick(st, nil, nil, ctx), 5, "1 s is clamped up to INTERVAL_MIN")
+				assert_eq(inform._tick(st, nil, nil, ctx), 1, "1 s is adopted: what a watched device gets")
+				inform._http_post = function() return response('{"_type":"noop","interval":0}', st) end
+				assert_eq(inform._tick(st, nil, nil, ctx), 1, "0 is clamped up to INTERVAL_MIN")
 				inform._http_post = function() return response('{"_type":"noop","interval":100000}', st) end
 				assert_eq(inform._tick(st, nil, nil, ctx), 300, "an hour is clamped down to INTERVAL_MAX")
 				inform._http_post = function() return response('{"_type":"noop","interval":"soon"}', st) end

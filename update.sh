@@ -116,7 +116,8 @@ fi
 if [ -L "$INSTALL_DIR" ] || [ -f /usr/lib/openuf/inform.lua ]; then
 	die "openUF is installed as the openuf package (/usr/lib/openuf; $INSTALL_DIR is a link to it).
        Upgrade it with the package manager (apk add --allow-untrusted ./openuf-<version>.apk,
-       or opkg install ./openuf_<version>_all.ipk), not with this updater."
+       or opkg install ./openuf_<version>_all.ipk), not with this updater.
+       To test a working tree on it, use tools/hotpatch.sh from the dev machine instead."
 fi
 [ -f "$INSTALL_DIR/conf.lua" ] || die "openUF is not installed in $INSTALL_DIR -- this updates an existing install; use setup.sh for a first install."
 command -v lua >/dev/null 2>&1 || die "lua not found; the installed openUF could not have been running either."
