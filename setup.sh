@@ -1588,15 +1588,24 @@ if [ -n "$RADIOS_ENABLED" ]; then
 fi
 
 # ── rrb-unifi: install the translator and its openUF plugin ─────────────────
-# Its own tool does the work (packages are already in, the translator files,
-# the veth pair, sysupgrade.conf, and -- where it finds openUF under
-# /opt/openuf -- the plugin). The veth needs a network reload, which the tool
-# guards with a 120 s watchdog that restores /etc/config/network unless
-# confirmed: confirmed here at once, the LAN bridge is untouched by a veth.
-# The plugin is put in place by this script as well, for a package release
-# that predates the /opt/openuf compatibility link.
+# Its own tool does the work: packages (already in), the translator files, the
+# veth pair, sysupgrade.conf, and -- where it finds openUF under /opt/openuf --
+# the plugin, a restart of openUF and the translator's start. Its detection
+# path is /opt/openuf (upstream's documented one), so on a PACKAGE install
+# that path is linked to /usr/lib/openuf first: the openuf package's postinst
+# makes the same link from its next release on and keeps one that exists.
+# The veth needs a network reload, which the tool guards with a 120 s watchdog
+# that restores /etc/config/network unless confirmed: confirmed here at once,
+# the LAN bridge is untouched by a veth. The plugin is also put in place by
+# this script, and the translator started, in case the tool ran in its
+# no-openUF mode after all (an older tool, a path it does not probe).
 if [ "$OPT_ROAMING" = 1 ] && [ -n "$RRB_SRC" ]; then
 	head1 "Installing rrb-unifi (802.11r roaming with genuine UniFi APs)"
+	if [ "$HEADLESS" = 0 ] && [ ! -e /opt/openuf ] && [ ! -L /opt/openuf ] && [ -f "$PKG_DIR/inform.lua" ]; then
+		mkdir -p /opt && ln -s "$PKG_DIR" /opt/openuf \
+			&& ok "/opt/openuf -> $PKG_DIR (where rrb-unifi-setup looks for openUF)" \
+			|| warn "could not link /opt/openuf to $PKG_DIR; rrb-unifi-setup will not see openUF"
+	fi
 	if ( cd "$RRB_SRC" && sh ./rrb-unifi-setup install --yes ); then
 		[ -x /usr/sbin/rrb-unifi-setup ] && /usr/sbin/rrb-unifi-setup confirm >/dev/null 2>&1
 		ok "rrb-unifi translator installed and enabled (service rrb-unifi)"
@@ -1604,15 +1613,26 @@ if [ "$OPT_ROAMING" = 1 ] && [ -n "$RRB_SRC" ]; then
 		warn "rrb-unifi-setup install did not finish (its output is above). The roaming"
 		warn "plugin is incomplete; finish it after the reboot with: rrb-unifi-setup install"
 	fi
+	_placed=0
 	mkdir -p "$STATE_DIR/plugins"
 	if ! cmp -s "$RRB_SRC/openuf-plugin/rrb-unifi.lua" "$STATE_DIR/plugins/rrb-unifi.lua"; then
-		cp "$RRB_SRC/openuf-plugin/rrb-unifi.lua" "$STATE_DIR/plugins/rrb-unifi.lua"
+		cp "$RRB_SRC/openuf-plugin/rrb-unifi.lua" "$STATE_DIR/plugins/rrb-unifi.lua"; _placed=1
 	fi
 	if ! sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' "$STATE_DIR/plugins.enabled" 2>/dev/null | grep -qxF rrb-unifi; then
 		[ -s "$STATE_DIR/plugins.enabled" ] && [ -n "$(tail -c1 "$STATE_DIR/plugins.enabled")" ] && echo >> "$STATE_DIR/plugins.enabled"
-		echo rrb-unifi >> "$STATE_DIR/plugins.enabled"
+		echo rrb-unifi >> "$STATE_DIR/plugins.enabled"; _placed=1
 	fi
-	ok "openUF plugin rrb-unifi in $STATE_DIR/plugins, enabled in $STATE_DIR/plugins.enabled"
+	if [ "$_placed" = 1 ]; then
+		ok "openUF plugin rrb-unifi placed in $STATE_DIR/plugins, enabled in $STATE_DIR/plugins.enabled (the tool had not)"
+		# openUF loads its plugin list at start; without the reboot below the
+		# running daemon would carry on without the plugin.
+		[ "$DO_REBOOT" = 1 ] || { /etc/init.d/openuf restart >/dev/null 2>&1 && info "openUF restarted for the plugin"; }
+	else
+		ok "openUF plugin rrb-unifi in $STATE_DIR/plugins, enabled in $STATE_DIR/plugins.enabled"
+	fi
+	if [ -x /etc/init.d/rrb-unifi ] && ! /etc/init.d/rrb-unifi running >/dev/null 2>&1; then
+		/etc/init.d/rrb-unifi start >/dev/null 2>&1 && info "rrb-unifi translator started (it waits for an FT WLAN on its veth)"
+	fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

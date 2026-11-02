@@ -64,10 +64,13 @@ openuf/uciconf.lua                /etc/config/openuf -> the `dev`/`config` table
   releases (`setup.sh` asks, default yes, and runs `rrb-unifi-setup install --yes`; the plugin
   lands in `/etc/openuf/plugins/rrb-unifi.lua`, enabled through `/etc/openuf/plugins.enabled`).
   `DEPENDS` no longer carries `ucode-mod-socket`/`kmod-veth`; the tool installs them. The
-  package ships `/opt/openuf` as a symlink to `/usr/lib/openuf`, because upstream's plugin
-  contract (`PLUGINS.md`) names `/opt/openuf/plugins.lua` as the hook's detection path and
-  every third-party installer, rrb-unifi-setup included, looks there; the postinst's
-  double-install warning ignores the symlink, and the postinst stops a leftover `openuf-rrb`
+  package's **postinst** links `/opt/openuf` to `/usr/lib/openuf` when the path is free (the
+  postrm removes the link when it is ours), because upstream's plugin contract (`PLUGINS.md`)
+  names `/opt/openuf/plugins.lua` as the hook's detection path and every third-party
+  installer, rrb-unifi-setup included, looks there. A link rather than a packaged file, so a
+  link `setup.sh` made before the package had one is kept, never a file conflict; `update.sh`
+  refuses to run through it. The postinst's double-install warning ignores the link, and it
+  stops a leftover `openuf-rrb`
   daemon from the vendored era (its veth in `/etc/config/network` goes after the daemon's next
   push, never before, see `inform._migrate_legacy_rrb`). `PKG_LICENSE` stays
   `GPL-3.0-or-later` (the repository's licence since 2026-10-25; NOTICE records the history).

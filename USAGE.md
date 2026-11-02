@@ -1278,9 +1278,14 @@ rrb-unifi-setup verify              # after the controller's next push (Force Pr
 rrb-unifi-setup uninstall           # the safe order: plugin out, re-push, then the veth and the daemon
 ```
 
-The tool finds openUF under `/opt/openuf`; on a package install that path is a symlink to
-`/usr/lib/openuf` (shipped since 2026-11-02 for exactly this; a release from before it has no
-symlink, which is why `setup.sh` puts the plugin in place itself as well). The controller then
+The tool finds openUF under `/opt/openuf`, upstream's documented detection path; on a package
+install `setup.sh` links that path to `/usr/lib/openuf` before running the tool, and the
+package's postinst makes the same link from its next release on (an existing link is kept). On
+a package device set up before 2026-11-02, make it by hand first -- `ln -s /usr/lib/openuf
+/opt/openuf` -- or the tool installs the translator but not the plugin, and its `verify` and
+`uninstall` run in the no-openUF mode (a pull request to probe `/usr/lib/openuf` too is open
+on the project). `setup.sh` also places the plugin itself and starts the translator in case
+the tool ran in that mode anyway. The controller then
 pushes the WLANs again within a few informs, because openUF notices the new plugin (the
 fingerprint in `state.json`, see "Plugins" below); Fast Roaming must be on for the WLAN in
 UniFi, or the controller sends no `iapp_key` and the plugin logs that. Only WPA2-PSK with

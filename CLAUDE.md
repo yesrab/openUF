@@ -818,9 +818,13 @@ at startup. `install.sh uninstall` still removes both.
   overview. A plugin written for upstream must run here unchanged, so do not rename `ctx`
   fields, change `M.API`'s line shape (`rrb-unifi-setup` reads it with `sed`), or move the
   hook away from "after every built-in option, before `wlan_add`". Upstream's `docs/PLUGINS.md`
-  names `/opt/openuf/plugins.lua` as the detection path, so the package ships `/opt/openuf` as
-  a symlink to `/usr/lib/openuf`; the postinst's double-install warning and `install.sh`'s
-  guard ignore a symlink. `inform._reconcile_plugins` forgets `cfgversion` when the fingerprint
+  names `/opt/openuf/plugins.lua` as the detection path, so `/opt/openuf` is a symlink to
+  `/usr/lib/openuf` on a package install: the package's postinst makes it when the path is
+  free (the postrm removes ours), `setup.sh` makes it before running rrb-unifi-setup on a
+  package install (a release before the postinst had it, and the tool's own PR to probe
+  `/usr/lib/openuf` is still open), and `update.sh` refuses to run through it. A link, never
+  a packaged file, so the two makers cannot conflict. The postinst's double-install warning
+  and `install.sh`'s guard ignore a symlink. `inform._reconcile_plugins` forgets `cfgversion` when the fingerprint
   (names + file contents) moves, so enabling or removing a plugin costs one re-push. The
   `feature/pluginsAndHooks` branch (our superset: `before_push`/`after_push`/`tick`/`on_boot`/
   `on_forget`/`status`/declared packages, with a built-in `rrb` plugin) is superseded and was

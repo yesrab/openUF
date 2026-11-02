@@ -109,6 +109,15 @@ if [ "$CHECK" = 1 ]; then
 fi
 
 [ "$(id -u 2>/dev/null || echo 0)" = 0 ] || die "must run as root."
+# A package install: /usr/lib/openuf holds the tree, and since 2026-11-02
+# /opt/openuf is a LINK to it (for plugin installers that look there). This
+# updater's rm -rf and copy would otherwise run through the link into the
+# package's files, or remove the link; a package is upgraded as a package.
+if [ -L "$INSTALL_DIR" ] || [ -f /usr/lib/openuf/inform.lua ]; then
+	die "openUF is installed as the openuf package (/usr/lib/openuf; $INSTALL_DIR is a link to it).
+       Upgrade it with the package manager (apk add --allow-untrusted ./openuf-<version>.apk,
+       or opkg install ./openuf_<version>_all.ipk), not with this updater."
+fi
 [ -f "$INSTALL_DIR/conf.lua" ] || die "openUF is not installed in $INSTALL_DIR -- this updates an existing install; use setup.sh for a first install."
 command -v lua >/dev/null 2>&1 || die "lua not found; the installed openUF could not have been running either."
 

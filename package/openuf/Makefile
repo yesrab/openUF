@@ -52,8 +52,9 @@ define Package/openuf/description
   Third-party plugins (/etc/openuf/plugins/<name>.lua, api 1, the same hook
   as upstream openUF's) extend the WLAN options; 802.11r fast roaming with
   genuine UniFi APs is one, d-malinowski's rrb-unifi, which setup.sh offers
-  to install. /opt/openuf is a symlink to /usr/lib/openuf so that plugin
-  installers written against upstream's documented path find the hook.
+  to install. The postinst links /opt/openuf to /usr/lib/openuf (unless that
+  path exists already) so that plugin installers written against upstream's
+  documented detection path find the hook; the postrm removes that link.
 
   Needs a FULL wpad build (wpad-openssl, wpad-wolfssl or wpad-mbedtls; a
   wpad-basic-* build rejects the 802.11v option every controller WLAN
@@ -73,6 +74,13 @@ define Package/openuf/postinst-pkg
 if [ -z "$${IPKG_INSTROOT}" ] && ! grep -q wnm_sleep_mode /usr/sbin/hostapd 2>/dev/null; then
 	echo "openuf: hostapd is a basic build (no 802.11v): openUF will not start until a full wpad is installed." >&2
 	echo "openuf: run 'openuf deps --install', or use the button on LuCI's openUF overview." >&2
+fi
+# upstream's plugin contract (PLUGINS.md) names /opt/openuf/plugins.lua as the
+# hook's detection path, and every third-party installer looks there. A link,
+# made here rather than shipped as a package file, so a link setup.sh (or a
+# hand) made earlier is simply kept and never a file conflict.
+if [ -z "$${IPKG_INSTROOT}" ] && [ ! -e /opt/openuf ] && [ ! -L /opt/openuf ]; then
+	mkdir -p /opt && ln -s /usr/lib/openuf /opt/openuf
 fi
 if [ -z "$${IPKG_INSTROOT}" ] && [ ! -L /opt/openuf ] && [ -f /opt/openuf/inform.lua ]; then
 	echo "openuf: a file install of openUF is also present under /opt/openuf. The service now" >&2
@@ -94,6 +102,15 @@ if [ -z "$${IPKG_INSTROOT}" ] && ls /etc/rc.d/*openuf-rrb >/dev/null 2>&1; then
 	echo "openuf: the former built-in 802.11r translator (openuf-rrb) was removed; its veth goes" >&2
 	echo "openuf: after the controller's next push. For fast roaming with genuine UniFi APs" >&2
 	echo "openuf: install the rrb-unifi plugin (USAGE.md section 6)." >&2
+fi
+endef
+
+# The compatibility link above, when it is ours (points at this package).
+define Package/openuf/postrm
+#!/bin/sh
+if [ -z "$${IPKG_INSTROOT}" ] && [ -L /opt/openuf ] \
+		&& [ "$$(readlink /opt/openuf)" = /usr/lib/openuf ]; then
+	rm -f /opt/openuf
 fi
 endef
 
@@ -123,8 +140,6 @@ define Package/openuf/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(LN) ../lib/openuf/hook/openuf-convert.sh $(1)/usr/sbin/openuf-convert
 	$(LN) ../lib/openuf/hook/openuf-deps.sh $(1)/usr/sbin/openuf-deps
-	$(INSTALL_DIR) $(1)/opt
-	$(LN) ../usr/lib/openuf $(1)/opt/openuf
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/openuf/etc/init.d/openuf $(1)/etc/init.d/openuf
 	$(INSTALL_DIR) $(1)/etc/config
