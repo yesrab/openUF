@@ -14,9 +14,6 @@
 #                               basic wpad for a full one (hook/openuf-deps.sh)
 #   openuf bootstrap-account    create the ubnt/ubnt adoption login
 #                               (hook/openuf-bootstrap.sh)
-#   openuf rrb status|peers|collect|verify
-#                               the 802.11r translator for genuine UniFi APs
-#                               (hook/openuf-rrb.sh)
 #
 # The set-*/reset-*/11k-scan verbs are syswrapper.sh's, the hook the
 # controller itself drives over SSH; this wrapper only saves typing its name.
@@ -76,11 +73,7 @@ case "$1" in
 		shift
 		exec sh "$DIR/hook/openuf-bootstrap.sh" --dir "$DIR" "$@"
 		;;
-	rrb)
-		[ -n "$DIR" ] || { echo "openuf: not installed" >&2; exit 1; }
-		shift
-		exec sh "$DIR/hook/openuf-rrb.sh" "$@"
-		;;
+
 	start|stop|restart|reload|enable|disable|running)
 		exec /etc/init.d/openuf "$1"
 		;;

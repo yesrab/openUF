@@ -9,6 +9,9 @@ local cjson  = require("cjson")
 local state  = dofile("openuf/state.lua")
 local inform = dofile("openuf/inform.lua")
 
+-- build_json looks the inform URL's host up; keep the suite off the network.
+inform._dns_toip = function() return nil end
+
 local function fixture(name)
 	local f = io.open("tests/fixtures/" .. name, "r")
 	if not f then return "" end
@@ -191,9 +194,19 @@ local function build(opts)
 		hostname   = "testap",
 		locating   = opts and opts.locating,
 	}
+	-- opts.st: fields laid over the defaults (upstream's harness shape; the
+	-- inform_ip and roam-report tests set inform_url / notif_assoc_stat).
+	if opts and type(opts.st) == "table" then
+		for k, v in pairs(opts.st) do st[k] = v end
+	end
 	local json_str = inform.build_json(st, nil, ufhw)
-	return cjson.decode(json_str), st
+	return cjson.decode(json_str), st, json_str
 end
+
+-- fw_caps as openUF claims it: 0x80101110, which is this negative 32-bit
+-- integer. Written out rather than as a hex literal, because on Lua 5.1
+-- (the target) 0x80101110 is a positive double and would not compare.
+local MAC_VLAN_FW_CAPS = -2146430704
 
 -- A socket-shaped modelmap: one port_idx per physical switch socket, and no
 -- static uplink flag -- which socket the cable is in is detected from the
@@ -656,6 +669,42 @@ return {
 				assert_eq(d.connect_request_port, "41234", "port, a string")
 			end)
 			inform._stun_c = real
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform json: inform_ip is the controller's IPv4, resolved once per TTL for a name",
+		fn = function()
+			local real_dns, real_time = inform._dns_toip, inform._time
+			local lookups, now = 0, 1000
+			inform._time = function() return now end
+			inform._dns_toip = function(h)
+				lookups = lookups + 1
+				if h == "unifi" then return "192.0.2.9" end
+				return nil, "host not found"
+			end
+			local function ip_for(url) return inform._inform_ip(url) end
+			local ok, err = pcall(function()
+				inform._inform_ip_cache = nil
+				assert_eq(ip_for("http://192.0.2.7:8080/inform"), "192.0.2.7", "literal passes through")
+				assert_eq(lookups, 0, "no lookup for a literal")
+				assert_eq(ip_for("http://unifi:8080/inform"), "192.0.2.9", "name resolves")
+				assert_eq(ip_for("http://unifi:8080/inform"), "192.0.2.9", "cached")
+				assert_eq(lookups, 1, "one lookup inside the TTL")
+				now = now + inform.INFORM_IP_TTL
+				ip_for("http://unifi:8080/inform")
+				assert_eq(lookups, 2, "looked up again after the TTL")
+				assert_eq(ip_for("http://nowhere.invalid/inform"), nil, "unresolvable: no field")
+				assert_eq(ip_for("http://nowhere.invalid/inform"), nil, "failure cached too")
+				assert_eq(lookups, 3, "a failed lookup is remembered for the TTL")
+				assert_eq(ip_for("http://[2001:db8::1]:8080/inform"), nil, "IPv6 literal: no field")
+				-- And it rides the payload.
+				inform._inform_ip_cache = nil
+				local d = build({st = {inform_url = "http://192.0.2.7:8080/inform"}})
+				assert_eq(d.inform_ip, "192.0.2.7", "inform_ip in build_json")
+			end)
+			inform._dns_toip, inform._time = real_dns, real_time
+			inform._inform_ip_cache = nil
 			if not ok then error(err, 0) end
 		end
 	},
@@ -1512,6 +1561,105 @@ return {
 		end
 	},
 	{
+		name = "inform json: one walk of radio_table settles both the country and the DFS flag",
+		fn = function()
+			-- The two per-device facts derived from radio_table (country_code
+			-- and M._dfs_radio) used to be two separate ipairs passes over
+			-- the same table. One pass now, stopping as soon as both are
+			-- settled -- counted through is_dfs_channel, the only fork-free
+			-- seam the loop calls per radio.
+			local real_is_dfs = inform._rrmscan.is_dfs_channel
+			local calls = 0
+			inform._rrmscan.is_dfs_channel = function(ch)
+				calls = calls + 1
+				return real_is_dfs(ch)
+			end
+			local o_dfs = inform._dfs_radio
+			local radios
+			inject_sysinfo(false)
+			inject_ucihelper()
+			inform._ucihelper.get_radio_table = function()
+				local out = {}
+				for i, r in ipairs(radios) do
+					out[i] = {name = "radio" .. (i - 1), radio = r.radio,
+						channel = r.channel, country = r.country, ht = "HT20",
+						tx_power = "20", disabled = false, max_txpower = 20}
+				end
+				return out
+			end
+			local function run()
+				calls = 0
+				local st = {
+					authkey = state.DEFAULT_KEY, adopted = false, cfgversion = "",
+					inform_url = "http://10.0.0.1:8080/inform",
+					mac = "00:00:5e:00:53:01", ip = "192.0.2.3",
+					hostname = "testap",
+				}
+				return cjson.decode(inform.build_json(st, nil, ufhw))
+			end
+			local ok, err = pcall(function()
+				-- The first radio answers both questions, so the second is
+				-- never looked at: one is_dfs_channel call, not two.
+				radios = {
+					{radio = "na", channel = 100, country = "CZ"},
+					{radio = "ng", channel = 6},
+				}
+				local d = run()
+				assert_eq(d.country_code, 203, "CZ off the first radio")
+				assert_true(inform._dfs_radio, "channel 100 is DFS")
+				assert_eq(calls, 1, "the walk stopped at the radio that settled both")
+
+				-- Neither fact is settled by the 2.4 radio's channel, so the
+				-- walk goes on and finds the DFS one behind it.
+				radios = {
+					{radio = "ng", channel = 6, country = "CZ"},
+					{radio = "na", channel = 100},
+				}
+				d = run()
+				assert_eq(d.country_code, 203, "still CZ")
+				assert_true(inform._dfs_radio, "the second radio is the DFS one")
+				assert_eq(calls, 2, "both channels tested")
+
+				-- A country option that is not in the ISO table still settles
+				-- the question on the radio that carries it, exactly as the
+				-- old loop's unconditional `break` did -- the fallback wins
+				-- and the second radio's CZ is not consulted.
+				radios = {
+					{radio = "na", channel = 36, country = "ZZ"},
+					{radio = "ng", channel = 6, country = "CZ"},
+				}
+				d = run()
+				assert_eq(d.country_code, 840, "unknown regdomain -> the 840 fallback")
+				assert_false(inform._dfs_radio, "36 and 6 are not DFS")
+				assert_eq(calls, 2, "and both radios were walked, since DFS never settled")
+			end)
+			inform._rrmscan.is_dfs_channel = real_is_dfs
+			inform._dfs_radio = o_dfs
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform json: the Hotspot 2.0 probe is read once per payload",
+		fn = function()
+			-- fw_caps 0x800000 and fw2_caps 0x80000 are the same probe; it is
+			-- cached in sysinfo, so this is about not asking twice per build.
+			local orig = inform._sysinfo.hs20_supported
+			local asked = 0
+			inform._sysinfo.hs20_supported = function()
+				asked = asked + 1
+				return true
+			end
+			local ok, err = pcall(function()
+				local d = build()
+				assert_eq(asked, 1, "one read for both masks")
+				assert_eq(d.fw_caps, MAC_VLAN_FW_CAPS + 0x800000, "the bit is still set")
+				assert_eq(d.fw2_caps, 0x80000, "and so is RadSec's")
+			end)
+			inform._sysinfo.hs20_supported = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform json: ACS radio's band is re-derived from the live channel (real ucihelper)",
 		fn = function()
 			-- The inject_ucihelper mock hardcodes radio="ng" and so bypasses
@@ -1924,7 +2072,7 @@ return {
 		end
 	},
 	{
-		name = "inform json: fw_caps sets the QCA-switch, OWRT-switch and multi-block schedule bits (0x1110)",
+		name = "inform json: fw_caps sets the switch, schedule, RADIUS-DAS and MAC-based-VLAN bits (0x80101110)",
 		fn = function()
 			-- Confirmed via decompiled controller 10.4.57: Device.hasQCASwitch()
 			-- is hasFirmwareCapability(16) (gates the Ports view's projection
@@ -1935,13 +2083,46 @@ return {
 			-- section 18). supportMultiBlockWlanSchedule() is
 			-- hasFirmwareCapability(4096): a day's schedule blocks as
 			-- schedule_<day>.<i> (wlansched.lua); schedule_invert (0x400000)
-			-- stays unclaimed.
-			local d = build()
-			assert_eq(d.fw_caps, 0x1110, "fw_caps bits 0x10 | 0x100 | 0x1000 set")
+			-- stays unclaimed. 0x100000 is RADIUS Dynamic Authorization, which
+			-- the config writer tests inline (VAZShipWTNxlo:567) and which brings
+			-- aaa.<n>.radius.das.* to an accounting WLAN; hostapd is the CoA
+			-- listener it needs (radius_das_port/radius_das_client).
+			local d, _, raw = build()
+			assert_eq(d.fw_caps, MAC_VLAN_FW_CAPS,
+				"fw_caps bits 0x10 | 0x100 | 0x1000 | 0x100000 | 0x80000000 set")
+			-- The SIGN is the point, and so is the absence of a fraction:
+			-- fw_caps is a Java int on the controller side, so 0x80101110 has
+			-- to go out as the negative it is, and as an integer literal.
+			-- No trailing comma in the needle: cjson emits object keys in hash
+			-- order, so fw_caps is sometimes the last one and followed by `}`.
+			assert_true(raw:find('"fw_caps":-2146430704', 1, true) ~= nil,
+				"and it is serialized as a negative integer, not 2148537104")
+			assert_eq(d.fw2_caps, 0,
+				"and no fw2_caps bit where Hotspot 2.0 is not supported")
 		end
 	},
 	{
-		name = "inform json: wifi_caps2 claims exactly advertise-name (0x40), assisted roaming (0x20), quick scan (0x80) and monitor RF scan (0x2)",
+		name = "inform json: a Hotspot-2.0-capable hostapd adds fw_caps 0x800000 and fw2_caps 0x80000",
+		fn = function()
+			-- supportHotspot2() is hasFirmwareCapability(0x800000) and
+			-- supportsRadSec() is hasFirmware2Capability(0x80000); the REST
+			-- validator that admits a Passpoint profile onto a WLAN requires
+			-- BOTH (supportsHotspot2Passpoint(), 10.6.106), so the two are
+			-- claimed together, off the one probe.
+			local orig = inform._sysinfo.hs20_supported
+			inform._sysinfo.hs20_supported = function() return true end
+			local ok, err = pcall(function()
+				local d = build()
+				assert_eq(d.fw_caps, MAC_VLAN_FW_CAPS + 0x800000,
+					"the Hotspot 2.0 bit joins fw_caps")
+				assert_eq(d.fw2_caps, 0x80000, "and RadSec is claimed for the gate")
+			end)
+			inform._sysinfo.hs20_supported = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform json: wifi_caps2 claims exactly advertise-name (0x40), assisted roaming (0x20), quick scan (0x80), monitor RF scan (0x2), ACS DFS (0x10) and multicast suppression (0x400000)",
 		fn = function()
 			-- Confirmed via decompiling the controller: Device.
 			-- supportAdvertisingDeviceNameInBeacon() is hasWifiCapability2(64)
@@ -1949,10 +2130,15 @@ return {
 			-- wireless.<n>.advertise_ap_name is ever pushed to system_cfg at
 			-- all for "Show Access Point Name in Beacon". supportsAssistedRoaming()
 			-- is hasWifiCapability2(32) and gates wireless.<n>.btm_disassoc
-			-- (Roaming Assistant). No other bit is claimed (see
+			-- (Roaming Assistant). supportsAcsDfs() is hasWifiCapability2(16)
+			-- and gates radio.<n>.acsdfs AND radio.<n>.blklst, the site's
+			-- auto-channel DFS switch and channel blacklist.
+			-- supportsMulticastSuppressor() is hasWifiCapability2(0x400000) and
+			-- gates wireless.<n>.multicast.suppressor plus, on Aggressive,
+			-- wireless.<n>.bcfilt.bypass_types. No other bit is claimed (see
 			-- PROTOCOL-VALIDATION.md for the ones this device does not implement).
 			local d = build()
-			assert_eq(d.wifi_caps2, 0xE2, "wifi_caps2 is exactly 0x40|0x20|0x80|0x2")
+			assert_eq(d.wifi_caps2, 0x4000F2, "wifi_caps2 is exactly 0x400000|0x40|0x20|0x80|0x2|0x10")
 		end
 	},
 	{
@@ -2560,13 +2746,13 @@ return {
 				inform_url = "http://10.0.0.1:8080/inform", mac = "aa:bb:cc:dd:ee:ff",
 				ip = "192.168.1.100", hostname = "testap"}
 			local d = cjson.decode(inform.build_json(st, {config = {}}, ufhw))
-			assert_eq(d.fw_caps, 0x1110, "shipped fw_caps without an override (0x1000: multi-block WLAN schedule)")
-			assert_eq(d.wifi_caps2, 0xE2, "shipped wifi_caps2 without an override")
+			assert_eq(d.fw_caps, 0x101110 - 0x80000000, "shipped fw_caps without an override (0x1000: multi-block WLAN schedule, 0x100000: RADIUS DAS, 0x80000000 MAC-based VLANs: sent signed)")
+			assert_eq(d.wifi_caps2, 0x4000F2, "shipped wifi_caps2 without an override")
 			assert_eq(d.wifi_caps, 0x1C + 0x801, "shipped wifi_caps without an override (mesh bits by default)")
 			d = cjson.decode(inform.build_json(st,
 				{config = {debug_caps = {wifi_caps = 0x2, wifi_caps2 = 0x41}}}, ufhw))
 			inform._airtime.supported = o
-			assert_eq(d.fw_caps, 0x1110, "an unlisted mask keeps its shipped value")
+			assert_eq(d.fw_caps, 0x101110 - 0x80000000, "an unlisted mask keeps its shipped value")
 			assert_eq(d.wifi_caps, 0x2, "wifi_caps override replaces the shipped bits")
 			assert_eq(d.wifi_caps2, 0x41, "wifi_caps2 override applied")
 		end
@@ -2982,16 +3168,16 @@ return {
 		-- asked for connection notifs and conf.lua has not vetoed them.
 		name = "inform json: wifi_caps2 adds 0x2000 only while roam reports are sent",
 		fn = function()
-			-- This tree's base is 0xE2 (0x60 + the Quick/Airtime scan bits 0x2
+			-- This tree's base is 0x4000F2 (0x400070 + the Quick/Airtime scan bits 0x2
 			-- and 0x80 it also claims); the roam bit rides on top of that.
-			assert_eq(build().wifi_caps2, 0xE2, "not asked: no claim")
+			assert_eq(build().wifi_caps2, 0x4000F2, "not asked: no claim")
 			inject_sysinfo()
 			local st = {authkey = state.DEFAULT_KEY, inform_url = "http://10.0.0.1:8080/inform",
 				mac = "aa:bb:cc:dd:ee:ff", notif_assoc_stat = true}
 			local d = cjson.decode(inform.build_json(st, {config = {}}, ufhw))
-			assert_eq(d.wifi_caps2, 0x20E2, "asked: claimed")
+			assert_eq(d.wifi_caps2, 0x4020F2, "asked: claimed")
 			d = cjson.decode(inform.build_json(st, {config = {assoc_tracker = false}}, ufhw))
-			assert_eq(d.wifi_caps2, 0xE2, "assoc_tracker = false: no claim")
+			assert_eq(d.wifi_caps2, 0x4000F2, "assoc_tracker = false: no claim")
 		end
 	},
 	{

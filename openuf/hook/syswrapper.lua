@@ -5,10 +5,11 @@
 	or reconfigure the device.
 
 	Usage (via syswrapper.sh):
-	  syswrapper.sh set-adopt  <inform_url> <authkey_hex32>
+	  syswrapper.sh set-adopt  <inform_url> <authkey_hex32> [<mac>]
 	  syswrapper.sh set-inform <inform_url>
 	  syswrapper.sh reset-inform
 	  syswrapper.sh 11k-scan          -- the controller's nightly cron job
+	  syswrapper.sh dfs-reset         -- its other one: back onto a fixed DFS channel
 
 	authkey_hex32: exactly 32 hex characters (= 16 bytes, AES-128 key).
 	inform_url:    http(s)://host:port/inform
@@ -79,10 +80,11 @@ end
 
 local function usage()
 	io.stderr:write(
-		"Usage: syswrapper.sh set-adopt <url> <key32hex>\n" ..
+		"Usage: syswrapper.sh set-adopt <url> <key32hex> [<mac>]\n" ..
 		"       syswrapper.sh set-inform <url>\n" ..
 		"       syswrapper.sh reset-inform\n" ..
 		"       syswrapper.sh 11k-scan\n" ..
+		"       syswrapper.sh dfs-reset\n" ..
 		"\n" ..
 		"key32hex: exactly 32 hexadecimal characters (16 bytes, AES-128)\n"
 	)
@@ -96,12 +98,18 @@ local function is_url(s)
 	return type(s) == "string" and (s:match("^https?://") ~= nil)
 end
 
+local function is_mac(s)
+	return type(s) == "string" and s:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") ~= nil
+end
+
 -- ─── Commands ────────────────────────────────────────────────────────────────
 
--- set-adopt <url> <key>
+-- set-adopt <url> <key> [<mac>]
 -- Called by the controller after clicking Adopt.  Stores the new authkey
 -- and marks the device as adopted.
-local function cmd_set_adopt(url, key)
+-- A MAC that differs from the one this device informs with is refused: the
+-- controller is adopting another device at this address.
+local function cmd_set_adopt(url, key, mac)
 	if not is_url(url) then
 		io.stderr:write("syswrapper: invalid URL: " .. tostring(url) .. "\n")
 		return false
@@ -111,8 +119,17 @@ local function cmd_set_adopt(url, key)
 			.. tostring(key) .. "\n")
 		return false
 	end
+	if mac ~= nil and not is_mac(mac) then
+		io.stderr:write("syswrapper: invalid MAC: " .. tostring(mac) .. "\n")
+		return false
+	end
 	local st = load_state()
 	local s  = st.load()
+	if mac and type(s.mac) == "string" and s.mac:lower() ~= mac:lower() then
+		io.stderr:write("syswrapper: set-adopt names " .. mac .. ", this device is "
+			.. s.mac .. "\n")
+		return false
+	end
 	s.inform_url = url
 	s.authkey    = key:lower()
 	s.adopted    = true
@@ -210,12 +227,40 @@ local function cmd_11k_scan()
 	return true
 end
 
+-- dfs-reset
+-- The controller's other pushed cron job (02:00 nightly, see sysconf.lua),
+-- scheduled whenever the site has a 5 GHz radio pinned to a fixed DFS
+-- channel. After a radar hit the radio leaves that channel for another one
+-- and never comes back on its own; this job puts it back once the 30-minute
+-- non-occupancy list has expired.
+--
+-- Like 11k-scan, the work belongs to the inform daemon -- it owns the radios'
+-- netdev names, the live channel and the control sockets -- so this only
+-- leaves a request file that inform._maybe_service_dfs_reset reads on its
+-- next heartbeat. No randomisation here, unlike the scan: the firmware's
+-- dfs_reset has none either, and a channel switch is not an off-channel sweep
+-- that neighbouring APs can spoil for each other.
+local dfs_request_file = "/tmp/openuf-dfs-reset-request"
+
+local function cmd_dfs_reset()
+	local f = io.open(dfs_request_file, "w")
+	if not f then
+		io.stderr:write("syswrapper: cannot write " .. dfs_request_file .. "\n")
+		return false
+	end
+	f:write(tostring(now()), "\n")
+	f:close()
+	io.stdout:write("syswrapper: DFS channel reset requested; the inform daemon"
+		.. " checks each 5 GHz radio on its next heartbeat\n")
+	return true
+end
+
 -- ─── Entry point ─────────────────────────────────────────────────────────────
 
 local function main(args)
 	local cmd = args[1]
 	if cmd == "set-adopt" then
-		if not cmd_set_adopt(args[2], args[3]) then
+		if not cmd_set_adopt(args[2], args[3], args[4]) then
 			usage(); os.exit(1)
 		end
 	elseif cmd == "set-inform" then
@@ -226,6 +271,8 @@ local function main(args)
 		cmd_reset_inform()
 	elseif cmd == "11k-scan" then
 		if not cmd_11k_scan() then os.exit(1) end
+	elseif cmd == "dfs-reset" then
+		if not cmd_dfs_reset() then os.exit(1) end
 	else
 		io.stderr:write("syswrapper: unknown command: " .. tostring(cmd) .. "\n")
 		usage()
@@ -246,7 +293,9 @@ return {
 	cmd_set_inform = cmd_set_inform,
 	cmd_reset_inform = cmd_reset_inform,
 	cmd_11k_scan = cmd_11k_scan,
+	cmd_dfs_reset = cmd_dfs_reset,
 	_set_scan_request_file = function(p) scan_request_file = p end,
+	_set_dfs_request_file = function(p) dfs_request_file = p end,
 	_set_rand = function(f) rand_below = f or urandom_below end,
 	_set_clock = function(f) now = f or os.time end,
 	_urandom_below = urandom_below,

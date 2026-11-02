@@ -20,7 +20,9 @@ M._bcfilter   = nil  -- nil = load openuf/bcfilter.lua on first use
 -- "WiFi Speed Limit" enforcement (tc). Injectable for the same reason.
 -- Minimum RSSI's constants (wire offset, refusal margin).
 M._minrssi    = nil  -- nil = load openuf/minrssi.lua on first use
-M._ftinterop  = nil  -- nil = load openuf/ftinterop.lua on first use
+-- The plugin hook (plugins.lua). Injectable; otherwise loaded once per
+-- process, since plugins.lua keeps a load cache and a per-pass memo.
+M._plugins    = nil  -- nil = load openuf/plugins.lua on first use
 M._run_cmd    = os.execute
 
 -- Injectable: command execution that captures stdout (for read-only introspection,
@@ -45,6 +47,27 @@ M.RADIO_DEFAULTS = {
 local function get_uci()
 	if M._uci then return M._uci end
 	return require("uci")
+end
+
+-- One cursor for a whole config push, instead of one per VAP.
+--
+-- Every writer below used to open its own cursor and commit it, so a push
+-- rewrote /etc/config/wireless once per WLAN -- three times over for a WLAN
+-- carrying private pre-shared keys and MAC-based VLANs. That is a flash write
+-- each time on boards with ~5 MB of free overlay, for a file whose final
+-- contents are the same either way. `apply_config` now opens one cursor, hands
+-- it to each writer, and commits once when the VAP loop is done.
+--
+-- Called with a cursor, borrow it and leave the committing to its owner;
+-- called with nil, open one and commit it, which is what every other caller
+-- (and every direct caller in the tests) still relies on.
+local function borrow_cursor(cursor)
+	if cursor then return cursor, false end
+	return get_uci().cursor(), true
+end
+
+local function release_cursor(cursor, owned, config)
+	if owned then cursor:commit(config) end
 end
 
 -- General memo for the lookup pass M.begin_pass/end_pass open (see the
@@ -104,7 +127,12 @@ end
 
 local function get_bcfilter() return get_sibling("bcfilter", M._bcfilter) end
 local function get_minrssi()  return get_sibling("minrssi",  M._minrssi)  end
-local function get_ftinterop() return get_sibling("ftinterop", M._ftinterop) end
+local _plugins_mod
+local function get_plugins()
+	if M._plugins then return M._plugins end
+	_plugins_mod = _plugins_mod or get_sibling("plugins", nil)
+	return _plugins_mod
+end
 
 -- Map a UCI wifi-device's channel number to the controller's band identifier.
 -- The real controller's radio_table schema requires this "radio" field
@@ -195,7 +223,52 @@ end
 -- actually lists, NOT by its "Band N:" index -- that index is assigned per
 -- driver (this project's ath9k radio reports 2.4GHz as Band 1, its ath10k
 -- radio reports 5GHz as Band 2) and means nothing on its own.
-local function parse_phy_caps(out)
+-- The pairwise cipher suite selectors nl80211 reports per wiphy
+-- (IEEE 802.11 Table 12-4: 0x000FAC<n>), keyed by the token OpenWrt's
+-- `encryption` string names them with -- iface.uc's second `+` token. Only the
+-- ciphers the controller can actually ask for are listed; TKIP and the WEP
+-- selectors are deliberately absent (see _wire_pairwise in inform.lua).
+local CIPHER_SELECTOR = {
+	ccmp    = 1027076,   -- 0x000FAC04
+	gcmp    = 1027080,   -- 0x000FAC08
+	gcmp256 = 1027081,   -- 0x000FAC09
+	ccmp256 = 1027082,   -- 0x000FAC0A
+}
+
+-- `iw phy` does NOT list cipher suites on this target (iw 6.17 on 25.12 prints
+-- no Supported Ciphers block at all, verified on both boards 2026-10-26), so
+-- the one reliable local source is nl80211 itself. ucode and its nl80211
+-- binding ship with the wifi stack on 25.12 and are present on both boards.
+-- Output is one line per phy: "<phyname> <selector> <selector> ...".
+local CIPHER_PROBE = "ucode -l nl80211 -e '"
+	.. "let r = nl80211.request(nl80211.const.NL80211_CMD_GET_WIPHY, "
+	.. "nl80211.const.NLM_F_DUMP, {}); "
+	.. "for (let w in r) print(w.wiphy_name + \" \" "
+	.. "+ join(\" \", w.cipher_suites || []) + \"\\n\");' 2>/dev/null"
+
+-- "phy0 1027076 1027080 ..." -> {phy0 = {ccmp = true, gcmp = true, ...}}.
+-- A phy that reports no suites at all is left OUT of the result rather than
+-- recorded as an empty set: "the probe told us nothing" must not read as "this
+-- radio supports no cipher", which would veto every override.
+local function parse_cipher_suites(out)
+	local by_phy = {}
+	for line in (tostring(out) .. "\n"):gmatch("([^\n]*)\n") do
+		local name, rest = line:match("^(phy%w+)%s+(.*)$")
+		if name and rest ~= "" then
+			local set = {}
+			for sel in rest:gmatch("%d+") do
+				local n = tonumber(sel)
+				for token, want in pairs(CIPHER_SELECTOR) do
+					if n == want then set[token] = true end
+				end
+			end
+			if next(set) then by_phy[name] = set end
+		end
+	end
+	return by_phy
+end
+
+local function parse_phy_caps(out, ciphers_by_phy)
 	local bands, cur, phy = {}, nil, nil
 	for line in (tostring(out) .. "\n"):gmatch("([^\n]*)\n") do
 		-- Phy-level lines carry exactly one leading tab; a Band block's
@@ -204,12 +277,15 @@ local function parse_phy_caps(out)
 		-- extended-feature list below) would be attributed to whichever band
 		-- happened to be last.
 		if line:match("^%s*Wiphy%s") then
-			phy = {beacon_rate = false, bands = {}}
+			-- The name is kept so the cipher probe, which is keyed by phy and
+			-- not by band, can be attributed to the right radio.
+			phy = {beacon_rate = false, bands = {},
+				name = line:match("^%s*Wiphy%s+(%S+)")}
 			cur = nil
 		elseif line:match("^\tBand %d+:") then
 			cur = {ht40 = false, vht = false, he = false, eht = false,
 				w160 = false, w320 = false, freq = nil, txpower = nil,
-				phy = phy}
+				channels = {}, phy = phy}
 			bands[#bands + 1] = cur
 			if phy then phy.bands[#phy.bands + 1] = cur end
 		elseif line:match("^\t[^\t]") then
@@ -241,6 +317,19 @@ local function parse_phy_caps(out)
 			local mhz, dbm = line:match("^%s*%*%s+([%d%.]+) MHz.*%(([%d%.]+) dBm%)")
 			if mhz and not line:match("disabled") then
 				cur.freq = cur.freq or tonumber(mhz)
+				-- The channel number in brackets, for the ACS candidate list
+				-- (rf_config's chanlist). The regdomain decides which channels
+				-- `iw phy` prints at all and which it marks disabled, so this
+				-- list is already the legal set -- which is what makes
+				-- inverting the controller's blacklist possible. "no IR" is
+				-- excluded on top: the radio may not initiate radiation there,
+				-- so it is legal to hear but never a channel an AP can beacon
+				-- on. (It still counts toward max_txpower above, which is a
+				-- reported capability and not a channel choice.)
+				local ch = tonumber(line:match("%[(%d+)%]") or "")
+				if ch and not line:match("no IR") then
+					cur.channels[#cur.channels + 1] = ch
+				end
 				-- `iw` prints one decimal ("23.0 dBm"); floored to an integer
 				-- so the payload carries 23 rather than 23.0 -- max_txpower is
 				-- a whole-dBm field, and flooring never claims more than the
@@ -280,6 +369,15 @@ local function parse_phy_caps(out)
 				max_width = width,
 				max_txpower = b.txpower,
 				beacon_rate = (b.phy and b.phy.beacon_rate) or false,
+				-- nil, not {}, when the probe said nothing about this phy --
+				-- cipher_ok() treats nil as "unknown, don't veto".
+				ciphers = (b.phy and b.phy.name and ciphers_by_phy
+					and ciphers_by_phy[b.phy.name]) or nil,
+				-- Channels this band can legally use, ascending. nil (not an
+				-- empty table) when `iw` said nothing, so rf_config can tell
+				-- "no channels" from "unknown" and skip narrowing ACS rather
+				-- than narrowing it to nothing.
+				channels = (b.channels and #b.channels > 0) and b.channels or nil,
 			}
 			if prev then
 				caps[key].max_kind  = math.max(prev.max_kind, caps[key].max_kind)
@@ -288,6 +386,37 @@ local function parse_phy_caps(out)
 					caps[key].max_txpower or 0)
 				if caps[key].max_txpower == 0 then caps[key].max_txpower = nil end
 				caps[key].beacon_rate = prev.beacon_rate or caps[key].beacon_rate
+				-- Channels fold as a UNION: either phy could end up hosting
+				-- the band, and a channel the one that does cannot use is
+				-- dropped by ACS itself, while a channel missing from the
+				-- candidate list is one ACS can never pick.
+				if prev.channels or caps[key].channels then
+					local seen, merged = {}, {}
+					for _, src in ipairs({prev.channels or {}, caps[key].channels or {}}) do
+						for _, ch in ipairs(src) do
+							if not seen[ch] then
+								seen[ch] = true
+								merged[#merged + 1] = ch
+							end
+						end
+					end
+					table.sort(merged)
+					caps[key].channels = merged
+				end
+				-- Ciphers fold the other way from every capability above:
+				-- the INTERSECTION, because a WLAN on this band may land on
+				-- either radio and a cipher one of them cannot program is a
+				-- hostapd that refuses to start. Unknown on either side
+				-- (nil) means unknown for the band.
+				if prev.ciphers and caps[key].ciphers then
+					local both = {}
+					for token in pairs(prev.ciphers) do
+						if caps[key].ciphers[token] then both[token] = true end
+					end
+					caps[key].ciphers = next(both) and both or nil
+				else
+					caps[key].ciphers = nil
+				end
 			end
 		end
 	end
@@ -308,10 +437,30 @@ function M.phy_caps()
 		end
 	end
 	if not M._phy_caps_cache or stale then
-		M._phy_caps_cache = parse_phy_caps(M._popen("iw phy") or "")
+		M._phy_caps_cache = parse_phy_caps(M._popen("iw phy") or "",
+			parse_cipher_suites(M._popen(CIPHER_PROBE) or ""))
 		M._phy_caps_read_at = now
 	end
 	return M._phy_caps_cache
+end
+
+-- Whether the given band's hardware can program the pairwise cipher the
+-- controller asked for (a token from _wire_pairwise / CIPHER_SELECTOR).
+--
+-- Unknown capabilities return true, like every other clamp here: openUF must
+-- not refuse a controller's request because a probe failed. But a KNOWN set
+-- that lacks the cipher returns false, and the caller keeps the default --
+-- hostapd treats a pairwise cipher the driver cannot program as fatal
+-- ("Failed to set beacon parameters"), so the BSS never comes up at all, which
+-- is strictly worse than running the default CCMP. This is not theoretical on
+-- the documented targets: the Archer C5's 5GHz ath10k phy reports neither GCMP
+-- nor CCMP-256 while its 2.4GHz ath9k phy reports both, and the AX3000T's
+-- mt76 phys report both on both bands (verified on hardware 2026-10-26).
+function M.cipher_ok(band, token)
+	if not token then return true end
+	local caps = M.phy_caps()[band]
+	if not caps or not caps.ciphers then return true end
+	return caps.ciphers[token] == true
 end
 
 -- The best PHY generation the given band's hardware can run ("HT"/"VHT"/
@@ -413,18 +562,72 @@ M.DELETE = setmetatable({}, {__tostring = function() return "<delete>" end})
 
 -- Map from UniFi security type strings to UCI encryption values.
 --
--- There is deliberately no "wpa-enterprise" entry. One existed, mapping to
--- "wpa2+ccmp", but no producer ever emitted that string -- and it could not
--- have worked anyway, since wlan_add() writes no auth_server/auth_secret and
--- the wire protocol carries no RADIUS configuration to write. Enterprise
--- WLANs are now rejected at parse time in inform.lua's
--- _parse_wifi_system_cfg() instead of being silently mis-provisioned.
+-- The four enterprise values were added 2026-10-26, when UAP firmware 6.8.2's
+-- hostapd generator and the controller's own AP config builder showed that the
+-- wire DOES carry the RADIUS servers (see inform.lua's _wire_radius). Until
+-- then there was deliberately no entry, on the belief that it could not work.
+--
+-- The encryption strings are verified against the LIVE generator on 25.12
+-- (/usr/share/ucode/wifi/, which is what runs -- /lib/netifd/wireless/mac80211.sh
+-- is itself a ucode script and /lib/netifd/hostapd.sh is dead weight).
+-- iface.uc takes auth_type from the first `+` token of `encryption`:
+--   wpa2+ccmp -> eap      (wpa=2, CCMP)        -> WPA-EAP
+--   wpa3      -> eap2                          -> WPA-EAP-SHA256
+--   wpa3-mixed-> eap-eap2                      -> WPA-EAP + WPA-EAP-SHA256
+--   wpa3-192  -> eap192   (GCMP-256)           -> WPA-EAP-SUITE-B-192
+-- `encryption=eap` would be wrong: auth_type would come out right, but no
+-- config.wpa wildcard matches it, so the BSS would get wpa=0.
+--
+-- ap.uc's EAP branch sets vlan_possible and calls its own
+-- iface_authentication_server()/iface_accounting_server(), so the server
+-- blocks need nothing beyond the options apply_config writes. It also leaves
+-- ft_psk_generate_local off for a non-psk auth_type, which is what FT-EAP
+-- needs, and hostapd adds FT-EAP/FT-EAP-SHA384 itself when ieee80211r=1 --
+-- so Enterprise fast roaming comes free from the existing 802.11r block.
 local SECURITY_MAP = {
-	["open"]       = "none",
-	["wpa2"]       = "psk2",
-	["wpa3"]       = "sae",
-	["wpa2/wpa3"]  = "sae-mixed",
-	["owe"]        = "owe",
+	["open"]                 = "none",
+	["wpa2"]                 = "psk2",
+	["wpa3"]                 = "sae",
+	["wpa2/wpa3"]            = "sae-mixed",
+	["owe"]                  = "owe",
+	["wpa2-enterprise"]      = "wpa2+ccmp",
+	["wpa3-enterprise"]      = "wpa3",
+	["wpa2/wpa3-enterprise"] = "wpa3-mixed",
+	["wpa3-enterprise-192"]  = "wpa3-192",
+}
+
+-- Append one raw per-BSS hostapd line to an `extra` table, creating the list
+-- on first use. Appending rather than assigning on purpose: hostapd_bss_options
+-- has more than one producer, and a bare `extra.hostapd_bss_options = {...}`
+-- from a second one would silently drop the first one's lines.
+local function add_bss_option(extra, line)
+	local t = extra.hostapd_bss_options
+	if type(t) ~= "table" then
+		t = {}
+		extra.hostapd_bss_options = t
+	end
+	t[#t + 1] = line
+end
+
+-- The encryption values whose auth_type lands in ap.uc's EAP branch, which is
+-- the only place (besides ppsk) that calls iface_authentication_server(). On
+-- any other BSS the auth_server_* wifi-iface options are stored and never
+-- reach hostapd, so a RADIUS MAC ACL there has to go in as raw lines. An
+-- allow-set, so a future encryption value fails to the route that always works.
+local EAP_ENC = {
+	["wpa2+ccmp"]  = true,
+	["wpa3"]       = true,
+	["wpa3-mixed"] = true,
+	["wpa3-192"]   = true,
+}
+
+-- The encryption values that take a `key` (a passphrase or a 64-hex PMK). An
+-- allow-set rather than a "not none, not owe" test: an EAP BSS must never
+-- carry a passphrase, and a future encryption value must fail closed.
+local PASSPHRASE_ENC = {
+	["psk2"]       = true,
+	["sae"]        = true,
+	["sae-mixed"]  = true,
 }
 
 -- Deterministic 16-bit id from a string, formatted as 4 hex chars (802.11r
@@ -495,8 +698,33 @@ function M.vap_vlan_ids(vap)
 	end
 	if vap.vlan_enabled then add(vap.vlan) end
 	for _, k in ipairs(vap.ppsk or {}) do add(k.vid) end
+	-- MAC-based VLANs: each overridden client needs its VLAN's L2 here too,
+	-- or hostapd refuses the station rather than falling back to the VAP's
+	-- own network (ieee802_11_set_radius_info -> hostapd_vlan_valid).
+	for _, e in ipairs(vap.mac_vlans or {}) do add(e.vid) end
 	table.sort(out)
 	return out
+end
+
+-- One wifi-vlan section for `vid` on the VAP in wifi-iface section `iface`,
+-- bound to UCI network `net`. Shared by the private-pre-shared-key and
+-- MAC-based-VLAN paths, which can both want the same VLAN on one VAP: the
+-- section name is derived from the VID alone, so the second writer reuses the
+-- first one's section instead of adding a duplicate vlan_file line.
+--
+-- ap.uc's iface_vlan() turns each one into a `<vid> <ifname>-<name>` line of
+-- hostapd's vlan_file and has netifd put that netdev in the named network's
+-- bridge.
+local function vlan_section(cursor, iface, vid, net)
+	local vs = iface .. "_vlan" .. vid
+	cursor:set("wireless", vs, "wifi-vlan")
+	cursor:set("wireless", vs, "iface", {iface})
+	-- The netdev is <vap ifname>-<name>: "phy0-ap0-20" stays
+	-- inside the 15-character limit, where "v20" might not.
+	cursor:set("wireless", vs, "name", tostring(vid))
+	cursor:set("wireless", vs, "vid", tostring(vid))
+	cursor:set("wireless", vs, "network", {net})
+	return vs
 end
 
 -- Private Pre-Shared Keys for the VAP in wifi-iface section `iface`.
@@ -509,14 +737,16 @@ end
 -- network it names. A key without a VLAN puts its client on the VAP's own
 -- network.
 --
--- keys:     vap.ppsk, {key=, vid=} each
+-- keys:     vap.ppsk, {key=, vid=, mac=} each (mac nil = any station)
 -- networks: vid -> UCI network section for that VLAN (ensure_vlan_network)
 -- A key whose VLAN has no network is left out rather than provisioned
 -- without one: that client would land on the VAP's own network, past the
 -- segmentation the key exists for.
-function M.ppsk_add(iface, keys, networks)
-	local uci = get_uci()
-	local cursor = uci.cursor()
+-- cursor:   optional caller's cursor to write into (see borrow_cursor); the
+--           caller then commits. Without one this opens and commits its own.
+function M.ppsk_add(iface, keys, networks, cursor)
+	local owned
+	cursor, owned = borrow_cursor(cursor)
 	for i, k in ipairs(keys or {}) do
 		local net = k.vid and networks[k.vid]
 		if k.vid and not net then
@@ -525,26 +755,188 @@ function M.ppsk_add(iface, keys, networks)
 		else
 			-- Two keys on one VLAN share its section.
 			if k.vid then
-				local vs = iface .. "_vlan" .. k.vid
-				cursor:set("wireless", vs, "wifi-vlan")
-				cursor:set("wireless", vs, "iface", {iface})
-				-- The netdev is <vap ifname>-<name>: "phy0-ap0-20" stays
-				-- inside the 15-character limit, where "v20" might not.
-				cursor:set("wireless", vs, "name", tostring(k.vid))
-				cursor:set("wireless", vs, "vid", tostring(k.vid))
-				cursor:set("wireless", vs, "network", {net})
+				vlan_section(cursor, iface, k.vid, net)
 			end
 			local ss = iface .. "_psk" .. i
 			cursor:set("wireless", ss, "wifi-station")
 			cursor:set("wireless", ss, "iface", {iface})
-			cursor:set("wireless", ss, "mac", {"00:00:00:00:00:00"})
+			cursor:set("wireless", ss, "mac", {k.mac or "00:00:00:00:00:00"})
 			cursor:set("wireless", ss, "key", k.key)
 			if k.vid then
 				cursor:set("wireless", ss, "vid", tostring(k.vid))
 			end
 		end
 	end
-	cursor:commit("wireless")
+	release_cursor(cursor, owned, "wireless")
+end
+
+-- MAC-based VLANs ("Virtual Network Override"): put a named client on a named
+-- VLAN whatever SSID it joins. The controller sends one list per WLAN
+-- (aaa.<n>.accept_mac.*, see inform.lua's _wire_mac_vlans).
+--
+-- THE CONSUMER is hostapd's accept-MAC list, whose lines take an optional VLAN
+-- id after the address ("<mac> <vid>"). hostapd_check_acl() is consulted on
+-- every authentication BEFORE macaddr_acl is even looked at, and a match
+-- returns ACCEPT carrying that VLAN; a station that is NOT listed falls
+-- through to the macaddr_acl default. So an accept file on its own assigns
+-- VLANs without restricting access -- which is the whole feature. Read out of
+-- hostapd v2.12-devel (src/ap/ieee802_11_auth.c, hostapd/config_file.c), the
+-- build both APs run.
+--
+-- The VLAN must also be in hostapd's vlan_file or the station is REFUSED, not
+-- put on the VAP's own network ("Invalid VLAN %d received from RADIUS server",
+-- ieee802_11_set_radius_info -> hostapd_vlan_valid). Hence a wifi-vlan section
+-- per VLAN, exactly as the private-pre-shared-key path builds them.
+--
+-- THREE WAYS IN, because OpenWrt owns the same file for "MAC Address Filter":
+--  * No filter: openUF's own file via a raw accept_mac_file= line. ap.uc emits
+--    no macaddr_acl, and hostapd's default (0, accept-unless-denied) is what
+--    lets unlisted clients keep joining.
+--  * macfilter=allow: ap.uc writes accept_mac_file ITSELF from `maclist`, plus
+--    macaddr_acl=1. openUF hands its entries to the schema's `macfile` option,
+--    which ap.uc appends to that same file -- and drops those MACs from the
+--    maclist it writes, so each address appears exactly once (two lines for one
+--    station, one with a VLAN and one without, would leave hostapd's bsearch to
+--    pick either). An address NOT already allowed is skipped: adding it would
+--    silently widen the admin's whitelist.
+--  * macfilter=deny: the deny list is a separate file, but the accept list is
+--    checked first -- so a mapped MAC that is also denied would be let in.
+--    Those entries are dropped and the rest go in via the raw line.
+--
+-- REFUSED outright when the WLAN has RADIUS MAC authentication: there
+-- macaddr_acl=2 asks the RADIUS server about every client, and an accept-list
+-- entry returns ACCEPT before the question is asked. A VLAN override is not
+-- worth bypassing an access control.
+local MACVLAN_DIR = "/etc/openuf"
+
+-- Injectable for tests: write `contents` to `path`, true on success.
+M._write_file = function(path, contents)
+	local f = io.open(path, "w")
+	if not f then return false end
+	f:write(contents)
+	f:close()
+	return true
+end
+
+-- Injectable for tests: remove `path`, ignoring an absent file.
+M._remove_file = function(path) os.remove(path) end
+
+-- Where this VAP's accept file lives. Named after the wifi-iface section, which
+-- is derived from radio + SSID and so is stable across pushes.
+function M.mac_vlan_path(section)
+	return MACVLAN_DIR .. "/macvlan-" .. section
+end
+
+-- Decide what (if anything) this VAP's accept file will hold, before the
+-- wifi-iface section exists. Returns nil when there is nothing to write, or
+--   {path =, entries = {{mac=, vid=}, ...}, mode = "raw" | "macfile"}
+-- `maclist` is the MAC Address Filter list openUF is about to write, and is
+-- MUTATED in the macfilter=allow case (see above).
+function M.mac_vlan_plan(vap, networks, section, maclist)
+	local entries = vap.mac_vlans
+	if not entries or #entries == 0 then return nil end
+	local policy = vap.mac_filter_policy
+	if vap.mac_auth then
+		io.stderr:write(("ucihelper: %s: %d MAC-based VLAN entries ignored -- the "
+			.. "WLAN uses RADIUS MAC authentication, and an accept-list entry "
+			.. "would skip it\n"):format(tostring(vap.ssid), #entries))
+		return nil
+	end
+	-- M.DELETE when the WLAN has no MAC Address Filter, so not a list to read.
+	if type(maclist) ~= "table" then maclist = {} end
+	local filter = {}
+	for _, m in ipairs(maclist) do filter[tostring(m):lower()] = true end
+	local keep = {}
+	for _, e in ipairs(entries) do
+		local why
+		if not networks[e.vid] then
+			-- Same rule as a private pre-shared key with no network: better no
+			-- override than a client silently left on the VAP's own VLAN, which
+			-- is the segmentation the override exists to cross.
+			why = ("no network for VLAN %d"):format(e.vid)
+		elseif policy == "allow" and not filter[e.mac] then
+			why = "the MAC Address Filter does not allow it"
+		elseif policy == "deny" and filter[e.mac] then
+			why = "the MAC Address Filter denies it"
+		end
+		if why then
+			io.stderr:write(("ucihelper: %s: MAC-based VLAN for %s left out -- %s\n")
+				:format(tostring(vap.ssid), e.mac, why))
+		else
+			keep[#keep + 1] = e
+		end
+	end
+	if #keep == 0 then return nil end
+	-- The FILE IS WRITTEN HERE, before anything points hostapd at it. An
+	-- accept_mac_file= line naming a file that does not exist is not a degraded
+	-- feature: hostapd_config_read_maclist() returns -1 and hostapd refuses the
+	-- whole BSS, so the WLAN would vanish. On a write failure the plan is
+	-- abandoned instead, and the WLAN goes up without the overrides.
+	--
+	-- A LEADING newline, not a trailing one: ap.uc writes the maclist with
+	-- `join('\n', ...)` and no terminator, so in macfile mode openUF's first
+	-- byte lands on the end of the last allow-list address. That does NOT fail
+	-- -- which is why the newline matters. hwaddr_aton() reads exactly six
+	-- octets and ignores whatever follows (src/utils/common.c), so the joined
+	-- line is read as that LAST address, and the VLAN id is then taken from
+	-- after its first space -- the mapped client's. The allow-listed station
+	-- would silently get the override, and the intended one no entry at all.
+	-- Verified against hostapd v2.12-devel: the joined line draws no complaint.
+	-- Harmless in raw mode, where openUF owns the file outright.
+	local lines = {"", "# openUF: MAC-based VLANs. Rebuilt on every config push."}
+	for _, e in ipairs(keep) do lines[#lines + 1] = e.mac .. " " .. e.vid end
+	local path = M.mac_vlan_path(section)
+	local body = table.concat(lines, "\n") .. "\n"
+	-- The entries change only when the admin edits the client list, while this
+	-- runs on every push. Read the file back first and skip a write whose bytes
+	-- are already on the flash. Only the WRITE is skipped: the maclist edit
+	-- below is part of what this push hands ap.uc, not part of the file.
+	if M._read_file(path) ~= body and not M._write_file(path, body) then
+		io.stderr:write(("ucihelper: %s: cannot write %s -- MAC-based VLANs left "
+			.. "unapplied\n"):format(tostring(vap.ssid), path))
+		return nil
+	end
+	if policy == "allow" then
+		-- One line per address in the file ap.uc builds: ours carry the VLAN.
+		local mapped = {}
+		for _, e in ipairs(keep) do mapped[e.mac] = true end
+		local i = 1
+		while maclist[i] do
+			if mapped[tostring(maclist[i]):lower()] then
+				table.remove(maclist, i)
+			else
+				i = i + 1
+			end
+		end
+	end
+	return {
+		path    = path,
+		entries = keep,
+		mode    = (policy == "allow") and "macfile" or "raw",
+	}
+end
+
+-- One wifi-vlan section per VLAN the plan names. Called after wlan_add, like
+-- ppsk_add, since the sections hang off the VAP's.
+-- One section per DISTINCT VLAN, not per entry: vlan_section derives the
+-- section name from the VID alone, so N clients on one VLAN wrote the same five
+-- options N times over. The controller's lists are per client, and a site that
+-- overrides 50 of them across 3 VLANs did 250 cursor:set calls for 15 options'
+-- worth of config.
+--
+-- cursor: optional caller's cursor (see borrow_cursor).
+function M.mac_vlans_add(iface, plan, networks, cursor)
+	if not plan then return end
+	local owned
+	cursor, owned = borrow_cursor(cursor)
+	local done = {}
+	for _, e in ipairs(plan.entries) do
+		if not done[e.vid] then
+			done[e.vid] = true
+			vlan_section(cursor, iface, e.vid, networks[e.vid])
+		end
+	end
+	release_cursor(cursor, owned, "wireless")
 end
 
 -- UCI option marking a wifi-iface that openUF disabled on the user's behalf,
@@ -597,21 +989,28 @@ function M.set_wlan_exclusive(enabled, keep)
 			end
 		end
 	end)
+	local changed = false
 	for _, t in ipairs(targets) do
 		if t.release then
 			cursor:set("wireless", t.name, "disabled", "0")
 			cursor:set("wireless", t.name, AUTODISABLED, "0")
+			changed = true
 		elseif enabled then
 			if t.disabled ~= "1" then
 				cursor:set("wireless", t.name, "disabled", "1")
 				cursor:set("wireless", t.name, AUTODISABLED, "1")
+				changed = true
 			end
 		elseif t.stamped then
 			cursor:set("wireless", t.name, "disabled", "0")
 			cursor:set("wireless", t.name, AUTODISABLED, "0")
+			changed = true
 		end
 	end
-	cursor:commit("wireless")
+	-- Each branch above is already a no-op once it has run, so in the steady
+	-- state -- which is every push after the first -- there is nothing to
+	-- commit, and committing anyway rewrote /etc/config/wireless for it.
+	if changed then cursor:commit("wireless") end
 end
 
 -- ─── Minimum Data Rate ───────────────────────────────────────────────────────
@@ -666,6 +1065,49 @@ function M.derive_rates(floor_kbps, allow_cck, drop_below)
 	return rates
 end
 
+-- The UCI wifi-iface section name for one WLAN on one radio. Deterministic,
+-- and exposed so a caller that needs the name BEFORE the section exists (the
+-- MAC-based-VLAN accept file is named after it) derives the same one.
+--
+-- The name includes the radio, not just the SSID: broadcasting the
+-- same SSID on both radios simultaneously is the default, common case
+-- (the controller UI's "Radio Band: 2.4 GHz + 5 GHz" checkboxes) and
+-- produces one wlan_add() call per radio with an identical ssid. Keying
+-- purely by SSID collapsed both calls into the same UCI section, so the
+-- second call's "device" silently overwrote the first -- confirmed live
+-- against a real controller: only the last-processed radio's VAP
+-- survived. The radio is sanitized the same way the ssid is, though UCI
+-- radio names ("radio0"/"radio1") never need it.
+--
+-- The character class must NOT keep "-". A UCI section name may contain
+-- only [A-Za-z0-9_], and libuci enforces that in the most unhelpful way
+-- available: cursor:set() returns true, cursor:commit() returns true, and
+-- the section is silently discarded -- it never reaches /etc/config and
+-- never appears in `uci show`. So an SSID with a hyphen produced a
+-- wlan_add that reported success at every step and left no WLAN behind,
+-- with nothing in any log to say so. Confirmed live: creating
+-- "openuf-verify" in the controller pushed correctly, parsed correctly
+-- into vap_table, and simply never provisioned. Hyphens are common in
+-- SSIDs, so this was a wide hole.
+--
+-- Sanitizing is lossy, and that loss used to collapse WLANs: "Guest WiFi",
+-- "Guest-WiFi" and "Guest_WiFi" all became openuf_radio0_Guest_WiFi, so
+-- two of them on one radio shared a section and the second silently
+-- overwrote the first -- the same failure the per-radio keying above
+-- exists to prevent, one level down. When the name had to be ALTERED at
+-- all, a short hash of the original keeps them apart; a name that needed
+-- no alteration keeps the section name it has always had, so nothing
+-- already deployed is renamed. (apply_config wlan_clear()s every openuf_
+-- section before rebuilding them, so a name that does change leaves
+-- nothing stale behind either.)
+function M.vap_section_name(radio, ssid)
+	local safe_ssid = ssid:gsub("[^%w_]", "_")
+	if safe_ssid ~= ssid then
+		safe_ssid = safe_ssid .. "_" .. M.derive_mobility_domain(ssid)
+	end
+	return OPENUF_PREFIX .. tostring(radio):gsub("[^%w_]", "_") .. "_" .. safe_ssid
+end
+
 -- Create a new wifi-iface section named openuf_<ssid> on the given radio.
 -- radio:    UCI radio name, e.g. "radio0" or "radio1"
 -- ssid:     SSID string
@@ -679,42 +1121,46 @@ end
 --           aaa.<n>.id), stashed the same way so get_vap_table() can echo it
 --           back as the vap's "id" -- required for the controller to accept
 --           the vap (and its sta_table) at all.
-function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id)
-	local uci = get_uci()
-	local cursor = uci.cursor()
-	-- Section name includes the radio, not just the SSID: broadcasting the
-	-- same SSID on both radios simultaneously is the default, common case
-	-- (the controller UI's "Radio Band: 2.4 GHz + 5 GHz" checkboxes) and
-	-- produces one wlan_add() call per radio with an identical ssid. Keying
-	-- purely by SSID collapsed both calls into the same UCI section, so the
-	-- second call's "device" silently overwrote the first -- confirmed live
-	-- against a real controller: only the last-processed radio's VAP
-	-- survived. name:gsub("[^%w_-]", "_") sanitizes radio the same way ssid
-	-- already was, though UCI radio names ("radio0"/"radio1") never need it.
-	-- The character class must NOT keep "-". A UCI section name may contain
-	-- only [A-Za-z0-9_], and libuci enforces that in the most unhelpful way
-	-- available: cursor:set() returns true, cursor:commit() returns true, and
-	-- the section is silently discarded -- it never reaches /etc/config and
-	-- never appears in `uci show`. So an SSID with a hyphen produced a
-	-- wlan_add that reported success at every step and left no WLAN behind,
-	-- with nothing in any log to say so. Upstream confirmed it live: an SSID
-	-- "openuf-verify" pushed correctly, parsed correctly into vap_table, and
-	-- simply never provisioned. Hyphens are common in SSIDs, so this was a
-	-- wide hole. (The test suite's mock cursor now refuses such a name, so
-	-- the class cannot quietly widen again.)
-	local safe_ssid = ssid:gsub("[^%w_]", "_")
-	-- Sanitizing is lossy: "Guest WiFi", "Guest-WiFi" and "Guest_WiFi" all
-	-- become Guest_WiFi, so two WLANs on one radio whose names differ only in
-	-- punctuation collapsed into one section, the second silently
-	-- overwriting the first. When the name had to be altered, a short hash
-	-- of the ORIGINAL keeps them apart; a name that needed no alteration
-	-- keeps the section name it has always had.
-	if safe_ssid ~= ssid then
-		safe_ssid = safe_ssid .. "_" .. M.derive_mobility_domain(ssid)
-	end
-	local section_name = OPENUF_PREFIX .. tostring(radio):gsub("[^%w_]", "_")
-		.. "_" .. safe_ssid
+-- pairwise: optional pairwise-cipher token ("gcmp", "ccmp256", ...) from
+--           inform.lua's _wire_pairwise, appended to the encryption string
+--           when this radio's hardware can program it. nil keeps the default.
+-- cursor:   optional caller's cursor to write into (see borrow_cursor), so a
+--           push with several WLANs rewrites /etc/config/wireless once rather
+--           than once per WLAN. The caller commits.
+function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id,
+		pairwise, cursor)
+	local owned
+	cursor, owned = borrow_cursor(cursor)
+	local section_name = M.vap_section_name(radio, ssid)
 	local enc = SECURITY_MAP[security] or "psk2"
+	-- The controller's own pairwise cipher (aaa.<n>.wpa.1.pairwise), as the
+	-- second `+` token of `encryption` -- which is where iface.uc reads a
+	-- cipher from. The base is taken first because SECURITY_MAP already
+	-- carries a suffix for the EAP values ("wpa2+ccmp"), and a second one
+	-- appended after it would be ignored outright.
+	--
+	-- "wpa3-192" is left alone on purpose: iface.uc pins that auth_type to
+	-- GCMP-256 itself, which is what the 192-bit suite requires, so a cipher
+	-- from the wire can only contradict it.
+	local enc_base = enc:match("^([^+]+)") or enc
+	if pairwise and enc_base ~= "none" and enc_base ~= "owe"
+			and enc_base ~= "wpa3-192" then
+		-- The radio's band comes from its own UCI declaration, as in
+		-- apply_config's htmode clamp: the band is fixed by hardware.
+		local band = band_for_device({
+			band    = cursor:get("wireless", radio, "band"),
+			hwmode  = cursor:get("wireless", radio, "hwmode"),
+			channel = cursor:get("wireless", radio, "channel"),
+		})
+		if M.cipher_ok(band, pairwise) then
+			enc = enc_base .. "+" .. pairwise
+		else
+			io.stderr:write(string.format(
+				"openuf: %s: controller asked for pairwise cipher %s, %s hardware "
+				.. "does not support it -- keeping %s\n",
+				tostring(ssid), pairwise, tostring(band), enc))
+		end
+	end
 	cursor:set("wireless", section_name, "wifi-iface")
 	cursor:set("wireless", section_name, "device", radio)
 	cursor:set("wireless", section_name, "mode", "ap")
@@ -724,7 +1170,10 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 	if wlanconf_id then
 		cursor:set("wireless", section_name, "openuf_wlanconf_id", wlanconf_id)
 	end
-	if password and enc ~= "none" and enc ~= "owe" then
+	-- Keyed on the BASE value: PASSPHRASE_ENC is an allow-set of security
+	-- values, and a cipher suffix must not turn a WLAN that takes a
+	-- passphrase into one that silently drops it.
+	if password and PASSPHRASE_ENC[enc_base] then
 		cursor:set("wireless", section_name, "key", password)
 	end
 	-- 802.11r/k/v
@@ -749,7 +1198,7 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 			end
 		end
 	end
-	cursor:commit("wireless")
+	release_cursor(cursor, owned, "wireless")
 	return section_name
 end
 
@@ -905,59 +1354,45 @@ function M.vap_bssid(radio, ssid)
 	return mac_of(M.get_ifname_for_vap(radio, ssid))
 end
 
--- ─── The translator's veth pair (unifi_ft_interop) ───────────────────────────
--- hostapd's ft_iface moves onto vft0 and the openuf-rrb daemon holds vft1
--- (rrb/README.md). The pair is a netifd `config device` of type veth plus two
--- proto-none interfaces, so netifd creates it at boot before the radios come
--- up (a BSS whose ft_iface is missing fails to start) and `forget` removes
--- it. The names come from openuf.rrb (ft_iface / peer_iface, as the service
--- reads them).
-M.FT_VETH_SECTIONS = {"openuf_ftveth", "openuf_ftlink", "openuf_ftpeer"}
+-- ─── The veth pair an earlier openUF wrote for its own translator ──────────
+-- Until 2026-11-02 this tree vendored the rrb-unifi translator and wrote its
+-- veth pair into /etc/config/network as these three sections (apply_config
+-- created them on the first push with an FT WLAN). The translator is a
+-- separate install now, with its own sections (`vft`, d-malinowski's names),
+-- so an upgraded device still carrying ours has them removed -- AFTER the
+-- push that rewrote the WLANs without `ft_iface=vft0`, never before: a BSS
+-- whose ft_iface vanishes under it fails. inform.run asks for that push.
+M.LEGACY_FT_VETH_SECTIONS = {"openuf_ftveth", "openuf_ftlink", "openuf_ftpeer"}
 
-local function ft_veth_names(cursor)
-	local ft = cursor and cursor:get("openuf", "rrb", "ft_iface")
-	local peer = cursor and cursor:get("openuf", "rrb", "peer_iface")
-	if type(ft) ~= "string" or not util.valid_ifname(ft) then ft = "vft0" end
-	if type(peer) ~= "string" or not util.valid_ifname(peer) then peer = "vft1" end
-	return ft, peer
+function M.legacy_ft_veth_present(cursor)
+	cursor = cursor or get_uci().cursor()
+	local present = false
+	cursor:foreach("network", "device", function(s)
+		if s[".name"] == M.LEGACY_FT_VETH_SECTIONS[1] then present = true end
+	end)
+	return present
 end
 
--- True when hostapd's end of the pair exists afterwards. Writes the sections
--- only when they are missing or name other interfaces, reloads the network
--- at once (the push that called this is about to write the VAPs that use the
--- veth, and ftinterop decides per VAP on whether the netdev exists), and
--- gives netifd a few seconds to create it.
-function M.ensure_ft_veth(cursor)
+-- Removes the pair's sections when present and marks the network dirty for
+-- the caller's reload; true when something was removed.
+function M.remove_legacy_ft_veth(cursor)
 	cursor = cursor or get_uci().cursor()
-	local ft, peer = ft_veth_names(cursor)
-	local function present()
-		return M._read_file("/sys/class/net/" .. ft .. "/ifindex") ~= nil
+	local present = {}
+	for _, t in ipairs({"device", "interface"}) do
+		cursor:foreach("network", t, function(s) present[s[".name"]] = true end)
 	end
-	if present() then return true end
-	local dev, link, peerif = M.FT_VETH_SECTIONS[1], M.FT_VETH_SECTIONS[2], M.FT_VETH_SECTIONS[3]
-	if cursor:get("network", dev, "name") ~= ft
-		or cursor:get("network", dev, "peer_name") ~= peer then
-		cursor:set("network", dev, "device")
-		cursor:set("network", dev, "type", "veth")
-		cursor:set("network", dev, "name", ft)
-		cursor:set("network", dev, "peer_name", peer)
-		cursor:set("network", link, "interface")
-		cursor:set("network", link, "proto", "none")
-		cursor:set("network", link, "device", ft)
-		cursor:set("network", peerif, "interface")
-		cursor:set("network", peerif, "proto", "none")
-		cursor:set("network", peerif, "device", peer)
+	local removed = false
+	for _, sec in ipairs(M.LEGACY_FT_VETH_SECTIONS) do
+		if present[sec] then
+			cursor:delete("network", sec)
+			removed = true
+		end
+	end
+	if removed then
 		cursor:commit("network")
+		M._network_dirty = true
 	end
-	M._run_cmd("/etc/init.d/network reload 2>/dev/null")
-	M._network_dirty = false
-	for _ = 1, 5 do
-		if present() then return true end
-		M._run_cmd("sleep 1")
-	end
-	io.stderr:write("openuf: the translator's veth " .. ft .. " did not appear after the "
-		.. "network reload; hostapd stays on the bridge this push\n")
-	return false
+	return removed
 end
 
 -- The bridge a netdev is enslaved to, or nil when it carries its own address.
@@ -1182,11 +1617,24 @@ end
 -- opts.maxsta: Load balance's per-radio client cap (openuf/loadbalance.lua),
 -- kept in the openUF-only option loadbalance_maxsta; false deletes it (off),
 -- nil leaves UCI alone.
+-- opts.country_beacon: advertise the 802.11d Country IE in this radio's
+-- beacons, collapsed from the per-WLAN aaa.<n>.country_beacon by apply_config.
+-- nil leaves UCI alone (no WLAN on this radio carried the key).
+-- opts.acs_exclude_dfs / opts.acs_blacklist: the site's auto-channel limits
+-- from the controller (Settings -> Radios). The board policy above wins where
+-- it forbids DFS: a radio whose driver cannot run CAC stays off DFS whatever
+-- the site allows.
 function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, rates,
 		disabled, country, radio_policy, opts)
 	local uci = get_uci()
 	local cursor = uci.cursor()
 	local maxsta = opts and opts.maxsta
+	local country_beacon = opts and opts.country_beacon
+	-- The site's auto-channel limits (radio.<n>.acsdfs / blklst, behind
+	-- wifi_caps2 0x10): the DFS switch as a boolean, the blacklist as a list
+	-- of channel numbers. nil when the controller sent neither.
+	local acs_exclude_dfs = opts and opts.acs_exclude_dfs
+	local acs_blacklist = opts and opts.acs_blacklist
 	-- Every write below is cursor:set on a named section, which in UCI CREATES
 	-- that section when it does not exist. A controller naming a phy this
 	-- device does not have (a stale device record, a config cloned from
@@ -1272,13 +1720,8 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 		else
 			cursor:delete("wireless", radio, "acs_exclude_dfs")
 		end
-		if policy and type(policy.channels) == "table" and #policy.channels > 0 then
-			local list = {}
-			for _, c in ipairs(policy.channels) do list[#list + 1] = tostring(c) end
-			cursor:set("wireless", radio, "channels", list)
-		else
-			cursor:delete("wireless", radio, "channels")
-		end
+		-- The board's own candidate list (policy.channels) is written below,
+		-- folded with the controller's channel blacklist, in one place.
 	else
 		-- A concrete channel was chosen: neither option means anything to
 		-- hostapd then (both are ACS inputs), and leaving them behind would
@@ -1394,6 +1837,171 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 	elseif maxsta == false then
 		cursor:delete("wireless", radio, "loadbalance_maxsta")
 	end
+	-- 802.11d Country IE. Written as an explicit 0 rather than deleted when
+	-- off: hostapd.uc gates `ieee80211d` on its own truthiness, so 0 and
+	-- absent behave identically to hostapd, and writing it keeps the applied
+	-- state visible in UCI -- the same reason the iot flag is recorded.
+	--
+	-- No guard on a country being configured is needed: hostapd itself treats
+	-- ieee80211d=1 without country_code as fatal, but hostapd.uc's
+	-- device_country_append() returns before emitting ieee80211d at all when
+	-- no radio declares a country (read from 25.12's live generator), so the
+	-- option cannot reach hostapd unaccompanied.
+	--
+	-- **Never 0 on a 5 GHz radio.** hostapd refuses the whole interface with
+	-- "Cannot enable IEEE 802.11h without IEEE 802.11d enabled", and
+	-- `ieee80211h` is exactly what hostapd.uc emits for every radio with
+	-- hw_mode 'a' and a country (it defaults to 1 in the schema, and is
+	-- deleted only for hw_mode != 'a'). The result is not a dropped option but
+	-- `hostapd.add_iface failed`: the 5 GHz phy stays down with no SSID on the
+	-- air and nothing in UCI to explain it. Seen in production on both boards
+	-- (ath79/ath10k and filogic/mt76) at the first `wifi reload` after this
+	-- option was first written -- not at the push that wrote it, which is why
+	-- reading UCI and hostapd.conf straight after the provision looked clean.
+	-- 802.11h carries DFS and TPC, so suppressing the country IE there is not
+	-- something to trade for it; the radio keeps 802.11d and the controller's
+	-- setting is honoured on 2.4 GHz only.
+	if country_beacon ~= nil then
+		local five = band_for_device({
+			band    = cursor:get("wireless", radio, "band"),
+			hwmode  = cursor:get("wireless", radio, "hwmode"),
+			channel = cursor:get("wireless", radio, "channel"),
+		}) == "na"
+		-- An explicit 1, not a delete: this also repairs a radio an earlier
+		-- openUF left at 0.
+		cursor:set("wireless", radio, "ieee80211d",
+			(country_beacon or five) and "1" or "0")
+		if five and not country_beacon and not M._warned_11d then
+			M._warned_11d = true
+			io.stderr:write("openuf: " .. tostring(radio) .. ": Country IE off is"
+				.. " not applicable on 5 GHz -- 802.11h (DFS) requires 802.11d,"
+				.. " and hostapd refuses the interface without it\n")
+		end
+	end
+	-- Auto-channel narrowing (the site's Radio settings, see
+	-- _parse_wifi_system_cfg). Both land on wifi-device options that only
+	-- hostapd's ACS reads, so writing them on a radio pinned to a fixed
+	-- channel is inert -- and keeps UCI showing what the controller asked for
+	-- the day the user switches that radio back to Auto.
+	-- This tree's two rules on top of upstream's mapping: the option is
+	-- written only while the radio is on Auto (a fixed channel deletes it
+	-- above, so a restriction never resurrects when Auto is chosen later --
+	-- the controller re-sends the key on every push anyway), and a board
+	-- policy that forbids DFS (dev.conf.radio.<band>.acs_exclude_dfs: a
+	-- driver whose CAC fails) is never overridden by the site's switch.
+	if acs_exclude_dfs ~= nil
+			and (tostring(eff_chan) == "auto" or tostring(eff_chan) == "0")
+			and not (policy and policy.acs_exclude_dfs) then
+		cursor:set("wireless", radio, "acs_exclude_dfs", acs_exclude_dfs and "1" or "0")
+	end
+	-- The ACS candidate list, UCI `channels` (24.10's generator reads that
+	-- list; 25.12's schema declares it as the alias of `chanlist`, which is
+	-- what hostapd.uc appends -- one option name serves both). Two sources
+	-- fold into it, the board's and the controller's, and the board's wins:
+	--
+	--   * dev.conf.radio.<band>.channels, the modelmap's explicit list for a
+	--     board that needs specific channels excluded (hardware truth);
+	--   * radio.<n>.blklst, the site's channel BLACKLIST (wifi_caps2 0x10),
+	--     what ACS may not pick. hostapd has no blacklist, only the candidate
+	--     list, so it is inverted against the channels this band may legally
+	--     use -- exactly what phy_caps reads out of `iw phy`: the regdomain
+	--     has already removed everything else, and disabled channels are
+	--     skipped there (upstream's mapping, 2026-10-27).
+	--
+	-- With both present the list is the board's minus the blacklist, and the
+	-- board's alone when that intersection would be empty (logged): a
+	-- candidate list with nothing the radio can use is a radio that never
+	-- comes up. On a fixed channel the option means nothing to hostapd and is
+	-- deleted above, so a restriction never resurrects when Auto is chosen
+	-- later -- the controller re-sends the key on every push anyway. A list
+	-- the user set by hand on an openUF-managed radio is replaced like every
+	-- other radio option rf_config owns.
+	local on_auto = tostring(eff_chan) == "auto" or tostring(eff_chan) == "0"
+	local policy_list = nil
+	if policy and type(policy.channels) == "table" and #policy.channels > 0 then
+		policy_list = {}
+		for _, c in ipairs(policy.channels) do policy_list[#policy_list + 1] = tostring(c) end
+	end
+	local allowed = nil
+	if acs_blacklist and on_auto then
+		local section = {
+			band    = cursor:get("wireless", radio, "band"),
+			hwmode  = cursor:get("wireless", radio, "hwmode"),
+			channel = cursor:get("wireless", radio, "channel") or chan,
+		}
+		-- band_for_device falls back to the channel number, and its documented
+		-- trap is that "auto" is not one: it answers "na" for a 2.4 GHz radio
+		-- on ACS. Everywhere else that costs a mis-clamped width; here it
+		-- would hand a 2.4 GHz radio a candidate list of 5 GHz channels --
+		-- i.e. an ACS with nothing it can tune. So a guess is not good enough:
+		-- the band has to come from the section's own band/hwmode, or from a
+		-- channel that is actually a number.
+		local bl_band = (section.band or section.hwmode or tonumber(section.channel))
+			and band_for_device(section) or nil
+		local caps = bl_band and M.phy_caps()[bl_band]
+		local legal = caps and caps.channels
+		if not legal then
+			-- Unknown channel set (no `iw`, unparseable output): leave ACS
+			-- alone. A guessed candidate list can contain nothing the radio
+			-- can actually use, and an ACS with no usable candidate is a radio
+			-- that does not come up -- strictly worse than ignoring the
+			-- blacklist.
+			io.stderr:write(string.format(
+				"openuf: %s: cannot read the %s channel list -- ignoring the"
+				.. " controller's channel blacklist\n", tostring(radio),
+				bl_band or "radio's own"))
+		else
+			local blocked = {}
+			for _, ch in ipairs(acs_blacklist) do blocked[ch] = true end
+			local keep, dropped = {}, 0
+			for _, ch in ipairs(legal) do
+				if blocked[ch] then
+					dropped = dropped + 1
+				else
+					keep[#keep + 1] = tostring(ch)
+				end
+			end
+			if dropped == 0 then
+				-- The blacklist names nothing this radio could have used anyway,
+				-- because the regdomain already excludes it: no narrowing at all,
+				-- so the band's whole list is not churned into UCI every push.
+			elseif #keep == 0 then
+				io.stderr:write(string.format(
+					"openuf: %s: the controller blacklists every %s channel this"
+					.. " radio has -- leaving auto-channel unrestricted\n",
+					tostring(radio), tostring(bl_band)))
+			else
+				allowed = keep
+			end
+		end
+	end
+	local final = policy_list
+	if allowed then
+		if policy_list then
+			local ok_set, both = {}, {}
+			for _, c in ipairs(allowed) do ok_set[c] = true end
+			for _, c in ipairs(policy_list) do
+				if ok_set[c] then both[#both + 1] = c end
+			end
+			if #both > 0 then
+				final = both
+			else
+				io.stderr:write(string.format(
+					"openuf: %s: the controller's channel blacklist leaves none of the"
+					.. " board's own candidate channels -- keeping the board's list\n",
+					tostring(radio)))
+			end
+		else
+			final = allowed
+		end
+	end
+	if on_auto then
+		if final then
+			cursor:set("wireless", radio, "channels", final)
+		else
+			cursor:delete("wireless", radio, "channels")
+		end
+	end
 	if rates then
 		-- Stamp the sections we rate-manage: "Minimum Data Rate off" arrives
 		-- as the minrate_* keys simply vanishing from the wire, which is
@@ -1492,8 +2100,21 @@ local function reconcile_runtime(entries)
 	if bcfilter then
 		local rules = {}
 		for _, e in ipairs(entries) do
+			-- "Multicast Suppression" has three positions and the wire names
+			-- none of them, so the mode is the pair of keys (see inform's vap
+			-- build): the blocker's own key means Aggressive -- block, with the
+			-- bypass types and the allow-list -- and the suppressor key on its
+			-- own means Conservative, which only limits the rate. Aggressive
+			-- wins when both arrive, since a rate limit under a block is dead
+			-- weight.
 			if e.bcfilt_enabled then
-				rules[#rules + 1] = {ifname = e.ifname, macs = e.bcfilt_macs or {}}
+				rules[#rules + 1] = {
+					ifname = e.ifname,
+					macs   = e.bcfilt_macs or {},
+					bypass = e.bcfilt_bypass,
+				}
+			elseif e.mcast_suppressor then
+				rules[#rules + 1] = {ifname = e.ifname, limit = true}
 			end
 		end
 		bcfilter.reconcile(rules)
@@ -1539,6 +2160,17 @@ function M.apply_config(resp, cfg, opts)
 	-- htmode_floor -- see rf_config. Collected here, before the radio loop,
 	-- for the same reason the rate aggregation below is.
 	local iot_by_radio = {}
+	-- aaa.<n>.country_beacon arrives per WLAN, but OpenWrt's ieee80211d is a
+	-- wifi-device option and hostapd's Country IE is a per-radio property
+	-- (it rides the radio's beacons, which every BSS on it shares), so the
+	-- per-BSS wire key has to collapse to one setting per radio. The
+	-- aggregate is "any WLAN on this radio asked for it", the most PERMISSIVE
+	-- reading, matching rates_by_radio below: the element is an advertisement,
+	-- not a restriction -- clients that ignore it are unaffected -- so
+	-- honouring the one WLAN that wants it costs the others nothing, while
+	-- the opposite fold would silently drop a setting the controller was
+	-- explicitly asked for. nil for a radio no WLAN mentions leaves UCI alone.
+	local country_beacon_by_radio = {}
 	for _, vap in ipairs(vap_table) do
 		-- `radio` is what the parsed wire shape calls the UCI device name
 		-- (_parse_wifi_system_cfg sets it from wireless.<n>.parent, and the rate
@@ -1547,6 +2179,9 @@ function M.apply_config(resp, cfg, opts)
 		-- caller/test handing over either shape works.
 		local rn = vap.radio or vap.radio_name
 		if vap.iot and rn then iot_by_radio[rn] = true end
+		if rn and vap.country_beacon ~= nil then
+			country_beacon_by_radio[rn] = country_beacon_by_radio[rn] or vap.country_beacon
+		end
 	end
 
 	local rates_by_radio = {}
@@ -1590,6 +2225,9 @@ function M.apply_config(resp, cfg, opts)
 				radio.country, cfg and cfg.radio,
 				{force_wifi4 = iot_by_radio[radio.name] or false,
 				 maxsta = radio.loadbalance_maxsta,
+				 country_beacon = country_beacon_by_radio[radio.name],
+				 acs_exclude_dfs = radio.acs_exclude_dfs,
+				 acs_blacklist = radio.acs_blacklist,
 				 country_override = cfg and cfg.config
 					and cfg.config.country_override or nil})
 		end
@@ -1600,22 +2238,17 @@ function M.apply_config(resp, cfg, opts)
 	-- Every VLAN this push still wants an L2 for; anything else gets pruned
 	-- after the loop.
 	local wanted_vlans = {}
-	-- Whether ftinterop put a BSS on the translator's veth this push (the
-	-- openuf-rrb service is restarted after the reload below).
-	local interop_veth = false
-	-- unifi_ft_interop: the translator's veth pair is created here, before
-	-- the VAPs are written, so ftinterop sees it on this very push. Only with
-	-- the translator installed and enabled: a veth nobody forwards would
-	-- swallow every key exchange, openUF-to-openUF too.
-	if cfg and cfg.config and cfg.config.unifi_ft_interop then
-		local fti = get_ftinterop()
-		if fti and fti.translator_active(get_uci().cursor()) then
-			local any_ft = false
-			for _, vap in ipairs(vap_table) do
-				if vap.fast_roaming_enabled or vap.wpa3_fast_roaming_enabled then any_ft = true end
-			end
-			if any_ft then M.ensure_ft_veth(get_uci().cursor()) end
-		end
+	-- ONE cursor for the whole loop, committed once below: the three writers
+	-- (wlan_add, ppsk_add, mac_vlans_add) each used to open and commit their
+	-- own, so a four-WLAN push rewrote /etc/config/wireless four to twelve
+	-- times. Nothing between here and the commit reads the wireless config
+	-- through a second cursor, so there is no half-written state to observe.
+	local wcursor = get_uci().cursor()
+	-- One read of the plugin list for the whole loop instead of one per VAP
+	-- (plugins.lua's begin_pass note). Closed after the loop.
+	do
+		local plugins = get_plugins()
+		if plugins and plugins.begin_pass then plugins.begin_pass() end
 	end
 	for _, vap in ipairs(vap_table) do
 		if vap.ssid and vap.radio then
@@ -1698,26 +2331,6 @@ function M.apply_config(resp, cfg, opts)
 					extra.r1kh = { "00:00:00:00:00:00,00:00:00:00:00:00,"
 						.. vap.iapp_key }
 				end
-				-- unifi_ft_interop: fast roaming with genuine UniFi APs through
-				-- the translator (rrb/, the openuf-rrb service). ftinterop.lua
-				-- rewrites the options above (UniFi's mobility domain,
-				-- ft_psk_generate_local=0 with explicit key holders for the
-				-- UniFi peers the translator heard or openuf.rrb lists, nasid =
-				-- BSSID, hostapd's ft_iface on the translator's veth). Off, the
-				-- section is exactly what the block above produced.
-				if cfg and cfg.config and cfg.config.unifi_ft_interop then
-					local fti = get_ftinterop()
-					if fti then
-						fti.apply(extra, vap, M.vap_bssid(vap.radio, vap.ssid),
-							get_uci().cursor(), M.DELETE, opts and opts.rrb_peers)
-						if type(extra.hostapd_bss_options) == "table" then
-							interop_veth = true
-						end
-					else
-						io.stderr:write("openuf: unifi_ft_interop is on but "
-							.. "ftinterop.lua is missing\n")
-					end
-				end
 			end
 			if opts and (opts.band_steering_active or opts.roam_assist_active) then
 				-- usteer requires 802.11k (neighbor reports) + BSS
@@ -1753,8 +2366,33 @@ function M.apply_config(resp, cfg, opts)
 			-- U-APSD. `uapsd` is hostapd.sh's option and, on 25.12, a schema
 			-- alias of uapsd_advertisement_enabled, so one name covers both.
 			if vap.uapsd ~= nil then extra.uapsd = vap.uapsd and "1" or "0" end
+			-- Opportunistic key caching (aaa.<n>.auth_cache). Sent only on a
+			-- WPA-Enterprise WLAN, so nil everywhere else and OpenWrt's own
+			-- default stands. ap.uc also writes disable_pmksa_caching from
+			-- the inverse, but only `okc` is in the 25.12 schema, so an
+			-- explicit 0 is the whole of "off" that is available.
+			if vap.okc ~= nil then extra.okc = vap.okc and "1" or "0" end
+			-- Forbid direct station-to-station links (aaa.<n>.tdls_prohibit).
+			-- On the wire for every WLAN, so this always writes.
+			if vap.tdls_prohibit ~= nil then
+				extra.tdls_prohibit = vap.tdls_prohibit and "1" or "0"
+			end
 			-- GTK rekey interval (s, 0 = off); hostapd's own default is 86400.
 			if vap.group_rekey then extra.wpa_group_rekey = vap.group_rekey end
+			-- SAE tuning, as the firmware writes it (6.8.2 ubntbox). Only on a WLAN
+			-- that really offers SAE. sae_groups is a wifi-iface option;
+			-- hostapd's anti-clogging threshold and sync time are not, so they
+			-- go in as raw lines (hostapd_bss_options: per-BSS raw lines, ucode generator).
+			if vap.security == "wpa3" or vap.security == "wpa2/wpa3" then
+				if vap.sae_groups then extra.sae_groups = vap.sae_groups end
+				if vap.sae_anti_clogging then
+					add_bss_option(extra,
+						"sae_anti_clogging_threshold=" .. vap.sae_anti_clogging)
+				end
+				if vap.sae_sync then
+					add_bss_option(extra, "sae_sync=" .. vap.sae_sync)
+				end
+			end
 			if vap.qbssload ~= nil then
 				-- "Force WiFi 4 Mode" (IoT Optimization) sends
 				-- wireless.<n>.qbssload=disabled alongside iot=enabled. The
@@ -1787,6 +2425,205 @@ function M.apply_config(resp, cfg, opts)
 				local w = 0
 				if vap.pmf_status == "enabled" then w = vap.pmf_mode or 1 end
 				extra.ieee80211w = tostring(w)
+			end
+			-- 802.1X / WPA-Enterprise. The CANONICAL option names, not the
+			-- aliases: /usr/share/schema/wireless.wifi-iface.json declares
+			-- auth_server/auth_port/auth_secret/acct_server/acct_port/
+			-- acct_secret/acct_interval/nasid as "type": "alias" for these, and
+			-- the ucode generator (ap.uc) names the canonical ones literally.
+			--
+			-- One port and one secret cover the WHOLE server list: ap.uc's
+			-- iface_authentication_server() re-appends the same
+			-- auth_server_port/auth_server_shared_secret after every
+			-- auth_server_addr, so a server with its own port or secret cannot
+			-- be expressed and is dropped with a named log line rather than
+			-- silently authenticated against the wrong secret.
+			--
+			-- Nothing here is invented: no ownip/dynamic_own_ip_addr,
+			-- eap_reauth_period, radius_request_cui, eap_server, ieee8021x or
+			-- wpa_key_mgmt. The wire carries none of them, and a consumer keyed
+			-- on a producer that does not exist is this codebase's recurring
+			-- defect. (radius_das_* IS on the wire -- see below.)
+			--
+			-- The AUTHENTICATION servers reach hostapd one of two ways. ap.uc
+			-- calls iface_authentication_server() only from its EAP branch (and
+			-- from iface_ppsk), so on a PSK, SAE or open BSS the wifi-iface
+			-- options are stored and silently dropped -- exactly the trap
+			-- CLAUDE.md names -- and raw per-BSS lines are the only route.
+			-- iface_accounting_server() IS called unconditionally, so the
+			-- accounting servers always go through UCI.
+			local eap_bss = EAP_ENC[SECURITY_MAP[vap.security] or ""] or false
+			if vap.radius then
+				local function servers(list, kind, addr_opt, port_opt, secret_opt, raw)
+					local first = list and list[1]
+					if not first then return end
+					local addrs = {first.ip}
+					for i = 2, #list do
+						local s = list[i]
+						if s.port == first.port and s.secret == first.secret then
+							addrs[#addrs + 1] = s.ip
+						else
+							io.stderr:write(("openuf: %s: RADIUS %s server %s has its "
+								.. "own port/secret, which OpenWrt's %s list cannot "
+								.. "express -- dropped\n")
+								:format(tostring(vap.ssid), kind, s.ip, addr_opt))
+						end
+					end
+					if not raw then
+						extra[addr_opt]   = addrs
+						extra[port_opt]   = first.port
+						extra[secret_opt] = first.secret
+						return
+					end
+					-- hostapd reads the port and the secret that FOLLOW each
+					-- server address, so the triplet repeats per address -- the
+					-- same shape iface_authentication_server() emits.
+					for _, ip in ipairs(addrs) do
+						add_bss_option(extra, addr_opt .. "=" .. ip)
+						add_bss_option(extra, port_opt .. "=" .. first.port)
+						add_bss_option(extra, secret_opt .. "=" .. first.secret)
+					end
+				end
+				servers(vap.radius.auth, "authentication", "auth_server_addr",
+					"auth_server_port", "auth_server_shared_secret", not eap_bss)
+				servers(vap.radius.acct, "accounting", "acct_server_addr",
+					"acct_server_port", "acct_server_shared_secret")
+				if vap.radius.interim_interval then
+					extra.radius_acct_interim_interval = vap.radius.interim_interval
+				end
+				if vap.radius.nas_id then extra.nas_identifier = vap.radius.nas_id end
+				-- RADIUS Dynamic Authorization (CoA / Disconnect-Request). Both
+				-- options are real wifi-iface options, appended by ap.uc for
+				-- EVERY auth type -- but the one place it joins the secret onto
+				-- the client address sits inside the EAP branch, so
+				-- radius_das_secret (and its dae_secret alias) is stored and
+				-- dropped on a PSK or open BSS. openUF therefore joins the two
+				-- itself, which is also exactly what hostapd parses (first token
+				-- the address, the REST of the line the shared secret) and what
+				-- UAP firmware 6.8.2 writes. radius_das_port is defaulted only
+				-- inside that same branch and hostapd's own default is 0 (= no
+				-- listener), so it is always written explicitly.
+				if vap.radius.das then
+					extra.radius_das_client =
+						vap.radius.das.client .. " " .. vap.radius.das.secret
+					extra.radius_das_port = vap.radius.das.port
+				end
+			end
+			-- RADIUS MAC authentication. macaddr_acl=2 is hostapd's "ask the
+			-- RADIUS server whether this MAC may associate"; it has no UCI
+			-- option of its own on 25.12 (the schema declares none, and the only
+			-- producers are macfilter -> 1/0 and ppsk -> 2), so it goes in raw.
+			-- ppsk would set it too, but on a PSK BSS it ALSO sets
+			-- wpa_psk_radius=2 and leaves the passphrase out (ap.uc's
+			-- `case psk`), turning the WLAN into a per-user-PSK one nobody
+			-- could join with the configured key -- a different UniFi feature.
+			if vap.mac_auth then add_bss_option(extra, "macaddr_acl=2") end
+			-- Hotspot 2.0 / Passpoint. Two gates in the ucode generator:
+			-- iw_enabled turns on iface_interworking (the Interworking element
+			-- and the ANQP answers), hs20 turns on iface_hs20 (the HS 2.0
+			-- indication element and the hs20_* options). Both are needed, and
+			-- both are real schema options rather than aliases.
+			--
+			-- The SCALARS go in as wifi-iface options, the LISTS as raw
+			-- hostapd lines, for a specific reason: wifi.common's append()
+			-- joins an array value with SPACES into a single key=a b c line,
+			-- which is not a format hostapd accepts for any of the cumulative
+			-- interworking options (venue_name, nai_realm, roaming_consortium,
+			-- hs20_conn_capab each need one line per entry). On top of that,
+			-- ap.uc's iface_interworking() overwrites config.domain_name with
+			-- the joined anqp_3gpp_cell_net whenever the latter is set, so
+			-- routing the domain list through UCI would lose it on any WLAN
+			-- that also advertises a cellular network. Raw lines are appended
+			-- after every append_vars (ap.uc, "/* raw options */"), so they are
+			-- also what hostapd reads last.
+			--
+			-- Every line below was validated by feeding the generated config to
+			-- a real hostapd v2.12-devel (the APs' own build, from
+			-- openwrt/rootfs:x86-64-25.12.0 + wpad-mbedtls): zero parse errors.
+			if vap.hs20 then
+				local hs = vap.hs20
+				extra.iw_enabled = "1"
+				extra.hs20       = "1"
+				local function bit(v) return v and "1" or "0" end
+				if hs.access_network_type then
+					extra.access_network_type = hs.access_network_type
+				end
+				if hs.internet ~= nil then extra.internet = bit(hs.internet) end
+				if hs.asra ~= nil then extra.asra = bit(hs.asra) end
+				if hs.uesa ~= nil then extra.uesa = bit(hs.uesa) end
+				if hs.venue_group then extra.venue_group = hs.venue_group end
+				if hs.venue_type then extra.venue_type = hs.venue_type end
+				if hs.disable_dgaf ~= nil then
+					extra.disable_dgaf = bit(hs.disable_dgaf)
+				end
+				if hs.deauth_req_timeout then
+					extra.hs20_deauth_req_timeout = hs.deauth_req_timeout
+				end
+				if hs.ipaddr_type_avail then
+					-- hostapd's own option name. The schema's
+					-- iw_ipaddr_type_availability is NOT an alias and ap.uc
+					-- never appends it, so through UCI it would be stored and
+					-- dropped.
+					add_bss_option(extra,
+						"ipaddr_type_availability=" .. hs.ipaddr_type_avail)
+				end
+				if hs.domain_name then
+					add_bss_option(extra, "domain_name=" .. hs.domain_name)
+				end
+				for i, v in ipairs(hs.venue_name or {}) do
+					add_bss_option(extra, "venue_name=" .. v.lang .. ":" .. v.name)
+					-- venue_url's index refers to the venue_name entry it
+					-- belongs to, 1-based in the order written above.
+					if v.url then
+						add_bss_option(extra, "venue_url=" .. i .. ":" .. v.url)
+					end
+				end
+				for _, r in ipairs(hs.nai_realm or {}) do
+					-- <encoding>,<realm>,<eap method>[<auth id>:<auth value>]...
+					local line = r.encoding .. "," .. r.name .. "," .. r.eap_method
+					for _, au in ipairs(r.auth or {}) do
+						line = line .. "[" .. au.id .. ":" .. au.val .. "]"
+					end
+					add_bss_option(extra, "nai_realm=" .. line)
+				end
+				for _, oi in ipairs(hs.roaming_consortium or {}) do
+					add_bss_option(extra, "roaming_consortium=" .. oi)
+				end
+				if hs.cell_net then
+					-- One option, all pairs: hostapd's anqp_3gpp_cell_net is a
+					-- single semicolon-separated list, and a second line would
+					-- replace the first rather than add to it.
+					local pairs_out = {}
+					for _, c in ipairs(hs.cell_net) do
+						pairs_out[#pairs_out + 1] = c.mcc .. "," .. c.mnc
+					end
+					add_bss_option(extra,
+						"anqp_3gpp_cell_net=" .. table.concat(pairs_out, ";"))
+				end
+				for _, f in ipairs(hs.friendly_name or {}) do
+					add_bss_option(extra,
+						"hs20_oper_friendly_name=" .. f.lang .. ":" .. f.text)
+				end
+				for _, c in ipairs(hs.conn_capab or {}) do
+					add_bss_option(extra, "hs20_conn_capab="
+						.. c.protocol .. ":" .. c.port .. ":" .. c.status)
+				end
+				if hs.wan_metrics then
+					local m = hs.wan_metrics
+					-- <WAN info>:<downlink speed>:<uplink speed>:<downlink
+					-- load>:<uplink load>:<load measurement duration>
+					-- WAN info is one OCTET IN HEX, not a decimal: hostapd
+					-- parses it with hexstr2bin() over exactly two chars, so
+					-- the controller's decimal "1" is rejected with "Invalid
+					-- hs20_wan_metrics" -- and a rejected line is a config
+					-- parse error, which makes hostapd refuse the whole BSS.
+					-- Caught by feeding openUF's own generated config to a
+					-- real hostapd v2.12-devel. Every other field is decimal.
+					extra.hs20_wan_metrics = table.concat({
+						string.format("%02x", tonumber(m.info)),
+						m.downlink_speed, m.uplink_speed, m.downlink_load,
+						m.uplink_load, m.measurement}, ":")
+				end
 			end
 			if vap.owe_transition then
 				-- Enhanced Open transition mode: the ucode generator (24.10+,
@@ -1843,6 +2680,27 @@ function M.apply_config(resp, cfg, opts)
 				if vap.bcfilt_macs and #vap.bcfilt_macs > 0 then
 					extra.openuf_bcfilt_macs = table.concat(vap.bcfilt_macs, " ")
 				end
+				-- The frame types the blocker must pass (bcfilt.bypass_types), in
+				-- the wire's own spelling so the stamp stays readable and the
+				-- startup reapply rebuilds an identical ruleset. Sorted, since the
+				-- parser hands over a set.
+				--
+				-- Neither stamp needs an M.DELETE for the shrinking case: every
+				-- openuf_ wifi-iface section is wlan_clear()ed and rebuilt on each
+				-- push, so an emptied allow-list or a withdrawn bypass list cannot
+				-- survive into the next one.
+				if vap.bcfilt_bypass then
+					local toks = {}
+					for tok in pairs(vap.bcfilt_bypass) do toks[#toks + 1] = tok end
+					table.sort(toks)
+					extra.openuf_bcfilt_bypass = table.concat(toks, " ")
+				end
+			end
+			if vap.mcast_suppressor ~= nil then
+				-- "Multicast Suppression". Recorded for the same reason as the
+				-- blocker above: the enforcement is nftables, applied after the wifi
+				-- reload, and this stamp is what the startup reapply re-derives from.
+				extra.openuf_mcast_suppress = vap.mcast_suppressor and "1" or "0"
 			end
 			if vap.l2_isolation ~= nil then
 				-- "Client Isolation": drop station-to-station frames inside the
@@ -1887,7 +2745,12 @@ function M.apply_config(resp, cfg, opts)
 			-- the two enum values and returns for anything else.
 			if vap.mac_filter_policy then
 				extra.macfilter = vap.mac_filter_policy
-				extra.maclist   = vap.mac_filter_list or {}
+				-- A COPY: the MAC-based-VLAN plan below takes addresses out of
+				-- the allow list it writes (they go in carrying a VLAN instead),
+				-- and the vap's own list is read again by get_vap_table.
+				local list = {}
+				for i, m in ipairs(vap.mac_filter_list or {}) do list[i] = m end
+				extra.maclist = list
 			else
 				extra.macfilter = M.DELETE
 				extra.maclist   = M.DELETE
@@ -1965,14 +2828,91 @@ function M.apply_config(resp, cfg, opts)
 			-- OpenWrt's ap.uc writes hostapd's VLAN options (vlan_no_bridge
 			-- above all: netifd, not hostapd, bridges the VLAN netdev) only
 			-- when it is set.
-			if vap.ppsk then extra.dynamic_vlan = "1" end
+			--
+			-- An 802.1X WLAN carries its own value (0/1/2, from the RADIUS
+			-- profile's "RADIUS assigned VLAN" mode). PPSK wins if the two ever
+			-- met -- they cannot, since EAP and PSK live on disjoint encryption
+			-- values, but "2" (required) alongside PPSK would reject every local
+			-- key that has no VLAN, so the harmless branch is the safe one.
+			--
+			-- The same RADIUS profile reaches a MAC-authenticated PSK or open
+			-- WLAN since 2026-10-27, and there the value is deliberately NOT
+			-- written: hostapd needs a vlan_file (ap.uc builds one from wifi-vlan
+			-- sections, which openUF creates none of) before it can put a station
+			-- on a RADIUS-assigned VLAN, so "2" (required) would reject every
+			-- client on a WLAN that worked a moment earlier. Honouring it needs
+			-- the dynamic-VLAN plumbing, which is its own piece of work.
+			if vap.ppsk then
+				extra.dynamic_vlan = "1"
+			elseif eap_bss and vap.radius and vap.radius.dynamic_vlan then
+				extra.dynamic_vlan = vap.radius.dynamic_vlan
+			end
+
+			-- MAC-based VLANs ("Virtual Network Override"). The plan writes the
+			-- accept file; see M.mac_vlan_plan for the three ways it reaches
+			-- hostapd and the cases it refuses.
+			local mac_vlan = M.mac_vlan_plan(vap, vlan_networks,
+				M.vap_section_name(vap.radio, vap.ssid), extra.maclist)
+			if mac_vlan then
+				if mac_vlan.mode == "macfile" then
+					extra.macfile = mac_vlan.path
+				else
+					add_bss_option(extra, "accept_mac_file=" .. mac_vlan.path)
+				end
+				-- The wifi-vlan sections below become hostapd's vlan_file either
+				-- way (ap.uc's iface_vlan writes it before any gate), but
+				-- vlan_no_bridge -- which keeps hostapd's hands off the bridge
+				-- netifd already built -- sits behind `vlan_possible &&
+				-- dynamic_vlan`. ap.uc sets vlan_possible itself for every
+				-- psk/sae/eap auth type, so dynamic_vlan=1 is enough there and
+				-- is also what the PPSK path has always written. On an OPEN or
+				-- OWE WLAN neither flag is ever set, so the option goes in raw:
+				-- without it hostapd creates its own brvlan<id> and moves the
+				-- VLAN netdev out of br-openuf<id>.
+				if not extra.dynamic_vlan then
+					if vap.security == "open" or vap.security == "owe" then
+						add_bss_option(extra, "vlan_no_bridge=1")
+					else
+						extra.dynamic_vlan = "1"
+					end
+				end
+			else
+				-- No overrides on this WLAN any more: take the client addresses
+				-- off the flash rather than leaving a list nothing reads.
+				M._remove_file(M.mac_vlan_path(M.vap_section_name(vap.radio, vap.ssid)))
+			end
+
+			-- Plugins (plugins.lua): third-party edits to this VAP's options,
+			-- after everything built in. Never raises, and does nothing
+			-- unless a plugin is listed. d-malinowski's rrb-unifi is the one
+			-- that rewrites the 802.11r block above for genuine UniFi peers.
+			do
+				local plugins = get_plugins()
+				if plugins then
+					plugins.vap_options(extra, vap, cfg, {
+						DELETE = M.DELETE,
+						bssid  = M.vap_bssid,
+						cursor = function() return get_uci().cursor() end,
+					})
+				end
+			end
 
 			local section = M.wlan_add(vap.radio, vap.ssid, vap.security,
-				vap.x_passphrase, extra, network, vap.wlanconf_id)
+				vap.x_passphrase, extra, network, vap.wlanconf_id, vap.pairwise,
+				wcursor)
 			if vap.ppsk and section then
-				M.ppsk_add(section, vap.ppsk, vlan_networks)
+				M.ppsk_add(section, vap.ppsk, vlan_networks, wcursor)
+			end
+			if mac_vlan and section then
+				M.mac_vlans_add(section, mac_vlan, vlan_networks, wcursor)
 			end
 		end
+	end
+	-- Everything the loop staged, in one rewrite of /etc/config/wireless.
+	wcursor:commit("wireless")
+	do
+		local plugins = get_plugins()
+		if plugins and plugins.end_pass then plugins.end_pass() end
 	end
 
 	-- A VLAN no WLAN uses may still be wanted by a wired port assigned to it
@@ -2034,14 +2974,12 @@ function M.apply_config(resp, cfg, opts)
 
 	-- Reload wireless
 	M._run_cmd("wifi reload")
-	-- unifi_ft_interop: a BSS was just put on the translator's veth. The
-	-- daemon derives the served BSSes and the LAN bridge from the running
-	-- hostapd configs at start, and its own reload trigger fires on LuCI's
-	-- reload_config, never on this `wifi reload`. So it is restarted here,
-	-- after the reload has written the configs it will read. A push is a
-	-- rare event, and the daemon keeps what it learned in its peers file.
-	if interop_veth and M._read_file("/etc/init.d/openuf-rrb") then
-		M._run_cmd("/etc/init.d/openuf-rrb restart")
+	-- An earlier openUF's own translator veth (LEGACY_FT_VETH_SECTIONS): the
+	-- WLANs that pointed hostapd at it were just rewritten without it, so it
+	-- can go now, and only now.
+	if M.remove_legacy_ft_veth() then
+		M._run_cmd("/etc/init.d/network reload 2>/dev/null")
+		M._network_dirty = false
 	end
 	-- netifd may hand the interfaces new netdev names on the way back up, and
 	-- the wireless config this reload just wrote is the very thing the radio
@@ -2060,9 +2998,11 @@ function M.apply_config(resp, cfg, opts)
 			-- An OWE transition VAP has two netdevs, and both get the rules.
 			for _, ifname in ipairs(M.get_ifnames_for_vap(vap.radio, vap.ssid)) do
 				entries[#entries + 1] = {
-					ifname         = ifname,
-					bcfilt_enabled = vap.bcfilt_enabled,
-					bcfilt_macs    = vap.bcfilt_macs,
+					ifname           = ifname,
+					bcfilt_enabled   = vap.bcfilt_enabled,
+					bcfilt_macs      = vap.bcfilt_macs,
+					bcfilt_bypass    = vap.bcfilt_bypass,
+					mcast_suppressor = vap.mcast_suppressor,
 				}
 			end
 		end
@@ -2116,23 +3056,9 @@ function M.forget()
 	M.wlan_clear()
 	M.prune_vlan_networks({})
 	M.set_wlan_exclusive(false)
-	-- The translator's veth pair (ensure_ft_veth): a controller's FT WLANs
-	-- were what used it.
-	local present = {}
-	for _, t in ipairs({"device", "interface"}) do
-		cursor:foreach("network", t, function(s) present[s[".name"]] = true end)
-	end
-	local removed = false
-	for _, s in ipairs(M.FT_VETH_SECTIONS) do
-		if present[s] then
-			cursor:delete("network", s)
-			removed = true
-		end
-	end
-	if removed then
-		cursor:commit("network")
-		M._network_dirty = true
-	end
+	-- An earlier openUF's own translator veth, if this device still has it:
+	-- a controller's FT WLANs were what used it.
+	M.remove_legacy_ft_veth(cursor)
 	if M._network_dirty then
 		M._run_cmd("/etc/init.d/network reload 2>/dev/null")
 		M._network_dirty = false
@@ -2175,11 +3101,20 @@ function M.reapply_runtime_rules()
 		for mac in (s.openuf_bcfilt_macs or ""):gmatch("%S+") do
 			macs[#macs + 1] = mac
 		end
+		-- Rebuilt as a set, the shape the parser produces, so the reapply and
+		-- the setparam path hand bcfilter.lua identical rules.
+		local bypass
+		for tok in (s.openuf_bcfilt_bypass or ""):gmatch("%S+") do
+			bypass = bypass or {}
+			bypass[tok] = true
+		end
 		for _, ifname in ipairs(ifnames) do
 			entries[#entries + 1] = {
-				ifname         = ifname,
-				bcfilt_enabled = (s.openuf_bcfilt == "1"),
-				bcfilt_macs    = macs,
+				ifname           = ifname,
+				bcfilt_enabled   = (s.openuf_bcfilt == "1"),
+				bcfilt_macs      = macs,
+				bcfilt_bypass    = bypass,
+				mcast_suppressor = (s.openuf_mcast_suppress == "1"),
 			}
 		end
 	end)

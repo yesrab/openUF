@@ -2259,6 +2259,89 @@ and its `check` tells the user to set `hostapd_bss_options`, and 24.10 has no su
 1000 on 24.10), the timing their validation ran with; whether UniFi's 3000 would do as well is
 untested and the only open question the adoption adds.
 
+**Superseded, 2026-11-02.** jonasevcik answered the same PR with a plugin hook (`8287ecf`,
+"opt-in hook for third-party edits to per-VAP UCI options"), d-malinowski moved his module
+into his own repository as `openuf-plugin/rrb-unifi.lua` (release 1.4, 2026-10-26, run on his
+HH5A against the U7 Lite through the hook: the fingerprint re-push worked without a Force
+Provision, the running hostapd configs carried the same FT options, walk tests both ways) and
+closed the PR; release 1.5 (2026-10-27) dropped the peer list altogether -- OpenWrt gets only
+the two wildcard key holders UniFi firmware writes on its own APs, and hostapd learns each
+peer from the first exchange through the wildcard (broadcast pull, sequence-number round
+trip, then an R0KH/R1KH entry from the frame's source; `pmk_r1_push` pushes to learned peers
+too; tested on his HH5A + U7 Lite, both bands, after a BSS restart; the cost is one extra
+exchange on the first roam to a peer not learned yet, and a BSS restart forgets the learned
+peers). That made this tree's two daemon changes unnecessary: `peers_file` had nothing left
+to feed, and `wait 0` he declined on its own merits (his veth exists before the daemon starts
+and the deadline is what reports a missing `ft_iface`; "starting the service from the push
+fits better than a daemon that never gives up"). PR #1 on his repository, opened from here on
+2026-10-25, was closed with those reasons on 2026-10-27. This tree therefore took upstream's
+hook as it is (see "Adopted from upstream, 2026-11-02" below), removed `ftinterop.lua`,
+`openuf/rrb/` and the `openuf-rrb` service, and offers his plugin from `setup.sh`. Everything
+above stays as the record of the interop's evidence; the `unifi_ft_interop` switch no longer
+exists.
+
+## Adopted from upstream (jonasevcik/openUF), 2026-11-02
+
+Fifth review, covering upstream's 40 commits of 22–30 October 2026 (`2f263f3..db5e92b`, tags
+`v0.12.0` and `v0.13.0`), re-implemented here commit by commit in upstream's order (a three-way
+apply per commit, the displaced blocks hand-placed in this tree's layout, their tests ported by
+name) rather than merged. The suite went from 1138 to 1246 tests; `tools/dist.sh --verify` passes
+(the verify tree now copies `tools/`, since the suite `dofile()`s `tools/cfg-coverage.lua`).
+**Every adoption below carries only upstream's evidence** -- their hardware is an Archer C5 v1
+(ath79) and a Xiaomi AX3000T (filogic), their controller 10.6.106 in Docker and a UCG Ultra --
+plus d-malinowski's for the roaming plugin (a BT Home Hub 5A and a U7 Lite on UniFi 8.7.11,
+Network 10.6). Nothing was deployed: both APs are production. REVERSE-ENGINEERING.md backlog
+row 26 lists the checks owed.
+
+Two decisions shaped the review. **The plugin hook replaced this tree's own 802.11r
+integration** (see the closure of the d-malinowski section above): `openuf/plugins.lua` is
+upstream's `8287ecf` + `9159efd` as they are (`api = 1`, `vap_options(extra, vap, ctx)`,
+`ctx.util`, `/etc/openuf/plugins.enabled`, the fingerprint in `state.json`, the per-push list
+cache), plus the UCI `list plugin` source and `M.list()` for the LuCI overview; their twelve
+tests pass unchanged and two of ours join them. `ftinterop.lua`, `openuf/rrb/`, the
+`openuf-rrb` service, `openuf rrb`, the `rrb` UCI section and `unifi_ft_interop` are gone;
+`setup.sh` asks (question 7, default yes) and installs d-malinowski's rrb-unifi from its own
+release; the package ships `/opt/openuf -> /usr/lib/openuf` because upstream's author guide
+names that path as the hook's detection; an upgraded device's leftover veth is removed only
+after the next push has rewritten the WLANs. The `feature/pluginsAndHooks` branch (our hook
+superset with a built-in `rrb` plugin) is superseded. **The guest portal stays unadopted**, so
+`e6395d7` (walled garden) and `afd7b32` (its DNS budget) were skipped with their guest-portal
+dependency, and `tools/cfg-coverage.lua` here leaves the `guestportal` parser out of its set.
+
+The commits, in order:
+
+| Upstream | What | Here |
+|---|---|---|
+| `cf8de43`, `7b2b9ed` | BT Home Hub 5 Type A modelmap (d-malinowski's; lantiq/xrx200, DSA) | Adopted as is, plus `dev.openwrt_boards = {"bt,homehub-v5a"}` (this tree's auto-detect convention). REFERENCE/USAGE rows |
+| `c1897e2` | Discovery requests: targeted `01 04 00 06 <mac>` reply, the `233.89.188.1` multicast join, one reply per asker and request type per 0.5 s | Ours already answered v1/v2 since 2026-10-03; the three additions re-implemented in `announce.lua` (`HDR_REPLY_TARGET`, `_join_multicast`, `REPLY_MIN_GAP`, fresh figures per reply), their three tests ported. IPv6 stays unanswered, as theirs |
+| `71f6365` | Issue templates, README "Questions, bugs and ideas" | Not taken (our README has its own contribution section) |
+| `8287ecf`, `9159efd` | The plugin hook, and its list read once per push | Adopted (above); `openuf probe status` gains `plugins[]` |
+| `4fef9ba`, `f92e7e7` | `tools/fw-extract.sh`, `tools/fw-oracle/` | Copied; the 12 MB Unicorn wheel they committed and later removed was never added here |
+| `a64bcfc` | SAE tuning (`sae.anti_clogging/sync/groups` → `sae_groups` + raw lines) | Adopted (clean apply). Replaces this tree's "not applicable on OpenWrt" verdict, which rested on 4.0.15 having no template; 6.8.2's ubntbox has one |
+| `8d0f5ed` | Per-station WPA3 keys (`sae.psk.<k>`) as MAC-bound `wifi-station`s | Adopted (clean apply) |
+| `f3f602c`, `2c94d75`, `9c340cd`, `6652535`, `fda1226` | Docs: the newer-firmware audit (4.3.28, 6.8.2), the full firmware cross | Summarised here: 627 key templates in 6.8.2 ubntbox, 469 in 4.3.28, 234 distinct keys in their 10.6.106 pushes; nine key families the controller pushes that nothing read (now read, below); 74 pushed keys that do not exist in 6.8.2 at all, so the MIPS firmware is not a complete oracle for a U6-IW identity; eleven per-station reporting keys libubnt fills that openUF never sends (the WiFi Experience hybrid port's inputs); ~50 syswrapper verbs with no equivalent, of which the controller's own cmd enum can send none (axis 4 settled by `ba3dec5`) |
+| `9400e68` | WPA-Enterprise (802.1X): `_wire_radius`, four security values, `eap_supported` warn-only probe | Adopted; two conflicts in `_parse_wifi_system_cfg` (our `is_station` mesh guard kept beside their `radius` gate; upstream's `is_guest` field left out with the guest portal). `tools/validation/radius/` and the compose profile copied |
+| `ce7163f`, `fb0967e` | Hotspot 2.0 / Passpoint, and its keys indexed once | Adopted; `fw_caps 0x800000` + `fw2_caps 0x80000` folded into our `debug_caps`-aware masks |
+| `e6395d7`, `afd7b32` | Guest walled garden, its DNS budget | **Skipped** (guest portal, backlog row 24) |
+| `8adbc72`, `d3ffb84`, `9f071fe` | `tools/cfg-coverage.lua`; `_parse_net_system_cfg` split out of `handle_response`; `RECOGNIZED_*` exported; the verify tree gets `tools/` | Adopted; the `wifi` parser entry guards the guest-portal call, and parsers whose module this tree lacks are left out of the set (their presence made every replay error identically, which read as "every key inert") |
+| `36e830d` | `auth_cache`/`tdls_prohibit`/`country_beacon`/`wpa.1.pairwise`; nl80211 cipher-suite probe | Adopted; `country_beacon` and the ACS limits travel through our `rf_config(..., radio_policy, opts)` rather than new positional parameters; our phy-caps cache test now counts only the `iw phy` read |
+| `f6dd839` | The 5 GHz Country IE regression fix; `EVT_AP_RadarDetected` | Adopted; `_send_events` wired next to `_send_notifs` in our `_tick`; the DFS-only test passes an explicit `rrm_enrichment = false` (absent means on here) |
+| `ba3dec5` | Nightly `dfs-reset` (hook verb, request file, CSA back at the live width) | Adopted; serviced beside our `_maybe_scan_neighbours`; the walled-garden cron test dropped with its feature, the `dfs-reset` one kept |
+| `6883b20` | Auto-channel limits (`acsdfs`, `blklst`; `wifi_caps2 0x10`) | Adopted **with two changes of this tree's own**: UCI `channels` (24.10's list, 25.12's alias of `chanlist`; upstream's `chanlist` option is read by nothing on 24.10), written only on Auto, and the modelmap's board policy wins (its `acs_exclude_dfs` is never overridden, its `channels` list is narrowed, never replaced). Their three tests rewritten for our signature, one of ours added for the precedence |
+| `bd2e29b` | RADIUS MAC authentication, Dynamic Authorization (`fw_caps 0x100000`) | Adopted; `mac_auth_broken` joins our `is_station` guard |
+| `f46cf36` | Multicast Suppression's three positions, the ARP/DHCP bypass (`wifi_caps2 0x400000`) | Adopted (clean apply in `bcfilter.lua`) |
+| `1f017d1` | MAC-based VLANs (`accept_mac.*`, `fw_caps 0x80000000`, `fw_caps` sent signed) | Adopted; `vap_section_name` factored out as theirs; their eight tests appended after ours |
+| `8f45d6a` | `/etc/config/wireless` written once per push; `set_wlan_exclusive` commits only on change | Adopted; the plugin pass closes after the single commit, as in their `9159efd` |
+| `aaf6eea` | Drain the event file only when it holds something; the collector reap latched; one blob walk for DFS | Adopted (comment-only conflicts) |
+| `98a07aa` | One `radio_table` walk in `build_json`; the Hotspot 2.0 probe read once | Adopted (the guest guard part has no counterpart here) |
+| `5f521bf` | Their docs split into `docs/WIRE-REFERENCE.md` | Not taken: our documents keep their own shape (REFERENCE.md, this file) |
+| `657c7af` | One log line per decided connection attempt | Adopted (clean) |
+| `6f1e242` | The WiFi parser splits each line at its first `=` (a passphrase with `=` parsed as the key) | Adopted (clean); the wire form of `=` in a passphrase is still uncaptured, as theirs |
+| `9d4b21d` | `inform_ip` from the inform URL's host, resolved once per 300 s | Adopted; our json harness learned `opts.st` overrides for it |
+| `3cd99c2` | Refuse an unencrypted controller response (`parse_packet` raises without flag 0x01) | Adopted (clean) |
+| `dcfe0df` | HTTP 503 waits the cap at once; 404 on an unadopted device keeps the cadence, logged once | Adopted; the guest-selfrun line of that hunk left out |
+| `db5e92b` | The set-adopt form Network 10.6 is reported to send (absolute path, trailing device MAC; a foreign MAC refused) | Adopted (clean). Relevant here: both APs adopt into a 10.6 UCG Ultra and AP2's bootstrap adoption is the open item of 2026-10-25 |
+
 ## Feature matrix
 
 Every controller-UI control exercised against a live openUF device. "Confirmed" means driven

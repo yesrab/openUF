@@ -67,11 +67,12 @@ return {
 			local c = mock_cursor({main({modelmap = "jiorouter-ax6000-jidu6101",
 				use_only_unifi_wlan = "0", rrm_request_interval = "300", inform_url = "http://c:8080/inform",
 				debug_dump_file = "", keep_wlan_section = {"a", "b"}, country_override = "SE",
-				unifi_ft_interop = "1"})})
+				plugin = "rrb-unifi"})})
 			local got, err = uciconf.load(c, DEFAULTS)
 			assert_not_nil(got, tostring(err))
 			assert_eq(got.config.use_only_unifi_wlan, false, "'0' is false")
-			assert_eq(got.config.unifi_ft_interop, true, "unifi_ft_interop is a boolean option")
+			assert_eq(#got.config.plugins, 1, "`list plugin` is the plugin allowlist")
+			assert_eq(got.config.plugins[1], "rrb-unifi", "a single list entry arrives as one name")
 			assert_eq(got.config.rrm_request_interval, 300, "numbers are numbers")
 			assert_eq(got.config.inform_url, "http://c:8080/inform", "strings pass through")
 			assert_nil(got.config.debug_dump_file, "'' is unset, as conf.lua's nil")

@@ -238,9 +238,7 @@ function M.describe(dev, config, opts)
 	out.config = {
 		inform_url = c.inform_url, use_only_unifi_wlan = c.use_only_unifi_wlan,
 		keep_wlan_sections = c.keep_wlan_sections, l2_announce = c.l2_announce,
-		-- An explicit boolean: a conf.lua from before the option has nil, which
-		-- the daemon runs as off, and the LuCI pages seed UCI from this value.
-		unifi_ft_interop = c.unifi_ft_interop == true,
+		plugins = c.plugins,
 		neighbour_scan_interval = c.neighbour_scan_interval,
 		rrm_enrichment = c.rrm_enrichment, rrm_request_interval = c.rrm_request_interval,
 		roam_assist_diff_db = c.roam_assist_diff_db, country_override = c.country_override,
@@ -252,6 +250,7 @@ function M.describe(dev, config, opts)
 
 	local state_file = c.state_file or "/etc/openuf/state.json"
 	out.state  = read_state(state_file)
+	out.plugins = M._plugins_list(c)
 	out.health = parse_health(M._read_file(M._status_file))
 	out.ledger = {file = c.unhandled_file or "/etc/openuf/unhandled.json",
 		entries = ledger_size(c.unhandled_file or "/etc/openuf/unhandled.json")}
@@ -263,6 +262,18 @@ function M.describe(dev, config, opts)
 	end
 	out.wlans = wlans
 	return out
+end
+
+-- The plugins asked for (conf.lua / UCI / plugins.enabled) with their load
+-- state, for the LuCI overview: {{name, loaded, reason}, ...}. Loading a
+-- plugin runs its chunk, as the daemon does; nil when plugins.lua is absent.
+function M._plugins_list(c)
+	local ok, pl = pcall(function()
+		return (loadfile("plugins.lua") or loadfile("openuf/plugins.lua"))()
+	end)
+	if not ok or type(pl) ~= "table" or type(pl.list) ~= "function" then return nil end
+	local ok2, res = pcall(pl.list, {config = c or {}})
+	return ok2 and res or nil
 end
 
 -- Load the configuration the daemons' way and describe it. Only ever called

@@ -62,9 +62,8 @@ for src in $(find openuf -type f ! -name '._*' ! -name .DS_Store | sort); do
 done
 
 # Preserve the executable bit the installer relies on.
-chmod +x "$STAGE/etc/init.d/openuf" "$STAGE/etc/init.d/openuf-rrb" "$STAGE/hook/syswrapper.sh" \
-	"$STAGE/hook/adopt-shell.sh" "$STAGE/hook/openuf-cli.sh" "$STAGE/hook/openuf-convert.sh" \
-	"$STAGE/hook/openuf-rrb.sh" "$STAGE/rrb/rrb-unifi.uc"
+chmod +x "$STAGE/etc/init.d/openuf" "$STAGE/hook/syswrapper.sh" \
+	"$STAGE/hook/adopt-shell.sh" "$STAGE/hook/openuf-cli.sh" "$STAGE/hook/openuf-convert.sh"
 
 # Build stamp: which commit this tarball is, so `openuf-update --check` on a
 # device can say what it runs. "-dirty" means uncommitted changes were in the
@@ -121,6 +120,10 @@ if [ "$1" = "--verify" ]; then
 	mkdir -p "$BUILD/verify"
 	cp -r "$STAGE" "$BUILD/verify/openuf"
 	cp -r tests "$BUILD/verify/tests"
+	# tools/ is not shipped, but the suite dofile()s one of them
+	# (tools/cfg-coverage.lua, since 2026-11-02), so the verify tree needs it
+	# present -- upstream's release workflow caught exactly this on a tag.
+	cp -r tools "$BUILD/verify/tools"
 	if ! ( cd "$BUILD/verify" && lua tests/run_tests.lua ); then
 		echo ""
 		echo "  FAIL tests do not pass against the stripped tree -- not packaging."

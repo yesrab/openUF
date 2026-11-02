@@ -135,7 +135,7 @@ return {
 			local dev = dofile("openuf/modelmap/jiorouter-ax6000-jidu6101.lua")
 			dev.modelmap_name = "jiorouter-ax6000-jidu6101"
 			local config = {inform_url = "http://c:8080/inform", use_only_unifi_wlan = true,
-				l2_announce = false, unifi_ft_interop = true, rrm_request_interval = 600,
+				l2_announce = false, plugins = {"rrb-unifi"}, rrm_request_interval = 600,
 				state_file = "/tmp/t-state.json",
 				unhandled_file = "/tmp/t-unhandled.json", debug_caps = {wifi_caps = 1}}
 			with_files({
@@ -164,7 +164,9 @@ return {
 				assert_false(d.identity.custom, "not custom")
 				assert_eq(d.config.inform_url, "http://c:8080/inform", "config echoed")
 				assert_eq(d.config.l2_announce, false, "booleans kept")
-				assert_eq(d.config.unifi_ft_interop, true, "the interop flag is exported for the LuCI pages")
+				assert_eq(d.config.plugins[1], "rrb-unifi", "the plugin list is exported for the LuCI pages")
+				assert_eq(d.plugins[1].name, "rrb-unifi", "and every requested plugin's load state")
+				assert_eq(d.plugins[1].loaded, false, "not loaded here: no such file")
 				assert_true(d.config.debug_overrides, "research overrides flagged")
 				assert_eq(d.state.adopted, true, "state read")
 				assert_nil(d.state.authkey, "the secret never leaves")

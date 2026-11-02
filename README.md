@@ -61,9 +61,13 @@ The few settings that stay on the device, behind the root password:
   VLANs, private pre-shared keys, hidden SSIDs, channel, width and power per radio,
   802.11r/k/v, band steering, minimum RSSI, per-client speed limits, WiFi schedules, client
   blocking and Locate.
-- **Fast roaming with genuine UniFi APs.** The built-in translator speaks UniFi's 802.11r
-  key exchange, so phones move between openUF and real UniFi access points without a
-  reconnect.
+- **Fast roaming with genuine UniFi APs.** The installer offers d-malinowski's rrb-unifi
+  plugin, which speaks UniFi's 802.11r key exchange, so phones move between openUF and real
+  UniFi access points without a reconnect. Plugins are the way to add such recipes
+  ([PLUGINS.md](PLUGINS.md)).
+- **WPA-Enterprise, RADIUS MAC authentication, Hotspot 2.0, MAC-based VLANs, DFS radar
+  reports and the site's auto-channel limits.** Adopted from upstream in November 2026 with
+  their evidence; not yet exercised on this tree's own access points.
 - **Live statistics.** Clients with WiFi Experience scores, radios and channel utilisation,
   wired hosts per port, the uplink, neighbouring access points and RF scans.
 - **Switch ports and mesh.** Per-port VLANs from the controller's Port settings, and a
@@ -194,9 +198,9 @@ thing.
 ## Credits
 
 openUF began as a fork of [jonasevcik/openUF](https://github.com/jonasevcik/openUF) and
-still exchanges work with it. The 802.11r translator for genuine UniFi APs is
+still exchanges work with it. Fast roaming with genuine UniFi APs is
 [d-malinowski/unifi-openwrt-roaming](https://github.com/d-malinowski/unifi-openwrt-roaming),
-whose author also contributed the interoperability work around it. The protocol groundwork
+whose translator and openUF plugin the installer offers to set up. The protocol groundwork
 came from [amd989/unifi-gateway](https://github.com/amd989/unifi-gateway),
 [jeffreykog/unifi-inform-protocol](https://github.com/jeffreykog/unifi-inform-protocol) and
 [fxkr/unifi-protocol-reverse-engineering](https://github.com/fxkr/unifi-protocol-reverse-engineering).

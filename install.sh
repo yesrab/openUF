@@ -6,7 +6,7 @@
 #
 # Usage:
 #   ./install.sh install [--bootstrap-adopt] [--replace-conf]
-#                           — copy files, enable the openuf and openuf-rrb
+#                           — copy files, enable the openuf
 #                             services. An existing /opt/openuf/conf.lua is
 #                             KEPT unless --replace-conf
 #   ./install.sh uninstall  — remove files, disable service
@@ -246,10 +246,19 @@ case "$ACTION" in
 		# Install init.d service
 		cp openuf/etc/init.d/openuf "$INIT_SCRIPT"
 		chmod +x "$INIT_SCRIPT"
-		# The 802.11r translator for genuine UniFi APs (openuf/rrb/, see its
-		# REFERENCE.md): its own procd service, started and stopped with openUF's.
-		cp openuf/etc/init.d/openuf-rrb /etc/init.d/openuf-rrb
-		chmod +x /etc/init.d/openuf-rrb "$INSTALL_DIR/rrb/rrb-unifi.uc" 2>/dev/null
+		# Until 2026-11-02 the tree carried its own 802.11r translator as the
+		# openuf-rrb service. It is a separate install now (d-malinowski's
+		# rrb-unifi, through the plugin hook; USAGE.md § 6), so a device
+		# upgraded from such a build loses the old service here. Its veth in
+		# /etc/config/network goes after the daemon's next push, never before:
+		# hostapd's BSSes may still name it.
+		if [ -f /etc/init.d/openuf-rrb ]; then
+			/etc/init.d/openuf-rrb stop 2>/dev/null
+			/etc/init.d/openuf-rrb disable 2>/dev/null
+			rm -f /etc/init.d/openuf-rrb
+			echo "Removed the former built-in 802.11r translator service (openuf-rrb); for fast"
+			echo "roaming with genuine UniFi APs install the rrb-unifi plugin (USAGE.md § 6)."
+		fi
 
 		# ── Dependencies, now that openUF itself is safely installed ──────
 		# REQUIRED: openUF cannot function without these. They may already be
@@ -330,11 +339,6 @@ case "$ACTION" in
 		# download cap applies and the upload cap silently does not.
 		try_optional kmod-ifb "WiFi Speed Limit, upload half (queued)"
 		try_optional kmod-sched-act-police "WiFi Speed Limit, upload fallback (tc police)"
-		# The 802.11r translator for genuine UniFi APs (openuf/rrb/): raw
-		# packet sockets from ucode, and the veth pair hostapd's key exchange
-		# moves onto.
-		try_optional ucode-mod-socket "802.11r roaming with genuine UniFi APs (translator sockets)"
-		try_optional kmod-veth        "802.11r roaming with genuine UniFi APs (translator veth)"
 		# No coreutils-stat any more: inform.lua used to fork `stat -c %Y` to
 		# notice an out-of-process state.json write and fell back to the file's
 		# contents when the applet was missing (a real WDR3500 has none). The
@@ -371,16 +375,6 @@ case "$ACTION" in
 		# Enable and start services
 		"$INIT_SCRIPT" enable 2>/dev/null
 		"$INIT_SCRIPT" start
-
-		# The 802.11r translator for genuine UniFi APs (USAGE § 6): enabled
-		# and started; it idles until a config push carries an FT WLAN, when
-		# openUF creates its veth and points hostapd at it. Needs
-		# ucode-mod-socket and kmod-veth (try_optional above); without them
-		# only roaming to genuine UniFi APs is missing.
-		/etc/init.d/openuf-rrb enable 2>/dev/null
-		if ! /etc/init.d/openuf-rrb start 2>/dev/null; then
-			echo "WARNING: the 802.11r translator (openuf-rrb) did not start; fast roaming to genuine UniFi APs needs it (openuf rrb status)."
-		fi
 
 		# Enable lldpd
 		if [ -f /etc/init.d/lldpd ]; then
@@ -428,8 +422,8 @@ case "$ACTION" in
 			"$INIT_SCRIPT" disable 2>/dev/null
 			rm -f "$INIT_SCRIPT"
 		fi
-		# The 802.11r translator's service, and the veth pair openUF wrote
-		# into /etc/config/network for it (ucihelper.ensure_ft_veth).
+		# The former built-in translator's service (before 2026-11-02), and
+		# the veth pair that openUF wrote into /etc/config/network for it.
 		if [ -f /etc/init.d/openuf-rrb ]; then
 			/etc/init.d/openuf-rrb stop 2>/dev/null
 			/etc/init.d/openuf-rrb disable 2>/dev/null

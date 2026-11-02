@@ -831,4 +831,206 @@ return {
 			assert_nil(rrmscan.sta_signal("phy0-ap1", "x; reboot"), "bad station refused")
 		end
 	},
+	{
+		name = "rrmscan: channel_of_freq inverts freq_of_channel, and refuses the gaps",
+		fn = function()
+			local C = rrmscan.channel_of_freq
+			for _, ch in ipairs({1, 6, 11, 13, 14, 36, 52, 100, 144, 165}) do
+				assert_eq(C(rrmscan.freq_of_channel(ch)), ch,
+					"round trip for channel " .. ch)
+			end
+			-- A frequency off the 5 MHz grid is not a channel.
+			assert_nil(C(5503), "off-grid 5 GHz")
+			assert_nil(C(2400), "below the 2.4 GHz band")
+			assert_nil(C(6115), "6 GHz: no channel vocabulary here")
+			assert_nil(C(nil), "nil")
+			assert_nil(C("radar"), "not a number")
+		end
+	},
+	{
+		name = "rrmscan: is_dfs_channel covers the whole 52-144 span and nothing else",
+		fn = function()
+			local D = rrmscan.is_dfs_channel
+			assert_eq(D(52), true, "52")
+			assert_eq(D(100), true, "100")
+			assert_eq(D(144), true, "144")
+			assert_eq(D("100"), true, "a string channel, as UCI stores it")
+			assert_eq(D(48), false, "48 is non-DFS")
+			assert_eq(D(149), false, "149 is non-DFS")
+			assert_eq(D(11), false, "2.4 GHz")
+			assert_eq(D("auto"), false, "auto is not a channel")
+			assert_eq(D(nil), false, "nil")
+		end
+	},
+	{
+		name = "rrmscan: parse_dfs_states reads the per-channel DFS state machine",
+		fn = function()
+			-- Verbatim shape of `iw phy phy1 channels` on the AX3000T
+			-- (OpenWrt 25.12, mt76), with one channel put on the
+			-- non-occupancy list by hand -- which is the state no live read
+			-- can be made to show on demand.
+			local blob = table.concat({
+				"Band 2:",
+				"\t* 5180 MHz [36] ",
+				"\t  Maximum TX power: 23.0 dBm",
+				"\t  Channel widths: 20MHz HT40+ VHT80 VHT160",
+				"\t* 5500 MHz [100] ",
+				"\t  Maximum TX power: 26.0 dBm",
+				"\t  Radar detection",
+				"\t  Channel widths: 20MHz HT40+ VHT80 VHT160",
+				"\t  DFS state: available (for 349821 sec)",
+				"\t  DFS CAC time: 60000 ms",
+				"\t* 5520 MHz [104] ",
+				"\t  Maximum TX power: 26.0 dBm",
+				"\t  Radar detection",
+				"\t  DFS state: unavailable (for 1766 sec)",
+				"\t  DFS CAC time: 60000 ms",
+				"\t* 5540 MHz [108] ",
+				"\t  Radar detection",
+				"\t  DFS state: usable (for 0 sec)",
+			}, "\n") .. "\n"
+			local s = rrmscan.parse_dfs_states(blob)
+			assert_eq(s[100].state, "available", "CAC done, may beacon")
+			assert_eq(s[100].secs, 349821, "and for how long")
+			assert_eq(s[104].state, "unavailable", "on the NOL after a radar hit")
+			assert_eq(s[104].secs, 1766, "the NOL has 1766 s left")
+			assert_eq(s[108].state, "usable", "a DFS channel awaiting CAC")
+			-- A non-DFS channel is absent rather than claimed usable, so
+			-- "not a DFS channel" stays distinguishable from "free".
+			assert_nil(s[36], "36 has no DFS state at all")
+			assert_eq(rrmscan.channel_in_nol(s, 104), true, "104 is blocked")
+			assert_eq(rrmscan.channel_in_nol(s, "104"), true, "a string channel")
+			assert_eq(rrmscan.channel_in_nol(s, 100), false, "100 is not")
+			assert_eq(rrmscan.channel_in_nol(s, 108), false,
+				"CAC pending is not the NOL -- hostapd does the CAC itself")
+			assert_eq(rrmscan.channel_in_nol(s, 36), false, "no state, not blocked")
+			assert_eq(rrmscan.channel_in_nol(nil, 100), false, "no dump at all")
+			assert_eq(next(rrmscan.parse_dfs_states(nil)), nil, "no blob")
+			assert_eq(next(rrmscan.parse_dfs_states("")), nil, "empty blob")
+		end
+	},
+	{
+		name = "rrmscan: chan_switch_args rebuilds a CSA for each 5 GHz width",
+		fn = function()
+			local A = rrmscan.chan_switch_args
+			-- 80 MHz on channel 100: the live values read off the AX3000T's
+			-- own hostapd (secondary_channel=1, centr_freq_seg0_idx=106).
+			assert_eq(A(100, 80),
+				"5500 sec_channel_offset=1 center_freq1=5530 bandwidth=80 vht",
+				"ch 100 at 80 MHz")
+			-- 104 is the upper half of the same 40 MHz pair, so its
+			-- secondary sits below it, and the 80 MHz centre is unchanged.
+			assert_eq(A(104, 80),
+				"5520 sec_channel_offset=-1 center_freq1=5530 bandwidth=80 vht",
+				"ch 104 at 80 MHz")
+			assert_eq(A(36, 80),
+				"5180 sec_channel_offset=1 center_freq1=5210 bandwidth=80 vht",
+				"ch 36 at 80 MHz")
+			assert_eq(A(149, 80),
+				"5745 sec_channel_offset=1 center_freq1=5775 bandwidth=80 vht",
+				"the UNII-3 block anchors on 149")
+			assert_eq(A(100, 160),
+				"5500 sec_channel_offset=1 center_freq1=5570 bandwidth=160 vht",
+				"160 MHz spans 100-128, centre 5570")
+			assert_eq(A(100, 40),
+				"5500 sec_channel_offset=1 center_freq1=5510 bandwidth=40 ht",
+				"40 MHz: ht, and the centre is between the pair")
+			assert_eq(A(104, 40),
+				"5520 sec_channel_offset=-1 center_freq1=5510 bandwidth=40 ht",
+				"the same pair from the other side")
+			-- 20 MHz carries nothing but the frequency: no secondary, no
+			-- centre, and no ht/vht token to mis-declare the width with.
+			assert_eq(A(100, 20), "5500", "20 MHz")
+			assert_eq(A(100, nil), "5500", "unknown width is read as 20 MHz")
+			-- 165 sits alone: no 40 MHz partner, so no bonded width at all.
+			assert_nil(A(165, 40), "165 has no partner")
+			assert_nil(A(165, 80), "and no 80 MHz block")
+			assert_eq(A(165, 20), "5825", "but it is a perfectly good 20 MHz channel")
+			assert_eq(rrmscan.block_center(149, 80), 155,
+				"UNII-3's centre is 155, not the 154 an anchor-on-36 formula gives")
+			assert_nil(A(11, 80), "2.4 GHz has no DFS and no block anchor")
+			assert_nil(A(100, 60), "not a width hostapd knows")
+			assert_nil(A("auto", 80), "auto is not a channel")
+			assert_nil(A(nil, 80), "nil")
+		end
+	},
+	{
+		name = "rrmscan: parse_dfs reads a radar detection, and only a radar detection",
+		fn = function()
+			-- hostapd's own wording, as the hook stamps it:
+			-- "<uptime> <ifname> <event words>".
+			local blob = table.concat({
+				"1234.56 phy1-ap0 DFS-CAC-START freq=5500 chan=100 sec_chan=1 width=1",
+				"1299.01 phy1-ap0 DFS-RADAR-DETECTED freq=5500 ht_enabled=0 "
+					.. "chan_offset=0 chan_width=1 cf1=5530 cf2=0",
+				"1299.02 phy1-ap0 DFS-NEW-CHANNEL freq=5180 chan_offset=1 chan_width=1",
+				"1300.00 phy1-ap0 BEACON-RESP-RX 00:00:5e:00:53:02 1 00 73240000",
+				'1300.50 { "assoc": {"address":"00:00:5e:00:53:03"} }',
+			}, "\n") .. "\n"
+			local d = rrmscan.parse_dfs(blob)
+			assert_eq(#d, 1, "one detection, not the CAC or the channel change")
+			assert_eq(d[1].freq, 5500, "freq as hostapd reported it")
+			assert_eq(d[1].channel, 100, "channel derived from the freq")
+			assert_eq(d[1].ifname, "phy1-ap0", "the BSS it came from")
+			assert_eq(d[1].t, 1299.01, "the hook's uptime stamp")
+			-- The radar frequency is not cf1: on a wide channel they differ,
+			-- and freq is the one that says where the radar was.
+			assert_eq(rrmscan.channel_of_freq(5530), 106, "cf1 would be another channel")
+			-- Nothing to report rather than a guessed channel.
+			assert_eq(#rrmscan.parse_dfs(
+				"1.0 phy1-ap0 DFS-RADAR-DETECTED ht_enabled=0\n"), 0, "no freq")
+			assert_eq(#rrmscan.parse_dfs(
+				"1.0 phy1-ap0 DFS-RADAR-DETECTED freq=5503\n"), 0, "unusable freq")
+			assert_eq(#rrmscan.parse_dfs(nil), 0, "no blob")
+			assert_eq(#rrmscan.parse_dfs(""), 0, "empty blob")
+		end
+	},
+	{
+		name = "rrmscan: the control-socket hook passes DFS events beside beacon reports",
+		fn = function()
+			local s = rrmscan.action_script()
+			-- The hook is `sh`, so the filter is testable by running it.
+			local path = os.tmpname()
+			local events = os.tmpname()
+			local orig = rrmscan.EVENT_FILE
+			rrmscan.EVENT_FILE = events
+			local f = assert(io.open(path, "w"))
+			f:write(rrmscan.action_script())
+			f:close()
+			rrmscan.EVENT_FILE = orig
+			local function run(args)
+				os.execute("sh " .. path .. " " .. args .. " >/dev/null 2>&1")
+			end
+			run("phy1-ap0 DFS-RADAR-DETECTED freq=5500")
+			run("phy1-ap0 BEACON-RESP-RX 00:00:5e:00:53:02 1 00 7324")
+			run("phy1-ap0 AP-STA-CONNECTED 00:00:5e:00:53:03")
+			local g = assert(io.open(events, "r"))
+			local out = g:read("*a")
+			g:close()
+			os.remove(path)
+			os.remove(events)
+			assert_eq(out:find("DFS-RADAR-DETECTED", 1, true) ~= nil, true,
+				"radar passed")
+			assert_eq(out:find("BEACON-RESP-RX", 1, true) ~= nil, true,
+				"beacon report still passed")
+			assert_eq(out:find("AP-STA-CONNECTED", 1, true), nil,
+				"everything else is still dropped at the hook")
+			-- Both kinds land as "<uptime> <ifname> <event...>", so one drain
+			-- reads both. The stamp is only checked where /proc/uptime exists:
+			-- the dev box is macOS, where the hook's `read` finds no such file
+			-- and leaves it empty. parse_dfs's own test pins the stamped form.
+			local up = io.open("/proc/uptime", "r")
+			if up then
+				up:close()
+				for line in out:gmatch("[^\n]+") do
+					assert_eq(line:match("^%d+%.?%d*%s") ~= nil, true, "stamped: " .. line)
+				end
+			end
+			for line in out:gmatch("[^\n]+") do
+				assert_eq(line:find("phy1-ap0 ", 1, true) ~= nil, true,
+					"carries the interface: " .. line)
+			end
+			assert_eq(s, rrmscan.action_script(), "the script is stable")
+		end
+	},
 }

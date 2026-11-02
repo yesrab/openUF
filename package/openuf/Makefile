@@ -21,9 +21,8 @@ PKG_SOURCE_URL:=https://github.com/yesrab/openUF/releases/download/v$(PKG_VERSIO
 PKG_HASH:=skip
 
 PKG_MAINTAINER:=Yesrab Ali <yesrab.ali111@gmail.com>
-# The whole tree, the vendored 802.11r translator included (NOTICE lists the
-# copyright holders, and carries the MIT notice for the parts from the
-# original openUF).
+# NOTICE lists the copyright holders, and carries the MIT notice for the parts
+# from the original openUF.
 PKG_LICENSE:=GPL-3.0-or-later
 PKG_LICENSE_FILES:=LICENSE NOTICE
 
@@ -37,7 +36,7 @@ define Package/openuf
   URL:=https://github.com/yesrab/openUF
   DEPENDS:=+lua +luabitop +lua-cjson +luasocket +lua-openssl +libuci-lua +iw \
 	+lldpd +ip-bridge +hostapd-utils +usteer +nftables +kmod-nft-bridge \
-	+tc-tiny +kmod-ifb +kmod-sched-act-police +ucode-mod-socket +kmod-veth
+	+tc-tiny +kmod-ifb +kmod-sched-act-police
   PKGARCH:=all
 endef
 
@@ -50,9 +49,11 @@ define Package/openuf/description
   presets or a custom one, the identity to present, the inform URL). The web
   front end is luci-app-openuf.
 
-  Includes the 802.11r translator for roaming between this AP and genuine
-  UniFi APs (the openuf-rrb service, see /usr/lib/openuf/rrb/README.md),
-  which needs ucode-mod-socket and kmod-veth.
+  Third-party plugins (/etc/openuf/plugins/<name>.lua, api 1, the same hook
+  as upstream openUF's) extend the WLAN options; 802.11r fast roaming with
+  genuine UniFi APs is one, d-malinowski's rrb-unifi, which setup.sh offers
+  to install. /opt/openuf is a symlink to /usr/lib/openuf so that plugin
+  installers written against upstream's documented path find the hook.
 
   Needs a FULL wpad build (wpad-openssl, wpad-wolfssl or wpad-mbedtls; a
   wpad-basic-* build rejects the 802.11v option every controller WLAN
@@ -73,11 +74,26 @@ if [ -z "$${IPKG_INSTROOT}" ] && ! grep -q wnm_sleep_mode /usr/sbin/hostapd 2>/d
 	echo "openuf: hostapd is a basic build (no 802.11v): openUF will not start until a full wpad is installed." >&2
 	echo "openuf: run 'openuf deps --install', or use the button on LuCI's openUF overview." >&2
 fi
-if [ -z "$${IPKG_INSTROOT}" ] && [ -f /opt/openuf/inform.lua ]; then
+if [ -z "$${IPKG_INSTROOT}" ] && [ ! -L /opt/openuf ] && [ -f /opt/openuf/inform.lua ]; then
 	echo "openuf: a file install of openUF is also present under /opt/openuf. The service now" >&2
 	echo "openuf: runs this package's copy and reads /etc/config/openuf, not /opt/openuf/conf.lua:" >&2
 	echo "openuf: carry that configuration over (LuCI: Services > openUF > Settings), then" >&2
 	echo "openuf: 'rm -rf /opt/openuf'. Two copies have shown up in a controller as two devices." >&2
+fi
+# Before 2026-11-02 the package carried its own 802.11r translator (the
+# openuf-rrb service). Its init script is gone with this upgrade; its daemon
+# and rc links are not, so they go here. Its veth sections in
+# /etc/config/network stay until the daemon's next push has rewritten the
+# WLANs without ft_iface (inform._migrate_legacy_rrb): a BSS whose ft_iface
+# vanishes under it fails.
+if [ -z "$${IPKG_INSTROOT}" ] && ls /etc/rc.d/*openuf-rrb >/dev/null 2>&1; then
+	rm -f /etc/rc.d/*openuf-rrb
+	for p in $$(pidof ucode 2>/dev/null); do
+		tr '\0' ' ' < /proc/$$p/cmdline 2>/dev/null | grep -q 'rrb/rrb-unifi.uc' && kill $$p
+	done
+	echo "openuf: the former built-in 802.11r translator (openuf-rrb) was removed; its veth goes" >&2
+	echo "openuf: after the controller's next push. For fast roaming with genuine UniFi APs" >&2
+	echo "openuf: install the rrb-unifi plugin (USAGE.md section 6)." >&2
 fi
 endef
 
@@ -107,12 +123,10 @@ define Package/openuf/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(LN) ../lib/openuf/hook/openuf-convert.sh $(1)/usr/sbin/openuf-convert
 	$(LN) ../lib/openuf/hook/openuf-deps.sh $(1)/usr/sbin/openuf-deps
-	$(INSTALL_DIR) $(1)/usr/lib/openuf/rrb
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/openuf/rrb/rrb-unifi.uc $(1)/usr/lib/openuf/rrb/
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/openuf/rrb/README.md $(1)/usr/lib/openuf/rrb/
+	$(INSTALL_DIR) $(1)/opt
+	$(LN) ../usr/lib/openuf $(1)/opt/openuf
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/openuf/etc/init.d/openuf $(1)/etc/init.d/openuf
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/openuf/etc/init.d/openuf-rrb $(1)/etc/init.d/openuf-rrb
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/openuf.config $(1)/etc/config/openuf
 	$(INSTALL_DIR) $(1)/etc/openuf

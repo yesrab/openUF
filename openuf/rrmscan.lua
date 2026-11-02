@@ -164,6 +164,187 @@ function M.freq_of_channel(ch)
 	return nil
 end
 
+-- The inverse, for hostapd's DFS events: they name a frequency and never a
+-- channel, while the controller's radar handler needs the channel.
+function M.channel_of_freq(freq)
+	freq = tonumber(freq)
+	if not freq then return nil end
+	if freq == 2484 then return 14 end
+	-- math.floor, not plain division: on Lua 5.3 and later `/` is float
+	-- division, so the channel would reach the wire as "100.0" -- a string
+	-- the controller's handler cannot match to a channel. The target is 5.1,
+	-- where the two agree, which is exactly how this would have shipped
+	-- unnoticed.
+	if freq >= 2412 and freq <= 2472 and (freq - 2407) % 5 == 0 then
+		return math.floor((freq - 2407) / 5)
+	end
+	if freq >= 5160 and freq <= 5885 and (freq - 5000) % 5 == 0 then
+		return math.floor((freq - 5000) / 5)
+	end
+	return nil
+end
+
+-- Channels that can carry a radar hit. Deliberately the whole 52-144 span
+-- rather than one regulatory domain's subset: this only gates whether the
+-- control-socket monitors are worth running, and a channel the domain forbids
+-- is never in use anyway.
+function M.is_dfs_channel(ch)
+	ch = tonumber(ch)
+	return (ch ~= nil) and ch >= 52 and ch <= 144
+end
+
+-- Per-channel DFS state out of `iw phy phyN channels` (sysinfo.phy_channels).
+-- mac80211 keeps the regulatory state machine per channel and `iw` prints it
+-- under each channel's entry:
+--
+--   * 5500 MHz [100]
+--     Maximum TX power: 26.0 dBm
+--     Radar detection
+--     Channel widths: 20MHz HT40+ VHT80 VHT160
+--     DFS state: available (for 349821 sec)
+--     DFS CAC time: 60000 ms
+--
+-- The three states are `usable` (CAC not done), `available` (CAC done, may
+-- beacon) and `unavailable` -- the last being the non-occupancy list a radar
+-- hit puts the channel on for 30 minutes. This is openUF's equivalent of the
+-- `radartool -i <radio> chknol <ch>` the UniFi firmware's dfs_reset consults
+-- (firmware-confirmed for U7LR 6.8.2), and the only reason it is consulted:
+-- switching back onto a channel still in the NOL is refused by the kernel,
+-- and the job simply waits for the next run.
+--
+-- Channels with no DFS state (the whole 2.4 GHz band, UNII-1, UNII-3) are
+-- absent from the table rather than reported as usable, so a caller can tell
+-- "not a DFS channel" from "a DFS channel that is free".
+function M.parse_dfs_states(blob)
+	local out = {}
+	if type(blob) ~= "string" then return out end
+	local ch = nil
+	for line in blob:gmatch("[^\n]+") do
+		local c = line:match("^%s*%*%s+%d+%s+MHz%s+%[(%d+)%]")
+		if c then
+			ch = tonumber(c)
+		elseif ch then
+			local state = line:match("DFS state:%s*(%a+)")
+			if state then
+				out[ch] = {state = state, secs = tonumber(line:match("%(for%s+(%d+)%s*sec"))}
+				ch = nil
+			end
+		end
+	end
+	return out
+end
+
+-- True when the channel is on the non-occupancy list and must not be switched
+-- onto yet. A channel the dump does not mention is not blocked: it either has
+-- no DFS state at all, or this driver does not report one, and in both cases
+-- the switch itself is the authority.
+function M.channel_in_nol(states, ch)
+	local s = states and states[tonumber(ch)]
+	return (s ~= nil) and s.state == "unavailable"
+end
+
+-- How many beacons the CSA counts down before the switch. Five is hostapd's
+-- own default for a user-requested switch and a little over half a second at
+-- the usual 100 TU beacon interval: long enough for associated clients to see
+-- the announcement, short enough not to matter to the job.
+M.CS_COUNT = 5
+
+-- The centre channel of every bonded 5 GHz block, in IEEE's own numbering.
+-- A table rather than arithmetic because the blocks are NOT evenly spaced:
+-- UNII-3 starts at 149, which is not 36 + 16k, so an anchor-on-36 formula
+-- puts the 149-161 block's centre one channel (5 MHz) too low -- a wrong
+-- center_freq1 hostapd would accept and then beacon a 20 MHz-wide lie.
+M.BLOCK_CENTERS = {
+	[40]  = {38, 46, 54, 62, 102, 110, 118, 126, 134, 142, 151, 159},
+	[80]  = {42, 58, 74, 90, 106, 122, 138, 155},
+	[160] = {50, 114, 163},
+}
+
+-- The centre channel of the `width` MHz block holding `ch`, or nil when the
+-- channel is not in one (165 at 40 MHz, say: it has no partner).
+function M.block_center(ch, width)
+	local centers = M.BLOCK_CENTERS[width]
+	if not centers then return nil end
+	-- Half the block, in channel numbers: 2 either side at 40 MHz, 6 at
+	-- 80 MHz, 14 at 160 MHz.
+	local reach = width / 10 - 2
+	for _, c in ipairs(centers) do
+		if ch >= c - reach and ch <= c + reach then return c end
+	end
+	return nil
+end
+
+-- The arguments for `hostapd_cli chan_switch <count> ...` that put a 5 GHz BSS
+-- on channel `ch` at `width` MHz, or nil when the pair cannot be expressed.
+--
+-- Grammar, verified against the hostapd in OpenWrt 25.12 (`hostapd_cli help`):
+--   chan_switch <cs_count> <freq> [sec_channel_offset=] [center_freq1=]
+--               [center_freq2=] [bandwidth=] [blocktx] [ht|vht]
+-- The build's help lists only ht|vht, so an HE or EHT BSS is switched with
+-- `vht` and keeps the HE/EHT operation elements from its own config; passing a
+-- token this hostapd does not parse would fail the whole command.
+--
+-- 5 GHz only, and deliberately: 2.4 GHz has no DFS, so the job that uses this
+-- never asks about it.
+function M.chan_switch_args(ch, width)
+	ch, width = tonumber(ch), tonumber(width) or 20
+	if not ch or ch < 32 then return nil end
+	local freq = M.freq_of_channel(ch)
+	if not freq then return nil end
+	if width == 20 then return tostring(freq) end
+
+	local center = M.block_center(ch, width)
+	if not center then return nil end
+	-- Which side of the primary its 40 MHz partner sits on. The 5 GHz
+	-- channels step by 4 and the pairs are (36,40), (44,48), ..., so the
+	-- lower member of each pair takes its secondary above it. Derived from
+	-- the 40 MHz block's own centre, which keeps UNII-3 right as well.
+	local pair = M.block_center(ch, 40)
+	if not pair then return nil end
+	return table.concat({
+		tostring(freq),
+		"sec_channel_offset=" .. (ch < pair and 1 or -1),
+		"center_freq1=" .. M.freq_of_channel(center),
+		"bandwidth=" .. width,
+		(width == 40) and "ht" or "vht",
+	}, " ")
+end
+
+-- DFS radar detections among the drained collector lines. hostapd prints
+-- "DFS-RADAR-DETECTED freq=5500 ht_enabled=0 chan_offset=0 chan_width=1
+-- cf1=5500 cf2=0" on the BSS control socket; the hook prefixes the uptime and
+-- the interface, as it does for BEACON-RESP-RX.
+--
+-- freq is the one field that matters: it is the frequency the radar was seen
+-- on, which is not necessarily the BSS's own centre frequency (cf1) on a wide
+-- channel. A line without a usable freq is dropped rather than reported with a
+-- guessed channel -- the controller's handler needs both fields and ignores
+-- the event if either is missing.
+-- One detection as the event queue wants it, or nil when the frequency is
+-- missing or unknown. The single place that decides a line is unusable: the
+-- collector blob is walked by assoctrack.parse_events when connection tracking
+-- is on (inform._dfs_poll then feeds its radar records through here) and by
+-- parse_dfs below when nothing else is reading the file.
+function M.radar_of(t, ifname, freq)
+	freq = tonumber(freq)
+	local ch = M.channel_of_freq(freq)
+	if not ch then return nil end
+	return {t = tonumber(t), ifname = ifname, freq = freq, channel = ch}
+end
+
+function M.parse_dfs(blob)
+	local out = {}
+	if type(blob) ~= "string" then return out end
+	for line in blob:gmatch("[^\n]+") do
+		local t, ifname = line:match("^(%d+%.?%d*)%s+(%S+)%s+DFS%-RADAR%-DETECTED")
+		if t then
+			local d = M.radar_of(t, ifname, line:match("%sfreq=(%d+)"))
+			if d then out[#out + 1] = d end
+		end
+	end
+	return out
+end
+
 -- Width from the operation elements, injected by inform.lua as
 -- sysinfo.channel_width so the scan cache and beacon reports decide it the
 -- same way. Unset (a test, or a load-order surprise), a report's width is
@@ -449,6 +630,15 @@ end
 -- script per event, which appends the beacon reports, uptime-stamped like the
 -- ubus lines, to the same EVENT_FILE, so a single drain() still reads both.
 -- hostapd_cli runs it as "<script> <ifname> <event words...>".
+--
+-- The hook also passes every DFS-* event, for parse_dfs below. Only
+-- DFS-RADAR-DETECTED is consumed; the rest (DFS-CAC-START, DFS-CAC-COMPLETED,
+-- DFS-NEW-CHANNEL, DFS-NOP-FINISHED) are drained and dropped. They are let
+-- through on purpose: a radar hit cannot be produced on demand, while a CAC
+-- pair arrives on every hostapd start on a DFS channel -- so they are the only
+-- way to show on real hardware that DFS events reach this file at all, which
+-- is the whole of what the radar path depends on. A handful of lines per
+-- hostapd restart is the cost.
 M.ACTION_SCRIPT   = "/tmp/openuf-bresp.sh"
 M.HOSTAPD_CTRL_DIR = "/var/run/hostapd"
 
@@ -456,7 +646,7 @@ function M.action_script()
 	return table.concat({
 		"#!/bin/sh",
 		"# openUF hostapd control-socket hook -- written by rrmscan.lua, do not edit.",
-		'[ "$2" = BEACON-RESP-RX ] || exit 0',
+		"case \"$2\" in BEACON-RESP-RX|DFS-*) ;; *) exit 0 ;; esac",
 		"read -r u _ < /proc/uptime",
 		"printf '%s %s\\n' \"$u\" \"$*\" >> " .. M.EVENT_FILE,
 	}, "\n") .. "\n"

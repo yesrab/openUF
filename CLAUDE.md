@@ -359,11 +359,16 @@ Other things to preserve:
   answers yes in places where the open then fails.
 - **Every question is asked before anything changes**, and each has a matching option so
   the same script runs unattended. Adding a prompt means adding an option.
-- **The 802.11r translator's packages go in the packages phase.** `ucode-mod-socket` and
-  `kmod-veth` are in `OPTIONAL`, so they arrive while the box still has internet; the daemon
-  itself is in the tree (`openuf/rrb/`) and `install.sh` enables its service, which `setup.sh`
-  also does on its package path. No question, no option: `openuf.rrb.enabled '0'` switches the
-  daemon off and `unifi_ft_interop` the whole feature.
+- **The rrb-unifi roaming plugin is question 7 (default yes), and its pieces are split across
+  the phases on purpose.** Its two packages (`ucode-mod-socket`, `kmod-veth`) join `OPTIONAL`
+  and its release archive is fetched at the end of the packages phase, both while the box still
+  has internet; `rrb-unifi-setup install --yes` runs at the end of phase 4, after openUF is
+  installed and configured, and `setup.sh` confirms the tool's 120 s network watchdog at once
+  (a veth cannot break the LAN) and puts the plugin into `/etc/openuf/plugins/` + `plugins.enabled`
+  itself, because a package release from before the `/opt/openuf` symlink is invisible to the
+  tool. `--unifi-roaming`/`--no-unifi-roaming`, `RRB_UNIFI_RELEASE_URL`, `RRB_UNIFI_DIR`,
+  `RRB_UNIFI_FALLBACK_TAG` (v1.5, the version checked against this tree). A download failure
+  skips the plugin with the manual steps printed; it never fails the install.
 - **Value-taking options** must go through `need_val`, or a forgotten value silently
   configures the empty string.
 
@@ -447,16 +452,17 @@ registers it, also for an account that exists already, and `uninstall` removes i
 validation container's OpenSSH never checked, so this was invisible until a real L2 adoption
 (AP2, 2026-10-25).
 
-**The 802.11r translator for genuine UniFi APs ships with the tree.** `openuf/rrb/rrb-unifi.uc`
-(d-malinowski's rrb-unifi, vendored; `openuf/rrb/README.md` names the upstream
-commit and every change, each marked `// openUF:` in the file) runs as `/etc/init.d/openuf-rrb`,
-which `install.sh` copies from `openuf/etc/init.d/` and enables after openUF's own service.
-Its packages, `ucode-mod-socket` and `kmod-veth`, are two more `try_optional`s. The veth pair
-is NOT the installer's business: `ucihelper.ensure_ft_veth` writes it into `/etc/config/network`
-on the first config push that carries an FT WLAN, and `install.sh uninstall` and
-`ucihelper.forget` remove it. Fixes to the daemon come from
-https://github.com/d-malinowski/unifi-openwrt-roaming (the local clone
-`../unifi-openwrt-roaming` has it as `upstream`), never from a fork of it.
+**The 802.11r translator is NOT in the tree any more (2026-11-02).** It was vendored from
+2026-10-25 to 2026-11-02 as `openuf/rrb/` with the `openuf-rrb` service; d-malinowski's own
+project now ships an openUF plugin (`openuf-plugin/rrb-unifi.lua`, release 1.4+) installed by
+his `rrb-unifi-setup`, and this tree's two daemon changes (`wait 0`, `peers_file`) were made
+unnecessary by his release 1.5 (wildcard key holders, hostapd learns the peers) and declined
+(PR #1 there, closed 2026-10-27). `install.sh install` therefore stops, disables and removes
+a leftover `/etc/init.d/openuf-rrb`; the veth sections an old build wrote
+(`openuf_ftveth`/`ftlink`/`ftpeer`, `ucihelper.LEGACY_FT_VETH_SECTIONS`) are removed by
+`apply_config` right AFTER the `wifi reload` of the next push (never before: a BSS whose
+`ft_iface` vanishes fails), and `inform._migrate_legacy_rrb` asks the controller for that push
+at startup. `install.sh uninstall` still removes both.
 
 ---
 
@@ -492,8 +498,10 @@ https://github.com/d-malinowski/unifi-openwrt-roaming (the local clone
   firing it at the next boot would land in hostapd's ACS sweep.
 - **A capability bit is claimed only where a device-side probe passes**, and the probe is
   cached: `sae_supported` (`radio_caps2` 0x1/0x2), `owe_supported` (0x8), `airtime.supported`
-  (`wifi_caps` 0x20), `ppsk_supported` (0x100000). `wifi_caps` 0xC and `wifi_caps2` 0x60 are
-  unconditional because they only make the controller *send* blocks openUF parses. The
+  (`wifi_caps` 0x20), `ppsk_supported` (0x100000), `hs20_supported` (`fw_caps` 0x800000 +
+  `fw2_caps` 0x80000). `wifi_caps` 0xC, `wifi_caps2` 0x60|0x10|0x400000 and `fw_caps`
+  0x100000|0x80000000 are unconditional because they only make the controller *send* blocks
+  openUF parses (the `fw_caps` landmine above says why the last one makes the field negative). The
   controller keeps a setting it could not push (upstream found `atf_enabled: false` stored
   from before the bit existed), so a newly claimed bit can change device state on the first
   push after an upgrade. `debug_caps` replaces a mask whole. PROTOCOL-VALIDATION.md's
@@ -778,22 +786,55 @@ https://github.com/d-malinowski/unifi-openwrt-roaming (the local clone
   constant to encode with; the old conversion drifted 12 dB between drivers.
 - **Never set `ft_psk_generate_local`.** It is FT-PSK-only, and pinning it stops OpenWrt
   configuring the key holders FT-SAE needs, so WPA3 clients silently lose fast roaming.
-  The one exception is `ftinterop.lua` under `unifi_ft_interop`: it sets `0` and writes the
-  explicit `r0kh`/`r1kh` key holders in the same breath, so the relationship FT-SAE needs
-  exists; a UniFi AP never derives keys locally and pulls from this AP instead. That path also
-  needs the external rrb-unifi translator's veth as hostapd's `ft_iface`, written as the raw
-  `hostapd_bss_options` form (the translator reads the generated `ft_iface=<bridge>` line that
-  precedes it), and only when the veth exists: hostapd fails a BSS whose `ft_iface` is missing.
-- **hostapd is pointed at the translator's veth only while something forwards it.**
-  `ftinterop.ft_iface` writes `hostapd_bss_options 'ft_iface=vft0'` only when the `openuf-rrb`
-  service is installed, `openuf.rrb.enabled` is not `0`, and the netdev exists, and
-  `ucihelper.ensure_ft_veth` creates the pair only under the same conditions: a veth nobody
-  forwards would swallow every RRB frame, openUF-to-openUF key pulls included, and the symptom
-  would be "FT silently falls back to a full handshake" on every roam. The daemon's own changes
-  (waiting instead of exiting, the peers file) are marked `// openUF:` in a file whose upstream
-  is d-malinowski's repository, not this one: keep them small and re-applicable. The whole
-  repository is GPL-3.0-or-later since 2026-10-25 because of it; NOTICE carries the MIT notice
-  for jonasevcik's original work, which MIT requires to travel with the code.
+  The one thing that does set it to `0` is d-malinowski's rrb-unifi plugin, which writes the
+  wildcard `r0kh`/`r1kh` key holders in the same breath and points hostapd's `ft_iface` at its
+  translator's veth only while the veth exists (hostapd fails a BSS whose `ft_iface` is
+  missing). That is a plugin's business now, not this tree's: `plugins.lua` is the hook, and
+  nothing in `ucihelper` knows about the veth.
+- **Plugins are upstream's `api = 1` contract, byte for byte, and `/opt/openuf` is part of it.**
+  `plugins.lua` is jonasevcik's (8287ecf + 9159efd) with two additions: the plugin list may
+  come from UCI (`openuf.main list plugin`, through `uciconf.lua`) and `M.list()` feeds the LuCI
+  overview. A plugin written for upstream must run here unchanged, so do not rename `ctx`
+  fields, change `M.API`'s line shape (`rrb-unifi-setup` reads it with `sed`), or move the
+  hook away from "after every built-in option, before `wlan_add`". Upstream's `docs/PLUGINS.md`
+  names `/opt/openuf/plugins.lua` as the detection path, so the package ships `/opt/openuf` as
+  a symlink to `/usr/lib/openuf`; the postinst's double-install warning and `install.sh`'s
+  guard ignore a symlink. `inform._reconcile_plugins` forgets `cfgversion` when the fingerprint
+  (names + file contents) moves, so enabling or removing a plugin costs one re-push. The
+  `feature/pluginsAndHooks` branch (our superset: `before_push`/`after_push`/`tick`/`on_boot`/
+  `on_forget`/`status`/declared packages, with a built-in `rrb` plugin) is superseded and was
+  mined only for the UCI list and the LuCI field: with the translator external, nothing uses
+  those hooks, and "proven by use, not by design" cuts the other way.
+- **The repository is GPL-3.0-or-later since 2026-10-25** because of the then-vendored GPL
+  translator; the translator is gone, the licence decision stays the user's (NOTICE records
+  the history; the MIT notice for jonasevcik's work travels with the code either way).
+- **`fw_caps` goes out SIGNED.** Bit `0x80000000` (MAC-based VLANs) sets the sign bit of a Java
+  `int` on the controller side; `0x80101110` as an unsigned 2148537104 is out of range for the
+  deserializer, so the sum is written as `0x101110 - 0x80000000 + ...` (a genuine gateway reports
+  its own caps negative too). `debug_caps.fw_caps` still replaces the whole value. The other
+  bits claimed since 2026-11-02 and why: `fw_caps 0x100000` (RADIUS DAS: hostapd is the
+  listener), `fw_caps 0x800000` + `fw2_caps 0x80000` (Hotspot 2.0 + RadSec, both behind
+  `sysinfo.hs20_supported`; RadSec is NOT implemented, the claim only makes a RadSec server
+  arrive distinguishable so it can be dropped), `wifi_caps2 0x10` (auto-channel limits) and
+  `0x400000` (Multicast Suppression's three positions). Each one is a controller feature that
+  pushes nothing at all without the bit.
+- **`rrm_enrichment` absent means ON here, off upstream.** Their tests pass `nil` for "off";
+  ported tests must pass an explicit `false` (the AP2 lesson in `_rrm_tick`'s comment).
+- **The ACS candidate list is UCI `channels`, one write, board policy first.** 24.10's generator
+  reads the `channels` list; 25.12's schema declares it as the alias of `chanlist`, which is what
+  `hostapd.uc` appends -- so `channels` serves both (upstream writes `chanlist`, which 24.10
+  ignores). `rf_config` folds the modelmap's `dev.conf.radio.<band>.channels` with the
+  controller's blacklist (`radio.<n>.blklst`, inverted against `phy_caps`' legal list): the
+  board's list minus the blacklist, the board's alone when that is empty, and
+  `dev.conf.radio.<band>.acs_exclude_dfs = true` is never overridden by the site's
+  `radio.<n>.acsdfs`. Both are written only while the channel is `auto`; a fixed channel
+  deletes them. A hand-set `channels` on an openUF-managed radio is replaced, as every radio
+  option `rf_config` owns is.
+- **`ieee80211d=0` kills a 5 GHz radio.** `hostapd.uc` emits `ieee80211h` for every radio with
+  hw_mode `a` and a country, and hostapd refuses 802.11h without 802.11d, at the NEXT `wifi
+  reload`, not at the push that writes it (upstream lost both 5 GHz radios an hour after a
+  clean-looking provision). `rf_config` writes `1` on 5 GHz whatever `country_beacon` said, and
+  a radio whose band is unknown counts as 5 GHz.
 - **Two kernel modules are not implied by their packages.** `kmod-nft-bridge` for the
   Multicast/Broadcast Blocker's `meta` rule (everything else in that table builds without
   it, so the control looks enabled and filters nothing) and `kmod-sched-act-police` for the
@@ -851,8 +892,15 @@ https://github.com/d-malinowski/unifi-openwrt-roaming (the local clone
   without a mode-0 report before benching it for `RRM_BENCH_SECONDS`; the operating class
   follows the band the station is on (81 for 2.4 GHz, 115 for 5 GHz), because a 2.4-only
   client cannot measure a 5 GHz class at all.
-- **WPA-Enterprise is unsupported and skipped**, not mis-provisioned: the wire protocol
-  carries no RADIUS server, port or secret.
+- **WPA-Enterprise is provisioned since 2026-11-02, and the old "the wire carries no RADIUS
+  server" claim was a capture artefact** (a site with no RADIUS profile, the absence-as-
+  discriminator trap this file warns about). `_wire_radius` reads `aaa.<n>.radius.*`; the
+  canonical UCI names (`auth_server_addr`...), never the schema's aliases; an EAP BSS carries no
+  passphrase (`PASSPHRASE_ENC` is an allow-set, so a new encryption value fails closed) and no
+  private keys; `hostapd_bss_options` has several producers now, so always `add_bss_option`,
+  never assign the list. RADIUS MAC authentication fails CLOSED (a WLAN that cannot have its
+  ACL is skipped, loudly); Hotspot 2.0 lists are raw lines; MAC-based VLANs write the accept
+  file BEFORE pointing hostapd at it. A `wpad-basic-*` has no RADIUS client: warn, never gate.
 - **On swconfig, mesh is two problems DSA does not have** (since 2026-10-18; first run on a
   Deco M4R v1 on 2026-10-19: untagged, online over the air with the cable pulled). (1)
   `br-lan`'s wired port is the CPU trunk's sub-device, whose carrier never
@@ -891,24 +939,30 @@ C5; this tree's lab is a JioRouter AX6000, DSA, `lan_cpueth = "br-lan"`). Upstre
 work from here (their 2026-09-25 commits were our 09-15 sysconf/l2guard/interval work,
 credited to this repo), so diff before assuming a commit is new.
 
-- **Last review point: `2f263f3` (upstream v0.11.0), sync 4 on 2026-10-18.** Earlier: the
+- **Last review point: `db5e92b` (upstream v0.13.0), sync 5 on 2026-11-02.** Earlier: the
   fork point `677f732`; sync 1 (2026-09-06) to `d7d7e21`; sync 2 (2026-09-13) to `12b4db0`;
-  sync 3 (2026-09-28) to `08d0003` (v0.9.3). Not adopted from sync 4 and still waiting:
-  the guest portal (REVERSE-ENGINEERING.md backlog row 24).
+  sync 3 (2026-09-28) to `08d0003` (v0.9.3); sync 4 (2026-10-18) to `2f263f3` (v0.11.0).
+  Not adopted from syncs 4 and 5 and still waiting: the guest portal and its walled garden
+  (`e6395d7`, `afd7b32`; REVERSE-ENGINEERING.md backlog row 24), their `docs/WIRE-REFERENCE.md`
+  split (`5f521bf`; our docs keep their own shape) and the GitHub issue templates.
   Each sync is a row in REVERSE-ENGINEERING.md's session log and an "Adopted from upstream,
   <date>" section in PROTOCOL-VALIDATION.md -- update both, and move this line.
-- **A third fork is a remote too: `dmalinowski` → d-malinowski/openUF.** Its
-  `pr/unifi-ft-interop` (one commit, `94ac182`) was adopted on 2026-10-25 as `ftinterop.lua`
-  (PROTOCOL-VALIDATION.md, "Adopted from d-malinowski/openUF"); it is proposed to upstream but
-  not merged there, so a later upstream sync may bring the same change back under
-  `openuf/ftinterop.lua` -- diff before re-applying. Their `pr/hh5a-modelmap` (a BT Home Hub 5A
-  map, lantiq/xrx200) was merged by jonasevcik on 2026-10-25 (`d6745b8`, the first upstream
-  commits past `2f263f3`) and is not yet reviewed here. Their hardware is a HH5A and a U7 Lite;
-  label it. **The translator has an upstream of its own**: `openuf/rrb/rrb-unifi.uc` is
-  https://github.com/d-malinowski/unifi-openwrt-roaming at 1.3 (`767a28c`), vendored
-  2026-10-25 with the changes marked `// openUF:`; take fixes from there (the local clone
-  `../unifi-openwrt-roaming` has it as `upstream`), re-apply the marked changes, and update
-  `openuf/rrb/README.md`'s commit. The fork `yesrab/unifi-openwrt-roaming` is not a source.
+- **A third fork is a remote too: `dmalinowski` → d-malinowski/openUF**, and his roaming
+  project is where 802.11r with genuine UniFi APs lives now. The story, so it is not relived:
+  his `pr/unifi-ft-interop` was adopted here on 2026-10-25 as `ftinterop.lua` with his
+  translator vendored; jonasevcik answered the same PR (#2 upstream) with a plugin hook
+  instead (`8287ecf`), he moved his module into his repository as an openUF plugin
+  (release 1.4, tested on his HH5A + U7 Lite), closed the PR, and release 1.5 replaced the
+  peer list with wildcard key holders -- which made this tree's two daemon changes
+  (`wait 0`, `peers_file`, offered as PR #1 on his repository) unnecessary; he closed that PR
+  on 2026-10-27 with the reasons. On 2026-11-02 this tree took upstream's hook as it is,
+  removed `ftinterop.lua`, `openuf/rrb/` and the `openuf-rrb` service, and `setup.sh` offers
+  his plugin (default yes). Their hardware is a HH5A and a U7 Lite; label it. The local clone
+  `../unifi-openwrt-roaming` (`upstream` = his repository) is only for reading what the plugin
+  and `rrb-unifi-setup` expect of openUF (`/opt/openuf/plugins.lua`, `M.API`); the fork
+  `yesrab/unifi-openwrt-roaming` is not a source. One PR worth offering him: `rrb-unifi-setup`
+  hardcodes `OUF=/opt/openuf`, and probing `/usr/lib/openuf` too would make the symlink
+  unnecessary.
 - **Mechanics that worked in syncs 3 and 4:** `git add -A` first, then per commit **in
   upstream's order** `git show --format= <c> -- openuf/ tests/ ':!openuf/guestportal.lua'
   ':!tests/test_guestportal.lua' | git apply --3way` (the fetch puts their blobs in our
@@ -962,11 +1016,10 @@ openuf/
   wlansched.lua     WiFi Blackout Schedule: the firmware's schedule lines, netdev down/up
   stun.lua          the STUN client whose mapped address the controller wakes
   rrbguard.lua      repairs hostapd's stale 802.11r key-exchange socket (wpad restart)
-  ftinterop.lua     802.11r with genuine UniFi APs (conf `unifi_ft_interop`, on by default
-                    for new installations; with the translator switched off it only changes
-                    the mobility-domain formula and FT-PSK's key path): UniFi's
-                    mobility domain, explicit key holders for the peers the rrb-unifi
-                    translator lists, nasid = BSSID, hostapd's ft_iface on the translator's veth
+  plugins.lua       the third-party plugin hook: upstream's api-1 `vap_options(extra, vap,
+                    ctx)` contract as it is (a plugin written for upstream runs here), the
+                    list from conf.lua / UCI `list plugin` / /etc/openuf/plugins.enabled,
+                    the fingerprint inform re-pushes on; PLUGINS.md is the author guide
   util.lua          shared helpers: file/command reads, exec_ok, is_mac, bit shim, sysfs
                     master_of/driver_of, nft_apply (one `nft -f` transaction per table)
   unhandled.lua     /etc/openuf/unhandled.json: every _type, cmd, mgmt_cfg key and
@@ -995,14 +1048,7 @@ openuf/
                     openuf-convert.sh (/usr/sbin/openuf-convert: setup.sh's AP
                     conversion as --check/--convert/--revert), openuf-deps.sh
                     (/usr/sbin/openuf-deps, `openuf deps`: what openUF needs
-                    installed as JSON, the basic-to-full wpad swap, and the
-                    translator service's start), openuf-rrb.sh (`openuf rrb
-                    status|peers|collect|verify`, adapted from rrb-unifi-setup)
-  rrb/              the 802.11r translator for genuine UniFi APs: rrb-unifi.uc
-                    (d-malinowski's, vendored; README.md there
-                    names the upstream commit and the `// openUF:` changes), run as
-                    etc/init.d/openuf-rrb; learns the UniFi APs on the LAN into
-                    /var/run/openuf/rrb-peers.json for ftinterop.lua
+                    installed as JSON and the basic-to-full wpad swap)
   etc/init.d/openuf procd service: announce + inform instances; finds either prefix
 package/            the OpenWrt feed: openuf (net/), luci-app-openuf (the LuCI pages, the device
                     page htdocs/openuf/ and its gate root/usr/share/ucode/openuf/gate.uc) and
@@ -1014,7 +1060,13 @@ update.sh           on-device updater (installed as openuf-update): backup, inst
 tools/              dist.sh (package), check.sh (preflight), simulate.sh (e2e),
                     deploy.sh (push a build to adopted APs and run update.sh on each),
                     heartbeat-probe.lua (what one inform costs a board: forks and reads),
-                    strip.lua, test_controller.py, validation/ (docker controller)
+                    cfg-coverage.lua (replay a captured system_cfg through every parser and
+                    sort each key into consumed / inert / ignored; the suite dofile()s it,
+                    so dist.sh --verify copies tools/ into the verify tree),
+                    fw-extract.sh (a UniFi MIPS AP firmware's rootfs: xz, cpio, binwalk),
+                    fw-oracle/ (run a libubnt function under Unicorn to check a formula),
+                    strip.lua, test_controller.py, validation/ (docker controller; the
+                    radius/ files are upstream's FreeRADIUS profile for an EAP WLAN)
 PROTOCOL-VALIDATION.md   evidence for every protocol claim — read before disputing one
 REVERSE-ENGINEERING.md   the open questions: unimplemented surfaces + experiment plans
 ```

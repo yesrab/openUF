@@ -41,7 +41,7 @@
 	      option roam_assist_diff_db '8'  option country_override ''
 	      option bootstrap_adopt_user ''  option debug_dump_file ''
 	      option debug_dump_requests '0'  option debug_dump_max_bytes '4194304'
-	      option unifi_ft_interop '1'
+	      list plugin 'name'              (third-party plugins, USAGE.md "Plugins")
 	      (debug_caps and debug_payload_extra stay conf.lua-only: they are
 	      research switches, not settings)
 	  config device 'custom'
@@ -159,8 +159,7 @@ end
 
 -- ─── main: the runtime options ─────────────────────────────────────────────
 
-local BOOL_OPTS = {"use_only_unifi_wlan", "l2_announce", "rrm_enrichment", "debug_dump_requests",
-	"unifi_ft_interop"}
+local BOOL_OPTS = {"use_only_unifi_wlan", "l2_announce", "rrm_enrichment", "debug_dump_requests"}
 local NUM_OPTS  = {"neighbour_scan_interval", "rrm_request_interval", "roam_assist_diff_db",
 	"debug_dump_max_bytes"}
 local STR_OPTS  = {"inform_url", "state_file", "unhandled_file", "debug_dump_file",
@@ -190,6 +189,11 @@ local function build_config(main, defaults)
 	end
 	if main.keep_wlan_section ~= nil then
 		cfg.keep_wlan_sections = to_list(main.keep_wlan_section)
+	end
+	-- Third-party plugins (plugins.lua): `list plugin 'name'`, the same
+	-- allowlist conf.lua's `plugins = {}` is.
+	if main.plugin ~= nil then
+		cfg.plugins = to_list(main.plugin)
 	end
 	return cfg
 end

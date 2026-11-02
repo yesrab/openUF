@@ -190,6 +190,21 @@ local function response(json, st) return inform.build_packet(json, st) end
 -- ctx as run() hands it to the first _tick: last_mtime already equal to what
 -- the stubbed _state_mtime returns, so no spurious reload fires.
 local function fresh_ctx() return {interval = 10, backoff = 10, last_mtime = 1} end
+-- tools/cfg-coverage.lua: the key-coverage sweep over a captured push. Loaded
+-- as a module (its script half is gated on arg[0]), so the tests below drive
+-- M.analyse/M.format directly with their own parser sets where a synthetic one
+-- pins the probe design, and with openUF's real ones where the point is what
+-- openUF does.
+local cfgcov = dofile("tools/cfg-coverage.lua")
+
+local function real_parsers()
+	return cfgcov.parsers(inform, {
+		sysconf     = inform._sysconf,
+		l2guard     = inform._l2guard,
+		guestportal = inform._guestportal,
+		airtime     = inform._airtime,
+	})
+end
 
 local MAGIC = "TNBU"
 
@@ -311,6 +326,25 @@ return {
 			assert_error(function()
 				inform.parse_packet(corrupted, st)
 			end, "bad magic raises error")
+		end
+	},
+	{
+		name = "inform packet: parse refuses a response without the encrypted flag",
+		fn = function()
+			-- A plain-JSON reply would otherwise be taken as the controller's:
+			-- anyone on the HTTP path could push a setparam without the key.
+			local st = sample_state()
+			local json = '{"_type":"setparam","inform_url":"http://192.0.2.66:8080/inform"}'
+			local pkt = inform.build_packet(json, st)
+			local flags = pkt:byte(15) * 256 + pkt:byte(16)
+			assert_eq(flags % 2, 1, "the sender sets the encrypted bit")
+			flags = flags - 1
+			-- Header with the 0x01 bit cleared and the payload swapped for JSON.
+			local plain = pkt:sub(1, 14) .. string.char(math.floor(flags / 256), flags % 256)
+				.. pkt:sub(17, 36) .. string.char(0, 0, 0, #json) .. json
+			local ok, err = pcall(inform.parse_packet, plain, st)
+			assert_false(ok, "an unencrypted packet raises")
+			assert_true(tostring(err):find("unencrypted", 1, true) ~= nil, "and says why")
 		end
 	},
 	{
@@ -659,6 +693,86 @@ return {
 		end
 	},
 	{
+		name = "inform packet: per-BSS okc, tdls_prohibit, country_beacon and the pairwise cipher",
+		fn = function()
+			-- Verbatim shapes from a 10.6.106 capture (lab, 2026-10-26),
+			-- diffed across the wlanconf's auth_cache / tdls_prohibit /
+			-- country_beacon / wpa_enc fields -- every one of them changed,
+			-- so none is a decoy. auth_cache rides only the WPA-Enterprise
+			-- branch of the generator, which is why the PSK vap below has
+			-- none: see the vap table's comments.
+			local psk = "aaa.1.ssid=net\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "aaa.1.wpa.psk=secret\naaa.1.tdls_prohibit=enabled\n"
+				.. "aaa.1.country_beacon=enabled\naaa.1.wpa.1.pairwise=GCMP\n"
+				.. "wireless.1.ssid=net\nwireless.1.parent=radio0\n"
+			local rt, vt = inform._parse_wifi_system_cfg(psk)
+			assert_nil(vt[1].okc, "no auth_cache on a PSK WLAN -> nil, not false")
+			assert_not_nil(rt, "radio_table comes back too")
+			assert_true(vt[1].tdls_prohibit, "tdls_prohibit=enabled")
+			assert_true(vt[1].country_beacon, "country_beacon=enabled")
+			assert_eq(vt[1].pairwise, "gcmp", "GCMP -> the encryption suffix token")
+
+			local off = psk:gsub("=enabled", "=disabled")
+				:gsub("pairwise=GCMP", "pairwise=CCMP")
+			rt, vt = inform._parse_wifi_system_cfg(off)
+			assert_false(vt[1].tdls_prohibit, "tdls_prohibit=disabled")
+			assert_false(vt[1].country_beacon, "country_beacon=disabled")
+			assert_nil(vt[1].pairwise,
+				"CCMP is OpenWrt's own default -- no suffix is written for it")
+
+			-- The other three values the generator's enum can reach. GCMP-256
+			-- is refused by the controller's validator today and mapped only
+			-- because the enum carries it; "TKIP CCMP" (a WPA1 WLAN) is
+			-- declined outright.
+			for wire, token in pairs({["CCMP-256"] = "ccmp256",
+					["GCMP-256"] = "gcmp256"}) do
+				rt, vt = inform._parse_wifi_system_cfg(
+					(psk:gsub("pairwise=GCMP", "pairwise=" .. wire)))
+				assert_eq(vt[1].pairwise, token, wire .. " -> " .. token)
+			end
+			for _, wire in ipairs({"TKIP CCMP", "TKIP", "", "AES"}) do
+				rt, vt = inform._parse_wifi_system_cfg(
+					(psk:gsub("pairwise=GCMP", "pairwise=" .. wire)))
+				assert_nil(vt[1].pairwise, "declined on the wire: " .. wire)
+			end
+		end
+	},
+	{
+		name = "inform packet: a '=' in a passphrase or SSID stays in the value",
+		fn = function()
+			-- A line splits at its FIRST '='. A greedy key pattern split at
+			-- the last one: the passphrase lost its head (key "wpa.psk=pass"),
+			-- and an SSID with '=' left wireless.<n>.ssid unset so no WLAN
+			-- was built at all.
+			local cfg = "aaa.1.ssid=a=b\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-PSK\n"
+				.. "aaa.1.wpa.psk=pass=word==\n"
+				.. "wireless.1.ssid=a=b\nwireless.1.parent=radio0\n"
+			local _, vt = inform._parse_wifi_system_cfg(cfg)
+			assert_not_nil(vt[1], "the WLAN with '=' in its SSID is built")
+			assert_eq(vt[1].ssid, "a=b", "SSID keeps its '='")
+			assert_eq(vt[1].x_passphrase, "pass=word==", "passphrase keeps every '='")
+		end
+	},
+	{
+		name = "inform packet: auth_cache rides the WPA-Enterprise branch and becomes okc",
+		fn = function()
+			-- The one WLAN kind the controller sends auth_cache on, captured
+			-- 2026-10-26: default enabled, and it flips with the field.
+			local eap = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.auth_cache=enabled\naaa.1.tdls_prohibit=disabled\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\n"
+				.. "aaa.1.radius.auth.1.port=1812\n"
+				.. "aaa.1.radius.auth.1.secret=shh\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local rt, vt = inform._parse_wifi_system_cfg(eap)
+			assert_eq(vt[1].security, "wpa2-enterprise", "the EAP branch")
+			assert_true(vt[1].okc, "auth_cache=enabled -> okc on")
+			rt, vt = inform._parse_wifi_system_cfg(
+				(eap:gsub("auth_cache=enabled", "auth_cache=disabled")))
+			assert_false(vt[1].okc, "auth_cache=disabled -> okc off, not nil")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg reads Roaming Assistant (btm_disassoc) per vap",
 		fn = function()
 			-- Wire format from the decompiled 10.6.101 generator: status is the
@@ -732,6 +846,44 @@ return {
 				.. "radio.2.phyname=radio1\nradio.2.countrycode=203\n")
 			assert_eq(radio_table[1].country, "CZ", "203 -> CZ on radio0")
 			assert_eq(radio_table[2].country, "CZ", "203 -> CZ on radio1")
+		end
+	},
+	{
+		name = "inform packet: the site's auto-channel DFS switch and channel blacklist reach the radio",
+		fn = function()
+			-- Verbatim shape from 10.6.106 once wifi_caps2 0x10 is claimed:
+			-- acsdfs only on the 5 GHz radio, blklst only while that radio is
+			-- on Auto, and the 2.4 GHz blacklist is the default site's
+			-- "conservative" preset (everything but 1/6/11).
+			local radio_table = inform._parse_wifi_system_cfg(
+				"radio.status=enabled\n"
+				.. "radio.1.phyname=radio0\nradio.1.channel=auto\n"
+				.. "radio.1.blklst=12,2,13,3,14,4,5,7,8,9,10\n"
+				.. "radio.2.phyname=radio1\nradio.2.channel=auto\n"
+				.. "radio.2.acsdfs=disabled\n")
+			assert_nil(radio_table[1].acs_exclude_dfs,
+				"2.4 GHz never carries acsdfs -- nil, not false")
+			-- Verbatim wire order: the controller builds the list from a Java
+			-- Set, so it arrives unsorted. The channels are kept as sent;
+			-- rf_config walks the band's own ascending channel list, so the
+			-- chanlist it writes is ordered whatever order this arrives in.
+			assert_eq(table.concat(radio_table[1].acs_blacklist, ","),
+				"12,2,13,3,14,4,5,7,8,9,10", "every blacklisted channel, as sent")
+			assert_eq(radio_table[2].acs_exclude_dfs, true, "DFS excluded from ACS")
+			assert_nil(radio_table[2].acs_blacklist, "no blacklist on this band")
+			-- enabled is an explicit false, so it can undo an earlier disable.
+			local on = inform._parse_wifi_system_cfg(
+				"radio.1.phyname=radio0\nradio.1.acsdfs=enabled\n")
+			assert_eq(on[1].acs_exclude_dfs, false, "DFS allowed -> explicit false")
+			-- Absent keys leave UCI alone; the teardown of a chanlist openUF
+			-- wrote earlier happens in rf_config, off its own stamp.
+			local none = inform._parse_wifi_system_cfg("radio.1.phyname=radio0\n")
+			assert_nil(none[1].acs_exclude_dfs, "no acsdfs -> nil")
+			assert_nil(none[1].acs_blacklist, "no blklst -> nil")
+			-- A blklst with nothing parseable in it is not an empty blacklist.
+			local junk = inform._parse_wifi_system_cfg(
+				"radio.1.phyname=radio0\nradio.1.blklst=\n")
+			assert_nil(junk[1].acs_blacklist, "empty blklst -> nil")
 		end
 	},
 	{
@@ -1196,14 +1348,14 @@ return {
 		end
 	},
 	{
-		name = "inform packet: _parse_wifi_system_cfg skips WPA-Enterprise WLANs",
+		name = "inform packet: _parse_wifi_system_cfg skips a WPA-Enterprise WLAN with no RADIUS server",
 		fn = function()
-			-- An Enterprise WLAN carries mgmt=WPA-EAP and NO wpa.psk. Before
-			-- this guard it matched neither the SAE nor the PSK branch and fell
-			-- through to security="wpa2", producing a psk2 section with a nil
-			-- key -- a VAP hostapd refuses to bring up, silently. openUF has no
-			-- RADIUS configuration on this wire protocol, so the only honest
-			-- outcome is to drop the WLAN and say so.
+			-- An Enterprise WLAN carries mgmt=WPA-EAP and NO wpa.psk. Without
+			-- the aaa.<n>.radius.auth.* block there is nothing to authenticate
+			-- against, and falling through would match neither the SAE nor the
+			-- PSK branch and land on security="wpa2", producing a psk2 section
+			-- with a nil key -- a VAP hostapd refuses to bring up, silently.
+			-- The only honest outcome is to drop the WLAN and say so.
 			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
 				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
 				.. "aaa.2.ssid=guest\naaa.2.wpa=2\naaa.2.wpa.key.1.mgmt=WPA-PSK\n"
@@ -1213,6 +1365,396 @@ return {
 			assert_eq(#vap_table, 1, "only the PSK WLAN survives")
 			assert_eq(vap_table[1].ssid, "guest", "the Enterprise WLAN was dropped, not mis-provisioned")
 			assert_eq(vap_table[1].security, "wpa2", "the PSK WLAN is unaffected")
+		end
+	},
+	{
+		name = "inform packet: a WPA-Enterprise WLAN is provisioned with its RADIUS servers",
+		fn = function()
+			-- The wire DOES carry the RADIUS configuration: 10.6.106's AP config
+			-- builder emits aaa.<n>.radius.auth.<k>.{ip,port,secret} and UAP
+			-- 6.8.2's ubntbox turns them into auth_server_addr/port/shared_secret.
+			-- No device capability gates a WPA2-Enterprise WLAN, so this arrives
+			-- whether openUF asks for it or not.
+			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.port=1812\n"
+				.. "aaa.1.radius.auth.1.secret=s3cret\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local vap_table
+			with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(#vap_table, 1, "the Enterprise WLAN is provisioned")
+			local v = vap_table[1]
+			assert_eq(v.security, "wpa2-enterprise", "security")
+			assert_eq(#v.radius.auth, 1, "one auth server")
+			assert_eq(v.radius.auth[1].ip, "192.0.2.10", "ip")
+			assert_eq(v.radius.auth[1].port, "1812", "port")
+			assert_eq(v.radius.auth[1].secret, "s3cret", "secret")
+			assert_eq(#v.radius.acct, 0, "no accounting server was sent")
+			assert_nil(v.radius.interim_interval, "no interim updates")
+			assert_nil(v.radius.dynamic_vlan, "no dynamic VLAN")
+			assert_nil(v.x_passphrase, "an EAP WLAN carries no passphrase")
+			assert_nil(v.ppsk, "and no private keys")
+		end
+	},
+	{
+		name = "inform packet: the EAP akm and the wpa3 keys pick the enterprise security value",
+		fn = function()
+			-- The akm alone cannot tell WPA3-Enterprise from transition: the
+			-- authoritative keys are wpa3.support/.transition, exactly as on the
+			-- PSK side. 192-bit is tested first, since it implies wpa3.support.
+			local function sec(extra, mgmt)
+				local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\n"
+					.. "aaa.1.wpa.key.1.mgmt=" .. (mgmt or "WPA-EAP") .. "\n"
+					.. "aaa.1.radius.auth.1.ip=192.0.2.10\n"
+					.. "aaa.1.radius.auth.1.secret=s3cret\n"
+					.. extra
+					.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+				local vt
+				with_stderr(function()
+					local _
+					_, vt = inform._parse_wifi_system_cfg(sys_cfg)
+				end)
+				assert_eq(#vt, 1, "provisioned")
+				return vt[1]
+			end
+			assert_eq(sec("").security, "wpa2-enterprise", "plain WPA-EAP")
+			assert_eq(sec("aaa.1.wpa3.support=enabled\n").security,
+				"wpa3-enterprise", "wpa3.support alone")
+			assert_eq(sec("aaa.1.wpa3.support=enabled\naaa.1.wpa3.transition=enabled\n")
+				.security, "wpa2/wpa3-enterprise", "transition")
+			assert_eq(sec("aaa.1.wpa3.support=enabled\naaa.1.wpa3.enhanced_192=enabled\n")
+				.security, "wpa3-enterprise-192", "enhanced_192 wins over wpa3.support")
+			assert_eq(sec("", "WPA-EAP-SUITE-B-192").security, "wpa3-enterprise-192",
+				"the Suite-B akm alone is enough")
+			-- FT-EAP contains "EAP", so it must still be an enterprise WLAN,
+			-- and the existing 802.11r field is what carries fast roaming.
+			local v = sec("aaa.1.ft.status=enabled\n", "FT-EAP")
+			assert_eq(v.security, "wpa2-enterprise", "FT-EAP is still WPA2-Enterprise")
+			assert_true(v.fast_roaming_enabled, "and fast roaming is on")
+		end
+	},
+	{
+		name = "inform packet: RADIUS servers are read in index order, with defaults and validation",
+		fn = function()
+			-- The tokenizer keeps the whole dotted path as one flat key, so the
+			-- per-server indices have to be re-matched and sorted; the controller
+			-- does not emit them in order. A server that cannot be used is
+			-- dropped individually, never silently repaired.
+			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.3.ip=192.0.2.30\naaa.1.radius.auth.3.secret=c\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+				.. "aaa.1.radius.auth.4.ip=not-an-ip\naaa.1.radius.auth.4.secret=d\n"
+				.. "aaa.1.radius.auth.2.ip=192.0.2.20\naaa.1.radius.auth.2.secret=\n"
+				.. "aaa.1.radius.auth.5.ip=192.0.2.50\naaa.1.radius.auth.5.secret=e\n"
+				.. "aaa.1.radius.auth.5.ca_cert=ca.pem\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_contains(logged, "dropping RADIUS auth server 4",
+				"the malformed address is named")
+			assert_true(logged:find("s3cret", 1, true) == nil
+				and logged:find("secret=", 1, true) == nil,
+				"no secret value is ever logged")
+			local auth = vap_table[1].radius.auth
+			assert_eq(#auth, 2, "the malformed, secretless and RadSec servers are dropped")
+			assert_eq(auth[1].ip, "192.0.2.10", "index 1 first")
+			assert_eq(auth[2].ip, "192.0.2.30", "then index 3")
+			assert_eq(auth[1].port, "1812", "an absent port defaults to 1812")
+		end
+	},
+	{
+		name = "inform packet: RADIUS accounting, interim updates, dynamic VLAN and NAS id",
+		fn = function()
+			local base = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+			local tail = "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local function r(extra)
+				local vt
+				with_stderr(function()
+					local _
+					_, vt = inform._parse_wifi_system_cfg(base .. extra .. tail)
+				end)
+				assert_eq(#vt, 1, "provisioned")
+				return vt[1].radius
+			end
+			local rad = r("aaa.1.radius.acct.1.ip=192.0.2.11\n"
+				.. "aaa.1.radius.acct.1.secret=b\n"
+				.. "aaa.1.interim_update.status=enabled\n"
+				.. "aaa.1.interim_update.interval=600\n"
+				.. "aaa.1.dynamic_vlan=2\naaa.1.nas_identifier=ap-office\n")
+			assert_eq(#rad.acct, 1, "one accounting server")
+			assert_eq(rad.acct[1].port, "1813", "accounting defaults to 1813")
+			assert_eq(rad.interim_interval, "600", "the pushed interval")
+			assert_eq(rad.dynamic_vlan, "2", "required")
+			assert_eq(rad.nas_id, "ap-office", "NAS id")
+			-- status with no interval is the firmware's 3600 default; status
+			-- off means "do not send interim updates", not "use 3600".
+			assert_eq(r("aaa.1.interim_update.status=enabled\n").interim_interval, "3600",
+				"default interval")
+			assert_nil(r("aaa.1.interim_update.status=disabled\n"
+				.. "aaa.1.interim_update.interval=600\n").interim_interval,
+				"disabled means none")
+			assert_nil(r("aaa.1.dynamic_vlan=0\n").dynamic_vlan, "0 is no dynamic VLAN")
+			assert_nil(r("").dynamic_vlan, "absent is no dynamic VLAN")
+		end
+	},
+	{
+		name = "inform packet: a WPA-Enterprise WLAN whose every RADIUS server is RadSec is skipped",
+		fn = function()
+			-- RadSec cannot be completed: the controller sends only the cert
+			-- FILENAMES, for files it transfers by another channel. Contacting
+			-- such a server as plain RADIUS would put the secret on the wire in
+			-- the clear, so the server is dropped -- and with no server left the
+			-- WLAN is skipped, like any other unprovisionable Enterprise WLAN.
+			local sys_cfg = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+				.. "aaa.1.radius.auth.1.ca_cert=ca.pem\n"
+				.. "aaa.1.radius.auth.1.private_key=key.pem\n"
+				.. "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(#vap_table, 0, "no usable server left, so no WLAN")
+			assert_contains(logged, "RadSec (TLS) is not supported", "the reason is named")
+			assert_contains(logged, "no usable RADIUS authentication server",
+				"and the skip says why")
+		end
+	},
+	{
+		name = "inform packet: RADIUS MAC authentication comes with its own server block",
+		fn = function()
+			-- aaa.<n>.radius.macacl.status is on the wire for every WLAN, and the
+			-- writer puts no capability gate on it: the VALUE is the whole
+			-- discriminator. It is not tied to the security type either -- this
+			-- is an OPEN WLAN, and the controller still sends the full
+			-- radius.auth.<k>.* block beside it, verbatim as captured from
+			-- 10.6.106 on 2026-10-27 (an open guest WLAN with "MAC
+			-- Authentication" on and the lab RADIUS profile attached).
+			local sys_cfg = "aaa.3.ssid=guest\naaa.3.devname=ath2\n"
+				.. "aaa.3.radius.auth.1.ip=192.0.2.10\naaa.3.radius.auth.1.port=1812\n"
+				.. "aaa.3.radius.auth.1.secret=a\n"
+				.. "aaa.3.radius.auth.2.ip=192.0.2.11\naaa.3.radius.auth.2.port=1812\n"
+				.. "aaa.3.radius.auth.2.secret=a\n"
+				.. "aaa.3.radius.macacl.status=enabled\n"
+				.. "aaa.3.radius.macacl.emptypassword=enabled\n"
+				.. "aaa.3.radius.macacl.format=%.2X-%.2X-%.2X-%.2X-%.2X-%.2X\n"
+				.. "wireless.3.ssid=guest\nwireless.3.parent=radio0\n"
+			local orig = inform._sysinfo.eap_supported
+			inform._sysinfo.eap_supported = function() return true end
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			inform._sysinfo.eap_supported = orig
+			assert_eq(#vap_table, 1, "the WLAN is provisioned")
+			local v = vap_table[1]
+			assert_eq(v.security, "open", "still an open WLAN")
+			assert_true(v.mac_auth, "MAC authentication is on")
+			assert_eq(#v.radius.auth, 2, "both authentication servers were read")
+			assert_eq(v.radius.auth[1].ip, "192.0.2.10", "in index order")
+			assert_eq(logged, "", "and nothing is complained about")
+			-- The two formatting keys are declines: both are options of UniFi's
+			-- patched hostapd (macaddr_format, mac_acl_empty_passwd), neither
+			-- string exists in OpenWrt's binary, so nothing may key on them.
+			assert_nil(v.radius.macacl, "no macacl field")
+			assert_nil(v.mac_auth_format, "the printf format derives nothing")
+			assert_nil(v.mac_filter_policy,
+				"radius.macacl is not the MAC Address Filter")
+			-- A WLAN the controller leaves alone keeps nothing.
+			local _, plain = inform._parse_wifi_system_cfg(
+				"aaa.1.ssid=open\naaa.1.radius.macacl.status=disabled\n"
+				.. "wireless.1.ssid=open\nwireless.1.parent=radio0\n")
+			assert_nil(plain[1].mac_auth, "macacl.status=disabled claims nothing")
+			assert_nil(plain[1].radius, "and brings no RADIUS block")
+		end
+	},
+	{
+		name = "inform packet: MAC-based VLANs are read per client, with the status key ignored",
+		fn = function()
+			-- VERBATIM from the home controller (UniFi Network on a UCG Ultra),
+			-- 2026-10-27, with a Virtual Network Override set on a placeholder
+			-- client onto the IoT network (VLAN 10). The same map arrives on
+			-- EVERY WLAN -- the emitter takes the site's whole override list and
+			-- writes it per WLAN index, so three WLANs got three identical
+			-- blocks. (The validation lab cannot produce this: its site has no
+			-- gateway, so the controller's second gate refuses to emit the keys
+			-- at all. See PROTOCOL-VALIDATION.md.)
+			local sys_cfg = "aaa.1.ssid=Home LAN\naaa.1.devname=ath0\n"
+				.. "aaa.1.accept_mac.status=enabled\n"
+				.. "aaa.1.accept_mac.1.mac=00:00:5e:00:53:01\n"
+				.. "aaa.1.accept_mac.1.vlanid=10\n"
+				.. "aaa.1.wpa.psk=basepass123\n"
+				.. "aaa.2.ssid=Home IoT\naaa.2.devname=ath1\n"
+				.. "aaa.2.accept_mac.status=enabled\n"
+				.. "aaa.2.accept_mac.1.mac=00:00:5e:00:53:01\n"
+				.. "aaa.2.accept_mac.1.vlanid=10\n"
+				.. "aaa.2.wpa.psk=basepass123\n"
+				.. "wireless.1.ssid=Home LAN\nwireless.1.parent=radio0\n"
+				.. "wireless.2.ssid=Home IoT\nwireless.2.parent=radio1\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(#vap_table, 2, "both WLANs are provisioned")
+			for i, v in ipairs(vap_table) do
+				assert_eq(#v.mac_vlans, 1, "WLAN " .. i .. " carries the override")
+				assert_eq(v.mac_vlans[1].mac, "00:00:5e:00:53:01", "the MAC")
+				assert_eq(v.mac_vlans[1].vid, 10, "and its VLAN, as a number")
+			end
+			assert_eq(logged, "", "nothing to complain about")
+			-- status is NOT the discriminator: the writer emits it from inside
+			-- the loop that writes the first entry, so it is present exactly when
+			-- entries are. The entries are the whole signal -- a block's presence
+			-- is this protocol's classic decoy.
+			local _, bare = inform._parse_wifi_system_cfg(
+				"aaa.1.ssid=home\naaa.1.accept_mac.status=enabled\n"
+				.. "wireless.1.ssid=home\nwireless.1.parent=radio0\n")
+			assert_nil(bare[1].mac_vlans, "status alone claims nothing")
+			-- A second entry, which the capture had no occasion to carry: the
+			-- controller's map is the site's, so a second overridden client adds
+			-- an index rather than a second block.
+			local _, two = inform._parse_wifi_system_cfg(
+				"aaa.1.ssid=home\naaa.1.accept_mac.status=enabled\n"
+				.. "aaa.1.accept_mac.1.mac=00:00:5e:00:53:01\n"
+				.. "aaa.1.accept_mac.1.vlanid=10\n"
+				.. "aaa.1.accept_mac.2.mac=00:00:5e:00:53:02\n"
+				.. "aaa.1.accept_mac.2.vlanid=30\n"
+				.. "wireless.1.ssid=home\nwireless.1.parent=radio0\n")
+			assert_eq(#two[1].mac_vlans, 2, "both clients")
+			assert_eq(two[1].mac_vlans[2].vid, 30, "each on its own VLAN")
+		end
+	},
+	{
+		name = "inform packet: a malformed or duplicated MAC-based VLAN entry is named and dropped",
+		fn = function()
+			-- Every entry is spliced into a hostapd accept-list line, where one
+			-- malformed line fails the whole FILE and takes the BSS with it.
+			local sys_cfg = "aaa.1.ssid=home\naaa.1.devname=ath0\n"
+				.. "aaa.1.accept_mac.1.mac=00:00:5e:00:53:01\n"
+				.. "aaa.1.accept_mac.1.vlanid=20\n"
+				.. "aaa.1.accept_mac.2.mac=not-a-mac\n"
+				.. "aaa.1.accept_mac.2.vlanid=30\n"
+				.. "aaa.1.accept_mac.3.mac=00:00:5e:00:53:03\n"
+				.. "aaa.1.accept_mac.3.vlanid=4095\n"
+				.. "aaa.1.accept_mac.4.mac=00:00:5E:00:53:01\n"
+				.. "aaa.1.accept_mac.4.vlanid=40\n"
+				.. "aaa.1.wpa.psk=basepass123\n"
+				.. "wireless.1.ssid=home\nwireless.1.parent=radio0\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			local v = vap_table[1]
+			assert_eq(#v.mac_vlans, 1, "only the sound entry survives")
+			assert_eq(v.mac_vlans[1].vid, 20, "the first one")
+			assert_contains(logged, "entry 2 -- not a MAC address", "entry 2 by number")
+			assert_contains(logged, "entry 3 -- VLAN id out of range", "4095 is not a VLAN")
+			assert_contains(logged, "entry 4 -- a duplicate of an earlier entry",
+				"two accept lines for one station would leave hostapd's bsearch to pick")
+		end
+	},
+	{
+		name = "inform packet: a WLAN needing MAC authentication is dropped, not left open",
+		fn = function()
+			-- MAC authentication is an access control, so it fails CLOSED: a WLAN
+			-- provisioned without it would admit every client the admin meant to
+			-- screen, and on an open WLAN that is the only barrier there is.
+			local function run(cfg, eap_ok)
+				local orig = inform._sysinfo.eap_supported
+				inform._sysinfo.eap_supported = function() return eap_ok end
+				local vt
+				local logged = with_stderr(function()
+					local _
+					_, vt = inform._parse_wifi_system_cfg(cfg)
+				end)
+				inform._sysinfo.eap_supported = orig
+				return vt, logged
+			end
+			local tail = "wireless.1.ssid=guest\nwireless.1.parent=radio0\n"
+			-- No usable server: the push names none at all.
+			local vt, logged = run("aaa.1.ssid=guest\n"
+				.. "aaa.1.radius.macacl.status=enabled\n" .. tail, true)
+			assert_eq(#vt, 0, "no server, no WLAN")
+			assert_contains(logged, "requires RADIUS MAC authentication",
+				"the reason is named")
+			assert_contains(logged, "no usable RADIUS authentication server",
+				"and so is what was missing")
+			-- A server, but a hostapd with no RADIUS client: auth_server_addr is
+			-- an unknown option to a basic wpad, which refuses the whole config,
+			-- so the BSS would not come up anyway.
+			vt, logged = run("aaa.1.ssid=guest\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+				.. "aaa.1.radius.macacl.status=enabled\n" .. tail, false)
+			assert_eq(#vt, 0, "no RADIUS client, no WLAN")
+			assert_contains(logged, "no RADIUS client", "and that is said plainly")
+			-- The same WLAN without MAC authentication is untouched by any of it.
+			vt = run("aaa.1.ssid=guest\naaa.1.radius.macacl.status=disabled\n" .. tail, false)
+			assert_eq(#vt, 1, "a plain open WLAN is provisioned either way")
+		end
+	},
+	{
+		name = "inform packet: Dynamic Authorization is read in the das shape only",
+		fn = function()
+			-- The controller sends CoA/Disconnect twice over: the das.* shape names
+			-- the client directly, the dad.* shape expects the AP's own daemon to
+			-- relay it from 127.0.0.1. openUF has no relay, so only das.* is read.
+			local base = "aaa.1.ssid=corp\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=WPA-EAP\n"
+				.. "aaa.1.radius.auth.1.ip=192.0.2.10\naaa.1.radius.auth.1.secret=a\n"
+			local tail = "wireless.1.ssid=corp\nwireless.1.parent=radio0\n"
+			local function r(extra)
+				local vt, logged
+				logged = with_stderr(function()
+					local _
+					_, vt = inform._parse_wifi_system_cfg(base .. extra .. tail)
+				end)
+				assert_eq(#vt, 1, "provisioned")
+				return vt[1].radius, logged
+			end
+			local rad = r("aaa.1.radius.das.status=enabled\naaa.1.radius.das.port=3801\n"
+				.. "aaa.1.radius.das.client=192.0.2.11\naaa.1.radius.das.secret=b\n"
+				.. "aaa.1.radius.dad.status=enabled\n"
+				.. "aaa.1.radius.dad.client.1.cidr=192.0.2.11/32\n"
+				.. "aaa.1.radius.dad.client.1.secret=c\n")
+			assert_eq(rad.das.client, "192.0.2.11", "the client the server will call from")
+			assert_eq(rad.das.secret, "b", "its shared secret")
+			assert_eq(rad.das.port, "3801", "the controller's own port (3800 + index)")
+			assert_nil(rad.dad, "the dad shape derives nothing")
+			-- RFC 5176's default, and the firmware's fallback.
+			assert_eq(r("aaa.1.radius.das.status=enabled\n"
+				.. "aaa.1.radius.das.client=192.0.2.11\n"
+				.. "aaa.1.radius.das.secret=b\n").das.port, "3799", "default port")
+			-- Absence, and an explicit off, are both "no listener".
+			assert_nil(r("").das, "absent is off")
+			assert_nil(r("aaa.1.radius.das.status=disabled\n"
+				.. "aaa.1.radius.das.client=192.0.2.11\n"
+				.. "aaa.1.radius.das.secret=b\n").das, "disabled is off")
+			-- Each refusal is named, and never with the secret in it.
+			local function refused(extra, why)
+				local rad2, logged = r("aaa.1.radius.das.status=enabled\n" .. extra)
+				assert_nil(rad2.das, "nothing is written for: " .. why)
+				assert_contains(logged, why, "the reason is logged")
+				assert_true(logged:find("sekrit", 1, true) == nil,
+					"and the secret is not")
+			end
+			refused("aaa.1.radius.das.client=not-an-ip\naaa.1.radius.das.secret=sekrit\n",
+				"no usable IPv4 client address")
+			refused("aaa.1.radius.das.client=192.0.2.11\naaa.1.radius.das.secret=\n",
+				"missing or oversized shared secret")
+			-- A newline cannot reach here (the tokenizer splits on it), but a
+			-- tab can, and radius_das_client is a single hostapd line.
+			refused('aaa.1.radius.das.client=192.0.2.11\n'
+				.. "aaa.1.radius.das.secret=sek\trit\n",
+				"a control character in the shared secret")
 		end
 	},
 	{
@@ -1570,6 +2112,57 @@ return {
 			assert_eq(on[1].uapsd, true, "uapsd=enabled -> true")
 			local _, none = inform._parse_wifi_system_cfg(base)
 			assert_eq(none[1].uapsd, nil, "no uapsd key -> nil")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg reads the per-station SAE keys (sae.psk.<n>)",
+		fn = function()
+			local base = "aaa.1.ssid=sae-keys\naaa.1.wpa=2\naaa.1.wpa.key.1.mgmt=SAE\n"
+				.. "wireless.1.ssid=sae-keys\nwireless.1.parent=radio0\n"
+			local _, v = inform._parse_wifi_system_cfg(base
+				.. "aaa.1.sae.psk.1.psk=mainpass123\naaa.1.sae.psk.1.mac=ff:ff:ff:ff:ff:ff\n"
+				.. "aaa.1.sae.psk.2.psk=stationkey1\naaa.1.sae.psk.2.mac=AA:BB:CC:DD:EE:01\n"
+				.. "aaa.1.sae.psk.2.vlan=30\naaa.1.sae.psk.2.id=phone\n"
+				.. "aaa.1.sae.psk.3.psk=anystation1\n"
+				.. "aaa.1.sae.psk.4.psk=short\n"
+				.. "aaa.1.sae.psk.5.psk=badvlankey1\naaa.1.sae.psk.5.vlan=9999\n"
+				.. "aaa.1.sae.psk.6.psk=badmackey11\naaa.1.sae.psk.6.mac=zz\n")
+			local p = v[1].ppsk
+			assert_eq(#p, 2, "main key (ff:..), short key, bad VLAN and bad MAC are left out")
+			assert_eq(p[1].key, "stationkey1", "key 2")
+			assert_eq(p[1].vid, 30, "its VLAN")
+			assert_eq(p[1].mac, "aa:bb:cc:dd:ee:01", "its station, lowercased")
+			assert_eq(p[2].key, "anystation1", "key 3")
+			assert_nil(p[2].mac, "no mac: any station")
+			-- The same key arriving through psk_file too is one key.
+			local _, d = inform._parse_wifi_system_cfg(base
+				.. "aaa.1.wpa.psk_file.status=enabled\naaa.1.wpa.psk_file.1.psk=anystation1\n"
+				.. "aaa.1.sae.psk.2.psk=anystation1\n")
+			assert_eq(#d[1].ppsk, 1, "psk_file + sae.psk duplicates collapse")
+			local _, none = inform._parse_wifi_system_cfg(base)
+			assert_nil(none[1].ppsk, "no keys -> nil")
+		end
+	},
+	{
+		name = "inform packet: _parse_wifi_system_cfg parses the SAE tuning keys",
+		fn = function()
+			local base = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+			local _, v = inform._parse_wifi_system_cfg(base
+				.. "aaa.1.sae.anti_clogging=5\naaa.1.sae.sync=7\n"
+				.. "aaa.1.sae.has_groups=enabled\n"
+				.. "aaa.1.sae.groups.2.group=20\naaa.1.sae.groups.1.group=19\n")
+			assert_eq(v[1].sae_anti_clogging, "5", "anti_clogging")
+			assert_eq(v[1].sae_sync, "7", "sync")
+			assert_eq(v[1].sae_groups, "19 20", "groups sorted by index")
+			local _, bad = inform._parse_wifi_system_cfg(base
+				.. "aaa.1.sae.anti_clogging=0\naaa.1.sae.sync=x\n"
+				.. "aaa.1.sae.has_groups=enabled\naaa.1.sae.groups.1.group=19;x\n")
+			assert_eq(bad[1].sae_anti_clogging, nil, "0 is off")
+			assert_eq(bad[1].sae_sync, nil, "non-numeric")
+			assert_eq(bad[1].sae_groups, nil, "non-numeric group")
+			local _, none = inform._parse_wifi_system_cfg(base)
+			assert_eq(none[1].sae_groups, nil, "no keys -> nil")
 		end
 	},
 	{
@@ -2019,6 +2612,78 @@ return {
 		end
 	},
 	{
+		name = "inform packet: Aggressive multicast suppression carries the bypass types",
+		fn = function()
+			-- Verbatim from the lab, 2026-10-27: both band entries of one WLAN
+			-- after setting multicast_suppressor_mode=aggressive with the
+			-- device claiming wifi_caps2 0x400000. bypass_types is ONE key
+			-- holding the whole pipe-separated list.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.multicast.suppressor=enabled\n"
+				.. "wireless.1.bcfilt.status=enabled\n"
+				.. "wireless.1.bcfilt.bypass_types=ARP|NSNA|DHCPV4|DHCPV6\n"
+				.. "wireless.1.bcfilt.1.status=enabled\n"
+				.. "wireless.1.bcfilt.1.mac=00:00:5e:00:53:01\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			local v = vap_table[1]
+			assert_eq(v.mcast_suppressor, true, "the suppressor key is read")
+			assert_eq(v.bcfilt_enabled, true, "and it is the Aggressive pair")
+			for _, tok in ipairs({"ARP", "NSNA", "DHCPV4", "DHCPV6"}) do
+				assert_eq(v.bcfilt_bypass[tok], true, "bypass type " .. tok)
+			end
+			assert_eq(v.bcfilt_macs[1], "00:00:5e:00:53:01", "allow-list still read")
+		end
+	},
+	{
+		name = "inform packet: Conservative multicast suppression arrives without a bcfilt block",
+		fn = function()
+			-- Verbatim from the lab, 2026-10-27, same WLAN set to
+			-- multicast_suppressor_mode=conservative: the suppressor key alone,
+			-- with no bcfilt.* of any kind. That absence IS the mode -- the
+			-- wire never names it -- so it is asserted, not assumed.
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.multicast.inspect=false\n"
+				.. "wireless.1.multicast.suppressor=enabled\n"
+			local _, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			local v = vap_table[1]
+			assert_eq(v.mcast_suppressor, true, "suppression is on")
+			assert_eq(v.bcfilt_enabled, nil, "and nothing is blocked")
+			assert_eq(v.bcfilt_bypass, nil, "no bypass types with Conservative")
+			-- multicast.inspect sits in the same block and is a decoy: it is
+			-- constant across the toggle and openUF reads nothing from it.
+			assert_eq(v.mcast_inspect, nil, "multicast.inspect stays unread")
+		end
+	},
+	{
+		name = "inform packet: an unknown bypass type is named and dropped, not guessed at",
+		fn = function()
+			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
+				.. "wireless.1.ssid=openuf-test\nwireless.1.parent=radio0\n"
+				.. "wireless.1.bcfilt.status=enabled\n"
+				.. "wireless.1.bcfilt.bypass_types=ARP| dhcpv4 ||IGMP\n"
+			local logged, vap_table
+			local orig, buf = io.stderr, {}
+			io.stderr = {write = function(_, ...)
+				for _, x in ipairs({...}) do buf[#buf + 1] = tostring(x) end
+			end}
+			local ok, err = pcall(function()
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			io.stderr = orig
+			logged = table.concat(buf)
+			if not ok then error(err, 0) end
+			local b = vap_table[1].bcfilt_bypass
+			assert_eq(b.ARP, true, "the known token is kept")
+			assert_eq(b.DHCPV4, true, "case and padding are normalised")
+			assert_eq(b.IGMP, nil, "a token with no nft match is not honoured")
+			assert_true(logged:find("unknown bypass type", 1, true) ~= nil,
+				"and the refusal is logged by name")
+			assert_true(logged:find("IGMP", 1, true) ~= nil, "naming the token")
+		end
+	},
+	{
 		name = "inform packet: _parse_wifi_system_cfg leaves bcfilt fields nil when absent",
 		fn = function()
 			local sys_cfg = "aaa.1.ssid=openuf-test\naaa.1.wpa=2\n"
@@ -2256,6 +2921,473 @@ return {
 			assert_true(s2 ~= nil, "vap section created")
 			assert_true(s2.ieee80211r ~= "1",
 				"the pre-0x2 push (both FT keys disabled) leaves 802.11r off")
+		end
+	},
+	{
+		-- Verbatim lab capture (controller 10.6.106, 2026-10-26): a wlanconf
+		-- with security="wpaeap" pointing at a radiusprofile that has two auth
+		-- servers, one acct server, interim updates and vlan_wlan_mode
+		-- "required". Addresses and the iapp_key are scrubbed to placeholders;
+		-- nothing else is edited. Two traps this capture pins down:
+		--   * aaa.<n>.wpa.psk is STILL sent on an EAP WLAN ("letmeinnow", a
+		--     dummy the controller fills in). Carrying it into UCI would give
+		--     the BSS a passphrase it must not have.
+		--   * wireless.<n>.security=none on the same push. The discriminator
+		--     is aaa.<n>.wpa.key.<k>.mgmt, never that field.
+		name = "inform packet: captured WPA-Enterprise push reaches UCI as wpa2+ccmp with RADIUS servers",
+		fn = function()
+			local ucihelper, db = new_apply_env()
+			local sys_cfg = table.concat({
+				"aaa.1.pmf.status=disabled", "aaa.1.pmf.mode=0",
+				"aaa.1.ft.status=disabled", "aaa.1.country_beacon=disabled",
+				"aaa.1.11k.status=disabled", "aaa.1.br.devname=br0",
+				"aaa.1.devname=ath0", "aaa.1.driver=madwifi",
+				"aaa.1.ssid=openuf-eap", "aaa.1.status=enabled",
+				"aaa.1.verbose=2", "aaa.1.wpa=2", "aaa.1.eapol_version=2",
+				"aaa.1.wpa.group_rekey=3600", "aaa.1.p2p=disabled",
+				"aaa.1.p2p_cross_connect=disabled", "aaa.1.proxy_arp=disabled",
+				"aaa.1.is_guest=false", "aaa.1.tdls_prohibit=disabled",
+				"aaa.1.bss_transition=enabled", "aaa.1.id=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP",
+				"aaa.1.wpa.psk=letmeinnow",
+				"aaa.1.auth_cache=enabled",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.port=1812",
+				"aaa.1.radius.auth.1.secret=openufradius",
+				"aaa.1.radius.auth.2.ip=192.0.2.11",
+				"aaa.1.radius.auth.2.port=1812",
+				"aaa.1.radius.auth.2.secret=openufradius",
+				"aaa.1.radius.acct.1.ip=192.0.2.10",
+				"aaa.1.radius.acct.1.port=1813",
+				"aaa.1.radius.acct.1.secret=openufradius",
+				"aaa.1.interim_update.status=enabled",
+				"aaa.1.interim_update.interval=900",
+				"aaa.1.dynamic_vlan=2",
+				"aaa.1.hs20.status=disabled",
+				"aaa.1.wpa.1.pairwise=CCMP",
+				"aaa.1.pmf.cipher=AES-128-CMAC",
+				"aaa.1.radius.macacl.status=disabled",
+				"aaa.1.hide_ssid=false",
+				"aaa.1.iapp_key=00112233445566778899aabbccddeeff",
+				"wireless.1.mode=master", "wireless.1.devname=ath0",
+				"wireless.1.id=2", "wireless.1.status=enabled",
+				"wireless.1.authmode=1", "wireless.1.l2_isolation=disabled",
+				"wireless.1.is_guest=false", "wireless.1.security=none",
+				"wireless.1.ssid=openuf-eap", "wireless.1.hide_ssid=false",
+				"wireless.1.wmm=enabled", "wireless.1.uapsd=disabled",
+				"wireless.1.parent=radio0", "wireless.1.usage=user",
+				"radio.1.phyname=radio0", "radio.1.devname=ath0",
+				"radio.1.channel=auto", "radio.1.status=enabled",
+			}, "\n") .. "\n"
+
+			local rt, vt = inform._parse_wifi_system_cfg(sys_cfg)
+			assert_eq(vt[1].security, "wpa2-enterprise",
+				"WPA-EAP without any wpa3 key -> wpa2-enterprise")
+			assert_nil(vt[1].x_passphrase,
+				"the dummy aaa.1.wpa.psk never becomes a passphrase")
+			assert_eq(vt[1].radius.auth[2].ip, "192.0.2.11",
+				"both auth servers parsed, in index order")
+			assert_eq(vt[1].radius.interim_interval, "900", "interim interval parsed")
+			assert_eq(vt[1].radius.dynamic_vlan, "2",
+				"vlan_wlan_mode=required reaches the wire as dynamic_vlan=2")
+
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			local s = db.wireless["openuf_radio0_openuf_eap_"
+				.. ucihelper.derive_mobility_domain("openuf-eap")]
+			assert_true(s ~= nil, "vap section created")
+			assert_eq(s.encryption, "wpa2+ccmp",
+				"wpa2-enterprise -> the encryption ucode maps to auth_type eap")
+			assert_nil(s.key, "no passphrase on an EAP BSS")
+			assert_eq(table.concat(s.auth_server_addr, " "), "192.0.2.10 192.0.2.11",
+				"both auth servers in the list (same port and secret)")
+			assert_eq(s.auth_server_port, "1812", "auth port")
+			assert_eq(s.auth_server_shared_secret, "openufradius", "auth secret")
+			assert_eq(table.concat(s.acct_server_addr, " "), "192.0.2.10", "acct server")
+			assert_eq(s.acct_server_port, "1813", "acct port")
+			assert_eq(s.radius_acct_interim_interval, "900", "interim interval")
+			assert_eq(s.dynamic_vlan, "2", "dynamic VLAN required")
+		end
+	},
+	{
+		-- Verbatim lab capture (controller 10.6.106, 2026-10-26): the WLAN's
+		-- embedded `hotspot2` object filled with every field
+		-- api/fields/WlanConf.json allows, pushed to an openUF AP claiming
+		-- fw_caps 0x800000 + fw2_caps 0x80000. The RADIUS and wireless keys of
+		-- the same push are exercised by the WPA-Enterprise replay above; this
+		-- one keeps the hs20 block whole, including what the controller does
+		-- NOT send.
+		name = "inform packet: captured Hotspot 2.0 push reaches UCI as interworking and hs20 lines",
+		fn = function()
+			local ucihelper, db = new_apply_env()
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=openuf-eap", "aaa.1.status=enabled", "aaa.1.wpa=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP", "aaa.1.wpa.1.pairwise=CCMP",
+				"aaa.1.id=2", "aaa.1.auth_cache=enabled",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.port=1812",
+				"aaa.1.radius.auth.1.secret=openufradius",
+				"aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.access_network_type=2",
+				"aaa.1.hs20.internet=enabled",
+				"aaa.1.hs20.asra=disabled",
+				"aaa.1.hs20.esr=disabled",
+				"aaa.1.hs20.uesa=disabled",
+				"aaa.1.hs20.venue_group=2",
+				"aaa.1.hs20.venue_type=8",
+				"aaa.1.hs20.disable_dgaf=disabled",
+				"aaa.1.hs20.deauth_req_timeout=60",
+				"aaa.1.hs20.network_availability=13",
+				"aaa.1.hs20.venue_name.1.lang=eng",
+				"aaa.1.hs20.venue_name.1.name=openUF Lab",
+				"aaa.1.hs20.venue_name.1.url=https://example.com/venue",
+				"aaa.1.hs20.venue_name.2.lang=fra",
+				"aaa.1.hs20.venue_name.2.name=Labo openUF",
+				"aaa.1.hs20.hs20_domain_name_list=example.com,example.net",
+				"aaa.1.hs20.nai_realm.1.status=enabled",
+				"aaa.1.hs20.nai_realm.1.encoding=0",
+				"aaa.1.hs20.nai_realm.1.name=example.com",
+				"aaa.1.hs20.nai_realm.1.eap_method=13",
+				"aaa.1.hs20.nai_realm.1.eap_method.auth.1.id=5",
+				"aaa.1.hs20.nai_realm.1.eap_method.auth.1.val=6",
+				"aaa.1.hs20.nai_realm.2.status=enabled",
+				"aaa.1.hs20.nai_realm.2.encoding=0",
+				"aaa.1.hs20.nai_realm.2.name=example.net",
+				"aaa.1.hs20.nai_realm.2.eap_method=21",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.1.id=2",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.1.val=4",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.2.id=5",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.2.val=7",
+				"aaa.1.hs20.1.roaming_consortium=506f9a",
+				"aaa.1.hs20.2.roaming_consortium=001bc504bd",
+				"aaa.1.hs20.3gpp.1.mcc=230",
+				"aaa.1.hs20.3gpp.1.mnc=01",
+				"aaa.1.hs20.3gpp.2.mcc=262",
+				"aaa.1.hs20.3gpp.2.mnc=002",
+				"aaa.1.hs20.friendly_name.1.language=eng",
+				"aaa.1.hs20.friendly_name.1.text=openUF Operator",
+				"aaa.1.hs20.capab.1.protocol=6",
+				"aaa.1.hs20.capab.1.port=80",
+				"aaa.1.hs20.capab.1.status=open",
+				"aaa.1.hs20.capab.2.protocol=17",
+				"aaa.1.hs20.capab.2.port=5060",
+				"aaa.1.hs20.capab.2.status=closed",
+				"aaa.1.hs20.capab.3.protocol=1",
+				"aaa.1.hs20.capab.3.port=0",
+				"aaa.1.hs20.capab.3.status=unknown",
+				"aaa.1.hs20.metrics.status=enabled",
+				"aaa.1.hs20.metrics.info=1",
+				"aaa.1.hs20.metrics.downlink_speed=8000",
+				"aaa.1.hs20.metrics.uplink_speed=1000",
+				"aaa.1.hs20.metrics.downlink_load=80",
+				"aaa.1.hs20.metrics.uplink_load=40",
+				"aaa.1.hs20.metrics.measurement=3000",
+				"wireless.1.ssid=openuf-eap", "wireless.1.parent=radio0",
+				"wireless.1.usage=user", "wireless.1.dgaf_disable=disabled",
+				"radio.1.phyname=radio0", "radio.1.devname=ath0",
+				"radio.1.channel=auto", "radio.1.status=enabled",
+			}, "\n") .. "\n"
+
+			local rt, vt = inform._parse_wifi_system_cfg(sys_cfg)
+			local hs = vt[1].hs20
+			assert_true(hs ~= nil, "the hs20 block parsed")
+			assert_eq(hs.access_network_type, "2", "access network type")
+			assert_true(hs.internet, "internet reachable")
+			assert_eq(hs.asra, false, "no additional step required")
+			assert_eq(hs.uesa, false, "no unauthenticated emergency services")
+			assert_eq(hs.venue_group, "2", "venue group")
+			assert_eq(hs.venue_type, "8", "venue type")
+			assert_eq(hs.disable_dgaf, false, "DGAF left on")
+			assert_eq(hs.deauth_req_timeout, "60", "deauth request timeout")
+			assert_eq(hs.ipaddr_type_avail, "13",
+				"v4=3, v6=1 arrive already combined as (v4 << 2) | v6")
+			assert_eq(hs.domain_name, "example.com,example.net",
+				"the domain list is comma-separated on the wire already")
+			assert_eq(#hs.venue_name, 2, "both venue names")
+			assert_eq(hs.venue_name[1].url, "https://example.com/venue",
+				"the first venue's URL")
+			assert_nil(hs.venue_name[2].url, "the second venue has none")
+			assert_eq(#hs.nai_realm, 2, "both realms")
+			assert_eq(hs.nai_realm[2].name, "example.net", "second realm")
+			assert_eq(hs.nai_realm[2].eap_method, "21", "its EAP method (TTLS)")
+			assert_eq(#hs.nai_realm[2].auth, 2, "its two auth parameters")
+			assert_eq(hs.nai_realm[2].auth[2].val, "7", "third-level auth value")
+			assert_eq(table.concat(hs.roaming_consortium, " "),
+				"506f9a 001bc504bd", "both OIs, in index order")
+			assert_eq(hs.cell_net[1].mnc, "01",
+				"a two-digit MNC stays two digits")
+			assert_eq(hs.cell_net[2].mnc, "002", "and a three-digit one does too")
+			assert_eq(hs.friendly_name[1].text, "openUF Operator", "operator name")
+			assert_eq(#hs.conn_capab, 3, "all three connection capabilities")
+			assert_eq(hs.conn_capab[2].status, "0", "closed -> 0")
+			assert_eq(hs.conn_capab[3].status, "2", "unknown -> 2")
+			assert_eq(hs.wan_metrics.downlink_speed, "8000", "downlink speed")
+
+			ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			local s = db.wireless["openuf_radio0_openuf_eap_"
+				.. ucihelper.derive_mobility_domain("openuf-eap")]
+			assert_true(s ~= nil, "vap section created")
+			assert_eq(s.iw_enabled, "1", "iface_interworking's gate")
+			assert_eq(s.hs20, "1", "iface_hs20's gate")
+			assert_eq(s.access_network_type, "2", "scalar through UCI")
+			assert_eq(s.internet, "1", "boolean as 1/0")
+			assert_eq(s.asra, "0", "and an off one as 0")
+			assert_eq(s.disable_dgaf, "0", "DGAF option written explicitly")
+			assert_eq(s.hs20_deauth_req_timeout, "60", "deauth timeout")
+			assert_eq(s.hs20_wan_metrics, "01:8000:1000:80:40:3000",
+				"WAN metrics as one colon-separated hostapd value, the WAN "
+				.. "info octet in hex (hostapd hexstr2bin's it and rejects "
+				.. "the whole config if it is not two hex chars)")
+			local raw = table.concat(s.hostapd_bss_options or {}, "\n")
+			for _, want in ipairs({
+				"ipaddr_type_availability=13",
+				"domain_name=example.com,example.net",
+				"venue_name=eng:openUF Lab",
+				"venue_name=fra:Labo openUF",
+				"venue_url=1:https://example.com/venue",
+				"nai_realm=0,example.com,13[5:6]",
+				"nai_realm=0,example.net,21[2:4][5:7]",
+				"roaming_consortium=506f9a",
+				"roaming_consortium=001bc504bd",
+				"anqp_3gpp_cell_net=230,01;262,002",
+				"hs20_oper_friendly_name=eng:openUF Operator",
+				"hs20_conn_capab=6:80:1",
+				"hs20_conn_capab=17:5060:0",
+				"hs20_conn_capab=1:0:2",
+			}) do
+				assert_contains(raw, want, "raw hostapd line: " .. want)
+			end
+			assert_true(raw:find("venue_url=2:") == nil,
+				"no venue_url for the venue that has no URL")
+			-- The SAE tuning lines share hostapd_bss_options; nothing here may
+			-- have replaced a previous producer's list.
+			assert_eq(#s.hostapd_bss_options, 14,
+				"one raw line per entry, nothing lost or duplicated")
+		end
+	},
+	{
+		name = "inform packet: the Hotspot 2.0 key table is indexed once, not once per collector",
+		fn = function()
+			-- _wire_hs20 has seven indexed collectors plus one per NAI realm,
+			-- and each used to re-walk the WLAN's whole key table. Counted
+			-- through string.match, since the hs20 patterns are the only ones
+			-- in the parser naming the block: one decomposition attempt per
+			-- hs20.* key, and nothing per collector.
+			local keys = {
+				"aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.access_network_type=2",
+				"aaa.1.hs20.internet=enabled",
+				"aaa.1.hs20.venue_group=2",
+				"aaa.1.hs20.venue_type=8",
+				"aaa.1.hs20.venue_name.1.lang=eng",
+				"aaa.1.hs20.venue_name.1.name=openUF Lab",
+				"aaa.1.hs20.venue_name.2.lang=fra",
+				"aaa.1.hs20.venue_name.2.name=Labo openUF",
+				"aaa.1.hs20.nai_realm.1.name=example.com",
+				"aaa.1.hs20.nai_realm.1.eap_method=13",
+				"aaa.1.hs20.nai_realm.1.eap_method.auth.1.id=5",
+				"aaa.1.hs20.nai_realm.1.eap_method.auth.1.val=6",
+				"aaa.1.hs20.nai_realm.2.name=example.net",
+				"aaa.1.hs20.nai_realm.2.eap_method=21",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.1.id=2",
+				"aaa.1.hs20.nai_realm.2.eap_method.auth.1.val=4",
+				"aaa.1.hs20.1.roaming_consortium=506f9a",
+				"aaa.1.hs20.2.roaming_consortium=001bc504bd",
+				"aaa.1.hs20.3gpp.1.mcc=230",
+				"aaa.1.hs20.3gpp.1.mnc=01",
+				"aaa.1.hs20.friendly_name.1.language=eng",
+				"aaa.1.hs20.friendly_name.1.text=openUF Operator",
+				"aaa.1.hs20.capab.1.protocol=6",
+				"aaa.1.hs20.capab.1.port=80",
+				"aaa.1.hs20.capab.1.status=open",
+			}
+			local lines = {
+				"aaa.1.ssid=openuf-eap", "aaa.1.status=enabled", "aaa.1.wpa=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP", "aaa.1.wpa.1.pairwise=CCMP",
+				"aaa.1.id=2", "aaa.1.auth_cache=enabled",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.port=1812",
+				"aaa.1.radius.auth.1.secret=openufradius",
+			}
+			for _, l in ipairs(keys) do lines[#lines + 1] = l end
+			lines[#lines + 1] = "wireless.1.ssid=openuf-eap"
+			lines[#lines + 1] = "wireless.1.parent=radio0"
+			lines[#lines + 1] = "radio.1.phyname=radio0"
+			lines[#lines + 1] = "radio.1.devname=ath0"
+			local sys_cfg = table.concat(lines, "\n") .. "\n"
+
+			local real, calls = string.match, 0
+			string.match = function(s, p, ...)
+				if type(p) == "string" and p:find("hs20", 1, true) then
+					calls = calls + 1
+				end
+				return real(s, p, ...)
+			end
+			local ok, rt, vt = pcall(inform._parse_wifi_system_cfg, sys_cfg)
+			string.match = real
+			if not ok then error(rt, 0) end
+
+			local hs = vt[1].hs20
+			assert_true(hs ~= nil, "the hs20 block still parsed")
+			assert_eq(#hs.venue_name, 2, "both venue names")
+			assert_eq(#hs.nai_realm, 2, "both realms")
+			assert_eq(#hs.nai_realm[1].auth, 1, "the first realm's auth pair")
+			assert_eq(hs.nai_realm[2].auth[1].id, "2",
+				"and the second realm's own, not the first realm's")
+			assert_eq(table.concat(hs.roaming_consortium, " "),
+				"506f9a 001bc504bd", "both OIs, in index order")
+			assert_eq(#hs.cell_net, 1, "the 3GPP cell")
+			assert_eq(#hs.friendly_name, 1, "the operator name")
+			assert_eq(#hs.conn_capab, 1, "the connection capability")
+			-- Two attempts per key at the very most: the indexed shape, then
+			-- the roaming_consortium one. Ten scans of the table would be
+			-- #keys * 10 or more.
+			assert_true(calls <= 2 * #keys, string.format(
+				"one index pass, not one per collector (%d matches for %d "
+				.. "hs20 keys)", calls, #keys))
+		end
+	},
+	{
+		name = "inform packet: a WAN info octet above 9 is hex, not zero-padded decimal",
+		fn = function()
+			-- "At Capacity" (bit 3) plus "link up" (bits 0-1) is decimal 9 on
+			-- the wire; the symmetric-link bit takes it to 10, which hostapd
+			-- must see as 0a. Zero-padding the decimal would silently change
+			-- the advertised WAN status rather than fail loudly.
+			local ucihelper, db = new_apply_env()
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=corp", "aaa.1.wpa=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.secret=s",
+				"aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.metrics.status=enabled",
+				"aaa.1.hs20.metrics.info=10",
+				"aaa.1.hs20.metrics.downlink_speed=0",
+				"aaa.1.hs20.metrics.uplink_speed=0",
+				"aaa.1.hs20.metrics.downlink_load=0",
+				"aaa.1.hs20.metrics.uplink_load=0",
+				"aaa.1.hs20.metrics.measurement=0",
+				"wireless.1.ssid=corp", "wireless.1.parent=radio0",
+				"radio.1.phyname=radio0", "radio.1.devname=ath0",
+			}, "\n") .. "\n"
+			local rt, vt = inform._parse_wifi_system_cfg(sys_cfg)
+			with_stderr(function()
+				ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+			end)
+			local s = db.wireless["openuf_radio0_corp"]
+			assert_true(s ~= nil, "vap section created")
+			assert_eq(s.hs20_wan_metrics, "0a:0:0:0:0:0", "WAN info in hex")
+		end
+	},
+	{
+		name = "inform packet: a Hotspot 2.0 block is dropped on a WLAN that is not WPA-Enterprise",
+		fn = function()
+			-- hostapd refuses a config with hs20=1 and anything but
+			-- WPA2-Enterprise/CCMP, so writing the block out would leave a BSS
+			-- that never starts. The controller only offers Passpoint on an
+			-- EAP/OSEN WLAN; this pins what happens if that ever changes.
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=home", "aaa.1.wpa=2", "aaa.1.wpa.key.1.mgmt=WPA-PSK",
+				"aaa.1.wpa.psk=hunter22", "aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.access_network_type=2",
+				"wireless.1.ssid=home", "wireless.1.parent=radio0",
+			}, "\n") .. "\n"
+			local vap_table
+			local logged = with_stderr(function()
+				local _
+				_, vap_table = inform._parse_wifi_system_cfg(sys_cfg)
+			end)
+			assert_eq(#vap_table, 1, "the WLAN itself is still provisioned")
+			assert_nil(vap_table[1].hs20, "but with no hs20 field")
+			assert_contains(logged, "not WPA-Enterprise", "and a line says why")
+		end
+	},
+	{
+		name = "inform packet: Hotspot 2.0 entries that cannot be expressed are dropped individually",
+		fn = function()
+			-- Every value here reaches a hostapd config FILE. A control
+			-- character would end the line and let the rest be read as further
+			-- hostapd options, and a malformed OI or MCC is rejected by hostapd
+			-- outright -- so each bad entry is dropped on its own, leaving the
+			-- good ones.
+			local sys_cfg = table.concat({
+				"aaa.1.ssid=corp", "aaa.1.wpa=2",
+				"aaa.1.wpa.key.1.mgmt=WPA-EAP",
+				"aaa.1.radius.auth.1.ip=192.0.2.10",
+				"aaa.1.radius.auth.1.secret=a",
+				"aaa.1.hs20.status=enabled",
+				"aaa.1.hs20.venue_name.1.lang=eng",
+				"aaa.1.hs20.venue_name.1.name=good venue",
+				"aaa.1.hs20.venue_name.2.lang=eng",
+				"aaa.1.hs20.venue_name.2.name=bad\tvenue",
+				"aaa.1.hs20.venue_name.3.lang=english",
+				"aaa.1.hs20.venue_name.3.name=bad lang",
+				"aaa.1.hs20.1.roaming_consortium=506f9a",
+				"aaa.1.hs20.2.roaming_consortium=notahexstring",
+				"aaa.1.hs20.3.roaming_consortium=abc",
+				"aaa.1.hs20.3gpp.1.mcc=230", "aaa.1.hs20.3gpp.1.mnc=01",
+				"aaa.1.hs20.3gpp.2.mcc=23", "aaa.1.hs20.3gpp.2.mnc=01",
+				"aaa.1.hs20.nai_realm.1.name=live.example",
+				"aaa.1.hs20.nai_realm.1.eap_method=13",
+				"aaa.1.hs20.nai_realm.2.status=disabled",
+				"aaa.1.hs20.nai_realm.2.name=off.example",
+				"aaa.1.hs20.nai_realm.2.eap_method=13",
+				"aaa.1.hs20.nai_realm.3.name=norealm.example",
+				"aaa.1.hs20.capab.1.protocol=6", "aaa.1.hs20.capab.1.port=80",
+				"aaa.1.hs20.capab.1.status=open",
+				"aaa.1.hs20.capab.2.protocol=6", "aaa.1.hs20.capab.2.port=81",
+				"aaa.1.hs20.capab.2.status=maybe",
+				"aaa.1.hs20.metrics.status=enabled",
+				"aaa.1.hs20.metrics.info=1",
+				"aaa.1.hs20.metrics.downlink_speed=8000",
+				"wireless.1.ssid=corp", "wireless.1.parent=radio0",
+			}, "\n") .. "\n"
+			local _, vt = inform._parse_wifi_system_cfg(sys_cfg)
+			local hs = vt[1].hs20
+			assert_eq(#hs.venue_name, 1, "only the clean venue name survives")
+			assert_eq(hs.venue_name[1].name, "good venue", "and it is the right one")
+			assert_eq(table.concat(hs.roaming_consortium, " "), "506f9a",
+				"a non-hex and a too-short OI are both dropped")
+			assert_eq(#hs.cell_net, 1, "a two-digit MCC is dropped")
+			assert_eq(#hs.nai_realm, 1, "a disabled realm and one with no EAP method go")
+			assert_eq(hs.nai_realm[1].name, "live.example", "the enabled one stays")
+			assert_nil(hs.nai_realm[1].auth, "a realm with no auth parameters has none")
+			assert_eq(#hs.conn_capab, 1, "an unknown status word is dropped")
+			assert_nil(hs.wan_metrics,
+				"WAN metrics are all-or-nothing: one missing field drops the set")
+		end
+	},
+	{
+		name = "inform packet: Hotspot 2.0 off leaves no interworking option behind",
+		fn = function()
+			-- aaa.<n>.hs20.status=disabled is what every non-Passpoint EAP push
+			-- carries. The section is rebuilt from scratch on each push, so the
+			-- options must simply not be there.
+			local ucihelper, db = new_apply_env()
+			local function push(on)
+				local sys_cfg = table.concat({
+					"aaa.1.ssid=corp", "aaa.1.wpa=2",
+					"aaa.1.wpa.key.1.mgmt=WPA-EAP",
+					"aaa.1.radius.auth.1.ip=192.0.2.10",
+					"aaa.1.radius.auth.1.secret=a",
+					"aaa.1.hs20.status=" .. (on and "enabled" or "disabled"),
+					on and "aaa.1.hs20.access_network_type=2" or "aaa.1.id=2",
+					on and "aaa.1.hs20.1.roaming_consortium=506f9a"
+						or "aaa.1.hide_ssid=false",
+					"wireless.1.ssid=corp", "wireless.1.parent=radio0",
+					"radio.1.phyname=radio0", "radio.1.channel=auto",
+				}, "\n") .. "\n"
+				local rt, vt = inform._parse_wifi_system_cfg(sys_cfg)
+				ucihelper.apply_config({radio_table = rt, vap_table = vt}, nil)
+				return db.wireless["openuf_radio0_corp"]
+			end
+			local s = push(true)
+			assert_eq(s.iw_enabled, "1", "on first")
+			s = push(false)
+			assert_nil(s.iw_enabled, "no iw_enabled left")
+			assert_nil(s.hs20, "no hs20 left")
+			assert_nil(s.access_network_type, "no access_network_type left")
+			assert_nil(s.hostapd_bss_options, "and no raw interworking lines")
 		end
 	},
 	{
@@ -4301,8 +5433,65 @@ return {
 		end
 	},
 	{
-		name = "inform: _rrm_tick benches a station that never answers, and forgives one that does",
+		name = "inform: HTTP 503 waits the cap at once, and 404 on an unadopted device keeps the cadence",
 		fn = function()
+			local orig = {
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				handle_response = inform.handle_response,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				stderr = io.stderr,
+			}
+			local logged = {}
+			io.stderr = {write = function(_, m) logged[#logged + 1] = m end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function() return "{}" end
+			inform.build_packet = function() return "pkt" end
+			inform.parse_packet = function() return '{"_type":"noop"}' end
+			inform.handle_response = function() return false end
+			inform._logged_pending = false
+			local ok, err = pcall(function()
+				local ctx = {interval = 10, backoff = 10}
+				local st = {inform_url = "http://unifi:8080/inform", adopted = true}
+
+				inform.http_post = function() return nil, "HTTP 503" end
+				assert_eq(inform._tick(st, nil, nil, ctx), 60, "503 waits the cap straight away")
+				ctx.interval, ctx.backoff = 90, 90
+				assert_eq(inform._tick(st, nil, nil, ctx), 90, "or the controller's own longer interval")
+
+				-- Adopted: a 404 is a failure like any other and doubles.
+				ctx.interval, ctx.backoff = 10, 10
+				inform.http_post = function() return nil, "HTTP 404" end
+				assert_eq(inform._tick(st, nil, nil, ctx), 20, "404 after adoption backs off")
+
+				-- Unadopted: the controller's normal answer; keep the cadence.
+				st.adopted = false
+				ctx.interval, ctx.backoff = 10, 10
+				logged = {}
+				assert_eq(inform._tick(st, nil, nil, ctx), 10, "pending: own cadence")
+				assert_eq(inform._tick(st, nil, nil, ctx), 10, "and again")
+				local pending = 0
+				for _, m in ipairs(logged) do
+					if m:find("pending adoption", 1, true) then pending = pending + 1 end
+				end
+				assert_eq(pending, 1, "logged once")
+				-- Other failures still back off for an unadopted device.
+				inform.http_post = function() return nil, "connection refused" end
+				assert_eq(inform._tick(st, nil, nil, ctx), 20, "a refused connection backs off")
+			end)
+			io.stderr = orig.stderr
+			inform.build_json, inform.build_packet, inform.http_post,
+				inform.parse_packet, inform.handle_response,
+				inform._reload_if_changed, inform._rrm_tick =
+				orig.build_json, orig.build_packet, orig.http_post,
+				orig.parse_packet, orig.handle_response, orig.reload, orig.rrm
+			inform._logged_pending = false
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: _rrm_tick benches a station that never answers, and forgives one that does",		fn = function()
 			-- AP2's one "capable" station advertises every measurement mode
 			-- (rrm byte 0xF9) and answers all of them with "incapable" -- and
 			-- hostapd does not notify a bodiless refusal, so from here it is a
@@ -5703,6 +6892,342 @@ return {
 		end
 	},
 	{
+		-- The monitors are what produce the radar event, so a DFS radio has to
+		-- keep them running on a site with neither 802.11k enrichment nor
+		-- connection tracking -- where _rrm_tick used to return early, stop
+		-- the collector and delete the event file.
+		name = "inform: a DFS radio keeps the control-socket monitors alive on its own",
+		fn = function()
+			local o_rrm, o_at, o_dfs = inform._rrmscan, inform._assoctrack, inform._dfs_radio
+			local o_next, o_time = inform._rrm_collector_next, inform._time
+			local calls
+			local stub = {
+				drain = function() return "" end,
+				collector_running = function() return false end,
+				collector_stop = function() calls[#calls + 1] = "collector_stop" end,
+				collector_ensure = function() calls[#calls + 1] = "collector_ensure" end,
+				monitors_ensure = function() calls[#calls + 1] = "monitors_ensure" end,
+				monitors_stop = function() calls[#calls + 1] = "monitors_stop" end,
+				parse_dfs = function() return {} end,
+			}
+			inform._rrmscan = stub
+			inform._assoctrack = nil	-- so _assoc_enabled is false
+			-- Restored through a pcall: this test replaces _assoctrack and the
+			-- collector clock, and a bare assert would leave both broken for
+			-- every test after it.
+			local function run(dfs, rrm_on)
+				calls = {}
+				inform._dfs_radio = dfs
+				inform._rrm_collector_next = 0
+				inform._time = function() return 1 end
+				-- An explicit false: in this tree an ABSENT rrm_enrichment key
+				-- means the documented default, ON (the AP2 lesson), where
+				-- upstream reads absence as off.
+				inform._rrm_tick({config = {rrm_enrichment = rrm_on}}, {})
+				return table.concat(calls, ",")
+			end
+			local ok, err = pcall(function()
+				assert_eq(run(true, false), "monitors_ensure",
+					"DFS only: the monitors run, the subscriber does not")
+				assert_eq(run(false, false), "",
+					"nothing wanted: the early branch, as before")
+				assert_eq(run(true, true), "collector_ensure,monitors_ensure",
+					"enrichment on: both")
+				assert_eq(run(false, true), "collector_ensure,monitors_ensure",
+					"enrichment alone still starts both")
+				-- A subscriber left over from a run with enrichment on is stopped.
+				stub.collector_running = function() return true end
+				assert_eq(run(true, false), "collector_stop,monitors_ensure",
+					"the stale subscriber goes before the monitors are restarted")
+			end)
+			inform._rrmscan, inform._assoctrack = o_rrm, o_at
+			inform._dfs_radio, inform._time = o_dfs, o_time
+			inform._rrm_collector_next = o_next
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- A DFS-only site has no subscriber, so nothing ever writes the event
+		-- file: draining it every heartbeat was a read of the whole file plus
+		-- the truncating rewrite that follows, for nothing.
+		name = "inform: a quiet collector file is not drained",
+		fn = function()
+			local o_rrm, o_at, o_dfs = inform._rrmscan, inform._assoctrack, inform._dfs_radio
+			local o_next, o_time = inform._rrm_collector_next, inform._time
+			local file = os.tmpname()
+			os.remove(file)	-- the DFS-only case: no collector, no file at all
+			local drains = 0
+			inform._rrmscan = {
+				EVENT_FILE = file,
+				drain = function()
+					drains = drains + 1
+					local h = io.open(file, "r")
+					local b = h and h:read("*a") or ""
+					if h then h:close() end
+					local w = io.open(file, "w"); if w then w:close() end
+					return b
+				end,
+				collector_running = function() return false end,
+				collector_stop = function() end,
+				monitors_ensure = function() end,
+				parse_dfs = function(blob)
+					return blob:find("RADAR", 1, true)
+						and {{channel = 100, freq = 5500, ifname = "phy1-ap0"}} or {}
+				end,
+			}
+			inform._assoctrack = nil
+			inform._dfs_radio, inform._time = true, function() return 1 end
+			inform._event_queue, inform._event_seen = {}, {}
+			local o_stderr = io.stderr
+			io.stderr = {write = function() end}
+			local cfg = {config = {rrm_enrichment = false}}
+			local ok, err = pcall(function()
+				inform._rrm_collector_next = 0
+				inform._rrm_tick(cfg, {})
+				assert_eq(drains, 0, "no file: nothing to drain")
+				local h = io.open(file, "w"); h:close()
+				inform._rrm_tick(cfg, {})
+				assert_eq(drains, 0, "an empty file costs an open and a seek, not a drain")
+				h = io.open(file, "w")
+				h:write("1299.01 phy1-ap0 DFS-RADAR-DETECTED freq=5500\n")
+				h:close()
+				inform._rrm_tick(cfg, {})
+				assert_eq(drains, 1, "lines in it: drained")
+				assert_eq(#inform._event_queue, 1, "and the radar event is queued")
+				inform._rrm_tick(cfg, {})
+				assert_eq(drains, 1, "the drain emptied it, so the next heartbeat is free again")
+			end)
+			io.stderr = o_stderr
+			os.remove(file)
+			inform._rrmscan, inform._assoctrack = o_rrm, o_at
+			inform._dfs_radio, inform._time = o_dfs, o_time
+			inform._rrm_collector_next = o_next
+			inform._event_queue, inform._event_seen = {}, {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- `elseif rrm.collector_running then` tested a FUNCTION value, so the
+		-- branch was always taken and the pgrep inside it ran every 60 s for
+		-- the lifetime of the daemon -- on every DFS-only site, to be told the
+		-- same thing every time.
+		name = "inform: the collector check stops once it reports there is none",
+		fn = function()
+			local o_rrm, o_at, o_dfs = inform._rrmscan, inform._assoctrack, inform._dfs_radio
+			local o_next, o_time, o_reaped =
+				inform._rrm_collector_next, inform._time, inform._collector_reaped
+			local checks, stops, alive = 0, 0, true
+			inform._rrmscan = {
+				drain = function() return "" end,
+				collector_running = function() checks = checks + 1; return alive end,
+				collector_stop = function() stops = stops + 1 end,
+				collector_ensure = function() end,
+				harvest = function() return {}, {} end,
+				hostapd_objects = function() return {} end,
+				monitors_ensure = function() end,
+				parse_dfs = function() return {} end,
+			}
+			inform._assoctrack = nil
+			inform._dfs_radio = true
+			local clock = 1000
+			inform._time = function() return clock end
+			local function minute()
+				clock = clock + inform.RRM_COLLECTOR_CHECK_INTERVAL
+				inform._rrm_tick({config = {rrm_enrichment = false}}, {})
+			end
+			local ok, err = pcall(function()
+				inform._rrm_collector_next, inform._collector_reaped = 0, false
+				minute()
+				assert_eq(checks, 1, "the leftover subscriber is looked for")
+				assert_eq(stops, 1, "and killed")
+				-- A kill whose success is never read back: while it still
+				-- reports alive the question is asked again.
+				minute()
+				assert_eq(checks, 2, "a survivor is chased")
+				assert_eq(stops, 2, "and killed again")
+				alive = false
+				minute()
+				assert_eq(checks, 3, "one more check reports it gone")
+				assert_eq(stops, 2, "nothing left to kill")
+				minute(); minute(); minute()
+				assert_eq(checks, 3, "and that is the last pgrep this state costs")
+				-- Enrichment back on starts a collector, so the answer can
+				-- change again: the latch is cleared.
+				inform._rrm_collector_next = 0
+				inform._rrm_tick({config = {rrm_enrichment = true}}, {})
+				assert_eq(checks, 3, "nothing is pgrepped while one is wanted")
+				alive = true
+				minute()
+				assert_eq(checks, 4, "once it is unwanted again it is looked for afresh")
+			end)
+			inform._rrmscan, inform._assoctrack = o_rrm, o_at
+			inform._dfs_radio, inform._time = o_dfs, o_time
+			inform._rrm_collector_next, inform._collector_reaped = o_next, o_reaped
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- parse_dfs walked the whole blob a second time, right after
+		-- assoctrack.parse_events had walked it for the funnel -- the
+		-- one-pass rule the rest of the tick follows.
+		name = "inform: one walk of the collector blob finds the funnel's events and the radar",
+		fn = function()
+			local at = inform._assoctrack
+			local STA = "00:00:5e:00:53:01"
+			local blob = table.concat({
+				'100.10 { "assoc": {"address":"' .. STA .. '","ifname":"phy1-ap0","signal":-61} }',
+				'100.20 { "probe": {"address":"00:00:5e:00:53:09"} }',
+				'100.30 phy1-ap0 DFS-RADAR-DETECTED freq=5500 ht_enabled=0 cf1=5530',
+				'100.40 phy1-ap0 BEACON-RESP-RX 00:00:5e:00:53:01 1 0 0011',
+			}, "\n") .. "\n"
+			local evs = at.parse_events(blob)
+			local kinds = {}
+			for _, e in ipairs(evs) do kinds[e.ev] = (kinds[e.ev] or 0) + 1 end
+			assert_eq(kinds.assoc, 1, "the association is still parsed")
+			assert_eq(kinds.radar, 1, "and the radar line comes out of the same walk")
+			assert_eq(kinds.probe, nil, "probes are still ignored")
+			local radar
+			for _, e in ipairs(evs) do if e.ev == "radar" then radar = e end end
+			assert_eq(radar.ifname, "phy1-ap0", "the BSS hostapd reported it on")
+			assert_eq(radar.freq, 5500, "the frequency the radar was seen on")
+			assert_eq(radar.t, 100.30, "stamped with the collector's uptime")
+
+			-- Handed those records, _dfs_poll does not walk the blob again.
+			local o_rrm, o_time = inform._rrmscan, inform._time
+			local walks = 0
+			inform._rrmscan = setmetatable({
+				parse_dfs = function(b) walks = walks + 1; return o_rrm.parse_dfs(b) end,
+			}, {__index = o_rrm})
+			inform._time = function() return 7000 end
+			inform._event_queue, inform._event_seen = {}, {}
+			local o_stderr = io.stderr
+			io.stderr = {write = function() end}
+			local ok, err = pcall(function()
+				assert_eq(inform._dfs_poll(blob, evs), 1, "the detection is still reported")
+				assert_eq(walks, 0, "off the walk parse_events already did")
+				assert_eq(inform._event_queue[1].channel, "100",
+					"and radar_of resolved the channel the same way")
+				-- No event list (DFS only, nothing else reading the file):
+				-- parse_dfs does the walk itself, as before.
+				inform._event_queue, inform._event_seen = {}, {}
+				assert_eq(inform._dfs_poll(blob), 1, "the standalone path still works")
+				assert_eq(walks, 1, "by walking the blob")
+			end)
+			io.stderr = o_stderr
+			inform._rrmscan, inform._time = o_rrm, o_time
+			inform._event_queue, inform._event_seen = {}, {}
+			at._stas, at._queue, at._here, at._roamed, at._roam_queue = {}, {}, {}, {}, {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- The contract is 10.6.106's own handler (com.ubnt.service.devmgr.e.c):
+		-- it needs BOTH "channel" and "freq" in the notif_payload and drops
+		-- the event with "Event without handler" if either is missing, reads
+		-- channel as a STRING and freq as an int, and then logs
+		-- "{ap} detected radar on channel {radar_channel} ({freq} MHz)".
+		-- 6.8.2's ubntbox sends the same three fields plus "vap".
+		name = "inform: a DFS radar detection goes out as EVT_AP_RadarDetected",
+		fn = function()
+			local o_post, o_build, o_ident = inform.http_post, inform.build_packet,
+				inform._notif_identity
+			local bodies = {}
+			inform.build_packet = function(json) return json end
+			inform.http_post = function(_, pkt) bodies[#bodies + 1] = cjson.decode(pkt); return "noop" end
+			inform._notif_identity = {mac = "00:00:5e:00:53:20", model = "U6IW"}
+			inform._event_queue, inform._event_seen = {}, {}
+			local queued = inform._dfs_poll(
+				"1299.01 phy1-ap0 DFS-RADAR-DETECTED freq=5500 ht_enabled=0 "
+				.. "chan_offset=0 chan_width=1 cf1=5530 cf2=0\n")
+			local sent = inform._send_events({adopted = true, inform_url = "http://x/inform"})
+			local q_after = #inform._event_queue
+			inform.http_post, inform.build_packet = o_post, o_build
+			inform._notif_identity = o_ident
+			inform._event_queue, inform._event_seen = {}, {}
+			assert_eq(queued, 1, "one detection queued")
+			assert_eq(sent, 1, "and sent")
+			assert_eq(q_after, 0, "queue drained")
+			local b = bodies[1]
+			assert_eq(b.inform_as_notif, true, "the notif envelope, as for a station notif")
+			assert_eq(b.notif_reason, "event", "notif_reason")
+			assert_eq(b.mac, "00:00:5e:00:53:20", "device identity")
+			local p = b.notif_payload
+			assert_eq(p.event_string, "EVT_AP_RadarDetected", "the event the controller dispatches on")
+			assert_eq(p.channel, "100", "channel as a string, which is how the handler reads it")
+			assert_eq(p.freq, 5500, "freq as a number")
+			assert_eq(p.vap, "phy1-ap0", "the BSS, as 6.8.2 sends it")
+			assert_eq(p.dedup_key, nil, "the dedup key is ours and never goes on the wire")
+		end
+	},
+	{
+		name = "inform: one radar hit on two BSSes is one event, and the queue is capped",
+		fn = function()
+			local o_time = inform._time
+			local now = 5000
+			inform._time = function() return now end
+			inform._event_queue, inform._event_seen = {}, {}
+			-- hostapd prints the detection on each BSS of the radio: same
+			-- channel, same second, two lines.
+			local two = "1299.01 phy1-ap0 DFS-RADAR-DETECTED freq=5500\n"
+				.. "1299.01 phy1-ap1 DFS-RADAR-DETECTED freq=5500\n"
+			assert_eq(inform._dfs_poll(two), 1, "collapsed to one")
+			-- A different channel in the same second is a different radar.
+			assert_eq(inform._dfs_poll("1299.02 phy1-ap0 DFS-RADAR-DETECTED freq=5260\n"),
+				1, "another channel still reported")
+			-- Past the window the same channel is a new detection.
+			now = now + inform.EVENT_DEDUP_S + 1
+			assert_eq(inform._dfs_poll(two), 1, "a later hit on the same channel is new")
+			-- The cap is a queue cap, not a drop-everything: an unreachable
+			-- controller must not let /tmp grow an unbounded backlog.
+			inform._event_queue, inform._event_seen = {}, {}
+			for i = 1, inform.MAX_EVENTS + 4 do
+				inform.queue_event{event_string = "EVT_AP_RadarDetected", n = i}
+			end
+			assert_eq(#inform._event_queue, inform.MAX_EVENTS, "capped")
+			assert_eq(inform._event_queue[1].n, 1, "the oldest is kept")
+			-- An event with no event_string is not an event.
+			assert_eq(inform.queue_event{channel = "100"}, false, "no event_string")
+			assert_eq(inform.queue_event("EVT_AP_RadarDetected"), false, "not a table")
+			inform._time = o_time
+			inform._event_queue, inform._event_seen = {}, {}
+		end
+	},
+	{
+		-- Unlike the station notifs, a device event rides no capability: the
+		-- controller asked for nothing, and the AP is telling it something it
+		-- has no other way to learn. It does still need an adopted device
+		-- with an identity to file the event under.
+		name = "inform: device events need no notif-assoc-stat, but do need an adopted device",
+		fn = function()
+			local o_post, o_build, o_ident = inform.http_post, inform.build_packet,
+				inform._notif_identity
+			local posts = 0
+			inform.build_packet = function(json) return json end
+			inform.http_post = function() posts = posts + 1; return "noop" end
+			local ev = {event_string = "EVT_AP_RadarDetected", channel = "100", freq = 5500}
+			inform._notif_identity = nil
+			inform._event_queue = {ev}
+			assert_eq(inform._send_events({adopted = true, inform_url = "http://x/inform"}), 0,
+				"no identity yet: nothing sent")
+			inform._notif_identity = {mac = "00:00:5e:00:53:20"}
+			assert_eq(inform._send_events({adopted = false, inform_url = "http://x/inform"}), 0,
+				"not adopted: nothing sent")
+			assert_eq(#inform._event_queue, 1, "and the event is still queued")
+			assert_eq(inform._send_events({adopted = true, inform_url = "http://x/inform"}), 1,
+				"adopted, with an identity: sent, with no capability asked for")
+			-- A failed POST keeps it for the next heartbeat.
+			inform.http_post = function() return nil, "timeout" end
+			inform._event_queue = {ev}
+			assert_eq(inform._send_events({adopted = true, inform_url = "http://x/inform"}), 0,
+				"POST failed")
+			assert_eq(#inform._event_queue, 1, "kept")
+			inform.http_post, inform.build_packet = o_post, o_build
+			inform._notif_identity = o_ident
+			inform._event_queue, inform._event_seen = {}, {}
+			assert_eq(posts, 1, "exactly one POST reached the controller")
+		end
+	},
+	{
 		-- A roam report spoils with delay; a funnel event does not. Roams go
 		-- first, and a failed roam POST stops the funnel too (the controller
 		-- is not answering).
@@ -6794,6 +8319,254 @@ return {
 				with_stderr(function() inform._tick(st, {net = {lan_cpueth = "br-lan"}}, nil, fresh_ctx()) end)
 				assert_eq(seen, "192.0.2.9", "build_json saw the address read this cycle, not the startup one")
 			end)
+		end
+	},
+	{
+		name = "net push: IP Settings, DNS order and the controller's hostname out of one blob",
+		fn = function()
+			local net = inform._parse_net_system_cfg(table.concat({
+				"netconf.1.ip=192.0.2.7",
+				"netconf.1.netmask=255.255.255.0",
+				"route.1.gateway=192.0.2.1",
+				"dhcpc.1.status=disabled",
+				-- Deliberately out of wire order: resolv.conf's order is the
+				-- resolver's preference order, so the index decides, not the
+				-- line position.
+				"resolv.nameserver.2.ip=192.0.2.3",
+				"resolv.nameserver.1.ip=192.0.2.2",
+				"resolv.nameserver.3.ip=",
+				"resolv.host.1.name=U6IW",
+			}, "\n"))
+			assert_eq(net.ip, "192.0.2.7", "static address")
+			assert_eq(net.netmask, "255.255.255.0", "netmask")
+			assert_eq(net.gateway, "192.0.2.1", "gateway")
+			assert_false(net.dhcp, "dhcpc.1.status=disabled is NOT DHCP")
+			assert_eq(net.device_name, "U6IW", "controller-assigned hostname")
+			assert_eq(table.concat(net.dns, ","), "192.0.2.2,192.0.2.3",
+				"sorted by wire index, the empty one dropped")
+		end
+	},
+	{
+		name = "net push: a DHCP push and a blob with none of these keys",
+		fn = function()
+			local dh = inform._parse_net_system_cfg("dhcpc.1.status=enabled\nnetconf.1.ip=192.0.2.7")
+			assert_true(dh.dhcp, "enabled means DHCP")
+			local empty = inform._parse_net_system_cfg("wireless.1.ssid=x")
+			assert_nil(empty.ip, "no address pushed")
+			assert_false(empty.dhcp, "absent dhcpc.1.status is not DHCP")
+			assert_eq(#empty.dns, 0, "no nameservers")
+			-- Called on every system_cfg, including the degenerate ones.
+			assert_eq(#inform._parse_net_system_cfg(nil).dns, 0, "nil blob is a table, not an error")
+		end
+	},
+	{
+		name = "cfg-coverage: a replay sorts a push into consumed / inert / ignored",
+		fn = function()
+			local report = cfgcov.analyse(table.concat({
+				"# no wlan provisioned as no radio found",
+				"radio.1.phyname=wifi0",
+				"radio.1.channel=36",
+				"",
+				"wireless.1.devname=ath0",
+				"wireless.1.parent=wifi0",
+				"wireless.1.ssid=openuf-test",
+				"wireless.1.status=enabled",
+				-- Claimed by `^wireless%.%d+%.` yet read by nothing: the
+				-- MAC-filter decoy from PROTOCOL-VALIDATION.md.
+				"wireless.1.mac_acl.policy=deny",
+				"unifi.version=10.6.106",
+				"",
+			}, "\n"), real_parsers(), inform.RECOGNIZED_SYSTEM_CFG)
+
+			local function bucket(key)
+				for _, name in ipairs({"consumed", "inert", "ignored"}) do
+					for _, row in ipairs(report[name]) do
+						if row.key == key then return name end
+					end
+				end
+				return "(absent)"
+			end
+			assert_eq(bucket("wireless.1.ssid"), "consumed", "the SSID reaches a VAP")
+			assert_eq(bucket("radio.1.channel"), "consumed", "the channel reaches a radio")
+			assert_eq(bucket("wireless.1.mac_acl.policy"), "inert",
+				"recognized by prefix, read by nothing")
+			assert_eq(bucket("unifi.version"), "ignored", "neither claimed nor read")
+			assert_eq(report.lines, 8, "key=value lines")
+			-- The comment and the interior blank. The trailing newline's empty
+			-- element is dropped rather than counted.
+			assert_eq(report.blanks, 2, "the comment and the blank line")
+		end
+	},
+	{
+		name = "cfg-coverage: mutating the value catches a key a fallback hides from deletion",
+		fn = function()
+			-- radio.<n>.countrycode falls back to the unindexed
+			-- radio.countrycode, so DELETING either leaves the regdomain
+			-- unchanged and a deletion-only sweep reports both as unread.
+			-- Modelled here as a parser with exactly that fallback, so the
+			-- probe design is pinned rather than one controller's capture.
+			local parsers = {{"fallback", function(blob)
+				return blob:match("\na%.1%.k=([%w_]+)") or blob:match("\na%.k=([%w_]+)")
+			end}}
+			local blob = "\na.1.k=203\na.k=203"
+			local report = cfgcov.analyse(blob, parsers, {})
+			local verdict = {}
+			for _, name in ipairs({"consumed", "inert", "ignored"}) do
+				for _, row in ipairs(report[name]) do verdict[row.key] = name end
+			end
+			assert_eq(verdict["a.1.k"], "consumed", "the indexed key is read, fallback or not")
+			-- The unindexed one genuinely cannot be observed while the indexed
+			-- one shadows it -- the honest verdict, and why the sweep needs two
+			-- captures across a toggle rather than one.
+			assert_eq(verdict["a.k"], "ignored", "shadowed: no probe can move the output")
+		end
+	},
+	{
+		name = "cfg-coverage: a report never prints a pushed secret",
+		fn = function()
+			local parsers = {{"none", function() return nil end}}
+			local report = cfgcov.analyse(table.concat({
+				"aaa.1.wpa.psk=letmeinnow",
+				"aaa.1.radius.auth.1.secret=letmeinnow",
+				"aaa.1.iapp_key=letmeinnow",
+				"authkey=letmeinnow",
+				"aaa.1.ssid=openuf-test",
+			}, "\n"), parsers, {})
+			local out = cfgcov.format(report, {values = true})
+			assert_nil(out:find("letmeinnow", 1, true), "no secret in the report")
+			assert_true(out:find("openuf%-test") ~= nil, "a non-secret value still prints")
+			assert_true(out:find("<redacted>") ~= nil, "and says it was redacted")
+		end
+	},
+	{
+		name = "inform packet: dfs-reset only moves a 5 GHz radio that is off its pinned channel",
+		fn = function()
+			local orig = {
+				uci = inform._ucihelper, si = inform._sysinfo,
+				run = inform._run_cmd, read = inform._read_file,
+				time = inform._time, stderr = io.stderr,
+			}
+			local said, cmds, request = "", {}, nil
+			io.stderr = {write = function(_, s) said = said .. s end}
+			-- The AX3000T's own layout: 2.4 on radio0, the DFS 5 GHz on radio1.
+			local live, width, nol = 36, 80, nil
+			inform._ucihelper = {
+				get_radio_table = function()
+					return {
+						{name = "radio0", radio = "ng", channel = 11},
+						{name = "radio1", radio = "na", channel = 100},
+					}
+				end,
+				get_ifname_for_radio = function(r)
+					return r == "radio0" and "phy0-ap0" or "phy1-ap0"
+				end,
+			}
+			inform._sysinfo = {
+				radio_caps = function(ifname)
+					if ifname == "phy1-ap0" then return {channel = live, width = width} end
+					-- The 2.4 radio is deliberately off ITS pinned channel
+					-- too (1, configured 11): the only thing keeping it out
+					-- of this job is the band gate.
+					return {channel = 1, width = 20}
+				end,
+				phy_channels = function()
+					return "\t* 5500 MHz [100] \n\t  Radar detection\n\t  DFS state: "
+						.. (nol and "unavailable (for 1766 sec)" or "available (for 86400 sec)")
+						.. "\n"
+				end,
+			}
+			inform._run_cmd = function(c) cmds[#cmds + 1] = c; return "OK\n" end
+			inform._read_file = function(p)
+				if p == inform.DFS_RESET_REQUEST_FILE then return request end
+				return nil
+			end
+			inform._time = function() return 1000000 end
+
+			local ok, err = pcall(function()
+				-- No request: nothing is read, nothing runs.
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "no request, no work")
+				assert_eq(#cmds, 0, "and no command")
+
+				-- Off its channel, the channel is free: one CSA, on the 5 GHz
+				-- radio only. The 2.4 radio is never even looked at -- no band
+				-- but 5 GHz has DFS.
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 1, "one radio moved")
+				assert_eq(#cmds, 1, "one command")
+				assert_contains(cmds[1], "hostapd_cli -i phy1-ap0 chan_switch 5 "
+					.. "5500 sec_channel_offset=1 center_freq1=5530 bandwidth=80 vht",
+					"a CSA back to the configured channel, at the live width")
+				assert_contains(said, "switching back from channel 36 to the configured 100",
+					"and says what it did")
+				assert_eq(said:find("phy0%-ap0"), nil,
+					"the 2.4 radio is off its channel too and is still not touched")
+
+				-- Already there: the firmware's own first check, and the state
+				-- openUF is in on every night but the one after a radar hit.
+				cmds, live = {}, 100
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "nothing to do")
+				assert_eq(#cmds, 0, "no switch when the channel already agrees")
+
+				-- Still on the non-occupancy list: wait, do not ask hostapd.
+				-- This is the case that makes the NOL read worth doing --
+				-- the kernel would refuse and the AP would have announced a
+				-- switch it cannot complete.
+				cmds, live, nol, said = {}, 36, true, ""
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "left alone")
+				assert_eq(#cmds, 0, "no switch attempted")
+				assert_contains(said, "still on the non-occupancy list",
+					"and the reason is named")
+				assert_contains(said, "another 1766 s", "with the time left")
+
+				-- hostapd refusing is reported, not swallowed.
+				cmds, nol, said = {}, nil, ""
+				inform._run_cmd = function(c) cmds[#cmds + 1] = c; return "FAIL\n" end
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "not counted as moved")
+				assert_contains(said, "hostapd refused the switch", "and is logged")
+				inform._run_cmd = function(c) cmds[#cmds + 1] = c; return "OK\n" end
+
+				-- A stale request (the daemon was down when crond fired) is
+				-- dropped rather than acted on hours later.
+				cmds, said = {}, ""
+				request = tostring(1000000 - inform.DFS_RESET_MAX_AGE - 1) .. "\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "stale, ignored")
+				assert_eq(#cmds, 0, "no switch")
+				assert_contains(said, "stale dfs-reset request", "and says so")
+
+				-- An unpinned radio is left to the driver: "auto" is the
+				-- controller's intent, not a channel to return to. Silently:
+				-- every site that lets the controller pick a channel is in
+				-- this case, and it is not a problem to report.
+				cmds, said = {}, ""
+				inform._ucihelper.get_radio_table = function()
+					return {{name = "radio1", radio = "na", channel = "auto"}}
+				end
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "auto is not pinned")
+				assert_eq(#cmds, 0, "no switch")
+				assert_eq(said, "", "and nothing logged")
+				-- Asserted on the reason, not just the silence: "auto" has to
+				-- be refused before anything reads the radio, or the live
+				-- channel gets compared against nothing.
+				local _, why = inform._dfs_reset_radio({channel = "auto"}, "phy1-ap0")
+				assert_eq(why, "channel is not pinned", "and refused up front")
+
+				-- A radio the controller turned off is not woken up.
+				cmds, said = {}, ""
+				inform._ucihelper.get_radio_table = function()
+					return {{name = "radio1", radio = "na", channel = 100, disabled = true}}
+				end
+				request = "1000000\n"
+				assert_eq(inform._maybe_service_dfs_reset({}), 0, "a disabled radio is skipped")
+				assert_eq(#cmds, 0, "no switch")
+			end)
+			inform._ucihelper, inform._sysinfo = orig.uci, orig.si
+			inform._run_cmd, inform._read_file = orig.run, orig.read
+			inform._time, io.stderr = orig.time, orig.stderr
+			if not ok then error(err, 0) end
 		end
 	},
 }

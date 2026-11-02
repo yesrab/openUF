@@ -58,39 +58,19 @@ openuf/uciconf.lua                /etc/config/openuf -> the `dev`/`config` table
 
 ## Decisions
 
-- **The 802.11r translator is part of the `openuf` package, not a package of its own**
-  (2026-10-25). d-malinowski's rrb-unifi (GPL-3.0-or-later) is vendored as `openuf/rrb/`
-  and installed to `/usr/lib/openuf/rrb/` with its LICENSE and README; its procd script is
-  `openuf/etc/init.d/openuf-rrb`; `DEPENDS` carries `+ucode-mod-socket +kmod-veth`;
-  `PKG_LICENSE` is `GPL-3.0-or-later` (the whole repository since 2026-10-25; NOTICE lists the copyright holders). The veth pair is written
-  by the daemon's user, openUF, into `/etc/config/network` on the first FT push, so neither a
-  uci-defaults nor a postinst touches the network. Fixes come from
-  https://github.com/d-malinowski/unifi-openwrt-roaming (see `openuf/rrb/README.md`), re-applied
-  with the `// openUF:` changes.
-
-| Topic | Decision | Why |
-|---|---|---|
-| Install prefix | `/usr/lib/openuf/` for the modules, presets and hook; `/usr/bin/syswrapper.sh` symlink (the controller's SSH adoption runs it by name); `/usr/bin/openuf` a tiny CLI (`--version`, `status`, `reset-inform`); `/etc/openuf/` for `state.json` and the ledger | Feed packages do not install under `/opt`. The cwd-relative `dofile` design stays: only the init script and the hook name the directory |
-| Configuration | `/etc/config/openuf` (UCI). `conf.lua` becomes a loader that builds today's `config`/`dev` tables from UCI; presets stay Lua files under `modelmap/` and `ufmodel/`; a custom map is UCI sections (`device`, `port`, `vlan`, `radio`, `identity`) turned into the same `dev` table by one loader that applies `test_modelmap.lua`'s invariants as refusals | LuCI forms edit UCI; the presets are tried and true and keep their tests |
-| Backend | ucode rpcd plugin `luci.openuf` under `/usr/share/rpcd/ucode/` (`rpcd-mod-ucode`, which `luci-base` already depends on) | Every current LuCI app with a backend is ucode or shell; Lua rpcd plugins are not what upstream takes |
-| Daemon deps | Hard: `+lua +luabitop +lua-cjson +luasocket +lua-openssl +libuci-lua +iw +lldpd +ip-bridge +hostapd-utils +usteer +nftables +kmod-nft-bridge +tc-tiny +kmod-sched-act-police` (2026-09-29: the feature packages were optional at first; the user found the package install leaving features off and made them hard). Not expressible: a **full wpad build**, so `openuf deps --install` (hook/openuf-deps.sh, `/usr/sbin/openuf-deps`) swaps a `wpad-basic-*` for the full build of the same crypto library, the init script refuses to start without one, the package's postinst-pkg says so, and the LuCI overview has the button | Every wpad variant PROVIDES the same names, so no virtual package tells full from basic; naming one variant would CONFLICT with the stock `wpad-basic-*` and make the package uninstallable; a postinst cannot swap under the package manager's own lock |
-| Package source | `PKG_SOURCE_URL` = the GitHub release archive `openuf-<ver>.tar.gz` (gzip, not xz: busybox tar on a device cannot unpack xz, and the same archive serves a manual install), which the release workflow produces from `tools/dist.sh --verify` (comment-stripped, proven bytecode-identical, tests passed) | Feed rules want an official release archive; the stripped tree halves the installed size, and the proof stays in CI logs |
-| Version | `PKG_VERSION` from the tag `vX.Y.Z`; `PKG_RELEASE` reset to 1 on a version change; `BUILD` stamp kept | Feed convention |
-| Minimum target | LuCI app: OpenWrt 24.10 and later (ucode rpcd, JS LuCI); daemon: unchanged reach | Both package formats the release builds (`opkg` on 24.10, `apk` on 25.12) |
-| Init | `#!/bin/sh /etc/rc.common`, `USE_PROCD=1`, `start_service` with two instances (announce, inform), `procd_add_reload_trigger "openuf"` | Feed review rules |
-| Upgrade safety | `conffiles`: `/etc/config/openuf`; `keep.d/openuf`: `/etc/config/openuf`, `/etc/openuf/` | What `install.sh` does with `sysupgrade.conf` today |
-
-## The LuCI app
-
-Menu: `admin/services/openuf` → *Overview*, *Settings*, *Log*; plus a few lines on
-*Status → Overview* (`view/status/include/05_openuf.js`, numbered so it sorts before the stock `10_system` block and shows first).
-
-Everything the pages show comes from `openuf probe …` (`openuf/hook/probe.lua`), which
-runs the daemon's own loader and reports how the configuration resolved. The ucode backend
-`luci.openuf` only adds what the daemon cannot know: the service state, the optional
-packages, `openuf-convert --check`. So the UI can never describe a configuration the daemon
-would read differently.
-
+- **The 802.11r translator is NOT part of the `openuf` package** (2026-11-02; it was vendored
+  from 2026-10-25 to 2026-11-02). Fast roaming with genuine UniFi APs is d-malinowski's
+  rrb-unifi: its translator, service and openUF plugin install from that project's own
+  releases (`setup.sh` asks, default yes, and runs `rrb-unifi-setup install --yes`; the plugin
+  lands in `/etc/openuf/plugins/rrb-unifi.lua`, enabled through `/etc/openuf/plugins.enabled`).
+  `DEPENDS` no longer carries `ucode-mod-socket`/`kmod-veth`; the tool installs them. The
+  package ships `/opt/openuf` as a symlink to `/usr/lib/openuf`, because upstream's plugin
+  contract (`PLUGINS.md`) names `/opt/openuf/plugins.lua` as the hook's detection path and
+  every third-party installer, rrb-unifi-setup included, looks there; the postinst's
+  double-install warning ignores the symlink, and the postinst stops a leftover `openuf-rrb`
+  daemon from the vendored era (its veth in `/etc/config/network` goes after the daemon's next
+  push, never before, see `inform._migrate_legacy_rrb`). `PKG_LICENSE` stays
+  `GPL-3.0-or-later` (the repository's licence since 2026-10-25; NOTICE records the history).
 - **Overview**: state and adoption, the profile and identity in use (and the refusal
   reason when there is one), the pushed WiFi networks, *Software openUF needs* (the
   hostapd build, full or basic, and the missing packages, from `openuf deps --check`,

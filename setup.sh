@@ -52,6 +52,13 @@ OPENUF_SELF_URL=${OPENUF_SELF_URL:-"https://raw.githubusercontent.com/$OPENUF_RE
 # (.../releases/tags/v0.1.8); OPENUF_PKG_DIR=/path uses package files already
 # on the device instead of downloading any.
 OPENUF_RELEASE_URL=${OPENUF_RELEASE_URL:-"https://api.github.com/repos/$OPENUF_REPO/releases/latest"}
+# d-malinowski's rrb-unifi: the 802.11r translator for genuine UniFi APs and
+# its openUF plugin (USAGE.md § 6). Fetched from its latest GitHub release; the
+# fallback tag is the version this openUF was last checked against.
+RRB_UNIFI_REPO=${RRB_UNIFI_REPO:-d-malinowski/unifi-openwrt-roaming}
+RRB_UNIFI_RELEASE_URL=${RRB_UNIFI_RELEASE_URL:-"https://api.github.com/repos/$RRB_UNIFI_REPO/releases/latest"}
+RRB_UNIFI_FALLBACK_TAG=${RRB_UNIFI_FALLBACK_TAG:-v1.5}
+RRB_UNIFI_DIR=${RRB_UNIFI_DIR:-}
 OPENUF_PKG_DIR=${OPENUF_PKG_DIR:-}
 export OPENUF_REPO OPENUF_REF OPENUF_TARBALL_URL OPENUF_SELF_URL OPENUF_RELEASE_URL
 
@@ -179,6 +186,7 @@ OPT_L2=""              # ""=derive 1=on 0=off
 OPT_COUNTRY=""         # ""=ask; "none" or a 2-letter code
 HEADLESS=""            # ""=ask 1=daemon only, as files  0=the packages, with LuCI
 OPT_THEME=""           # ""=ask 1=yes 0=no  (luci-theme-halo; web install only)
+OPT_ROAMING=""         # ""=ask 1=yes 0=no  (rrb-unifi: 802.11r with genuine UniFi APs)
 DO_REBOOT=""           # ""=ask 1=yes 0=no
 KEEP_WORK=0
 
@@ -226,6 +234,10 @@ is asked interactively (or takes its default under --yes).
                             to LuCI (headless)
       --theme / --no-theme  with --web: also the Halo LuCI theme (default:
                             yes with 4 MB free on the flash, else no)
+      --unifi-roaming / --no-unifi-roaming
+                            install d-malinowski's rrb-unifi, the translator
+                            and openUF plugin for 802.11r fast roaming with
+                            genuine UniFi access points (default: yes)
       --reboot / --no-reboot
                             reboot when done (default: yes)
       --keep-work           leave the downloaded tree in /tmp for inspection
@@ -233,7 +245,10 @@ is asked interactively (or takes its default under --yes).
 
 Environment: OPENUF_REPO, OPENUF_REF, OPENUF_SRC, OPENUF_TARBALL_URL,
              OPENUF_RELEASE_URL (which release the packages come from),
-             OPENUF_PKG_DIR (package files already on the device)
+             OPENUF_PKG_DIR (package files already on the device),
+             RRB_UNIFI_RELEASE_URL (which rrb-unifi release; default: the
+             latest, falling back to $RRB_UNIFI_FALLBACK_TAG),
+             RRB_UNIFI_DIR (an unpacked rrb-unifi tree already on the device)
 EOF
 }
 
@@ -266,6 +281,8 @@ while [ $# -gt 0 ]; do
 		--headless)          HEADLESS=1 ;;
 		--theme)             OPT_THEME=1 ;;
 		--no-theme)          OPT_THEME=0 ;;
+		--unifi-roaming)     OPT_ROAMING=1 ;;
+		--no-unifi-roaming)  OPT_ROAMING=0 ;;
 		--reboot)            DO_REBOOT=1 ;;
 		--no-reboot)         DO_REBOOT=0 ;;
 		--keep-work)         KEEP_WORK=1 ;;
@@ -606,7 +623,7 @@ fi
 # Phase 1b — the interview
 # ═══════════════════════════════════════════════════════════════════════════
 
-head1 "1/7  Access-point conversion"
+head1 "1/8  Access-point conversion"
 say "  openUF emulates a UniFi ACCESS POINT. A device still acting as a router"
 say "  fights the real gateway for DHCP and NAT, so this step strips the router"
 say "  role: no WAN interface, no DHCP server, no firewall, everything bridged."
@@ -651,7 +668,7 @@ if [ "$DO_AP_MODE" = 1 ]; then
 	esac
 fi
 
-head1 "2/7  Hardware profile (modelmap)"
+head1 "2/8  Hardware profile (modelmap)"
 say "  The profile describes YOUR board: radio names, ethernet sockets, status"
 say "  LED. The UniFi identity presented to the controller is separate: the"
 say "  profile picks it (U6-InWall for most; the Archer A7/C7 profile presents"
@@ -712,7 +729,7 @@ if [ "$MODELMAP" = auto ] && [ "$IS_DSA" != 1 ]; then
        correct dev.conf.vlan by hand, per openuf/modelmap/*.lua."
 fi
 
-head1 "3/7  Controller"
+head1 "3/8  Controller"
 say "  Leave blank to be discovered on this LAN (the controller's Devices page"
 say "  shows the AP by itself). Give an address when the controller is on"
 say "  another subnet, or to skip discovery entirely."
@@ -728,7 +745,7 @@ case "$OPT_CONTROLLER" in
 esac
 [ -n "$INFORM_URL" ] && ok "inform URL: $INFORM_URL"
 
-head1 "4/7  Adoption account"
+head1 "4/8  Adoption account"
 say "  L2 adoption works by the controller SSHing in and running"
 say "  'syswrapper.sh set-adopt'. Real Ubiquiti hardware ships an ubnt/ubnt"
 say "  login for exactly this; openUF can create a locked-down copy of it --"
@@ -743,7 +760,7 @@ if [ -z "$OPT_BOOTSTRAP" ]; then
 	fi
 fi
 
-head1 "5/7  SSIDs"
+head1 "5/8  SSIDs"
 say "  openUF only ever creates, edits or deletes wireless sections it named"
 say "  'openuf_*' -- your hand-made SSIDs are never rewritten. The question is"
 say "  whether they keep BROADCASTING alongside the controller's."
@@ -814,7 +831,7 @@ if [ -z "$OPT_L2" ]; then
 	fi
 fi
 
-head1 "6/7  Web interface"
+head1 "6/8  Web interface"
 say "  openUF can be managed from LuCI: a dashboard as LuCI's landing page,"
 say "  openUF's own pages (overview, settings, log) and the device page that"
 say "  fronts LuCI with the access point's status. That is the OpenWrt packages"
@@ -858,7 +875,22 @@ else
 	ok "web install: the openuf and luci-app-openuf packages$([ "$OPT_THEME" = 1 ] && echo ' and the Halo theme')"
 fi
 
-head1 "7/7  Summary"
+head1 "7/8  Fast roaming with genuine UniFi access points"
+say "  On a site that also has real UniFi access points, 802.11r fast roaming"
+say "  between them and this device needs a small translator: UniFi's hostapd"
+say "  frames the inter-AP key exchange differently from OpenWrt's. d-malinowski's"
+say "  rrb-unifi (github.com/$RRB_UNIFI_REPO, GPL-3.0-or-later)"
+say "  converts it on a veth pair, and its openUF plugin writes the matching"
+say "  802.11r settings on every controller push. It is installed from that"
+say "  project's latest release, with two small packages (ucode-mod-socket,"
+say "  kmod-veth); its own tool, rrb-unifi-setup, verifies and uninstalls it"
+say "  later. Without it openUF access points still roam among themselves."
+if [ -z "$OPT_ROAMING" ]; then
+	if ask_yn "  Install the rrb-unifi roaming plugin?" Y; then OPT_ROAMING=1; else OPT_ROAMING=0; fi
+fi
+[ "$OPT_ROAMING" = 1 ] && ok "rrb-unifi: translator, service and openUF plugin" || ok "no UniFi roaming plugin"
+
+head1 "8/8  Summary"
 say "  AP conversion     $([ "$DO_AP_MODE" = 1 ] && echo yes || echo 'no (left as a router)')"
 if [ "$DO_AP_MODE" = 1 ]; then
 	say "    WAN -> LAN      $([ "$AP_ABSORB_WAN" = 1 ] && echo yes || echo no)"
@@ -876,6 +908,7 @@ if [ "$HEADLESS" = 1 ]; then
 else
 	say "  Install           packages openuf + luci-app-openuf$([ "$OPT_THEME" = 1 ] && echo ' + luci-theme-halo') (the LuCI dashboard and device page)"
 fi
+say "  UniFi roaming     $([ "$OPT_ROAMING" = 1 ] && echo 'rrb-unifi translator + openUF plugin (d-malinowski)' || echo no)"
 if [ "$OPT_L2" = 0 ] && [ -z "$INFORM_URL" ]; then
 	warn "L2 discovery is off and no controller address was given, so nothing"
 	warn "will reach a controller. Set one later with:"
@@ -937,10 +970,10 @@ if [ -d /sys/bus/platform/devices/leds ] \
 	OPTIONAL="$OPTIONAL kmod-leds-gpio"
 fi
 case "$INFORM_URL" in https*) OPTIONAL="$OPTIONAL luasec" ;; esac
-# The 802.11r translator for genuine UniFi APs ships with openUF (openuf/rrb/);
-# its two packages go in here, in the packages phase, while this box is still
-# the router with internet.
-OPTIONAL="$OPTIONAL ucode-mod-socket kmod-veth"
+# rrb-unifi (802.11r roaming with genuine UniFi APs, question 7): its two
+# packages go in here, in the packages phase, while this box is still the
+# router with internet; the tool itself is fetched below for the same reason.
+[ "$OPT_ROAMING" = 1 ] && OPTIONAL="$OPTIONAL ucode-mod-socket kmod-veth"
 
 MISSING=""
 for p in $REQUIRED; do pkg_installed "$p" || MISSING="$MISSING $p"; done
@@ -1033,6 +1066,46 @@ else
 			fi
 		fi
 	fi
+fi
+
+# ── rrb-unifi: fetch while there is internet ────────────────────────────────
+# The tool and its files come from the project's latest GitHub release (the
+# tag from the release JSON, the tag archive from github.com); RRB_UNIFI_DIR
+# names an unpacked tree already on the device instead. A failure here only
+# costs the roaming plugin: the install goes on without it, and the manual
+# steps are printed at the end.
+RRB_SRC=""
+if [ "$OPT_ROAMING" = 1 ]; then
+	if [ -n "$RRB_UNIFI_DIR" ]; then
+		RRB_SRC=$(CDPATH= cd -- "$RRB_UNIFI_DIR" 2>/dev/null && pwd) \
+			|| die "RRB_UNIFI_DIR=$RRB_UNIFI_DIR is not a directory"
+	else
+		RRB_WORK=${WORK:-/tmp/openuf-setup-$$}/rrb-unifi
+		mkdir -p "$RRB_WORK" || die "cannot create $RRB_WORK"
+		_tag=""
+		if fetch "$RRB_UNIFI_RELEASE_URL" "$RRB_WORK/release.json"; then
+			_tag=$(tr ',' '\n' < "$RRB_WORK/release.json" \
+				| sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+		fi
+		[ -n "$_tag" ] || { _tag=$RRB_UNIFI_FALLBACK_TAG; info "could not read the latest rrb-unifi release; using $_tag"; }
+		_url="https://github.com/$RRB_UNIFI_REPO/archive/refs/tags/$_tag.tar.gz"
+		info "fetching rrb-unifi $_tag"
+		if fetch "$_url" "$RRB_WORK/rrb-unifi.tar.gz" && tar -xzf "$RRB_WORK/rrb-unifi.tar.gz" -C "$RRB_WORK" 2>/dev/null; then
+			RRB_SRC=$(dirname "$(find "$RRB_WORK" -name rrb-unifi-setup -type f 2>/dev/null | head -1)")
+		fi
+		[ -n "$RRB_SRC" ] && [ -f "$RRB_SRC/rrb-unifi-setup" ] || {
+			warn "could not download rrb-unifi from $_url; the roaming plugin is skipped."
+			warn "Install it later by hand (USAGE.md § 6): download that archive, unpack it"
+			warn "on this device and run: sh rrb-unifi-setup install"
+			OPT_ROAMING=0; RRB_SRC=""
+		}
+	fi
+	if [ -n "$RRB_SRC" ]; then
+		for _f in rrb-unifi.uc rrb-unifi.init rrb-unifi.config openuf-plugin/rrb-unifi.lua; do
+			[ -f "$RRB_SRC/$_f" ] || { warn "rrb-unifi tree is missing $_f; the roaming plugin is skipped"; OPT_ROAMING=0; RRB_SRC=""; break; }
+		done
+	fi
+	[ -n "$RRB_SRC" ] && ok "rrb-unifi $(sed -n 's/^VERSION=\(.*\)/\1/p' "$RRB_SRC/rrb-unifi-setup" | head -1) ready in $RRB_SRC"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1352,12 +1425,6 @@ else
 		|| die "the package manager reported success but $PKG_DIR/inform.lua is missing"
 	ok "installed openuf and luci-app-openuf${P_THEME:+ and luci-theme-halo}"
 
-	# The 802.11r translator for genuine UniFi APs is in the package (the
-	# openuf-rrb service): enable it now; it idles until a config push
-	# carries an FT WLAN. Never fatal.
-	/etc/init.d/openuf-rrb enable 2>/dev/null && ok "openuf-rrb (802.11r translator) enabled" \
-		|| warn "openuf-rrb could not be enabled (openuf rrb status)"
-
 	head1 "Configuring openUF"
 
 	# The package's /etc/config/openuf carries a `main` section, which puts
@@ -1487,6 +1554,34 @@ done
 if [ -n "$RADIOS_ENABLED" ]; then
 	uci commit wireless
 	ok "enabled radios:$RADIOS_ENABLED (they shipped disabled)"
+fi
+
+# ── rrb-unifi: install the translator and its openUF plugin ─────────────────
+# Its own tool does the work (packages are already in, the translator files,
+# the veth pair, sysupgrade.conf, and -- where it finds openUF under
+# /opt/openuf -- the plugin). The veth needs a network reload, which the tool
+# guards with a 120 s watchdog that restores /etc/config/network unless
+# confirmed: confirmed here at once, the LAN bridge is untouched by a veth.
+# The plugin is put in place by this script as well, for a package release
+# that predates the /opt/openuf compatibility link.
+if [ "$OPT_ROAMING" = 1 ] && [ -n "$RRB_SRC" ]; then
+	head1 "Installing rrb-unifi (802.11r roaming with genuine UniFi APs)"
+	if ( cd "$RRB_SRC" && sh ./rrb-unifi-setup install --yes ); then
+		[ -x /usr/sbin/rrb-unifi-setup ] && /usr/sbin/rrb-unifi-setup confirm >/dev/null 2>&1
+		ok "rrb-unifi translator installed and enabled (service rrb-unifi)"
+	else
+		warn "rrb-unifi-setup install did not finish (its output is above). The roaming"
+		warn "plugin is incomplete; finish it after the reboot with: rrb-unifi-setup install"
+	fi
+	mkdir -p "$STATE_DIR/plugins"
+	if ! cmp -s "$RRB_SRC/openuf-plugin/rrb-unifi.lua" "$STATE_DIR/plugins/rrb-unifi.lua"; then
+		cp "$RRB_SRC/openuf-plugin/rrb-unifi.lua" "$STATE_DIR/plugins/rrb-unifi.lua"
+	fi
+	if ! sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' "$STATE_DIR/plugins.enabled" 2>/dev/null | grep -qxF rrb-unifi; then
+		[ -s "$STATE_DIR/plugins.enabled" ] && [ -n "$(tail -c1 "$STATE_DIR/plugins.enabled")" ] && echo >> "$STATE_DIR/plugins.enabled"
+		echo rrb-unifi >> "$STATE_DIR/plugins.enabled"
+	fi
+	ok "openUF plugin rrb-unifi in $STATE_DIR/plugins, enabled in $STATE_DIR/plugins.enabled"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1783,6 +1878,10 @@ else
 	say "  Configuration:          /etc/config/openuf, or LuCI: Services -> openUF -> Settings"
 fi
 say "  State (authkey etc):    $STATE_DIR/state.json"
+if [ "$OPT_ROAMING" = 1 ] && [ -n "$RRB_SRC" ]; then
+	say "  UniFi roaming:          rrb-unifi-setup verify, after the controller's first push"
+	say "                          (Fast Roaming must be on for the WLAN in UniFi)"
+fi
 say ""
 if [ "$HEADLESS" = 0 ]; then
 	say "  Web: after the reboot the device's address opens openUF's page (status"

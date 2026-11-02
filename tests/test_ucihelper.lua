@@ -107,7 +107,7 @@ local function with_ucihelper(fn)
 		ucihelper._uci, ucihelper._popen, ucihelper._read_file, ucihelper._run_cmd
 	local orig_bcf, orig_shaper, orig_ifnames_vap =
 		ucihelper._bcfilter, ucihelper._shaper, ucihelper.get_ifnames_for_vap
-	local orig_fti, orig_ifname_vap = ucihelper._ftinterop, ucihelper.get_ifname_for_vap
+	local orig_plugins, orig_ifname_vap = ucihelper._plugins, ucihelper.get_ifname_for_vap
 	ucihelper._uci = m.mock
 	ucihelper._popen = function() return "" end       -- no live ifname resolution in tests
 	-- Hardware capability probing is cached (it describes hardware); clear it
@@ -128,7 +128,7 @@ local function with_ucihelper(fn)
 		orig_uci, orig_popen, orig_read, orig_run
 	ucihelper._bcfilter, ucihelper._shaper, ucihelper.get_ifnames_for_vap =
 		orig_bcf, orig_shaper, orig_ifnames_vap
-	ucihelper._ftinterop, ucihelper.get_ifname_for_vap = orig_fti, orig_ifname_vap
+	ucihelper._plugins, ucihelper.get_ifname_for_vap = orig_plugins, orig_ifname_vap
 	ucihelper._phy_caps_cache = nil
 	ucihelper._phy_caps_unstable_until = nil
 	ucihelper._phy_caps_read_at = nil
@@ -275,6 +275,36 @@ Wiphy phy0
 	Supported extended features:
 		* [ BEACON_RATE_LEGACY ]: legacy beacon rate setting
 ]]
+
+-- Real cipher-suite output from the same two boards, read over ucode's
+-- nl80211 binding on 2026-10-26 (`iw` 6.17 prints no Supported Ciphers block
+-- on 25.12, which is why the probe is a separate command at all). The
+-- selectors are IEEE 802.11 Table 12-4's 0x000FAC<n>.
+--
+-- The Archer C5 is the interesting one and is not what anyone would guess:
+-- its OLDER ath9k 2.4GHz radio (phy1) reports GCMP, GCMP-256 and CCMP-256,
+-- while its newer ath10k 5GHz radio (phy0) reports none of them. So a
+-- controller asking for GCMP has to be honoured on one band of this board and
+-- refused on the other -- refusing is what keeps hostapd from failing to start
+-- and taking the BSS off the air entirely.
+local ARCHER_C5_CIPHERS = "phy0 1027073 1027077 1027074 1027076 1027078 "
+	.. "1027085 1027083 1027084\n"
+	.. "phy1 1027073 1027077 1027074 1027076 1027082 1027080 1027081 "
+	.. "1027078 1027085 1027083 1027084\n"
+
+-- The AX3000T's mt76 phys report the full set on both bands.
+local AX3000T_CIPHERS = "phy0 1027076 1027080 1027081 1027082\n"
+	.. "phy1 1027076 1027080 1027081 1027082\n"
+
+-- Route each of phy_caps's two probes to its own fixture. Anything else (the
+-- ubus/ifname reads with_ucihelper stubs out) stays empty.
+local function phy_probe(iw_out, cipher_out)
+	return function(cmd)
+		if tostring(cmd):match("^iw phy") then return iw_out end
+		if tostring(cmd):match("^ucode ") then return cipher_out or "" end
+		return ""
+	end
+end
 
 -- The same board if its 2.4GHz driver COULD set the beacon frame rate, to pin
 -- the capability gate in both directions. Only that phy's extended-feature
@@ -920,6 +950,134 @@ return {
 				assert_eq(#got, 1, "one nft rule reconciled")
 				assert_eq(got[1].ifname, "wlan0", "rule targets the vap's own netdev")
 				assert_eq(#got[1].macs, 2, "both allow-listed MACs carried through")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: Aggressive suppression carries the bypass types through to nft",
+		fn = function()
+			with_ucihelper(function(db)
+				local got
+				ucihelper._bcfilter = {reconcile = function(rules) got = rules end}
+				local orig = ucihelper.get_ifnames_for_vap
+				ucihelper.get_ifnames_for_vap = function(radio, ssid)
+					if radio == "radio0" and ssid == "corp" then return {"wlan0"} end
+					return {}
+				end
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2",
+					 x_passphrase = "hunter22", bcfilt_enabled = true,
+					 mcast_suppressor = true,
+					 bcfilt_macs = {"00:00:5e:00:53:01"},
+					 bcfilt_bypass = {DHCPV4 = true, ARP = true}},
+				}}, nil)
+				ucihelper.get_ifnames_for_vap = orig
+				ucihelper._bcfilter = nil
+
+				local s = db.wireless.openuf_radio0_corp
+				-- Stamped sorted, so the startup reapply rebuilds the identical
+				-- ruleset and `uci show` reads the same twice.
+				assert_eq(s.openuf_bcfilt_bypass, "ARP DHCPV4", "bypass types recorded sorted")
+				assert_eq(s.openuf_mcast_suppress, "1", "suppression recorded")
+				assert_eq(#got, 1, "one rule")
+				assert_eq(got[1].bypass.ARP, true, "ARP reaches bcfilter")
+				assert_eq(got[1].bypass.DHCPV4, true, "DHCPv4 reaches bcfilter")
+				assert_eq(got[1].limit, nil, "Aggressive blocks, it does not rate-limit")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: Conservative suppression reconciles a rate limit, not a block",
+		fn = function()
+			with_ucihelper(function(db)
+				local got
+				ucihelper._bcfilter = {reconcile = function(rules) got = rules end}
+				local orig = ucihelper.get_ifnames_for_vap
+				ucihelper.get_ifnames_for_vap = function(radio, ssid)
+					if radio == "radio0" and ssid == "corp" then return {"wlan0"} end
+					return {}
+				end
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2",
+					 x_passphrase = "hunter22", mcast_suppressor = true},
+				}}, nil)
+				ucihelper.get_ifnames_for_vap = orig
+				ucihelper._bcfilter = nil
+
+				assert_eq(db.wireless.openuf_radio0_corp.openuf_mcast_suppress, "1",
+					"recorded on")
+				assert_eq(#got, 1, "one rule")
+				assert_eq(got[1].limit, true, "and it is the rate ceiling")
+				assert_eq(got[1].macs, nil, "no allow-list is involved")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a shrunk allow-list or withdrawn bypass list leaves no stamp behind",
+		fn = function()
+			-- These options are the ONLY record reapply_runtime_rules has, so a
+			-- stale one would come back after a reboot as rules the admin had
+			-- just removed. What prevents it is that apply_config wlan_clear()s
+			-- every openuf_ section and rebuilds it, rather than any delete here
+			-- -- which is worth pinning, since it is what lets the stamps above
+			-- be written conditionally.
+			with_ucihelper(function(db)
+				local orig = ucihelper.get_ifnames_for_vap
+				ucihelper.get_ifnames_for_vap = function() return {"wlan0"} end
+				ucihelper._bcfilter = {reconcile = function() end}
+				local function push(vap) ucihelper.apply_config(
+					{radio_table = {}, vap_table = {vap}}, nil) end
+
+				push({ssid = "corp", radio = "radio0", security = "wpa2",
+					x_passphrase = "hunter22", bcfilt_enabled = true,
+					bcfilt_macs = {"00:00:5e:00:53:01"},
+					bcfilt_bypass = {ARP = true}})
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.openuf_bcfilt_macs, "00:00:5e:00:53:01", "stamped first")
+				assert_eq(s.openuf_bcfilt_bypass, "ARP", "stamped first")
+
+				push({ssid = "corp", radio = "radio0", security = "wpa2",
+					x_passphrase = "hunter22", bcfilt_enabled = true})
+				s = db.wireless.openuf_radio0_corp
+				assert_eq(s.openuf_bcfilt_macs, nil, "emptied allow-list is removed")
+				assert_eq(s.openuf_bcfilt_bypass, nil, "withdrawn bypass types are removed")
+				assert_eq(s.openuf_bcfilt, "1", "the control itself is untouched")
+
+				ucihelper.get_ifnames_for_vap = orig
+				ucihelper._bcfilter = nil
+			end)
+		end
+	},
+	{
+		name = "ucihelper: reapply_runtime_rules rebuilds both suppression modes from UCI",
+		fn = function()
+			with_ucihelper(function()
+				local c = ucihelper._uci.cursor()
+				for _, v in ipairs({{"corp", "1", "ARP DHCPV4 DHCPV6 NSNA", "1"},
+						{"iot", "0", nil, "1"}}) do
+					local sec = "openuf_radio0_" .. v[1]
+					c:set("wireless", sec, "wifi-iface")
+					c:set("wireless", sec, "device", "radio0")
+					c:set("wireless", sec, "ssid", v[1])
+					c:set("wireless", sec, "openuf_bcfilt", v[2])
+					if v[3] then c:set("wireless", sec, "openuf_bcfilt_bypass", v[3]) end
+					c:set("wireless", sec, "openuf_mcast_suppress", v[4])
+				end
+				local bc
+				ucihelper._bcfilter = {reconcile = function(r) bc = r end}
+				ucihelper.get_ifnames_for_vap = function(_, ssid)
+					if ssid == "corp" then return {"wlan0"} end
+					if ssid == "iot" then return {"wlan1"} end
+					return {}
+				end
+
+				ucihelper.reapply_runtime_rules()
+
+				local by = {}
+				for _, r in ipairs(bc) do by[r.ifname] = r end
+				assert_eq(by.wlan0.limit, nil, "the Aggressive VAP still blocks")
+				assert_eq(by.wlan0.bypass.NSNA, true, "with its bypass types restored")
+				assert_eq(by.wlan1.limit, true, "the Conservative VAP rate-limits")
 			end)
 		end
 	},
@@ -2143,6 +2301,330 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: apply_config writes the SAE tuning keys only on an SAE WLAN",
+		fn = function()
+			for _, sec in ipairs({"wpa3", "wpa2/wpa3", "wpa2"}) do
+				with_ucihelper(function(db)
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = sec,
+						 x_passphrase = "hunter22", sae_anti_clogging = "5",
+						 sae_sync = "7", sae_groups = "19 20"},
+					}}, nil)
+					local s = db.wireless.openuf_radio0_corp
+					if sec == "wpa2" then
+						assert_eq(s.sae_groups, nil, "wpa2: no groups")
+						assert_eq(s.hostapd_bss_options, nil, "wpa2: no raw options")
+					else
+						assert_eq(s.sae_groups, "19 20", sec .. ": groups")
+						assert_eq(table.concat(s.hostapd_bss_options, ","),
+							"sae_anti_clogging_threshold=5,sae_sync=7", sec .. ": raw options")
+					end
+				end)
+			end
+		end
+	},
+	{
+		name = "ucihelper: an EAP vap gets its RADIUS servers and no passphrase",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+					 -- x_passphrase is nil off the wire for an EAP WLAN; set
+					 -- here on purpose, to pin that it still cannot reach UCI.
+					 x_passphrase = "hunter22",
+					 radius = {
+						auth = {{ip = "192.0.2.10", port = "1812", secret = "a"}},
+						acct = {{ip = "192.0.2.11", port = "1813", secret = "b"}},
+						interim_interval = "600", nas_id = "ap-office",
+						dynamic_vlan = "2",
+					 }},
+				}}, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.encryption, "wpa2+ccmp", "encryption")
+				assert_nil(s.key, "an EAP BSS must carry no passphrase")
+				assert_eq(table.concat(s.auth_server_addr, " "), "192.0.2.10", "auth server")
+				assert_eq(s.auth_server_port, "1812", "auth port")
+				assert_eq(s.auth_server_shared_secret, "a", "auth secret")
+				assert_eq(table.concat(s.acct_server_addr, " "), "192.0.2.11", "acct server")
+				assert_eq(s.acct_server_port, "1813", "acct port")
+				assert_eq(s.acct_server_shared_secret, "b", "acct secret")
+				assert_eq(s.radius_acct_interim_interval, "600", "interim interval")
+				assert_eq(s.nas_identifier, "ap-office", "NAS id")
+				assert_eq(s.dynamic_vlan, "2", "dynamic VLAN")
+				-- Nothing invented: the wire carries none of these.
+				for _, k in ipairs({"ownip", "dynamic_own_ip_addr", "eap_reauth_period",
+						"radius_request_cui", "radius_das_client", "radius_das_port",
+						"eap_server", "ieee8021x", "wpa_key_mgmt"}) do
+					assert_nil(s[k], k .. " is not written")
+				end
+			end)
+		end
+	},
+	{
+		name = "ucihelper: each enterprise security value maps to its own encryption",
+		fn = function()
+			-- Verified against 25.12's live ucode generator: iface.uc takes
+			-- auth_type from the first `+` token of encryption, so these four
+			-- strings are what produce eap / eap2 / eap-eap2 / eap192.
+			for _, c in ipairs({
+				{"wpa2-enterprise", "wpa2+ccmp"},
+				{"wpa3-enterprise", "wpa3"},
+				{"wpa2/wpa3-enterprise", "wpa3-mixed"},
+				{"wpa3-enterprise-192", "wpa3-192"},
+			}) do
+				with_ucihelper(function(db)
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = c[1],
+						 x_passphrase = "hunter22", radius = {
+							auth = {{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {},
+						 }},
+					}}, nil)
+					local s = db.wireless.openuf_radio0_corp
+					assert_eq(s.encryption, c[2], c[1] .. " -> encryption")
+					assert_nil(s.key, c[1] .. ": no passphrase")
+				end)
+			end
+		end
+	},
+	{
+		name = "ucihelper: extra RADIUS servers join the list only when port and secret match",
+		fn = function()
+			-- ap.uc re-appends the SAME auth_server_port/shared_secret after
+			-- every auth_server_addr, so a server with its own port or secret
+			-- cannot be expressed. Dropping it with a log beats authenticating
+			-- against the wrong secret.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {
+							{ip = "192.0.2.10", port = "1812", secret = "a"},
+							{ip = "192.0.2.20", port = "1812", secret = "a"},
+							{ip = "192.0.2.30", port = "1812", secret = "different"},
+							{ip = "192.0.2.40", port = "1645", secret = "a"},
+						 }, acct = {}}},
+					}}, nil)
+				end)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(table.concat(s.auth_server_addr, " "), "192.0.2.10 192.0.2.20",
+					"only the servers sharing port and secret")
+				assert_eq(s.auth_server_shared_secret, "a", "the first server's secret")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an EAP vap adds no raw hostapd lines and leaves the SAE ones intact",
+		fn = function()
+			-- hostapd_bss_options has more than one producer, so it is appended
+			-- to, never assigned. Both WLANs in one push: the SAE lines must
+			-- survive and the EAP section must get none.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "home", radio = "radio0", security = "wpa3",
+						 x_passphrase = "hunter22", sae_anti_clogging = "5",
+						 sae_sync = "7"},
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {
+							{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {}}},
+					}}, nil)
+				end)
+				assert_eq(table.concat(db.wireless.openuf_radio0_home.hostapd_bss_options, ","),
+					"sae_anti_clogging_threshold=5,sae_sync=7", "the SAE lines survive")
+				assert_nil(db.wireless.openuf_radio0_corp.hostapd_bss_options,
+					"the EAP vap adds none")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: PPSK still wins dynamic_vlan over a RADIUS profile",
+		fn = function()
+			-- They cannot meet (EAP and PSK live on disjoint encryption
+			-- values), but "2" alongside PPSK would reject every local key
+			-- without a VLAN, so the harmless branch has to be the one that wins.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22",
+						 ppsk = {{key = "userkey1"}},
+						 radius = {auth = {
+							{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {}, dynamic_vlan = "2"}},
+					}}, nil)
+				end)
+				assert_eq(db.wireless.openuf_radio0_corp.dynamic_vlan, "1", "PPSK's value")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an EAP vap's RADIUS options are gone on the next push",
+		fn = function()
+			-- No teardown code exists for these on purpose: apply_config
+			-- wlan_clear()s every openuf_ section and rebuilds it, so a option
+			-- the controller stops sending cannot persist. This pins that.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {
+							{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {}, nas_id = "ap-office", dynamic_vlan = "1"}},
+					}}, nil)
+				end)
+				assert_eq(table.concat(
+					db.wireless.openuf_radio0_corp.auth_server_addr, " "),
+					"192.0.2.10", "written first")
+				-- The same WLAN comes back as plain WPA2 (the admin changed its
+				-- security), carrying no RADIUS keys at all.
+				ucihelper.apply_config({radio_table = {}, vap_table = {
+					{ssid = "corp", radio = "radio0", security = "wpa2",
+					 x_passphrase = "hunter22"},
+				}}, nil)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.encryption, "psk2", "back to PSK")
+				assert_eq(s.key, "hunter22", "with its passphrase")
+				for _, k in ipairs({"auth_server_addr", "auth_server_port",
+						"auth_server_shared_secret", "acct_server_addr",
+						"radius_acct_interim_interval", "nas_identifier",
+						"dynamic_vlan"}) do
+					assert_nil(s[k], k .. " is gone")
+				end
+			end)
+		end
+	},
+	{
+		name = "ucihelper: RADIUS MAC authentication on an open vap goes in as raw lines",
+		fn = function()
+			-- ap.uc calls iface_authentication_server() only from its EAP branch
+			-- (and from iface_ppsk), so on an open BSS the auth_server_* UCI
+			-- options are stored and never reach hostapd. Raw per-BSS lines are
+			-- the only route, and the port and secret repeat after each address
+			-- because that is how hostapd reads them.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "guest", radio = "radio0", security = "open",
+						 mac_auth = true, radius = {
+							auth = {{ip = "192.0.2.10", port = "1812", secret = "a"},
+							        {ip = "192.0.2.11", port = "1812", secret = "a"}},
+							acct = {{ip = "192.0.2.12", port = "1813", secret = "b"}},
+							interim_interval = "600", dynamic_vlan = "2"}},
+					}}, nil)
+				end)
+				local s = db.wireless.openuf_radio0_guest
+				assert_eq(s.encryption, "none", "still an open BSS")
+				assert_eq(table.concat(s.hostapd_bss_options, "\n"),
+					"auth_server_addr=192.0.2.10\nauth_server_port=1812\n"
+					.. "auth_server_shared_secret=a\n"
+					.. "auth_server_addr=192.0.2.11\nauth_server_port=1812\n"
+					.. "auth_server_shared_secret=a\nmacaddr_acl=2",
+					"the server triplets, then the RADIUS MAC ACL")
+				assert_nil(s.auth_server_addr,
+					"and nothing through UCI, where it would be dropped")
+				-- Accounting is different: iface_accounting_server() runs for every
+				-- auth type, so those options work as options.
+				assert_eq(table.concat(s.acct_server_addr, " "), "192.0.2.12",
+					"the accounting server still goes through UCI")
+				assert_eq(s.radius_acct_interim_interval, "600", "and its interval")
+				-- hostapd needs a vlan_file before it can put a station on a
+				-- RADIUS-assigned VLAN, and openUF writes no wifi-vlan sections, so
+				-- "2" (required) here would reject every client on the WLAN.
+				assert_nil(s.dynamic_vlan, "the RADIUS VLAN mode is not honoured")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: MAC authentication on an EAP vap keeps the UCI server options",
+		fn = function()
+			-- The same WLAN setting, on a WLAN whose encryption lands in ap.uc's
+			-- EAP branch: there the generator emits the server block itself, so
+			-- only macaddr_acl needs a raw line.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 mac_auth = true, radius = {
+							auth = {{ip = "192.0.2.10", port = "1812", secret = "a"}},
+							acct = {}, dynamic_vlan = "2"}},
+					}}, nil)
+				end)
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(table.concat(s.auth_server_addr, " "), "192.0.2.10",
+					"the servers go through UCI")
+				assert_eq(table.concat(s.hostapd_bss_options, ","), "macaddr_acl=2",
+					"and only the MAC ACL is raw")
+				assert_eq(s.dynamic_vlan, "2", "an EAP WLAN keeps its RADIUS VLAN mode")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: MAC authentication writes nothing unless the controller asks",
+		fn = function()
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {{ip = "192.0.2.10", port = "1812",
+						  secret = "a"}}, acct = {}}},
+					}}, nil)
+				end)
+				local s = db.wireless.openuf_radio0_corp
+				assert_nil(s.hostapd_bss_options, "no macaddr_acl line")
+				assert_nil(s.macaddr_acl, "and no option of that name either")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: Dynamic Authorization joins the client and the secret",
+		fn = function()
+			-- radius_das_client holds both, separated by a space: hostapd takes the
+			-- first token as the address and the rest of the line as the secret.
+			-- ap.uc would do that join itself, but only inside its EAP branch, so
+			-- radius_das_secret must never be written -- on a PSK or open BSS it
+			-- would be stored and dropped, leaving hostapd a client with no
+			-- secret. Written the same way for every auth type for that reason.
+			for _, sec in ipairs({"wpa2-enterprise", "wpa2", "open"}) do
+				with_ucihelper(function(db)
+					silently(function()
+						ucihelper.apply_config({radio_table = {}, vap_table = {
+							{ssid = "corp", radio = "radio0", security = sec,
+							 x_passphrase = sec == "wpa2" and "hunter22" or nil,
+							 mac_auth = sec ~= "wpa2-enterprise" or nil,
+							 radius = {
+								auth = {{ip = "192.0.2.10", port = "1812", secret = "a"}},
+								acct = {},
+								das = {client = "192.0.2.11", secret = "s3cret too",
+								       port = "3801"}}},
+						}}, nil)
+					end)
+					local s = db.wireless.openuf_radio0_corp
+					assert_eq(s.radius_das_client, "192.0.2.11 s3cret too",
+						sec .. ": address and secret on one line")
+					assert_eq(s.radius_das_port, "3801", sec .. ": the port")
+					assert_nil(s.radius_das_secret,
+						sec .. ": never the option the generator may ignore")
+				end)
+			end
+			-- No das block, no listener: hostapd's own radius_das_port default is
+			-- 0, so leaving both out is the off state.
+			with_ucihelper(function(db)
+				silently(function()
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2-enterprise",
+						 radius = {auth = {{ip = "192.0.2.10", port = "1812",
+						  secret = "a"}}, acct = {}}},
+					}}, nil)
+				end)
+				assert_nil(db.wireless.openuf_radio0_corp.radius_das_client,
+					"no client without a das block")
+				assert_nil(db.wireless.openuf_radio0_corp.radius_das_port, "no port either")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes wpa_group_rekey and leaves it alone when absent",
 		fn = function()
 			for _, c in ipairs({{"3600", "3600"}, {"0", "0"}, {nil, nil}}) do
@@ -2322,6 +2804,31 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: use_only_unifi_wlan commits nothing once the SSIDs are already off",
+		fn = function()
+			-- Every push calls this, and after the first one each branch is a
+			-- no-op -- but it used to commit regardless, so the steady state
+			-- rewrote /etc/config/wireless on the overlay for no change at all.
+			with_ucihelper(function(db, cmds, commits)
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "theirs", "wifi-iface")
+
+				ucihelper.set_wlan_exclusive(true)
+				assert_eq(db.wireless.theirs.disabled, "1", "disabled on the first pass")
+				assert_eq(commits.wireless, 1, "which is a change, so it commits")
+
+				ucihelper.set_wlan_exclusive(true)
+				ucihelper.set_wlan_exclusive(true)
+				assert_eq(commits.wireless, 1, "and then nothing more to write")
+
+				-- A real change still reaches the flash.
+				ucihelper.set_wlan_exclusive(false)
+				assert_eq(db.wireless.theirs.disabled, "0", "re-enabled")
+				assert_eq(commits.wireless, 2, "and committed")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: a missing cfg is treated as use_only_unifi_wlan=false",
 		fn = function()
 			with_ucihelper(function(db)
@@ -2439,6 +2946,187 @@ return {
 				assert_eq(caps.na.max_txpower, 30, "5GHz max dBm across usable channels")
 				assert_eq(tostring(caps.na.max_txpower), "30",
 					"whole dBm, not the 30.0 float `iw` prints")
+				-- The ACS candidate list (rf_config's chanlist). 169 is "no
+				-- IR": it still counts toward max_txpower above, but an AP may
+				-- not beacon there, so it is not a channel ACS may pick.
+				assert_eq(table.concat(caps.ng.channels, ","), "1,6,13",
+					"every usable 2.4GHz channel, in order")
+				assert_eq(table.concat(caps.na.channels, ","), "36,52,149",
+					"'no IR' is excluded from the candidate channels")
+			end)
+		end
+	},
+	{
+		-- radio.<n>.acsdfs / radio.<n>.blklst, the site's auto-channel DFS
+		-- switch and channel blacklist (wifi_caps2 0x10). hostapd has no
+		-- blacklist, so the blacklist is inverted against the band's own legal
+		-- channel list -- read from the same `iw phy` output phy_caps parses.
+		-- This tree writes UCI `channels` (24.10's list, 25.12's alias of
+		-- chanlist), through rf_config's opts table.
+		name = "ucihelper: rf_config turns the controller's channel blacklist into a channels list",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio0", "radio1"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "2g")
+				cursor:set("wireless", "radio1", "band", "5g")
+				-- 2.4GHz: the default "conservative" site preset blacklists
+				-- everything but 1/6/11, and this phy only has 1, 6 and 13.
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, nil,
+					{acs_blacklist = {2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14}})
+				local cl = db.wireless.radio0.channels
+				assert_eq(#cl, 2, "only the channels this radio has and the site allows")
+				assert_eq(cl[1], "1", "channel 1 kept")
+				assert_eq(cl[2], "6", "channel 6 kept")
+				-- A blacklist that names only channels the regdomain already
+				-- withholds narrows nothing, so it writes nothing rather than
+				-- churning the band's whole channel list into UCI every push.
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, nil,
+					{acs_blacklist = {14}})
+				assert_nil(db.wireless.radio0.channels,
+					"a blacklist this radio has nothing in common with writes no list")
+				-- 5GHz, same push: acsdfs=disabled is its own hostapd flag,
+				-- not part of the candidate list.
+				ucihelper.rf_config("radio1", nil, "auto", nil, nil, nil, nil, nil, nil, nil,
+					{acs_exclude_dfs = true})
+				assert_eq(db.wireless.radio1.acs_exclude_dfs, "1", "ACS must skip DFS")
+				assert_nil(db.wireless.radio1.channels, "no blacklist, no list")
+				ucihelper.rf_config("radio1", nil, "auto", nil, nil, nil, nil, nil, nil, nil,
+					{acs_exclude_dfs = false})
+				assert_eq(db.wireless.radio1.acs_exclude_dfs, "0", "DFS allowed again")
+				-- On a fixed channel neither option means anything to hostapd:
+				-- both are deleted, whatever the controller sent.
+				ucihelper.rf_config("radio1", nil, 36, nil, nil, nil, nil, nil, nil, nil,
+					{acs_exclude_dfs = true, acs_blacklist = {52}})
+				assert_nil(db.wireless.radio1.acs_exclude_dfs, "fixed channel: no ACS flag")
+				assert_nil(db.wireless.radio1.channels, "fixed channel: no candidate list")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the channels list is torn down when the blacklist leaves the wire",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio0"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "2g")
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, nil,
+					{acs_blacklist = {6}})
+				assert_eq(db.wireless.radio0.channels[1], "1", "narrowed")
+				-- The site clearing its blacklist is the key simply vanishing.
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, nil, {})
+				assert_nil(db.wireless.radio0.channels, "list removed with the blacklist")
+				-- The candidate list of an openUF-managed radio is openUF's:
+				-- a list set by hand on Auto is replaced like every other
+				-- radio option rf_config owns (the board-policy block always
+				-- did this), where upstream leaves an unstamped one alone.
+				cursor:set("wireless", "radio0", "channels", {"11"})
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, nil, {})
+				assert_nil(db.wireless.radio0.channels, "a hand-set list on a managed radio goes")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the board's channel policy wins over the controller's blacklist and DFS switch",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				seed_radios({"radio0"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "2g")
+				local policy = {ng = {channels = {1, 6}}}
+				-- Board list minus the blacklist.
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, policy,
+					{acs_blacklist = {6, 13}})
+				assert_eq(table.concat(db.wireless.radio0.channels, ","), "1", "the board's list, minus the site's blacklist")
+				-- A blacklist that empties the board's list is logged and the
+				-- board's list kept: hardware truth is not the site's to override.
+				local real, log = io.stderr, {}
+				io.stderr = {write = function(_, ...) for _, x in ipairs({...}) do log[#log + 1] = x end end}
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, policy,
+					{acs_blacklist = {1, 6}})
+				io.stderr = real
+				assert_eq(table.concat(db.wireless.radio0.channels, ","), "1,6", "the board's list stands")
+				assert_true(table.concat(log):find("keeping the board's list", 1, true) ~= nil, "and says so")
+				-- No blacklist: the board's list alone.
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, policy, {})
+				assert_eq(table.concat(db.wireless.radio0.channels, ","), "1,6", "board policy alone")
+				-- A board that cannot run CAC keeps ACS off DFS whatever the site allows.
+				cursor:set("wireless", "radio1", "wifi-device")
+				cursor:set("wireless", "radio1", "band", "5g")
+				ucihelper.rf_config("radio1", nil, "auto", nil, nil, nil, nil, nil, nil,
+					{na = {acs_exclude_dfs = true}}, {acs_exclude_dfs = false})
+				assert_eq(db.wireless.radio1.acs_exclude_dfs, "1", "the board's DFS veto is never overridden")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: two radios on one band contribute their channels to one candidate list",
+		fn = function()
+			with_ucihelper(function()
+				-- The mirror image of the cipher intersection below: a channel
+				-- the hosting radio cannot use is dropped by ACS itself, but a
+				-- channel missing from the list is one ACS can never pick.
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY .. [[
+Wiphy phy2
+	Band 1:
+		Capabilities: 0x11ef
+			HT20/HT40
+		Frequencies:
+			* 2462.0 MHz [11] (20.0 dBm)
+]]
+				end
+				ucihelper._phy_caps_cache = nil
+				assert_eq(table.concat(ucihelper.phy_caps().ng.channels, ","), "1,6,11,13",
+					"both phys' channels, deduped and sorted")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an unknown or fully blacklisted channel set leaves auto-channel alone",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "2g")
+				-- No `iw` output at all: narrowing on a guess could hand ACS a
+				-- list with nothing usable on it. Distinguished from the
+				-- fully-blacklisted case below by what it logs -- the outcome
+				-- is the same, the cause is not.
+				ucihelper._popen = function() return "" end
+				local real, log = io.stderr, {}
+				io.stderr = {write = function(_, ...)
+					for _, s in ipairs({...}) do log[#log + 1] = s end
+				end}
+				local ok, err = pcall(ucihelper.rf_config, "radio0", nil, "auto", nil,
+					nil, nil, nil, nil, nil, nil, {acs_blacklist = {2}})
+				io.stderr = real
+				assert_true(ok, "rf_config survives an unreadable channel list: " .. tostring(err))
+				assert_true(table.concat(log):find("cannot read", 1, true) ~= nil,
+					"logged as unreadable, not as a blacklist that covers everything")
+				assert_nil(db.wireless.radio0.channels, "unknown channel set: no list")
+				-- A radio on ACS whose section declares no band: band_for_device
+				-- falls back to the channel number, and "auto" is not one, so
+				-- it answers "na" for any radio. Narrowing on that guess would
+				-- hand a 2.4 GHz radio a list of 5 GHz channels -- an ACS with
+				-- nothing it can tune.
+				ucihelper._phy_caps_cache = nil
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				local cur = ucihelper._uci.cursor()
+				cur:delete("wireless", "radio0", "band")
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, nil,
+					{acs_blacklist = {2}})
+				assert_nil(db.wireless.radio0.channels, "a guessed band writes nothing")
+				cur:set("wireless", "radio0", "band", "2g")
+
+				-- Every channel the radio has, blacklisted.
+				ucihelper._phy_caps_cache = nil
+				ucihelper._popen = function() return ARCHER_C5_IW_PHY end
+				ucihelper.rf_config("radio0", nil, "auto", nil, nil, nil, nil, nil, nil, nil,
+					{acs_blacklist = {1, 6, 13}})
+				assert_nil(db.wireless.radio0.channels, "empty candidate list is never written")
 			end)
 		end
 	},
@@ -3124,7 +3812,13 @@ return {
 			-- back holding the previous domain's figures until restart.
 			with_ucihelper(function()
 				local calls = 0
-				ucihelper._popen = function() calls = calls + 1; return ARCHER_C5_IW_PHY end
+				-- Only the `iw phy` read is counted: phy_caps also runs the
+				-- nl80211 cipher probe (2026-11-02), and this test is about the
+				-- caching of the capability read, not how many commands it takes.
+				ucihelper._popen = function(cmd)
+					if tostring(cmd):match("^iw phy") then calls = calls + 1; return ARCHER_C5_IW_PHY end
+					return ""
+				end
 				local t = 1000
 				local orig_time = ucihelper._time
 				ucihelper._time = function() return t end
@@ -3749,6 +4443,260 @@ return {
 		end
 	},
 	{
+		name = "ucihelper: two radios on one band expose only the ciphers BOTH can program",
+		fn = function()
+			with_ucihelper(function()
+				-- Rare, but real: a 2.4GHz-only phy beside a dual-band one.
+				-- A WLAN on that band can land on either radio, so the band's
+				-- cipher set has to be the intersection -- a union would hand
+				-- one radio a cipher it cannot program, and hostapd treats
+				-- that as fatal.
+				local two = ARCHER_C5_IW_PHY .. [[
+Wiphy phy2
+	Band 1:
+		Capabilities: 0x11ef
+			HT20/HT40
+		Frequencies:
+			* 2412.0 MHz [1] (20.0 dBm)
+]]
+				ucihelper._popen = phy_probe(two, ARCHER_C5_CIPHERS
+					.. "phy2 1027076 1027082\n")
+				ucihelper._phy_caps_cache = nil
+				assert_true(ucihelper.cipher_ok("ng", "ccmp256"),
+					"both 2.4GHz phys report CCMP-256")
+				assert_false(ucihelper.cipher_ok("ng", "gcmp"),
+					"only one of them reports GCMP, so the band does not")
+
+				-- And a phy the probe said nothing about makes the band
+				-- unknown rather than empty: unknown never vetoes.
+				ucihelper._popen = phy_probe(two, ARCHER_C5_CIPHERS)
+				ucihelper._phy_caps_cache = nil
+				assert_true(ucihelper.cipher_ok("ng", "gcmp"),
+					"one unprobed phy on the band -> unknown, not a veto")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: the controller's pairwise cipher is honoured only where the radio can program it",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = phy_probe(ARCHER_C5_IW_PHY, ARCHER_C5_CIPHERS)
+				ucihelper._phy_caps_cache = nil
+				seed_radios({"radio0", "radio1"})
+				local cursor = ucihelper._uci.cursor()
+				cursor:set("wireless", "radio0", "band", "5g")
+				cursor:set("wireless", "radio1", "band", "2g")
+				local warn = {}
+				local real = io.stderr
+				io.stderr = {write = function(_, s) warn[#warn + 1] = s end}
+				local ok, err = pcall(ucihelper.apply_config, {
+					radio_table = {},
+					vap_table = {
+						{ssid = "net", radio = "radio0", security = "wpa2",
+						 x_passphrase = "secret", pairwise = "gcmp"},
+						{ssid = "net", radio = "radio1", security = "wpa2",
+						 x_passphrase = "secret", pairwise = "gcmp"},
+					},
+				}, nil)
+				io.stderr = real
+				if not ok then error(err, 0) end
+				assert_eq(db.wireless.openuf_radio1_net.encryption, "psk2+gcmp",
+					"the ath9k 2.4GHz radio reports GCMP, so the suffix is written")
+				assert_eq(db.wireless.openuf_radio1_net.key, "secret",
+					"and the passphrase still reaches the suffixed section")
+				assert_eq(db.wireless.openuf_radio0_net.encryption, "psk2",
+					"the ath10k 5GHz radio does not, so the default stands")
+				assert_eq(db.wireless.openuf_radio0_net.key, "secret",
+					"the refused WLAN is still a working WPA2 WLAN")
+				assert_true(table.concat(warn):find("does not support it", 1, true) ~= nil,
+					"and the refusal is logged, not silent")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: an unknown cipher probe never vetoes a pairwise cipher",
+		fn = function()
+			with_ucihelper(function(db)
+				-- No ucode, no nl80211 binding, unparseable output: openUF
+				-- must not refuse the controller's request because a probe
+				-- failed -- the same contract every other clamp here keeps.
+				ucihelper._popen = phy_probe(ARCHER_C5_IW_PHY, "")
+				ucihelper._phy_caps_cache = nil
+				seed_radios({"radio0"})
+				ucihelper._uci.cursor():set("wireless", "radio0", "band", "5g")
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {{ssid = "net", radio = "radio0",
+						security = "wpa2", pairwise = "ccmp256"}},
+				}, nil)
+				assert_eq(db.wireless.openuf_radio0_net.encryption, "psk2+ccmp256",
+					"unknown capabilities leave the controller's request alone")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a cipher suffix never lands on an EAP, OWE or 192-bit WLAN's base",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper._popen = phy_probe(AX3000T_IW_PHY, AX3000T_CIPHERS)
+				ucihelper._phy_caps_cache = nil
+				seed_radios({"radio0"})
+				ucihelper._uci.cursor():set("wireless", "radio0", "band", "5g")
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {
+						-- SECURITY_MAP already suffixes this one; a second
+						-- suffix after the first would be ignored outright.
+						{ssid = "eap", radio = "radio0",
+						 security = "wpa2-enterprise", pairwise = "gcmp",
+						 radius = {auth = {{ip = "192.0.2.10", port = 1812,
+							secret = "shh"}}}},
+						-- 192-bit pins GCMP-256 in the generator itself.
+						{ssid = "suiteb", radio = "radio0",
+						 security = "wpa3-enterprise-192", pairwise = "gcmp",
+						 radius = {auth = {{ip = "192.0.2.10", port = 1812,
+							secret = "shh"}}}},
+						{ssid = "open", radio = "radio0", security = "owe",
+						 pairwise = "gcmp"},
+					},
+				}, nil)
+				assert_eq(db.wireless.openuf_radio0_eap.encryption, "wpa2+gcmp",
+					"the EAP base keeps its single, replaced cipher suffix")
+				assert_nil(db.wireless.openuf_radio0_eap.key,
+					"and an EAP BSS still carries no passphrase")
+				assert_eq(db.wireless.openuf_radio0_suiteb.encryption, "wpa3-192",
+					"192-bit is left exactly as the generator wants it")
+				assert_eq(db.wireless.openuf_radio0_open.encryption, "owe",
+					"OWE has no pairwise cipher to override")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: apply_config writes okc and tdls_prohibit per WLAN",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0"})
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 okc = true, tdls_prohibit = true},
+						{ssid = "guest", radio = "radio0", security = "wpa2",
+						 okc = false, tdls_prohibit = false},
+						{ssid = "bare", radio = "radio0", security = "wpa2"},
+					},
+				}, nil)
+				assert_eq(db.wireless.openuf_radio0_corp.okc, "1", "auth_cache on")
+				assert_eq(db.wireless.openuf_radio0_corp.tdls_prohibit, "1", "TDLS forbidden")
+				assert_eq(db.wireless.openuf_radio0_guest.okc, "0",
+					"off is written explicitly, not left to OpenWrt's default")
+				assert_eq(db.wireless.openuf_radio0_guest.tdls_prohibit, "0", "TDLS allowed")
+				assert_nil(db.wireless.openuf_radio0_bare.okc,
+					"a WLAN the controller sent no auth_cache for is left alone")
+				assert_nil(db.wireless.openuf_radio0_bare.tdls_prohibit, "same for TDLS")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: country_beacon collapses per-WLAN to one ieee80211d per radio",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0", "radio1", "radio2", "radio3"})
+				-- Bands matter here: ieee80211d=0 is refused on 5 GHz (see the
+				-- 802.11h test below), so the radios that are meant to end up
+				-- at 0 have to be 2.4 GHz ones.
+				local c = ucihelper._uci.cursor()
+				for _, r in ipairs({"radio0", "radio1", "radio2", "radio3"}) do
+					c:set("wireless", r, "band", "2g")
+				end
+				ucihelper.apply_config({
+					radio_table = {{name = "radio0"}, {name = "radio1"},
+						{name = "radio2"}, {name = "radio3"}},
+					vap_table = {
+						-- radio0: one WLAN wants the Country IE, one does not.
+						-- The permissive fold wins -- the element is an
+						-- advertisement, not a restriction.
+						{ssid = "a", radio = "radio0", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "b", radio = "radio0", security = "wpa2",
+						 country_beacon = true},
+						-- radio1 repeats radio0 in the opposite ORDER, which
+						-- is what distinguishes the permissive fold from a
+						-- plain last-one-wins assignment.
+						{ssid = "c", radio = "radio1", security = "wpa2",
+						 country_beacon = true},
+						{ssid = "c2", radio = "radio1", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "e", radio = "radio3", security = "wpa2",
+						 country_beacon = false},
+						-- radio2's WLAN carries the key not at all.
+						{ssid = "d", radio = "radio2", security = "wpa2"},
+					},
+				}, nil)
+				assert_eq(db.wireless.radio0.ieee80211d, "1",
+					"any WLAN on the radio asking for it is enough")
+				assert_eq(db.wireless.radio1.ieee80211d, "1",
+					"and the order the WLANs arrive in makes no difference")
+				assert_eq(db.wireless.radio3.ieee80211d, "0",
+					"nobody asked: written off, so the applied state is visible")
+				assert_nil(db.wireless.radio2.ieee80211d,
+					"a radio no WLAN carried the key for is left alone")
+			end)
+		end
+	},
+	{
+		-- A production outage, both boards, 2026-10-27: hostapd refuses the
+		-- whole interface with "Cannot enable IEEE 802.11h without IEEE
+		-- 802.11d enabled", and hostapd.uc emits ieee80211h=1 for every
+		-- hw_mode 'a' radio with a country. The failure is
+		-- `hostapd.add_iface failed` -- the 5 GHz phy stays down -- and it
+		-- lands at the next `wifi reload`, not at the push that wrote the
+		-- option, which is why the provision looked clean.
+		name = "ucihelper: the Country IE is never turned off on a 5 GHz radio",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0", "radio1", "radio2", "radio3", "radio4"})
+				local c = ucihelper._uci.cursor()
+				c:set("wireless", "radio0", "band", "5g")
+				c:set("wireless", "radio1", "band", "2g")
+				c:set("wireless", "radio2", "hwmode", "11a")
+				c:set("wireless", "radio3", "channel", "36")
+				-- radio4: no band, no hwmode, channel auto -- the band is not
+				-- knowable, so it must NOT be the one that takes a radio down.
+				c:set("wireless", "radio4", "channel", "auto")
+				-- An earlier openUF left this radio at the value that breaks
+				-- hostapd; the next push has to repair it, not leave it.
+				c:set("wireless", "radio0", "ieee80211d", "0")
+				ucihelper.apply_config({
+					radio_table = {{name = "radio0"}, {name = "radio1"},
+						{name = "radio2"}, {name = "radio3"}, {name = "radio4"}},
+					vap_table = {
+						{ssid = "a", radio = "radio0", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "b", radio = "radio1", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "c", radio = "radio2", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "d", radio = "radio3", security = "wpa2",
+						 country_beacon = false},
+						{ssid = "e", radio = "radio4", security = "wpa2",
+						 country_beacon = false},
+					},
+				}, nil)
+				assert_eq(db.wireless.radio0.ieee80211d, "1",
+					"band=5g: the controller's 'off' cannot be honoured, and the"
+					.. " stale 0 is repaired")
+				assert_eq(db.wireless.radio1.ieee80211d, "0",
+					"band=2g: honoured, no 802.11h there")
+				assert_eq(db.wireless.radio2.ieee80211d, "1", "hwmode=11a")
+				assert_eq(db.wireless.radio3.ieee80211d, "1", "channel 36")
+				assert_eq(db.wireless.radio4.ieee80211d, "1",
+					"band unknown: treated as 5 GHz, because the cost of"
+					.. " guessing wrong is a radio with no SSID on the air")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config writes an OWE WLAN as encryption=owe, transition as owe_transition=1",
 		fn = function()
 			with_ucihelper(function(db)
@@ -3854,6 +4802,25 @@ return {
 					if sec[".type"] == "wifi-vlan" then nvlan = nvlan + 1 end
 				end
 				assert_eq(nvlan, 2, "VLAN 20 once, though two keys use it")
+			end)
+		end
+	},
+	{
+		name = "ucihelper: a station-bound private key becomes a wifi-station for that MAC only",
+		fn = function()
+			with_ucihelper(function(db)
+				ucihelper.apply_config({
+					radio_table = {},
+					vap_table = {{ssid = "keys", radio = "radio0", security = "wpa3",
+						x_passphrase = "basepass123", ppsk = {
+							{key = "anystation1"},
+							{key = "stationkey1", mac = "aa:bb:cc:dd:ee:01"},
+						}}},
+				}, {net = {lan_cpueth = "eth1"}})
+				local w = db.wireless
+				assert_eq(w.openuf_radio0_keys_psk1.mac[1], "00:00:00:00:00:00", "any station")
+				assert_eq(w.openuf_radio0_keys_psk2.mac[1], "aa:bb:cc:dd:ee:01", "that station")
+				assert_eq(w.openuf_radio0_keys_psk2.key, "stationkey1", "its key")
 			end)
 		end
 	},
@@ -4184,5 +5151,439 @@ return {
 				assert_eq(db.network.br_lan.macaddr, nil, "and nothing was pinned")
 			end)
 		end
+	},
+	{
+		name = "ucihelper: MAC-based VLANs become an accept file, its VLAN sections and a raw accept_mac_file line",
+		fn = function()
+			local files, removed = {}, {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function(path) removed[path] = true end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123", mac_vlans = {
+								{mac = "00:00:5e:00:53:01", vid = 20},
+								{mac = "00:00:5e:00:53:02", vid = 30},
+								{mac = "00:00:5e:00:53:03", vid = 20},
+							}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					local iface = "openuf_radio0_home"
+					local w = db.wireless
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_eq(table.concat(w[iface].hostapd_bss_options, ","),
+						"accept_mac_file=" .. path,
+						"hostapd is pointed at openUF's own file, not OpenWrt's maclist")
+					assert_nil(w[iface].macfile, "macfile is only for the allow-filter case")
+					assert_nil(w[iface].macaddr_acl,
+						"and nothing restricts access: unlisted clients still join")
+					assert_eq(w[iface].dynamic_vlan, "1",
+						"so ap.uc emits vlan_no_bridge and netifd keeps the bridge")
+					-- The LEADING blank line is load-bearing: without it the
+					-- allow-list case joins openUF's first line onto the last
+					-- address ap.uc wrote, and hostapd reads that silently as
+					-- the WRONG station. See mac_vlan_plan.
+					assert_eq(files[path],
+						"\n# openUF: MAC-based VLANs. Rebuilt on every config push."
+						.. "\n00:00:5e:00:53:01 20\n00:00:5e:00:53:02 30"
+						.. "\n00:00:5e:00:53:03 20\n",
+						"<mac> <vid> per line, in the order the controller sent them")
+					assert_eq(w[iface .. "_vlan20"].network[1], "openuf_vlan20",
+						"VLAN 20 is in hostapd's vlan_file, or the station is refused")
+					assert_eq(w[iface .. "_vlan30"].network[1], "openuf_vlan30", "and 30")
+					local nvlan = 0
+					for _, sec in pairs(w) do
+						if sec[".type"] == "wifi-vlan" then nvlan = nvlan + 1 end
+					end
+					assert_eq(nvlan, 2, "VLAN 20 once, though two clients use it")
+					assert_not_nil(db.network.openuf_vlan20, "VLAN 20 got its L2")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: a push rewrites the wireless config once, whatever the WLAN count",
+		fn = function()
+			-- /etc/config/wireless lives on the overlay, and the boards openUF
+			-- targets have around 5 MB of it free. wlan_add, ppsk_add and
+			-- mac_vlans_add each used to open their own cursor and commit it, so
+			-- this push (three WLANs, one with private pre-shared keys, one with
+			-- MAC-based VLANs) rewrote the file five times for one set of final
+			-- contents. The commit counter is the only way to see it.
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db, cmds, commits)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {
+							{ssid = "home", radio = "radio0", security = "wpa2",
+							 x_passphrase = "basepass123"},
+							{ssid = "keys", radio = "radio0", security = "wpa2",
+							 x_passphrase = "basepass123",
+							 ppsk = {{key = "clientpass1", vid = 20},
+							         {key = "clientpass2", vid = 30}}},
+							{ssid = "mapped", radio = "radio0", security = "wpa2",
+							 x_passphrase = "basepass123",
+							 mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 40}}},
+						},
+					}, {net = {lan_cpueth = "eth1"}})
+					-- One for wlan_clear's teardown, one for everything the VAP
+					-- loop staged. Not one per WLAN, and not three for the WLAN
+					-- that carries keys and overrides.
+					assert_eq(commits.wireless, 2,
+						"wlan_clear, then the whole VAP loop in a single commit")
+					-- And the config itself is unchanged by the deferral.
+					assert_not_nil(db.wireless.openuf_radio0_home, "the plain WLAN")
+					assert_eq(db.wireless.openuf_radio0_keys_psk1.key, "clientpass1",
+						"the private pre-shared keys still landed")
+					assert_not_nil(db.wireless.openuf_radio0_mapped_vlan40,
+						"and the MAC-based VLAN's section")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: one VLAN section per VLAN, not per overridden client",
+		fn = function()
+			-- vlan_section derives the section name from the VID alone, so the
+			-- written config was always right -- but the loop ran it once per
+			-- ENTRY, and the controller's list is per client. 30 clients on 3
+			-- VLANs issued 150 cursor:set calls for 15 options' worth of config.
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					local cursor = ucihelper._uci.cursor()
+					local real_set, sets = cursor.set, 0
+					cursor.set = function(self, config, section, ...)
+						if config == "wireless"
+								and tostring(section):find("_vlan", 1, true) then
+							sets = sets + 1
+						end
+						return real_set(self, config, section, ...)
+					end
+					local entries = {}
+					for i = 1, 30 do
+						entries[i] = {mac = ("00:00:5e:00:53:%02x"):format(i),
+							vid = 20 + (i % 3) * 10}
+					end
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0",
+							security = "wpa2", x_passphrase = "basepass123",
+							mac_vlans = entries}},
+					}, {net = {lan_cpueth = "eth1"}})
+					cursor.set = real_set
+					-- The type plus iface/name/vid/network, per distinct VLAN.
+					assert_eq(sets, 15, "five sets per distinct VLAN, not per client")
+					local nvlan = 0
+					for _, sec in pairs(db.wireless) do
+						if sec[".type"] == "wifi-vlan" then nvlan = nvlan + 1 end
+					end
+					assert_eq(nvlan, 3, "and still a section for each of the three")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: the accept file is not rewritten when its bytes are already there",
+		fn = function()
+			-- Another flash write on every push for a list that changes only when
+			-- the admin edits it.
+			local body = "\n# openUF: MAC-based VLANs. Rebuilt on every config push."
+				.. "\n00:00:5e:00:53:01 20\n"
+			local writes = 0
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() writes = writes + 1; return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					local orig_read = ucihelper._read_file
+					ucihelper._read_file = function(path)
+						if path == "/etc/openuf/macvlan-openuf_radio0_home" then
+							return body
+						end
+						return orig_read(path)
+					end
+					local vaps = {{ssid = "home", radio = "radio0", security = "wpa2",
+						x_passphrase = "basepass123",
+						mac_filter_policy = "allow",
+						mac_filter_list = {"00:00:5e:00:53:01", "00:00:5e:00:53:09"},
+						mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}}
+					ucihelper.apply_config({radio_table = {}, vap_table = vaps},
+						{net = {lan_cpueth = "eth1"}})
+					ucihelper._read_file = orig_read
+					local w = db.wireless
+					local iface = "openuf_radio0_home"
+					assert_eq(writes, 0, "identical bytes: no write")
+					-- Only the write is skipped. Everything the push hands ap.uc
+					-- still has to happen, or the mapped station gets two lines.
+					assert_eq(w[iface].macfile, "/etc/openuf/macvlan-" .. iface,
+						"hostapd is still pointed at the file")
+					assert_eq(table.concat(w[iface].maclist, ","), "00:00:5e:00:53:09",
+						"and the mapped address still left the maclist")
+					assert_not_nil(w[iface .. "_vlan20"], "its VLAN section too")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: with an allow filter the entries go in via macfile and leave the maclist",
+		fn = function()
+			local files = {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					local vaps = {{ssid = "home", radio = "radio0", security = "wpa2",
+						x_passphrase = "basepass123",
+						mac_filter_policy = "allow",
+						mac_filter_list = {"00:00:5E:00:53:01", "00:00:5e:00:53:09"},
+						mac_vlans = {
+							{mac = "00:00:5e:00:53:01", vid = 20},
+							-- Not in the allow list: it could not join anyway,
+							-- and an accept entry would let it.
+							{mac = "00:00:5e:00:53:02", vid = 30},
+						}}}
+					ucihelper.apply_config({radio_table = {}, vap_table = vaps},
+						{net = {lan_cpueth = "eth1"}})
+					local iface = "openuf_radio0_home"
+					local w = db.wireless
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_eq(w[iface].macfile, path,
+						"ap.uc appends it to the accept file it writes itself")
+					assert_nil(w[iface].hostapd_bss_options,
+						"no second accept_mac_file: one address, one line")
+					assert_eq(table.concat(w[iface].maclist, ","), "00:00:5e:00:53:09",
+						"the mapped address left the maclist, carrying its VLAN instead")
+					assert_eq(files[path],
+						"\n# openUF: MAC-based VLANs. Rebuilt on every config push."
+						.. "\n00:00:5e:00:53:01 20\n",
+						"and only the allowed client is mapped")
+					assert_nil(w[iface .. "_vlan30"],
+						"the refused entry got no VLAN section either")
+					assert_eq(#vaps[1].mac_filter_list, 2,
+						"and the vap's own filter list was not emptied under it")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: a denied MAC is never given a VLAN, since the accept list is checked first",
+		fn = function()
+			local files = {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123",
+							mac_filter_policy = "deny",
+							mac_filter_list = {"00:00:5e:00:53:02"},
+							mac_vlans = {
+								{mac = "00:00:5e:00:53:01", vid = 20},
+								{mac = "00:00:5e:00:53:02", vid = 30},
+							}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					local iface = "openuf_radio0_home"
+					local w = db.wireless
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_eq(table.concat(w[iface].hostapd_bss_options, ","),
+						"accept_mac_file=" .. path, "the deny file is a different one")
+					assert_eq(table.concat(w[iface].maclist, ","), "00:00:5e:00:53:02",
+						"the deny list is untouched")
+					assert_eq(files[path],
+						"\n# openUF: MAC-based VLANs. Rebuilt on every config push."
+						.. "\n00:00:5e:00:53:01 20\n",
+						"the denied client would have been let in by an accept entry")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: RADIUS MAC authentication refuses MAC-based VLANs outright",
+		fn = function()
+			local files, removed = {}, {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function(path) removed[path] = true end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123", mac_auth = true,
+							radius = {auth = {{ip = "192.0.2.10", port = "1812",
+								secret = "sec"}}, acct = {}},
+							mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					local iface = "openuf_radio0_home"
+					local w = db.wireless
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_nil(files[path], "no accept file is written")
+					assert_true(removed[path], "and a stale one is taken off the flash")
+					local raw = table.concat(w[iface].hostapd_bss_options, ",")
+					assert_true(raw:find("macaddr_acl=2", 1, true) ~= nil,
+						"the RADIUS ACL is in place")
+					assert_nil(raw:find("accept_mac_file", 1, true),
+						"and no accept entry, which would skip the lookup")
+					assert_nil(w[iface .. "_vlan20"], "and no VLAN section")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: an override whose VLAN has no network is left out, and the last one withdraws the file",
+		fn = function()
+			local files, removed = {}, {}
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function(path, c) files[path] = c; return true end
+			ucihelper._remove_file = function(path) removed[path] = true end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					-- No lan_cpueth, so openUF can build no VLAN at all. A client
+					-- left on the VAP's own network would be across the very
+					-- segmentation the override exists to cross.
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123",
+							mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}},
+					}, nil)
+					local iface = "openuf_radio0_home"
+					local path = "/etc/openuf/macvlan-" .. iface
+					assert_nil(files[path], "nothing is written")
+					assert_true(removed[path], "the file goes")
+					assert_nil(db.wireless[iface].hostapd_bss_options,
+						"and hostapd is pointed at no file, which would sink the BSS")
+					assert_nil(db.wireless[iface].dynamic_vlan, "no VLAN options either")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: an open WLAN gets vlan_no_bridge raw, where ap.uc would never emit it",
+		fn = function()
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {
+							{ssid = "guest", radio = "radio0", security = "open",
+								mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}},
+							{ssid = "home", radio = "radio0", security = "wpa2",
+								x_passphrase = "basepass123",
+								mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}},
+						},
+					}, {net = {lan_cpueth = "eth1"}})
+					local g = db.wireless.openuf_radio0_guest
+					-- ap.uc sets vlan_possible only for psk/sae/eap, and
+					-- vlan_no_bridge sits behind it -- so without this line
+					-- hostapd bridges the VLAN netdev into its own brvlan20.
+					assert_true(table.concat(g.hostapd_bss_options, ","):find(
+						"vlan_no_bridge=1", 1, true) ~= nil,
+						"the open BSS says so itself")
+					assert_nil(g.dynamic_vlan, "and asks for no dynamic VLANs")
+					local h = db.wireless.openuf_radio0_home
+					assert_eq(h.dynamic_vlan, "1", "the WPA2 BSS lets ap.uc do it")
+					assert_nil(table.concat(h.hostapd_bss_options, ","):find(
+						"vlan_no_bridge", 1, true),
+						"and does not repeat the option")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: a MAC-based VLAN and a private pre-shared key share one VLAN section",
+		fn = function()
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return true end
+			ucihelper._remove_file = function() end
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0", security = "wpa2",
+							x_passphrase = "basepass123",
+							ppsk = {{key = "keyvlan20a", vid = 20}},
+							mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					local w = db.wireless
+					local nvlan = 0
+					for _, sec in pairs(w) do
+						if sec[".type"] == "wifi-vlan" then nvlan = nvlan + 1 end
+					end
+					assert_eq(nvlan, 1,
+						"one section, or vlan_file would carry VLAN 20 twice")
+					assert_eq(w.openuf_radio0_home_vlan20.network[1], "openuf_vlan20",
+						"and it still names the VLAN's network")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "ucihelper: a failed accept-file write leaves the WLAN alone rather than sinking it",
+		fn = function()
+			local ow, orm = ucihelper._write_file, ucihelper._remove_file
+			ucihelper._write_file = function() return false end
+			ucihelper._remove_file = function() end
+			local logged
+			local ok, err = pcall(function()
+				with_ucihelper(function(db)
+					local buf = {}
+					local real = io.stderr
+					io.stderr = {write = function(_, t) buf[#buf + 1] = t end}
+					ucihelper.apply_config({
+						radio_table = {},
+						vap_table = {{ssid = "home", radio = "radio0",
+							security = "wpa2", x_passphrase = "basepass123",
+							mac_vlans = {{mac = "00:00:5e:00:53:01", vid = 20}}}},
+					}, {net = {lan_cpueth = "eth1"}})
+					io.stderr = real
+					logged = table.concat(buf)
+					local w = db.wireless.openuf_radio0_home
+					assert_not_nil(w, "the WLAN is still provisioned")
+					-- accept_mac_file naming a file hostapd cannot read is not a
+					-- degraded feature: config_file.c fails the whole BSS.
+					assert_nil(w.hostapd_bss_options, "but hostapd is pointed nowhere")
+					assert_nil(db.wireless.openuf_radio0_home_vlan20, "and no VLAN section")
+					assert_contains(logged, "MAC-based VLANs left unapplied",
+						"and the reason is logged")
+				end)
+			end)
+			ucihelper._write_file, ucihelper._remove_file = ow, orm
+			if not ok then error(err, 0) end		end
 	},
 }

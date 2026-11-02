@@ -17,9 +17,7 @@
 #      the modelmap, and with THAT the identity MAC the controller adopted the
 #      device under (CLAUDE.md, "lan_cpueth decides IDENTITY"). state.json is
 #      never touched. That is what makes this safe on an adopted AP: nothing
-#      to re-adopt, nothing to re-provision. The 802.11r translator for
-#      genuine UniFi APs (openuf/rrb/, the openuf-rrb service) is part of the
-#      tree and comes along
+#      to re-adopt, nothing to re-provision
 #   4. restart the service and WAIT for the new daemon to complete an inform
 #      cycle (it writes /tmp/openuf-status after each one)
 #   5. if it does not within the deadline, put the backup back and restart
@@ -99,11 +97,8 @@ show_installed() {
 	fi
 	_n=$(ps w 2>/dev/null | grep -E 'lua (inform|announce)\.lua' | grep -vc grep)
 	say "  daemons     $_n running"
-	_rv=$(sed -n "s/^const VERSION = '\([^']*\)'.*/\1/p" "$INSTALL_DIR/rrb/rrb-unifi.uc" 2>/dev/null | head -1)
-	if [ -f "$INSTALL_DIR/rrb/rrb-unifi.uc" ]; then
-		say "  translator  ${_rv:-?}$( /etc/init.d/openuf-rrb running >/dev/null 2>&1 && echo ', running' || echo ', not running') (802.11r with genuine UniFi APs)"
-	else
-		say "  translator  not in this install (older than 2026-10-25)"
+	if [ -f /etc/openuf/plugins/rrb-unifi.lua ]; then
+		say "  rrb-unifi   plugin installed$( /etc/init.d/rrb-unifi running >/dev/null 2>&1 && echo ', translator running' || echo ', translator not running') (802.11r with genuine UniFi APs)"
 	fi
 	return 0
 }

@@ -60,7 +60,7 @@ local wlansched = _require_sibling("wlansched")
 local stun      = _require_sibling("stun")
 local shaper    = _require_sibling("shaper")
 local rrbguard  = _require_sibling("rrbguard")
-local ftinterop = _require_sibling("ftinterop")
+local plugins   = _require_sibling("plugins")
 
 local M = {}
 local util = package.loaded["openuf.util"]
@@ -100,7 +100,7 @@ M._assoctrack = assoctrack
 M._satisfaction = satisfaction
 M._stun      = stun
 M._rrbguard  = rrbguard
-M._ftinterop = ftinterop
+M._plugins   = plugins
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -122,6 +122,11 @@ M._rrm_rr           = 0
 -- push -- exactly when the neighbourhood is worth re-reading.
 M.RRM_COLLECTOR_CHECK_INTERVAL = 60
 M._rrm_collector_next = 0
+-- ... and once that check reports no collector, there is nothing left for it
+-- to find: only collector_ensure starts one, and it clears this. A site that
+-- wants no subscriber (DFS only, or nothing on at all) therefore pgreps once,
+-- not once a minute forever. _reap_collector owns both.
+M._collector_reaped = false
 
 -- Connection tracking for the controller's WiFi Connectivity view (see
 -- assoctrack.lua). _vap_by_ifname maps a hostapd BSS netdev to the vap_table
@@ -149,6 +154,10 @@ M._roam_fast         = false
 M._roam_keep         = false
 M._roam_st           = nil
 M._pre_blob          = nil
+-- Whether any radio was on a DFS channel on the last build_json, which is
+-- what decides the control-socket monitors are worth running even with
+-- 802.11k enrichment off: they are the only producer of the radar event.
+M._dfs_radio         = false
 
 -- Stations asked for a beacon report that have not answered, keyed by MAC:
 -- {n = unanswered requests so far, at = when the last one went out}. A
@@ -303,6 +312,33 @@ function M._account_locked(user)
 	return nil
 end
 
+-- inform_ip: the controller's IPv4 address, from inform_url's host. Without
+-- it the controller reads that host as an IP literal and answers HTTP 400
+-- ("invalid inform_ip <host>") when it is a name, which is the shipped
+-- default. A name is looked up at most once per INFORM_IP_TTL seconds (a
+-- failed lookup is remembered as long); an IP literal costs nothing.
+M.INFORM_IP_TTL = 300
+M._inform_ip_cache = nil
+
+function M._dns_toip(host)
+	return require("socket").dns.toip(host)
+end
+
+function M._inform_ip(url)
+	local host = type(url) == "string" and url:match("^%a+://([^:/]+)") or nil
+	if not host then return nil end
+	if host:find("^%d+%.%d+%.%d+%.%d+$") then return host end
+	local now = M._time()
+	local c = M._inform_ip_cache
+	if c and c.host == host and now >= c.at and now - c.at < M.INFORM_IP_TTL then
+		return c.ip
+	end
+	local ok, ip = pcall(M._dns_toip, host)
+	ip = ok and type(ip) == "string" and ip:find("^%d+%.%d+%.%d+%.%d+$") and ip or nil
+	M._inform_ip_cache = {host = host, ip = ip, at = now}
+	return ip
+end
+
 -- Locks or unlocks the temporary SSH bootstrap account (see conf.lua's
 -- bootstrap_adopt_user and USAGE.md's SSH prerequisite section) to match
 -- the device's current adopted state. No-op if user is nil/false (feature
@@ -394,6 +430,19 @@ end
 -- key and a forged setparam is within reach of anyone on the path; this is
 -- what keeps that from becoming a shell.
 local is_mac = util.is_mac
+
+-- The only tokens wireless.<n>.bcfilt.bypass_types can carry (the controller
+-- writes the whole string as one literal, so this is the closed vocabulary,
+-- not a sample). Each maps to one nft exemption in bcfilter.lua; the value is
+-- documentation only, the key is what matters. NSNA is IPv6 Neighbour
+-- Solicitation/Advertisement -- ARP's IPv6 equivalent, which is why the
+-- controller pairs the two.
+local BCFILT_BYPASS_TYPES = {
+	ARP    = "ether type arp",
+	NSNA   = "ICMPv6 neighbour solicitation/advertisement",
+	DHCPV4 = "UDP 67/68 over IPv4",
+	DHCPV6 = "UDP 546/547 over IPv6",
+}
 
 -- ─── Packet builder ──────────────────────────────────────────────────────────
 
@@ -489,18 +538,23 @@ function M.parse_packet(raw, st)
 		error("inform: truncated payload")
 	end
 
-	-- Decrypt
-	if bit.band(flags, FLAG_ENCRYPTED) ~= 0 then
-		local key = st.authkey
-		if bit.band(flags, FLAG_GCM) ~= 0 then
-			-- AAD = full 40-byte packet header (per amd989/unifi-gateway decode_inform)
-			local aad = raw:sub(1, 40)
-			local ct  = payload:sub(1, #payload - 16)
-			local tag = payload:sub(#payload - 15)
-			payload = crypto.aes_gcm_decrypt(key, iv, ct, tag, aad)
-		else
-			payload = crypto.aes_cbc_decrypt(key, iv, payload)
-		end
+	-- Decrypt. Every inform openUF sends is encrypted and the controller
+	-- encrypts its answer, as the AP firmware insists on ("only support
+	-- encrypted data"). An unflagged packet is not from the controller, and
+	-- taking it would let anyone on the plain-HTTP path push a setparam (a
+	-- new inform_url, a WiFi config) without knowing the key.
+	if bit.band(flags, FLAG_ENCRYPTED) == 0 then
+		error("inform: refusing an unencrypted response")
+	end
+	local key = st.authkey
+	if bit.band(flags, FLAG_GCM) ~= 0 then
+		-- AAD = full 40-byte packet header (per amd989/unifi-gateway decode_inform)
+		local aad = raw:sub(1, 40)
+		local ct  = payload:sub(1, #payload - 16)
+		local tag = payload:sub(#payload - 15)
+		payload = crypto.aes_gcm_decrypt(key, iv, ct, tag, aad)
+	else
+		payload = crypto.aes_cbc_decrypt(key, iv, payload)
 	end
 
 	-- Decompress — Snappy (0x04) is not supported; zlib (0x02) is.
@@ -813,15 +867,47 @@ function M.build_json(st, cfg, ufhw)
 		local ok_r, rr = pcall(ufuci.get_radio_table, hwassign)
 		if ok_r then radio_table = rr end
 
-		-- Regulatory domain for the payload's country_code, off the first
-		-- radio that declares one (UCI sets the same country on every
-		-- wifi-device). Was hardcoded 840 (US) for every deployment.
+		-- One walk of radio_table for the two facts derived from it, both of
+		-- them per-device rather than per-radio:
+		--
+		--   country_code -- the regulatory domain, off the first radio that
+		--   declares one (UCI sets the same country on every wifi-device).
+		--   Was hardcoded 840 (US) for every deployment.
+		--
+		--   dfs_radio -- is any radio somewhere a radar hit can happen? Read
+		--   off the configured channel rather than the live one on purpose:
+		--   "auto" has no channel here and ACS can land on a DFS channel
+		--   either way, so an auto radio counts, and the monitors then run
+		--   for a 2.4-only board too. Cheap: they are one hostapd_cli per
+		--   BSS, idle until an event.
+		--
+		-- Neither answer can change again once it is settled, so the walk
+		-- stops as soon as both are -- which on both reference boards is the
+		-- first radio, since UCI gives every wifi-device the country.
+		-- `country_done`, not `derived_country ~= nil`: the first radio that
+		-- declares a country settles the question even when the name is not
+		-- in the table, which is what the separate loop did by breaking.
+		local dfs_radio, country_done = false, false
 		for _, r in ipairs(radio_table) do
-			if r.country then
+			if r.country and not country_done then
 				derived_country = ISO3166_NUMERIC[tostring(r.country):upper()]
-				break
+				country_done = true
 			end
+			if not dfs_radio then
+				local ch = tostring(r.channel or "")
+				if ch == "" or ch == "auto" or ch == "0" then
+					-- r.radio is get_radio_table's band ("ng"/"na");
+					-- build_json only re-derives `band` further down, after
+					-- this point.
+					if r.radio ~= "ng" then dfs_radio = true end
+				elseif M._rrmscan and M._rrmscan.is_dfs_channel
+					and M._rrmscan.is_dfs_channel(ch) then
+					dfs_radio = true
+				end
+			end
+			if country_done and dfs_radio then break end
 		end
+		M._dfs_radio = dfs_radio
 
 		-- Live per-radio channel utilization, parallel to radio_table (matches
 		-- real UniFi's split of static config vs. live stats). Also kept in
@@ -1994,6 +2080,10 @@ function M.build_json(st, cfg, ufhw)
 	-- unless overridden, exactly as before.
 	local dbg_caps = cfg and cfg.config and type(cfg.config.debug_caps) == "table"
 		and cfg.config.debug_caps or nil
+	-- Read once for the two capability masks below (fw_caps 0x800000 and
+	-- fw2_caps 0x80000 are the same probe, and sysinfo caches it for the
+	-- process, so this is only about not asking the same question twice).
+	local hs20_ok = M._sysinfo.hs20_supported and M._sysinfo.hs20_supported()
 
 	local payload = {
 		_type            = "state",
@@ -2055,7 +2145,45 @@ function M.build_json(st, cfg, ufhw)
 		-- itself is wlansched.lua. 0x400000 (schedule_invert) stays
 		-- unclaimed: the controller then inverts the blackout windows into
 		-- on-times itself, the form the 4.0.15 firmware reads.
-		fw_caps          = (dbg_caps and tonumber(dbg_caps.fw_caps)) or 0x1110,
+		-- Bit 0x800000 (8388608): supportHotspot2(). Without it the
+		-- controller refuses to provision a WLAN with a Hotspot 2.0
+		-- profile attached AT ALL -- ubntconf/LsyaJoEysWb returns null
+		-- for it, logging "Hotspot 2 cannot provision OSEN on ..." --
+		-- so the whole aaa.<n>.hs20.* keyspace is unreachable without
+		-- the claim. Claimed only where hostapd can actually answer
+		-- ANQP (sysinfo.hs20_supported: the ucode generator knows the
+		-- interworking options AND the binary was built with
+		-- CONFIG_HS20), because the alternative to a dropped WLAN is a
+		-- WLAN that advertises Passpoint and answers nothing.
+		-- Bit 0x100000 (1048576): RADIUS Dynamic Authorization (RFC 5176
+		-- CoA / Disconnect-Request). The config writer tests this one inline
+		-- rather than through a named Device helper (10.6.106
+		-- com/ubnt/service/config/VAZShipWTNxlo:567), and with it a WLAN
+		-- whose RADIUS profile has accounting on, and which has either
+		-- "RADIUS DAS" or Hotspot 2.0 enabled, gets
+		-- aaa.<n>.radius.das.{status,port,client,secret}. Claimed since
+		-- 2026-10-27: openUF needs no CoA listener of its own, because
+		-- hostapd IS one -- radius_das_port/radius_das_client are real
+		-- wifi-iface options on 25.12, and a Disconnect-Request from the
+		-- RADIUS server then deauthenticates the station. See _wire_radius
+		-- for the keys, and for why radius.dad.* is declined.
+		-- Bit 0x80000000 (Integer.MIN_VALUE): MAC-based VLANs, the per-client
+		-- "Virtual Network Override". Device.supportsMacBasedVlans() =
+		-- hasFirmwareCapability(Integer.MIN_VALUE), and the emitter
+		-- (ubntconf/fdwW) needs it AND a site-wide quorum: a ubios gateway that
+		-- claims the bit or is one of 23 listed models, and NO client-bearing AP
+		-- or switch in the site that fails to claim it. One AP without the bit
+		-- therefore switched the feature off for every device in the site --
+		-- which is where openUF stood until 2026-10-27.
+		--
+		-- SIGNED, deliberately: the sum is written as a negative number because
+		-- fw_caps is a Java `int` on the controller side (a genuine gateway
+		-- reports its own caps negative for the same reason), and 0x80101110
+		-- sent as 2148537104 is out of range for the deserializer. Subtracting
+		-- 0x80000000 from a positive sum is exactly what setting the sign bit
+		-- means in two's complement.
+		fw_caps          = (dbg_caps and tonumber(dbg_caps.fw_caps)) or (0x101110 - 0x80000000
+			+ (hs20_ok and 0x800000 or 0)),
 		-- wifi_caps, the first WiFi bitmask. Bit 0x4 is
 		-- Device.supportBandsteering(): without it the controller never emits
 		-- the device-level bandsteering.* block (the AP's own Band Steering
@@ -2122,6 +2250,28 @@ function M.build_json(st, cfg, ufhw)
 		-- Assistant and Minimum RSSI tags). Claimed only while those are
 		-- sent: without the reports the bit would make roams vanish.
 		--
+		-- Bit 0x10 (16): Device.supportsAcsDfs(). It gates TWO per-radio keys
+		-- at once -- the whole block that emits them sits behind this one
+		-- check (10.6.106,
+		-- com/ubnt/service/config/ubntconf/PFljhxhmKJyhpeIhf): the 5 GHz
+		-- radio's radio.<n>.acsdfs (may auto-channel land on a DFS channel)
+		-- and, for any radio on Auto, radio.<n>.blklst (the site's channel
+		-- blacklist for that band). Without it a site that excludes channels
+		-- -- which the DEFAULT "conservative" preset does, blacklisting
+		-- everything but 1/6/11 on 2.4 GHz -- is silently dropped and ACS
+		-- picks whatever it likes. Claimed because both have real consumers
+		-- here: wifi-device acs_exclude_dfs and chanlist (see
+		-- ucihelper.rf_config).
+		--
+		-- Bit 0x400000: Device.supportsMulticastSuppressor(). Gates the
+		-- WLAN's wireless.<n>.multicast.suppressor key -- the "Multicast
+		-- Suppression" control, which is the same WLAN setting the old
+		-- "Multicast and Broadcast Blocker" was: 10.6.106's own UI bundle
+		-- maps mode=aggressive onto bc_filter_enabled + bc_filter_list (the
+		-- bcfilt.* keys openUF already enforces) and mode=conservative onto
+		-- this key ALONE. Without the bit a WLAN set to Conservative pushes
+		-- nothing at all. See bcfilter.lua for what each mode does.
+		--
 		-- No other bit is claimed: wifi_caps2 also gates real-hardware-only
 		-- features (Mesh MLO parent/child and others, see
 		-- PROTOCOL-VALIDATION.md) that openUF does not implement.
@@ -2132,8 +2282,45 @@ function M.build_json(st, cfg, ufhw)
 		-- notifs, which carry Fast Roaming, failures and the Roaming
 		-- Assistant and Minimum RSSI tags). Claimed only while those are
 		-- sent: without the reports the bit would make roams vanish.
+		-- Bit 0x10 (16): supportsAcsDfs(). One `if` in the controller's
+		-- config writer guards BOTH per-radio auto-channel limits (the DFS
+		-- switch and the channel blacklist), so without the bit neither
+		-- radio.<n>.acsdfs nor radio.<n>.blklst is ever sent. Upstream's
+		-- reading of 10.6.106, 2026-10-27; mapped onto hostapd's own ACS
+		-- options in rf_config, where this tree's board policy still wins.
+		-- Bit 0x400000 (4194304): Multicast Suppression. Both of the
+		-- feature's keys are gated on it (upstream's reading of 10.6.106,
+		-- 2026-10-27): without it a WLAN set to Conservative pushed nothing
+		-- and one set to Aggressive pushed a blocker with no ARP/DHCP
+		-- carve-out, which openUF then enforced to the letter. bcfilter.lua
+		-- honours the bypass types and the Conservative rate ceiling.
 		wifi_caps2       = (dbg_caps and tonumber(dbg_caps.wifi_caps2))
-			or (0xE2 + (M._assoc_enabled(st, cfg) and 0x2000 or 0)),
+			or (0x4000F2 + (M._assoc_enabled(st, cfg) and 0x2000 or 0)),
+		-- fw2_caps, a THIRD firmware bitmask (hyFnQ.getFirmware2Capabilities
+		-- reads the field "fw2_caps"), sent only for its one needed bit.
+		--
+		-- Bit 0x80000 (524288): supportsRadSec(). openUF does NOT implement
+		-- RadSec, and this is claimed anyway, for one reason: the REST
+		-- validator that admits a Hotspot 2.0 profile onto a WLAN
+		-- (com/ubnt/service/W/ctfbDsCjrxgkv) tests
+		-- supportsHotspot2Passpoint() = supportHotspot2() AND
+		-- supportsRadSec(), and rejects the whole request with
+		-- api.err.DevicePasspointNotSupported otherwise -- so on 10.6.106
+		-- Passpoint is unreachable without it, bit 0x800000 or not.
+		-- Claimed only alongside that bit (same probe) so it never appears
+		-- on a device that cannot do Passpoint at all.
+		--
+		-- What claiming it actually changes on the wire: for a RADIUS server
+		-- whose profile has TLS on, the controller adds
+		-- aaa.<n>.radius.{auth,acct}.<k>.{ca_cert,client_cert,private_key,
+		-- private_key_passwd} -- FILENAMES of files it transfers by another
+		-- channel. _wire_radius drops such a server with a log rather than
+		-- speaking plain RADIUS to a RadSec port. That is strictly better
+		-- than the behaviour without the bit, where the same server arrives
+		-- as a bare ip/port/secret, indistinguishable from a plaintext one,
+		-- and its shared secret goes out in the clear.
+		fw2_caps         = (dbg_caps and tonumber(dbg_caps.fw2_caps))
+			or (hs20_ok and 0x80000 or 0),
 		-- Device-level (not per-radio -- see radio_table_stats above)
 		-- Device-level Experience: the VAP scores weighted by their client
 		-- counts (calc_ap_satisfaction, see satisfaction.lua). The controller
@@ -2176,6 +2363,7 @@ function M.build_json(st, cfg, ufhw)
 		-- strings as the firmware sends them, and only while STUN runs.
 		connect_request_ip   = stun_ip,
 		connect_request_port = stun_port,
+		inform_ip            = M._inform_ip(st.inform_url),
 		["system-stats"] = {
 			cpu    = tostring(cpu_pct),
 			mem    = tostring(mem_pct),
@@ -2334,6 +2522,472 @@ local function _wire_group_rekey(v)
 	return tostring(tonumber(v))
 end
 
+-- A positive whole number (aaa.<n>.sae.anti_clogging / .sae.sync), as a string
+-- for UCI; nil when absent, zero or malformed (the controller sends > 0 only).
+local function _wire_posint(v)
+	if type(v) ~= "string" or not v:match("^%d+$") or #v > 9 then return nil end
+	local n = tonumber(v)
+	return n > 0 and tostring(n) or nil
+end
+
+-- aaa.<n>.wpa.1.pairwise: the WLAN's pairwise cipher, as the controller's own
+-- authoritative answer rather than openUF's derivation from the akm set.
+-- CONFIRMED live 2026-10-26 against 10.6.106 by diffing system_cfg across the
+-- wlanconf's `wpa_enc` field (REST-only; the 10.6 UI has no control): the
+-- generator maps the enum {auto, ccmp, gcmp, ccmp-256, gcmp-256} through
+-- com.ubnt.i.b.aL.kYktyHCkPVCBdJC, where `auto` becomes "CCMP" -- or
+-- "TKIP CCMP" on a WPA1 WLAN -- and every other value is the name upper-cased.
+-- Observed on the wire: CCMP (auto/ccmp), CCMP-256, GCMP. `gcmp-256` is
+-- refused by the controller's own validator and normalised back to auto, so it
+-- cannot arrive; it is mapped anyway because the enum carries it and a later
+-- build may let it through.
+--
+-- The return value is the cipher token for OpenWrt's `encryption` string
+-- (iface.uc's second `+` token), NOT a hostapd wpa_pairwise value.
+-- "CCMP" returns nil on purpose: it is what every WLAN openUF provisions gets
+-- by default (iface.uc's final `wpa_pairwise ??= 'CCMP'`), so carrying it
+-- would add a suffix that changes nothing and mask a genuine default.
+--
+-- "TKIP CCMP" is deliberately declined: it appears only on a WPA1-mode WLAN,
+-- openUF maps no controller security value to WPA1 at all, and TKIP is
+-- forbidden by both WPA2 and WPA3 certification. Anything else unrecognised is
+-- nil, which leaves the default in place rather than writing a cipher the
+-- driver may not have.
+local PAIRWISE_SUFFIX = {
+	["CCMP-256"] = "ccmp256",
+	["GCMP"]     = "gcmp",
+	["GCMP-256"] = "gcmp256",
+}
+
+local function _wire_pairwise(v)
+	if type(v) ~= "string" then return nil end
+	return PAIRWISE_SUFFIX[v:upper()]
+end
+
+-- aaa.<n>.sae.groups.<k>.group, in index order, as hostapd's space-separated
+-- sae_groups; nil unless sae.has_groups is on and every entry is a number.
+local function _wire_sae_groups(a)
+	if not _wire_bool(a["sae.has_groups"]) then return nil end
+	local idxs = {}
+	for k in pairs(a) do
+		local i = k:match("^sae%.groups%.(%d+)%.group$")
+		if i then idxs[#idxs + 1] = tonumber(i) end
+	end
+	table.sort(idxs)
+	local out = {}
+	for _, i in ipairs(idxs) do
+		local g = a["sae.groups." .. i .. ".group"]
+		if not g:match("^%d+$") or #g > 3 then return nil end
+		out[#out + 1] = g
+	end
+	return #out > 0 and table.concat(out, " ") or nil
+end
+
+-- aaa.<n>.radius.* -- the 802.1X / WPA-Enterprise RADIUS configuration.
+--
+-- The controller DOES send this, contrary to what openUF assumed until
+-- 2026-10-26: the AP config builder (10.6.106
+-- com/ubnt/service/config/VAZShipWTNxlo) emits
+--   aaa.<n>.radius.auth.<k>.{ip,port,secret}   k = 1..4
+--   aaa.<n>.radius.acct.<k>.{ip,port,secret}   k = 1..4, accounting only
+--   aaa.<n>.interim_update.{status,interval}   interval defaults to 3600
+--   aaa.<n>.dynamic_vlan                       0 | 1 optional | 2 required
+--   aaa.<n>.nas_identifier
+-- and UAP firmware 6.8.2's own hostapd generator (ubntbox) turns them into
+-- auth_server_addr/port/shared_secret, acct_server_*,
+-- radius_acct_interim_interval, dynamic_vlan and nas_identifier. The
+-- eligibility filter (ubntconf/LsyaJoEysWb) puts NO device capability gate on
+-- a WPA2-Enterprise WLAN, so this arrives whether or not openUF asks for it.
+--
+-- Since 2026-10-27 this also carries RADIUS MAC authentication and Dynamic
+-- Authorization; see the macacl and das blocks below.
+--
+-- Deliberately NOT read (and tested for, so nothing downstream keys on them):
+--   * radius.dad.*  -- the SECOND shape of Dynamic Authorization: a top-level
+--     aaa.radius.dad.{status,port,loglevel} plus per-client
+--     aaa.<n>.radius.dad.client.<k>.{cidr,secret}. UAP firmware 6.8.2 turns
+--     those into `radius_das_client=127.0.0.1 <secret>` -- the AP accepts the
+--     request from its OWN mcad, which relays what it received from the
+--     network and does the CIDR check itself. openUF has no such relay, so
+--     pointing hostapd at 127.0.0.1 would make it answer nobody. The das.*
+--     shape names the client directly and is the one openUF implements; the
+--     controller sends both whenever either applies.
+--   * radius.macacl.{format,emptypassword} -- how the AP renders the MAC as
+--     the RADIUS User-Name/User-Password. Both are options of UniFi's own
+--     patched hostapd (6.8.2 writes `macaddr_format=%s` from a printf format
+--     string -- the wire really does carry e.g.
+--     "%.2X-%.2X-%.2X-%.2X-%.2X-%.2X" -- and `mac_acl_empty_passwd=%d`).
+--     Neither string exists in OpenWrt's hostapd binary on either AP, which
+--     always sends lower-case colon-separated for both attributes. A RADIUS
+--     server configured for another format will reject the client, so this is
+--     a real limitation rather than a cosmetic one -- see USAGE.md.
+--   * radius.auth|acct.<k>.{ca_cert,client_cert,private_key,private_key_passwd}
+--     -- RadSec. The controller sends only FILENAMES, for files it transfers
+--     by another channel, so it cannot be completed here. Their presence is
+--     what marks a server as RadSec (there is no .tls key), and such a server
+--     is dropped rather than contacted with its secret in the clear. They
+--     arrive only because openUF claims fw2_caps 0x80000 for the Passpoint
+--     gate; see build_json.
+--
+-- Returns a table, or nil plus a reason naming what was missing. Secrets are
+-- never written to any log line.
+local function _wire_radius(a)
+	local function servers(kind, default_port)
+		local idxs = {}
+		for k in pairs(a) do
+			local i = k:match("^radius%." .. kind .. "%.(%d+)%.ip$")
+			if i then idxs[#idxs + 1] = tonumber(i) end
+		end
+		table.sort(idxs)
+		local out = {}
+		for _, i in ipairs(idxs) do
+			local pfx = "radius." .. kind .. "." .. i .. "."
+			local ip, secret = a[pfx .. "ip"], a[pfx .. "secret"]
+			local port = _wire_posint(a[pfx .. "port"]) or default_port
+			local why
+			-- RadSec. There is NO aaa.<n>.radius.<kind>.<k>.tls key: the
+			-- emitter writes only the cert FILENAMES, and only when
+			-- supportsRadSec() (fw2_caps 0x80000, which openUF claims for the
+			-- Passpoint gate -- see build_json). Their presence is therefore
+			-- the whole discriminator, and the server is dropped rather than
+			-- contacted with a shared secret in the clear.
+			if a[pfx .. "ca_cert"] or a[pfx .. "client_cert"]
+					or a[pfx .. "private_key"] then
+				why = "RadSec (TLS) is not supported"
+			elseif not netconfig.is_ipv4(ip) then
+				why = "no usable IPv4 address"
+			elseif type(secret) ~= "string" or secret == "" or #secret > 64 then
+				why = "missing or oversized shared secret"
+			end
+			if why then
+				io.stderr:write(("inform: dropping RADIUS %s server %d -- %s\n")
+					:format(kind, i, why))
+			else
+				out[#out + 1] = {ip = ip, port = port, secret = secret}
+			end
+		end
+		return out
+	end
+
+	local auth = servers("auth", "1812")
+	if #auth == 0 then return nil, "no usable RADIUS authentication server" end
+
+	local dynamic_vlan = a.dynamic_vlan
+	if dynamic_vlan ~= "1" and dynamic_vlan ~= "2" then dynamic_vlan = nil end
+
+	-- Dynamic Authorization (RFC 5176): the RADIUS server may send a
+	-- Disconnect-Request or a CoA-Request for a station already online. One
+	-- client and one shared secret, which is all hostapd can express
+	-- (radius_das_client holds both, separated by a space), and all the
+	-- controller sends in this shape -- das.client is the FIRST accounting
+	-- server's address, written once (VAZShipWTNxlo:973).
+	local das
+	if _wire_bool(a["radius.das.status"]) then
+		local ip, secret = a["radius.das.client"], a["radius.das.secret"]
+		local why
+		if not netconfig.is_ipv4(ip) then
+			why = "no usable IPv4 client address"
+		elseif type(secret) ~= "string" or secret == "" or #secret > 64 then
+			why = "missing or oversized shared secret"
+		elseif secret:find("%c") then
+			-- The secret is the REST of the radius_das_client line, so a space
+			-- inside it is harmless; a newline would end the line and let what
+			-- follows be read as further hostapd options.
+			why = "a control character in the shared secret"
+		end
+		if why then
+			io.stderr:write(("inform: ignoring RADIUS Dynamic Authorization -- %s\n")
+				:format(why))
+		else
+			-- The controller's own port is 3800 + the WLAN's section index, so
+			-- each BSS gets its own UDP socket. 3799 is the RFC 5176 default and
+			-- what the firmware falls back to.
+			das = {client = ip, secret = secret,
+				port = _wire_posint(a["radius.das.port"]) or "3799"}
+		end
+	end
+
+	return {
+		auth = auth,
+		das = das,
+		acct = servers("acct", "1813"),
+		-- Only when the controller says so: absent means "do not send interim
+		-- accounting updates", not "use 3600".
+		interim_interval = _wire_bool(a["interim_update.status"])
+			and (_wire_posint(a["interim_update.interval"]) or "3600") or nil,
+		dynamic_vlan = dynamic_vlan,
+		nas_id = a.nas_identifier,
+	}
+end
+
+-- aaa.<n>.accept_mac.* -- MAC-based VLANs ("Virtual Network Override").
+--
+-- Per CLIENT, not per WLAN: the controller's own UI calls it Virtual Network
+-- Override and it lives on the client, which is why the SAME list reaches every
+-- WLAN in the site. The emitter (10.6.106
+-- com/ubnt/service/config/ubntconf/fdwW) groups every user object carrying
+-- virtual_network_override_enabled by its override network, then writes, per
+-- WLAN index n:
+--   aaa.<n>.accept_mac.status=enabled      (once, before the first entry)
+--   aaa.<n>.accept_mac.<k>.mac             k = 1..
+--   aaa.<n>.accept_mac.<k>.vlanid          that network's VLAN id
+-- (a switch identity gets the same list as switch.vnet.<n>.{name,vlan,mac.<k>}).
+--
+-- TWO gates, and the second one is site-wide -- see build_json for fw_caps
+-- 0x80000000, and PROTOCOL-VALIDATION.md for the gateway/AP/switch quorum.
+--
+-- status is NOT the discriminator and is deliberately not read: the writer
+-- emits it from inside the same loop that writes the first entry, so it is
+-- present exactly when there is at least one entry and absent exactly when
+-- there is none. The entries are the whole signal.
+local function _wire_mac_vlans(a)
+	local out, seen = {}, {}
+	local k = 1
+	while a["accept_mac." .. k .. ".mac"] do
+		local mac = tostring(a["accept_mac." .. k .. ".mac"]):lower()
+		local vid = tonumber(a["accept_mac." .. k .. ".vlanid"])
+		local why
+		if not is_mac(mac) then
+			why = "not a MAC address"
+		elseif not vid or vid ~= math.floor(vid) or vid < 1 or vid > 4094 then
+			why = "VLAN id out of range"
+		elseif seen[mac] then
+			-- A client has one override network, so the controller cannot send
+			-- the same MAC twice. If it ever did, two accept-list lines for one
+			-- station would leave hostapd's bsearch to pick one of them.
+			why = "a duplicate of an earlier entry"
+		end
+		if why then
+			io.stderr:write(("inform: dropping MAC-based VLAN entry %d -- %s\n")
+				:format(k, why))
+		else
+			seen[mac] = true
+			out[#out + 1] = {mac = mac, vid = vid}
+		end
+		k = k + 1
+	end
+	return #out > 0 and out or nil
+end
+
+-- Free text from a controller-side profile (a venue or operator name, a realm,
+-- a URL) on its way to a hostapd config FILE. A control character -- a newline
+-- above all -- would end the line and let the rest be read as further hostapd
+-- options, so anything carrying one is dropped rather than sanitised. 128 is
+-- the controller's own cap on every one of these fields.
+local function _wire_text(v, maxlen)
+	if type(v) ~= "string" or v == "" or #v > (maxlen or 128) then return nil end
+	if v:find("%c") then return nil end
+	return v
+end
+
+-- A whole number within [lo, hi], as a string; nil when absent or out of range.
+local function _wire_range(v, lo, hi)
+	if type(v) ~= "string" or not v:match("^%d+$") or #v > 10 then return nil end
+	local n = tonumber(v)
+	if n < lo or n > hi then return nil end
+	return tostring(n)
+end
+
+-- One pass over the WLAN's key table for every indexed Hotspot 2.0 block.
+--
+-- The tokenizer keeps the whole dotted tail as one flat key, so a sub-indexed
+-- block has to be recovered by re-matching it (same shape as sae.groups /
+-- wpa.psk_file). _wire_indexed used to do that re-match itself, walking every
+-- key of `a` per call -- and _wire_hs20 calls it seven times plus once per NAI
+-- realm, so a Passpoint WLAN paid ~10 full scans of the same table per push.
+--
+-- Instead, index once. Every indexed hs20 key is `hs20.<prefix>.<i>.<leaf>`,
+-- or `hs20.<i>.<leaf>` for roaming_consortium, where <prefix> may itself carry
+-- an index (nai_realm.<i>.eap_method.auth). <leaf> is dotless and anchored, so
+-- <i> is always the key's LAST indexed level -- which is what puts each
+-- realm's auth parameters in a bucket of their own. Keys with no index
+-- (hs20.status, hs20.metrics.*) are read by name and so are skipped here.
+local function _wire_hs20_index(a)
+	local idx = {}
+	for k in pairs(a) do
+		if k:sub(1, 5) == "hs20." then
+			local prefix, i, leaf = k:match("^hs20%.(.+)%.(%d+)%.([^.]+)$")
+			if not prefix then
+				i, leaf = k:match("^hs20%.(%d+)%.([^.]+)$")
+				prefix = i and ""
+			end
+			if prefix then
+				local bucket = prefix .. "/" .. leaf
+				local l = idx[bucket]
+				if l then l[#l + 1] = tonumber(i)
+				else idx[bucket] = {tonumber(i)} end
+			end
+		end
+	end
+	return idx
+end
+
+-- The indices filed under <prefix>/<leaf> by _wire_hs20_index, in index order,
+-- as whatever `build` makes of each. nil when none of them survives.
+local function _wire_indexed(idx, prefix, leaf, build)
+	local idxs = idx[prefix .. "/" .. leaf]
+	if not idxs then return nil end
+	table.sort(idxs)
+	local out = {}
+	for _, i in ipairs(idxs) do
+		local e = build(i)
+		if e then out[#out + 1] = e end
+	end
+	return #out > 0 and out or nil
+end
+
+-- aaa.<n>.hs20.* -- Hotspot 2.0 / Passpoint.
+--
+-- Reachable only because openUF claims fw_caps 0x800000 and fw2_caps 0x80000
+-- (see build_json): without them the controller drops the whole WLAN.
+--
+-- The emitter (10.6.106 com/ubnt/service/config/VAZShipWTNxlo) knows a wider
+-- keyspace than the controller can actually be made to send. A WLAN's Hotspot
+-- 2.0 settings live in the wlanconf's own embedded `hotspot2` object, and
+-- api/fields/WlanConf.json's schema for it is a SUBSET of the standalone
+-- api/fields/Hotspot2Conf.json template: it has no hessid, anqp_domain_id,
+-- network_auth_type/url, disable_dgaf, deauth_req_timeout, t_c_filename/
+-- timestamp, osu_ssid, osu.*, icon.*, gas_comeback_delay/gas_frag_limit or
+-- qos.map.*/qos.exception.* at all. A full-profile push (lab capture, every
+-- field the subset allows filled) carried exactly the keys read below and
+-- none of the others. So the rest is deliberately NOT read: there is no
+-- producer to test a consumer against.
+--
+-- Independently unimplementable even if they did arrive:
+--   * osu.* / icon.*  -- the installed hostapd (wpad-mbedtls 2025.08.26,
+--     hostapd v2.12-devel) carries no osu_server_uri, osu_ssid or hs20_icon
+--     option at all: the OSU/OSEN online-signup pieces are not built in.
+--     Verified by string search on /usr/sbin/hostapd on both APs.
+--   * t_c_filename / t_c_timestamp -- hostapd serves the Terms and Conditions
+--     file from disk, and the controller transfers it by another channel.
+--
+-- Returns a table, or nil when Hotspot 2.0 is off for this WLAN.
+local function _wire_hs20(a)
+	if not _wire_bool(a["hs20.status"]) then return nil end
+
+	local function k(suffix) return a["hs20." .. suffix] end
+	local idx = _wire_hs20_index(a)
+
+	local hs = {
+		-- Interworking element. access_network_type is the 4-bit ANQP field
+		-- (0 private, 2 chargeable public, 3 free public ...).
+		access_network_type = _wire_range(k("access_network_type"), 0, 15),
+		internet            = _wire_bool(k("internet")),
+		asra                = _wire_bool(k("asra")),
+		uesa                = _wire_bool(k("uesa")),
+		venue_group         = _wire_range(k("venue_group"), 0, 11),
+		venue_type          = _wire_range(k("venue_type"), 0, 255),
+		-- Downstream Group-Addressed Forwarding. Sent twice, as
+		-- aaa.<n>.hs20.disable_dgaf and wireless.<n>.dgaf_disable, from the
+		-- same wlanconf field; this one is read and the other ignored.
+		disable_dgaf        = _wire_bool(k("disable_dgaf")),
+		deauth_req_timeout  = _wire_range(k("deauth_req_timeout"), 1, 3600),
+		-- IP Address Type Availability: (v4 << 2) | v6, already combined by
+		-- the controller (ipaddr_type_avail_v4 0-7, _v6 0-2).
+		ipaddr_type_avail   = _wire_range(k("network_availability"), 0, 31),
+		-- Already a comma-separated list on the wire, which is exactly
+		-- hostapd's domain_name format.
+		domain_name         = _wire_text(k("hs20_domain_name_list"), 1024),
+	}
+
+	-- aaa.<n>.hs20.esr is sent and deliberately dropped: the live ucode
+	-- generator (ap.uc, iface_interworking) never appends `esr`, although the
+	-- schema declares iw_esr as an alias for it, so the option would be stored
+	-- in UCI and silently discarded. Writing it would be a consumer keyed on a
+	-- producer that does not exist.
+
+	hs.venue_name = _wire_indexed(idx, "venue_name", "name", function(i)
+		local p = "hs20.venue_name." .. i .. "."
+		local lang, name = _wire_text(a[p .. "lang"], 3), _wire_text(a[p .. "name"])
+		if not (lang and name) then return nil end
+		return {lang = lang, name = name, url = _wire_text(a[p .. "url"], 1024)}
+	end)
+
+	hs.nai_realm = _wire_indexed(idx, "nai_realm", "name", function(i)
+		local p = "hs20.nai_realm." .. i .. "."
+		if a[p .. "status"] and not _wire_bool(a[p .. "status"]) then return nil end
+		local name = _wire_text(a[p .. "name"])
+		local eap  = _wire_range(a[p .. "eap_method"], 1, 255)
+		if not (name and eap) then return nil end
+		-- The auth parameters are a THIRD level down, under
+		-- aaa.<n>.hs20.nai_realm.<i>.eap_method.auth.<j>.{id,val}.
+		local auth = _wire_indexed(idx, "nai_realm." .. i
+			.. ".eap_method.auth", "id", function(j)
+			local q = p .. "eap_method.auth." .. j .. "."
+			local id  = _wire_range(a[q .. "id"], 1, 255)
+			local val = _wire_range(a[q .. "val"], 0, 255)
+			if not (id and val) then return nil end
+			return {id = id, val = val}
+		end)
+		return {
+			encoding = _wire_range(a[p .. "encoding"], 0, 1) or "0",
+			name = name, eap_method = eap, auth = auth,
+		}
+	end)
+
+	-- Note the index position: the key is hs20.<k>.roaming_consortium, not
+	-- hs20.roaming_consortium.<k>.
+	hs.roaming_consortium = _wire_indexed(idx, "", "roaming_consortium",
+		function(i)
+			local oi = a["hs20." .. i .. ".roaming_consortium"]
+			-- An Organization Identifier is 3 to 15 octets of hex (hostapd
+			-- rejects anything else outright).
+			if type(oi) ~= "string" or not oi:match("^%x+$")
+					or #oi % 2 ~= 0 or #oi < 6 or #oi > 30 then
+				return nil
+			end
+			return oi
+		end)
+
+	hs.cell_net = _wire_indexed(idx, "3gpp", "mcc", function(i)
+		local p = "hs20.3gpp." .. i .. "."
+		local mcc, mnc = a[p .. "mcc"], a[p .. "mnc"]
+		-- Kept as sent, not renormalised: a two-digit MNC is not a
+		-- three-digit one with a leading zero.
+		if type(mcc) ~= "string" or not mcc:match("^%d%d%d$") then return nil end
+		if type(mnc) ~= "string" or not mnc:match("^%d%d%d?$") then return nil end
+		return {mcc = mcc, mnc = mnc}
+	end)
+
+	hs.friendly_name = _wire_indexed(idx, "friendly_name", "text",
+		function(i)
+			local p = "hs20.friendly_name." .. i .. "."
+			local lang = _wire_text(a[p .. "language"], 3)
+			local text = _wire_text(a[p .. "text"])
+			if not (lang and text) then return nil end
+			return {lang = lang, text = text}
+		end)
+
+	hs.conn_capab = _wire_indexed(idx, "capab", "protocol", function(i)
+		local p = "hs20.capab." .. i .. "."
+		local proto = _wire_range(a[p .. "protocol"], 1, 255)
+		local port  = _wire_range(a[p .. "port"], 0, 65535)
+		-- hostapd wants a number: 0 closed, 1 open, 2 unknown.
+		local STATUS = {closed = "0", open = "1", unknown = "2"}
+		local status = STATUS[a[p .. "status"] or ""]
+		if not (proto and port and status) then return nil end
+		return {protocol = proto, port = port, status = status}
+	end)
+
+	if _wire_bool(a["hs20.metrics.status"]) then
+		local m = {}
+		local ok = true
+		-- info is the WAN Info bitfield the controller has already assembled
+		-- from link status + symmetric + at-capacity. The four rate/load
+		-- fields are 0 when the admin left them unset, which is also
+		-- hostapd's "unknown", so 0 is kept rather than dropped.
+		for field, hi in pairs({info = 255, downlink_speed = 4294967295,
+				uplink_speed = 4294967295, downlink_load = 255,
+				uplink_load = 255, measurement = 65535}) do
+			local v = _wire_range(a["hs20.metrics." .. field], 0, hi)
+			if v then m[field] = v else ok = false end
+		end
+		if ok then hs.wan_metrics = m end
+	end
+
+	return hs
+end
+
 -- Tri-state read of a `status` key for the radio/VAP disable controls:
 --   nil       -> the key was absent; leave whatever UCI already has alone
 --   false     -> explicitly enabled
@@ -2353,15 +3007,15 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- qos.vap.<m>: "WiFi Speed Limit". Needs its own pattern rather than
 		-- the generic <section>.<idx>.<key> one below, since the index sits a
 		-- level down (qos.vap.1.*, alongside qos.if.<n>.* and qos.ebt.<n>.*).
-		local qidx, qkey, qv = line:match("^qos%.vap%.(%d+)%.(.+)=(.*)$")
+		local qidx, qkey, qv = line:match("^qos%.vap%.(%d+)%.([^=]+)=(.*)$")
 		if qidx then
 			qidx = tonumber(qidx)
 			qos_vap[qidx] = qos_vap[qidx] or {}
 			qos_vap[qidx][qkey] = qv
 		end
-		local section, idx, key, v = line:match("^(aaa)%.(%d+)%.(.+)=(.*)$")
-		if not section then section, idx, key, v = line:match("^(wireless)%.(%d+)%.(.+)=(.*)$") end
-		if not section then section, idx, key, v = line:match("^(radio)%.(%d+)%.(.+)=(.*)$") end
+		local section, idx, key, v = line:match("^(aaa)%.(%d+)%.([^=]+)=(.*)$")
+		if not section then section, idx, key, v = line:match("^(wireless)%.(%d+)%.([^=]+)=(.*)$") end
+		if not section then section, idx, key, v = line:match("^(radio)%.(%d+)%.([^=]+)=(.*)$") end
 		-- stamgr.<n>: per-radio "Station Manager" block, indexed the same as
 		-- radio.<n> -- confirmed live 2026-07-14 (Devices -> [AP] -> Radios ->
 		-- "Minimum RSSI" checkbox+slider, NOT a WLAN-level setting): toggling
@@ -2370,7 +3024,7 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- stamgr.<n>.loadbalance.status/maxsta sharing the same block.
 		-- The whole block is simply absent when disabled (no explicit
 		-- status=false), same convention as every other optional section here.
-		if not section then section, idx, key, v = line:match("^(stamgr)%.(%d+)%.(.+)=(.*)$") end
+		if not section then section, idx, key, v = line:match("^(stamgr)%.(%d+)%.([^=]+)=(.*)$") end
 		-- macacl.<m>: the "MAC Address Filter". CONFIRMED live 2026-07-18 by
 		-- enabling the control with one allow-listed MAC and diffing system_cfg
 		-- -- this whole top-level section appeared at once, and it is keyed by
@@ -2383,8 +3037,8 @@ function M._parse_wifi_system_cfg(sys_raw)
 		-- not move in the diff -- the same decoy shape as
 		-- radio.<n>.bcmc_l2_filter.status was for the broadcast blocker.
 		-- aaa.<n>.radius.macacl.status is the separate RADIUS MAC
-		-- Authentication control.
-		if not section then section, idx, key, v = line:match("^(macacl)%.(%d+)%.(.+)=(.*)$") end
+		-- Authentication control, read in the vap build below.
+		if not section then section, idx, key, v = line:match("^(macacl)%.(%d+)%.([^=]+)=(.*)$") end
 		if section then
 			local tbl = (section == "aaa" and aaa) or (section == "wireless" and wireless)
 				or (section == "radio" and radio) or (section == "macacl" and macacl) or stamgr
@@ -2493,6 +3147,40 @@ function M._parse_wifi_system_cfg(sys_raw)
 			local maxsta = sm ~= nil and sm["loadbalance.status"] == "true"
 				and tonumber(sm["loadbalance.maxsta"])
 			entry.loadbalance_maxsta = (maxsta and maxsta > 0) and math.floor(maxsta) or false
+			-- Auto-channel narrowing, both keys emitted only to a device
+			-- claiming wifi_caps2 0x10 (Device.supportsAcsDfs(), see
+			-- build_json) and both from the site's Radio settings, not the
+			-- WLAN's. Decompiled from 10.6.106
+			-- (com/ubnt/service/config/ubntconf/PFljhxhmKJyhpeIhf) and
+			-- cross-read against U7LR 6.8.2's own consumers:
+			--
+			--   radio.<n>.acsdfs=enabled|disabled -- 5 GHz radio only, from
+			--     radios_configuration[radio=na].dfs. Firmware: with it off,
+			--     wifitool block_acs_channel over the whole DFS list.
+			--     openUF: wifi-device acs_exclude_dfs, hostapd's own flag.
+			--   radio.<n>.blklst=2,3,4,...        -- only while the radio is
+			--     on Auto, from the site's channels_blacklist for this band
+			--     (the "conservative" preset blacklists everything but 1/6/11
+			--     on 2.4 GHz, which is what a default site carries). Firmware:
+			--     wifitool block_acs_channel <list>. hostapd has no blacklist,
+			--     only chanlist, so ucihelper inverts it against the phy's own
+			--     channel list.
+			--
+			-- Tri-state like the rest of this block: absent acsdfs leaves UCI
+			-- alone (it never arrives for 2.4 GHz), and an absent blklst is
+			-- the wire's "nothing excluded" -- which has to tear down a
+			-- chanlist openUF wrote earlier, so it reaches rf_config as nil
+			-- and is handled there against openUF's own stamp.
+			if r.acsdfs == "enabled" or r.acsdfs == "disabled" then
+				entry.acs_exclude_dfs = (r.acsdfs == "disabled")
+			end
+			if r.blklst then
+				local blocked = {}
+				for ch in tostring(r.blklst):gmatch("%d+") do
+					blocked[#blocked + 1] = tonumber(ch)
+				end
+				if #blocked > 0 then entry.acs_blacklist = blocked end
+			end
 			radio_table[#radio_table + 1] = entry
 		end
 	end
@@ -2649,29 +3337,81 @@ function M._parse_wifi_system_cfg(sys_raw)
 		end
 		local owe_transition = a.owe_devname ~= nil and owe_hidden_half[a.owe_devname] == true
 
-		-- WPA-Enterprise (802.1X, mgmt "WPA-EAP"). openUF cannot provision it:
-		-- the wire carries no RADIUS server/port/secret -- aaa.<n>.wpa.psk is
-		-- simply absent -- and wlan_add() writes no auth_server/auth_secret.
-		-- Left to fall through, an Enterprise WLAN matched neither the SAE nor
-		-- the PSK branch and landed on security="wpa2", producing a psk2
-		-- section with a nil key: a VAP hostapd refuses to bring up, with
-		-- nothing logged anywhere. Skipping it loudly is strictly better -- a
-		-- missing WLAN an admin can diagnose beats a broken one that looks
-		-- provisioned.
+		-- WPA-Enterprise (802.1X, mgmt "WPA-EAP"). Provisioned since 2026-10-26
+		-- from the aaa.<n>.radius.* block (see _wire_radius above). It is still
+		-- skipped when that block names no usable authentication server: left to
+		-- fall through, an Enterprise WLAN matches neither the SAE nor the PSK
+		-- branch and lands on security="wpa2", producing a psk2 section with a
+		-- nil key -- a VAP hostapd refuses to bring up, with nothing logged
+		-- anywhere. A missing WLAN an admin can diagnose beats a broken one that
+		-- looks provisioned.
 		local is_enterprise = akm:find("EAP", 1, true) ~= nil
-		if is_enterprise and w.ssid then
-			io.stderr:write(("inform: skipping WLAN %q -- WPA-Enterprise (%s) is not "
-				.. "supported; openUF has no RADIUS configuration on this wire protocol\n")
-				:format(w.ssid, (akm:gsub("^%s+", ""))))
+		-- RADIUS MAC authentication (the WLAN's own "MAC Authentication", a
+		-- RADIUS lookup of the client's MAC before it may associate). On the
+		-- wire for EVERY WLAN as radius.macacl.status, so the value is the
+		-- whole discriminator; the writer has no capability gate on it
+		-- (VAZShipWTNxlo:639, `if (radius_mac_auth_enabled)`), and it brings
+		-- the same radius.auth.<k>.* block an Enterprise WLAN gets -- which is
+		-- why the WLAN need not be Enterprise for _wire_radius to have work.
+		local mac_auth = _wire_bool(a["radius.macacl.status"]) or false
+		local radius, radius_err
+		if is_enterprise or mac_auth then radius, radius_err = _wire_radius(a) end
+		if is_enterprise and not radius and w.ssid then
+			io.stderr:write(("inform: skipping WLAN %q -- WPA-Enterprise (%s): %s\n")
+				:format(w.ssid, (akm:gsub("^%s+", "")), radius_err))
+		end
+		-- Warn-only. There is no capability bit to gate 802.1X on, so this must
+		-- not change what gets provisioned: a basic wpad brings the BSS up and
+		-- then authenticates nobody, logging nothing of its own.
+		local no_radius_client = M._sysinfo and M._sysinfo.eap_supported
+			and not M._sysinfo.eap_supported()
+		if is_enterprise and radius and w.ssid and no_radius_client then
+			io.stderr:write(("inform: WLAN %q is WPA-Enterprise, but this hostapd has "
+				.. "no RADIUS client (a full wpad is needed) -- clients will not "
+				.. "authenticate\n"):format(w.ssid))
+		end
+		-- MAC authentication fails CLOSED, unlike the warning above. It is an
+		-- access control: provisioning the WLAN without it would let every
+		-- client the admin meant to screen straight on, and on an open WLAN that
+		-- is the only thing standing between the network and anyone in range.
+		-- So the WLAN is dropped instead, loudly. (With no RADIUS client in
+		-- hostapd the BSS would not come up anyway: auth_server_addr is an
+		-- unknown option to a basic wpad, which refuses the whole config.)
+		local mac_auth_broken = false
+		if mac_auth and (not radius or no_radius_client) then
+			mac_auth_broken = true
+			if w.ssid then
+				io.stderr:write(("inform: skipping WLAN %q -- it requires RADIUS MAC "
+					.. "authentication, and %s\n"):format(w.ssid,
+					radius and "this hostapd has no RADIUS client (a full wpad is "
+						.. "needed)" or radius_err))
+			end
+		end
+
+		-- Hotspot 2.0 / Passpoint. Only ever on an EAP WLAN: hostapd refuses
+		-- a config with hs20=1 and anything but WPA2-Enterprise/CCMP ("HS 2.0:
+		-- WPA2-Enterprise/CCMP configuration is required for Hotspot 2.0
+		-- functionality", confirmed against hostapd v2.12-devel), and the
+		-- controller offers Passpoint on a wpaeap/OSEN WLAN only. A block
+		-- arriving on any other WLAN is dropped with a line rather than
+		-- written out to produce a BSS hostapd will not start.
+		local hs20
+		if is_enterprise then
+			hs20 = _wire_hs20(a)
+		elseif _wire_bool(a["hs20.status"]) and w.ssid then
+			io.stderr:write(("inform: WLAN %q carries Hotspot 2.0 but is not "
+				.. "WPA-Enterprise -- ignoring the hs20 block\n"):format(w.ssid))
 		end
 
 		-- A UID IoT WLAN whose keys come from RADIUS only. Claiming
 		-- wifi_caps 0x100000 (PPSK) lets it through too, with
 		-- aaa.<n>.wpa.psk_radius = 0/1/2 (disabled/optional/required, the
 		-- same values as hostapd's wpa_psk_radius; enum decompiled from
-		-- 10.6.101, not seen on the wire). As with Enterprise the push names
-		-- no RADIUS server for it, so "required" is a WLAN nobody could
-		-- join. "optional" keeps working on its local keys.
+		-- 10.6.101, not seen on the wire). Still skipped, and not covered by
+		-- the 802.1X support above: this is a *PSK* WLAN whose keys come from
+		-- RADIUS (hostapd's wpa_psk_radius), a different feature from EAP, and
+		-- the push names no server for it -- so "required" is a WLAN nobody
+		-- could join. "optional" keeps working on its local keys.
 		local radius_psk_only = a["wpa.psk_radius"] == "2"
 		if radius_psk_only and w.ssid then
 			io.stderr:write(("inform: skipping WLAN %q -- its keys come from RADIUS "
@@ -2679,15 +3419,39 @@ function M._parse_wifi_system_cfg(sys_raw)
 				.. "this wire protocol\n"):format(w.ssid))
 		end
 
-		if w.ssid and w.parent and not is_enterprise and not radius_psk_only
+		-- WPA3 rides on its OWN keys, shared by the EAP and the PSK branch
+		-- below: the akm set alone cannot tell transition from WPA3-only.
+		local wpa3_support    = _wire_bool(a["wpa3.support"])
+		local wpa3_transition = _wire_bool(a["wpa3.transition"])
+
+		if w.ssid and w.parent and (not is_enterprise or radius) and not radius_psk_only
 				and not is_station
+				and not mac_auth_broken
 				and not (a.devname and owe_hidden_half[a.devname]) then
 			local security = "open"
 			-- Enhanced Open: the akm is the only marker. It carries no
 			-- aaa.<n>.wpa and no psk. The pmf.* keys that do come along
 			-- cannot reach hostapd: OpenWrt's ap.uc forces ieee80211w=2 on
 			-- an OWE BSS and writes 0 on the open transition BSS.
-			if owe_transition or (a.wpa == nil and akm:find("OWE", 1, true)) then
+			if is_enterprise then
+				-- 802.1X. The encryption value each of these maps to is
+				-- verified against the LIVE generator (25.12's
+				-- /usr/share/ucode/wifi/, since /lib/netifd/wireless/mac80211.sh
+				-- is itself a ucode script): iface.uc takes auth_type from the
+				-- first `+` token of `encryption`, so wpa2+ccmp -> eap,
+				-- wpa3 -> eap2, wpa3-mixed -> eap-eap2, wpa3-192 -> eap192.
+				-- 192-bit is tested first: it implies wpa3.support.
+				if _wire_bool(a["wpa3.enhanced_192"])
+						or akm:find("SUITE-B-192", 1, true) then
+					security = "wpa3-enterprise-192"
+				elseif wpa3_support and wpa3_transition then
+					security = "wpa2/wpa3-enterprise"
+				elseif wpa3_support then
+					security = "wpa3-enterprise"
+				else
+					security = "wpa2-enterprise"
+				end
+			elseif owe_transition or (a.wpa == nil and akm:find("OWE", 1, true)) then
 				security = "owe"
 			elseif a.wpa == "2" or a.wpa == "3" then
 				local has_sae = akm:find("SAE", 1, true) ~= nil
@@ -2700,8 +3464,6 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- therefore provision a transition WLAN as pure WPA3 and drop
 				-- every WPA2-only client on the network (IoT devices above
 				-- all). These two keys are authoritative where present.
-				local wpa3_support    = _wire_bool(a["wpa3.support"])
-				local wpa3_transition = _wire_bool(a["wpa3.transition"])
 				if wpa3_support and wpa3_transition then security = "wpa2/wpa3"
 				elseif wpa3_support then security = "wpa3"
 				elseif has_sae and has_psk then security = "wpa2/wpa3"
@@ -2761,6 +3523,39 @@ function M._parse_wifi_system_cfg(sys_raw)
 				end
 			end
 			if bcfilt_macs then table.sort(bcfilt_macs) end
+			-- wireless.<n>.bcfilt.bypass_types: the frame types the blocker must
+			-- let through. CONFIRMED live 2026-10-27 in the lab, as exactly
+			-- "ARP|NSNA|DHCPV4|DHCPV6" -- the controller writes that string as a
+			-- literal (10.6.106, com/ubnt/service/config/ubntconf/EYFcHmSpOqr),
+			-- so those four tokens are the whole vocabulary it can send today.
+			-- It is emitted only for a WLAN whose Multicast Suppression is
+			-- "Aggressive" on a device claiming wifi_caps2 0x400000, which is why
+			-- openUF never saw it before: without it the blocker drops ARP and
+			-- DHCP too, and bcfilter.lua's header called that deliberate fidelity
+			-- to Ubiquiti's older documentation. The controller now says the
+			-- opposite in its own UI -- "Aggressive blocks all except DHCP and
+			-- ARP" -- so the tokens are honoured.
+			--
+			-- Parsed as a set, upper-cased, with unknown tokens named and
+			-- dropped rather than guessed at: each one has to become an nft
+			-- match, so a token with no mapping cannot be silently "allowed".
+			local bcfilt_bypass
+			for raw in tostring(w["bcfilt.bypass_types"] or ""):gmatch("[^|]+") do
+				-- A fresh local, not the loop variable: Lua 5.5 makes the
+				-- generic-for control variable const and refuses the assignment
+				-- outright, while 5.1 (the target) accepts it -- so the dev box
+				-- is the strict one here for once.
+				local tok = raw:gsub("^%s+", ""):gsub("%s+$", ""):upper()
+				if tok ~= "" then
+					if BCFILT_BYPASS_TYPES[tok] then
+						bcfilt_bypass = bcfilt_bypass or {}
+						bcfilt_bypass[tok] = true
+					else
+						io.stderr:write(("inform: bcfilt: ignoring unknown bypass type %q\n")
+							:format(tok))
+					end
+				end
+			end
 
 			-- Private Pre-Shared Keys: several passphrases on one SSID, each
 			-- landing its client on its own VLAN. Pushed only to a device
@@ -2773,9 +3568,12 @@ function M._parse_wifi_system_cfg(sys_raw)
 			-- stays on the VAP's own network. aaa.<n>.wpa.psk still comes
 			-- along, a random passphrase the controller generates for the
 			-- WLAN, and is provisioned like any other key.
+			-- `not is_enterprise`: an EAP BSS authenticates against RADIUS and
+			-- must never carry local private keys (nor a passphrase, see
+			-- x_passphrase below).
 			local ppsk
 			if _wire_bool(a["wpa.psk_file.status"]) and security ~= "open"
-					and security ~= "owe" then
+					and security ~= "owe" and not is_enterprise then
 				local idxs = {}
 				for k in pairs(a) do
 					local i = k:match("^wpa%.psk_file%.(%d+)%.psk$")
@@ -2804,6 +3602,52 @@ function M._parse_wifi_system_cfg(sys_raw)
 				end
 			end
 
+			-- aaa.<n>.sae.psk.<k>.{psk,mac,vlan,id}: SAE passwords bound to a
+			-- station (wlanconf sae_psk; 10.x emitter XWWFgnDBrNRLQZ). Entry
+			-- ff:ff:ff:ff:ff:ff is the WLAN's own key, already the WLAN's
+			-- passphrase. UniFi firmware writes the rest as sae_password=
+			-- lines (6.8.2 ubntbox); OpenWrt's wifi-station writes the same
+			-- key to the SAE and the PSK file, so they join the private keys.
+			if security ~= "open" and security ~= "owe" and not is_enterprise then
+				local idxs = {}
+				for k in pairs(a) do
+					local i = k:match("^sae%.psk%.(%d+)%.psk$")
+					if i then idxs[#idxs + 1] = tonumber(i) end
+				end
+				table.sort(idxs)
+				for _, i in ipairs(idxs) do
+					local pre = "sae.psk." .. i .. "."
+					local key = a[pre .. "psk"]
+					local mac_raw = a[pre .. "mac"]
+					local mac = mac_raw and mac_raw:lower()
+					local vid_raw = a[pre .. "vlan"]
+					local vid = tonumber(vid_raw)
+					local key_ok = (#key >= 8 and #key <= 63)
+						or (#key == 64 and key:match("^%x+$") ~= nil)
+					local vid_ok = vid_raw == nil
+						or (vid ~= nil and vid == math.floor(vid) and vid >= 1 and vid <= 4094)
+					local mac_ok = mac == nil or is_mac(mac)
+					if mac ~= "ff:ff:ff:ff:ff:ff" then
+						if key_ok and vid_ok and mac_ok then
+							local dup = false
+							for _, e in ipairs(ppsk or {}) do
+								if e.key == key and e.vid == vid and e.mac == mac then dup = true end
+							end
+							if not dup then
+								ppsk = ppsk or {}
+								ppsk[#ppsk + 1] = {key = key, vid = vid, mac = mac}
+							end
+						else
+							io.stderr:write(("inform: WLAN %q: skipping SAE key %d (%s)\n")
+								:format(w.ssid, i, not key_ok
+									and "passphrase is not 8-63 characters or 64 hex digits"
+									or (not vid_ok and "bad VLAN id " .. tostring(vid_raw)
+										or "bad station MAC " .. tostring(mac_raw))))
+						end
+					end
+				end
+			end
+
 			vap_table[#vap_table + 1] = {
 				ssid                  = w.ssid,
 				radio                 = w.parent,
@@ -2815,7 +3659,29 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- one, taking the nested sta_table -- and thus every wireless
 				-- client -- with them).
 				wlanconf_id           = a.id,
-				x_passphrase          = a["wpa.psk"],
+				-- An EAP WLAN has no passphrase. The controller leaves
+				-- aaa.<n>.wpa.psk absent on one, but forcing nil here keeps a
+				-- stray key from ever reaching an EAP BSS.
+				x_passphrase          = (not is_enterprise) and a["wpa.psk"] or nil,
+				-- 802.1X / WPA-Enterprise: see _wire_radius above for the wire
+				-- keys, what is deferred, and why. Also set on a non-EAP WLAN
+				-- that has RADIUS MAC authentication on, which brings the same
+				-- server block; nil when the WLAN has neither.
+				radius                = radius,
+				-- aaa.<n>.radius.macacl.status: the client's MAC is checked
+				-- against RADIUS before it may associate (hostapd's
+				-- macaddr_acl=2). Independent of the security type -- an
+				-- Enterprise WLAN can carry it too -- and never true without a
+				-- usable `radius` beside it, since the WLAN is dropped instead.
+				mac_auth              = mac_auth or nil,
+				-- aaa.<n>.accept_mac.*: MAC-based VLANs, the controller's
+				-- per-client "Virtual Network Override". See _wire_mac_vlans
+				-- for the wire shape and why `status` is not the discriminator.
+				mac_vlans             = _wire_mac_vlans(a),
+				-- Hotspot 2.0 / Passpoint: see _wire_hs20 above for the wire
+				-- keys, what the controller cannot be made to send, and why.
+				-- nil unless this WLAN has a Hotspot 2.0 profile attached.
+				hs20                  = hs20,
 				fast_roaming_enabled  = (a["ft.status"] == "enabled"),
 				-- aaa.<n>.wpa3.ft.status: FT for the SAE akm specifically,
 				-- a SEPARATE toggle from ft.status. Confirmed from the
@@ -2845,12 +3711,49 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- eWivisHeQsnaqDtx). UniFi firmware writes it to hostapd as
 				-- wpa_group_rekey= (firmware-confirmed for 4.0.15). 0 = off.
 				group_rekey           = _wire_group_rekey(a["wpa.group_rekey"]),
+				-- aaa.<n>.sae.{anti_clogging,sync,groups}: SAE tuning. The firmware
+				-- writes them to hostapd as sae_anti_clogging_threshold=, sae_sync=
+				-- and sae_groups= (firmware-confirmed for 6.8.2 ubntbox).
+				sae_anti_clogging     = _wire_posint(a["sae.anti_clogging"]),
+				sae_sync              = _wire_posint(a["sae.sync"]),
+				sae_groups            = _wire_sae_groups(a),
 				-- aaa.<n>.11k.status: the wlanconf's rrm_enabled (default
 				-- false; REST-only, the 10.6 UI has no control), "enabled" or
 				-- "disabled" on every WLAN (10.x generator eWivisHeQsnaqDtx).
 				-- UniFi firmware runs `iwpriv <ath> rrm 0|1` with it
 				-- (firmware-confirmed for 4.0.15). nil when absent.
 				rrm                   = _wire_bool(a["11k.status"]),
+				-- aaa.<n>.auth_cache: opportunistic key caching / PMKSA
+				-- caching, from the wlanconf's `auth_cache` (REST-only, the
+				-- 10.6 UI has no control), DEFAULT ENABLED. CONFIRMED live
+				-- 2026-10-26 against 10.6.106 by diffing system_cfg across the
+				-- field. Emitted only in the generator's WPA branch that also
+				-- writes wpa.key.1.mgmt + wpa.psk (10.6 VAZShipWTNxlo), and
+				-- only ever observed on a WPA-Enterprise WLAN -- a WPA2-PSK
+				-- WLAN's aaa block carries no auth_cache at all, which is
+				-- consistent with OKC being an 802.1X notion. Maps onto
+				-- OpenWrt's `okc` wifi-iface option (schema-confirmed on
+				-- 25.12; ap.uc's own default is on for sae/owe and for FT).
+				-- nil when absent, so a PSK WLAN is left alone.
+				okc                   = _wire_bool(a.auth_cache),
+				-- aaa.<n>.tdls_prohibit: forbid direct station-to-station
+				-- (TDLS) links, from the wlanconf's `tdls_prohibit` (REST-only),
+				-- default disabled, on every aaa block. CONFIRMED live
+				-- 2026-10-26 the same way. Maps 1:1 onto OpenWrt's
+				-- `tdls_prohibit` wifi-iface option (schema-confirmed on 25.12).
+				tdls_prohibit         = _wire_bool(a.tdls_prohibit),
+				-- aaa.<n>.country_beacon: advertise the regulatory domain in
+				-- beacons (the 802.11d Country information element), from the
+				-- wlanconf's `country_beacon` (REST-only), default disabled,
+				-- on every aaa block. CONFIRMED live 2026-10-26 the same way.
+				-- OpenWrt's counterpart, `ieee80211d`, is a wifi-DEVICE
+				-- option, so apply_config has to collapse the per-BSS wire key
+				-- to one setting per radio -- see its aggregation.
+				country_beacon        = _wire_bool(a.country_beacon),
+				-- aaa.<n>.wpa.1.pairwise: the pairwise cipher the controller
+				-- actually chose -- see _wire_pairwise for the enum, what
+				-- reaches the wire and why CCMP comes back as nil.
+				pairwise              = _wire_pairwise(a["wpa.1.pairwise"]),
 				vlan_enabled          = vlan_id ~= nil,
 				vlan                  = vlan_id,
 				-- {key=, vid=} per private pre-shared key, in wire order;
@@ -3056,6 +3959,30 @@ function M._parse_wifi_system_cfg(sys_raw)
 					-- See the bcfilt derivation above the vap literal.
 					bcfilt_enabled        = _wire_bool(w["bcfilt.status"]),
 					bcfilt_macs           = bcfilt_macs,
+					bcfilt_bypass         = bcfilt_bypass,
+					-- wireless.<n>.multicast.suppressor: "Multicast Suppression"
+					-- (Settings -> WiFi -> [WLAN] -> Advanced). CONFIRMED live
+					-- 2026-10-27 in the lab, on both band entries of the WLAN, once
+					-- wifi_caps2 0x400000 is claimed.
+					--
+					-- The control has three positions and the wire carries no mode
+					-- string, so the mode is read off the PAIR of keys. 10.6.106's
+					-- own writer settles it: bcfilt.status (plus bypass_types) is
+					-- emitted when the mode is Aggressive, and this key is emitted
+					-- for Aggressive and Conservative alike, so
+					--   suppressor + bcfilt  -> Aggressive: block all group frames
+					--                           except the four bypass types and the
+					--                           allow-listed senders (bcfilter.lua)
+					--   suppressor, no bcfilt -> Conservative: "prevents storms"
+					--   bcfilt, no suppressor -> an older controller, or the blocker
+					--                           turned on with the mode left Off:
+					--                           today's behaviour, unchanged
+					-- The controller's own description of the two modes is "Limits
+					-- multicast and broadcast traffic to reduce WiFi airtime usage.
+					-- Conservative prevents storms; Aggressive blocks all except DHCP
+					-- and ARP" (10.6.106 en locale,
+					-- SETTINGS_WIFI_FORM_ADVANCED_MULTICAST_SUPPRESSION_DESC).
+					mcast_suppressor      = _wire_bool(w["multicast.suppressor"]),
 					-- Per-VAP disable. Moves with the parent radio's
 					-- radio.<n>.status (disabling a radio disables every VAP
 					-- on it), but is an independent key -- confirmed live
@@ -3331,6 +4258,64 @@ function M._note_unknown_fields(resp)
 	end
 end
 
+-- The IP Settings / DNS / hostname half of a system_cfg: the keys
+-- handle_response acts on outside the wifi, switch and sysconf passes.
+--
+-- Pure on purpose. It was inline in handle_response until 2026-10-26, which
+-- left the device-level keys as the one part of a push with no replayable
+-- parser -- neither a unit test nor tools/cfg-coverage.lua could reach them
+-- without running the whole response handler and its side effects.
+-- The malformed-address refusal stays in handle_response: it writes to stderr
+-- and feature-detects netconfig, neither of which belongs in a parser.
+--
+-- Returns a table, always: {ip, netmask, gateway, dhcp, device_name, dns}.
+function M._parse_net_system_cfg(sys_raw)
+	if type(sys_raw) ~= "string" then return {dhcp = false, dns = {}} end
+	local ip, netmask, gateway, device_name
+	local dhcp = false
+	-- DNS servers, keyed by their wire index so the controller's ordering
+	-- (primary/secondary) survives -- resolv.conf's order is the resolver's
+	-- preference order, so it is load-bearing. Same index-keyed-then-sorted
+	-- treatment as macacl's acl.<k> list.
+	local dns_by_idx = {}
+	for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
+		local k, v = line:match("^([^=]+)=(.*)$")
+		if k and v then
+			local dns_idx = k:match("^resolv%.nameserver%.(%d+)%.ip$")
+			if dns_idx then
+				if v ~= "" then dns_by_idx[tonumber(dns_idx)] = v end
+			elseif k == "netconf.1.ip" then ip = v
+			elseif k == "netconf.1.netmask" then netmask = v
+			elseif k == "route.1.gateway" then gateway = v
+			elseif k == "dhcpc.1.status" then
+				-- Only an enabled-ish value means DHCP. The key's presence
+				-- alone used to set dhcp=true, so a hypothetical
+				-- dhcpc.1.status=disabled alongside a netconf.1.ip would have
+				-- misread a static push as DHCP and flushed the working static
+				-- address. Every capture so far carries =enabled; this is
+				-- defensive for the static-mode shape that hasn't been
+				-- captured yet.
+				dhcp = _wire_bool(v) == true
+			elseif k == "resolv.host.1.name" then
+				-- The controller's own idea of this device's name (its local
+				-- network hostname) -- already present in every capture (e.g.
+				-- "U6IW" when never renamed). Reused as the WPS Device Name
+				-- value when advertise_ap_name is on, since it's the only
+				-- controller-assigned "AP name" string available on this wire
+				-- protocol.
+				if v ~= "" then device_name = v end
+			end
+		end
+	end
+	-- Flatten the index-keyed DNS table into controller order.
+	local dns, idxs = {}, {}
+	for i in pairs(dns_by_idx) do idxs[#idxs + 1] = i end
+	table.sort(idxs)
+	for _, i in ipairs(idxs) do dns[#dns + 1] = dns_by_idx[i] end
+	return {ip = ip, netmask = netmask, gateway = gateway,
+		dhcp = dhcp, device_name = device_name, dns = dns}
+end
+
 -- ─── Dropped-key visibility ──────────────────────────────────────────────────
 
 -- Key shapes some pass in openUF actually reads. Everything else in a config
@@ -3395,6 +4380,13 @@ local RECOGNIZED_MGMT_CFG = {
 	"^inform_url$", "^use_aes_gcm$", "^cfgversion$", "^led_enabled$", "^authkey$",
 	"^capability$", "^stun_url$",
 }
+
+-- Exported for tools/cfg-coverage.lua, which cross-checks these CLAIMS against
+-- what a replay proves the parsers actually use. The lists are prefix-coarse by
+-- design (`^aaa%.%d+%.` covers keys openUF drops, such as auth_cache), so a key
+-- being "recognized" here is not evidence that anything reads it.
+M.RECOGNIZED_SYSTEM_CFG = RECOGNIZED_SYSTEM_CFG
+M.RECOGNIZED_MGMT_CFG   = RECOGNIZED_MGMT_CFG
 
 -- Set from handle_response when cfg.config.debug_dump_file is on -- the
 -- dropped-key report is a diagnostic for exactly the same workflow (diffing
@@ -3588,53 +4580,9 @@ function M.handle_response(json_str, st, cfg)
 		if type(sys_raw) == "string" then
 			M._report_dropped_keys("system_cfg", sys_raw, RECOGNIZED_SYSTEM_CFG)
 
-			local ip, netmask, gateway
-			local dhcp = false
-			local device_name
-			-- DNS servers, keyed by their wire index so the controller's
-			-- ordering (primary/secondary) survives -- resolv.conf's order is
-			-- the resolver's preference order, so it is load-bearing. Same
-			-- index-keyed-then-sorted treatment as macacl's acl.<k> list.
-			local dns_by_idx = {}
-			for line in (sys_raw .. "\n"):gmatch("([^\n]*)\n") do
-				local k, v = line:match("^([^=]+)=(.*)$")
-				if k and v then
-					local dns_idx = k:match("^resolv%.nameserver%.(%d+)%.ip$")
-					if dns_idx then
-						if v ~= "" then dns_by_idx[tonumber(dns_idx)] = v end
-					elseif k == "netconf.1.ip" then ip = v
-					elseif k == "netconf.1.netmask" then netmask = v
-					elseif k == "route.1.gateway" then gateway = v
-					elseif k == "dhcpc.1.status" then
-						-- Only an enabled-ish value means DHCP. The key's
-						-- presence alone used to set dhcp=true, so a
-						-- hypothetical dhcpc.1.status=disabled alongside a
-						-- netconf.1.ip would have misread a static push as
-						-- DHCP and flushed the working static address. Every
-						-- capture so far carries =enabled; this is defensive
-						-- for the static-mode shape that hasn't been
-						-- captured yet.
-						dhcp = _wire_bool(v) == true
-					elseif k == "resolv.host.1.name" then
-						-- The controller's own idea of this device's name
-						-- (its local network hostname) -- already present
-						-- in every capture (e.g. "U6IW" when never
-						-- renamed). Reused as the WPS Device Name value
-						-- when advertise_ap_name is on, since it's the
-						-- only controller-assigned "AP name" string
-						-- available on this wire protocol.
-						if v ~= "" then device_name = v end
-					end
-				end
-			end
-			-- Flatten the index-keyed DNS table into controller order.
-			local dns = {}
-			do
-				local idxs = {}
-				for i in pairs(dns_by_idx) do idxs[#idxs + 1] = i end
-				table.sort(idxs)
-				for _, i in ipairs(idxs) do dns[#dns + 1] = dns_by_idx[i] end
-			end
+			local net = M._parse_net_system_cfg(sys_raw)
+			local ip, netmask, gateway = net.ip, net.netmask, net.gateway
+			local dhcp, device_name, dns = net.dhcp, net.device_name, net.dns
 
 			-- Shape check BEFORE anything is recorded or run. These three
 			-- values are interpolated into `ip addr`/`ip route` command lines
@@ -3763,8 +4711,7 @@ function M.handle_response(json_str, st, cfg)
 							roam_assist_active = roam_assist_active,
 							device_name = device_name, keep_vlans = port_vlans,
 							peer_ie = M._sysinfo.peer_ie_hex(st and st.mac),
-							backhaul = backhaul_plan,
-							rrb_peers = st and st.rrb_peers})
+							backhaul = backhaul_plan})
 					M._deny_reloaded()   -- apply_config ran `wifi reload`
 				end
 			end
@@ -5343,46 +6290,40 @@ function M._rrbguard_tick()
 	return g.tick(now, hour)
 end
 
--- ─── UniFi peers the translator heard (ftinterop.lua, rrb/rrb-unifi.uc) ────
+-- ─── Plugins (plugins.lua) ──────────────────────────────────────────────────
 
--- Every heartbeat: the openuf-rrb daemon records each UniFi BSSID it hears on
--- the LAN, with the mobility domain once a roam announcement verified with
--- that WLAN's key names it (its peers file). A BSSID with a domain is a key
--- holder for that WLAN: it goes into st.rrb_peers (state.json, so a reboot
--- keeps it) and, on an adopted AP, cfgversion is forgotten so the controller
--- pushes the full config again and apply_config writes the new r0kh/r1kh
--- lines. At most one such re-push every RRB_PEERS_REPUSH_GAP, since a push
--- reloads the FT WLANs' BSSes. Returns nil (nothing new), "learned" (kept,
--- no re-push yet) or "repush".
-M.RRB_PEERS_REPUSH_GAP = 600
-M._rrb_peers_next_repush = 0
-function M._rrb_peers_tick(st, cfg)
-	if not (st and cfg and cfg.config and cfg.config.unifi_ft_interop) then return nil end
-	local fti = M._ftinterop
-	if not (fti and fti.learned) then return nil end
-	local learned = fti.learned(fti._read_file)
-	if #learned == 0 then return nil end
-	st.rrb_peers = st.rrb_peers or {}
-	local new = {}
-	for _, p in ipairs(learned) do
-		if p.md and st.rrb_peers[p.bssid] ~= p.md then
-			st.rrb_peers[p.bssid] = p.md
-			new[#new + 1] = p.bssid .. " (" .. p.md .. ")"
-		end
-	end
-	if #new == 0 then return nil end
-	io.stderr:write("openuf: rrb: UniFi peer(s) learned: " .. table.concat(new, ", ") .. "\n")
-	local now = M._time()
-	if st.adopted and now >= M._rrb_peers_next_repush then
-		st.cfgversion = ""
-		M._rrb_peers_next_repush = now + M.RRB_PEERS_REPUSH_GAP
+-- The WLAN options the controller last pushed were built with the plugins
+-- then enabled. When that set (or a plugin's source) has changed since, forget
+-- cfgversion so the controller pushes again, instead of waiting for a Force
+-- Provision. A device that has never been pushed to has nothing stale.
+function M._reconcile_plugins(st, cfg)
+	local pl = M._plugins
+	if not pl then return end
+	local ok, fp = pcall(pl.fingerprint, cfg)
+	if not ok then return end
+	if fp ~= (st.plugins_fp or "") then
+		if st.adopted and st.cfgversion ~= "" then st.cfgversion = "" end
+		st.plugins_fp = fp
 		M._state.save(st)
-		io.stderr:write("openuf: rrb: cfgversion forgotten so the controller pushes the "
-			.. "full config again; the new peer(s) become key holders then\n")
-		return "repush"
 	end
-	M._state.save(st)
-	return "learned"
+end
+
+-- Until 2026-11-02 openUF pointed hostapd at the veth of its own vendored
+-- 802.11r translator. A device upgraded from such a build still has those
+-- WLAN options and the veth sections; the sections may only go once the
+-- WLANs no longer name the veth (ucihelper.remove_legacy_ft_veth, after the
+-- reload of a push), so the controller is asked to push again, once.
+function M._migrate_legacy_rrb(st, cfg)
+	local ok, present = pcall(M._ucihelper.legacy_ft_veth_present)
+	if not (ok and present) then return false end
+	if st.adopted and st.cfgversion ~= "" then
+		st.cfgversion = ""
+		M._state.save(st)
+		io.stderr:write("openuf: this device still carries the veth of openUF's former built-in "
+			.. "802.11r translator; the controller is asked to push the WLANs again, after which "
+			.. "the veth is removed (the translator is a separate install now, see USAGE.md)\n")
+	end
+	return true
 end
 
 -- ─── WiFi Blackout Schedule ─────────────────────────────────────────────────
@@ -5530,18 +6471,58 @@ end
 -- Fold the drained collector lines into connection attempts and decide the
 -- ones that are complete. The nft listing is skipped while nobody is
 -- mid-connection, which is nearly every heartbeat.
+--
+-- Returns the parsed event list, which is the only walk of these lines: the
+-- radar records in it are _dfs_poll's.
 function M._assoc_poll(blob)
 	local at = M._assoctrack
 	local evs = at.parse_events(blob)
 	at.ingest(evs)
 	at.roam_ingest(evs, M._vap_by_ifname)
-	if next(at._stas) == nil then return end
+	if next(at._stas) == nil then return evs end
 	local up = tonumber(((M._read_file("/proc/uptime") or ""):match("^(%S+)")))
-	if not up then return end
+	if not up then return evs end
 	at.poll({
 		now = up, epoch = M._time(), sets = at.read_sets(up),
 		vap_by_ifname = M._vap_by_ifname,
 	})
+	return evs
+end
+
+-- Kill a collector nobody wants any more, and stop asking once it is gone.
+--
+-- The question costs a `pgrep` and the answer cannot change behind our back:
+-- nothing starts a collector except collector_ensure, which clears the latch.
+-- Without it a DFS-only site -- or one that never had enrichment on at all --
+-- pays that pgrep every RRM_COLLECTOR_CHECK_INTERVAL for as long as the daemon
+-- runs, to be told the same thing every time.
+function M._reap_collector(rrm)
+	if M._collector_reaped or not (rrm and rrm.collector_running) then return end
+	local ok, running = pcall(rrm.collector_running)
+	if not ok then return end
+	if running then
+		-- Not latched on a stop: collector_stop is a `kill` whose success is
+		-- not read back, and a child that survived it is exactly the unbounded
+		-- append this check exists to stop. The next interval asks again.
+		pcall(rrm.collector_stop)
+		return
+	end
+	M._collector_reaped = true
+end
+
+-- Is there anything in the collector's event file? An open and a seek, against
+-- drain()'s read of the whole file plus the truncating rewrite that follows it
+-- -- and on a site where the collector is not running (DFS only) the file does
+-- not exist at all, so the answer is one failed open per heartbeat.
+function M._events_pending(rrm)
+	-- No file to look at (a test's stub, a future collector that keeps its
+	-- lines elsewhere): drain and let it answer, as before.
+	if not rrm.EVENT_FILE then return true end
+	local f = io.open(rrm.EVENT_FILE, "r")
+	if not f then return false end
+	local size = f:seek("end")
+	f:close()
+	return (tonumber(size) or 0) > 0
 end
 
 -- One cycle of the client-assisted enrichment: keep the notification
@@ -5570,17 +6551,26 @@ function M._rrm_tick(cfg, st)
 	M._roam_keep = rrm_on and true or false
 	if not (assoc_on and rrm_on) then M._pre_blob = nil end
 	local now = M._time()
-	if not rrm_on and not assoc_on then
+	-- A radio that can see radar is a third consumer of the control-socket
+	-- monitors, alongside 802.11k enrichment and connection tracking. Without
+	-- it in this condition the whole path below is skipped -- and the branch
+	-- stops the collector and deletes the event file -- so on a site with
+	-- neither of the other two the radar event would never be sent.
+	local dfs_on = M._dfs_radio and true or false
+	if not rrm_on and not assoc_on and not dfs_on then
 		-- Off -- but a collector started while it was ON is a detached `ubus
 		-- subscribe` child, reparented to init, appending to a file on a RAM
 		-- disk that harvest() -- the only thing that ever truncates it -- no
 		-- longer drains. rrmscan.collector_stop() existed and had no caller;
 		-- this is where it belongs. Rate-limited on the collector's own
 		-- liveness clock, since finding out is a pgrep.
+		-- Latched on top of that (see M._collector_reaped): a site that never
+		-- had enrichment on, or had it on and has since been cleaned up, would
+		-- otherwise pgrep every 60 s for the lifetime of the daemon to learn
+		-- the same thing every time.
 		if now >= M._rrm_collector_next then
 			M._rrm_collector_next = now + M.RRM_COLLECTOR_CHECK_INTERVAL
-			local ok_r, running = pcall(rrm.collector_running)
-			if ok_r and running then pcall(rrm.collector_stop) end
+			M._reap_collector(rrm)
 			if M._assoc_installed then
 				pcall(M._assoctrack.teardown)
 				M._assoc_installed = false
@@ -5600,27 +6590,54 @@ function M._rrm_tick(cfg, st)
 			pcall(M._assoctrack.teardown)
 			M._assoc_installed = false
 		end
-		pcall(rrm.collector_ensure,
-			assoc_on and {on_auth = M._assoctrack.forget_shell("m"), fdb = true} or nil)
-		-- The control-socket monitors serve only the 802.11k enrichment:
-		-- connection tracking reads the ubus lines alone.
-		if rrm_on then
+		-- The `ubus subscribe` half serves enrichment and connection tracking
+		-- only: the radar event comes off the control socket, so a DFS-only
+		-- site pays for the monitors and not for the subscriber.
+		if rrm_on or assoc_on then
+			pcall(rrm.collector_ensure,
+				assoc_on and {on_auth = M._assoctrack.forget_shell("m"), fdb = true} or nil)
+			-- A collector is wanted again, so whatever the latch below learned
+			-- about there not being one no longer holds.
+			M._collector_reaped = false
+		else
+			-- DFS only: no subscriber is wanted, and one left over from a run
+			-- with enrichment on is a detached child that would append to the
+			-- event file forever. collector_stop also takes the monitors and
+			-- the file with it, so it runs before monitors_ensure below.
+			M._reap_collector(rrm)
+		end
+		-- The control-socket monitors serve the 802.11k enrichment and the
+		-- DFS radar event: connection tracking reads the ubus lines alone.
+		-- M._dfs_radio is what build_json saw on the last cycle -- one cycle
+		-- stale, which costs nothing on a check that runs every
+		-- RRM_COLLECTOR_CHECK_INTERVAL.
+		if rrm_on or dfs_on then
 			if rrm.monitors_ensure then pcall(rrm.monitors_ensure) end
 		elseif rrm.monitors_stop then
 			pcall(rrm.monitors_stop)
 		end
 	end
 
-	-- The file can only be emptied once, so one drain feeds both consumers.
+	-- A quiet event file is the common case -- on a DFS-only site it is every
+	-- heartbeat, since nothing is subscribing -- so the size is checked before
+	-- draining, the way _roam_poll already does between heartbeats.
 	local blob
-	if rrm.drain then
+	if rrm.drain and M._events_pending(rrm) then
 		local ok_d, b = pcall(rrm.drain)
 		if ok_d then blob = b end
 	end
+	local evs
 	if assoc_on then
-		local ok_a, err_a = pcall(M._assoc_poll, blob)
-		if not ok_a then io.stderr:write("inform: assoctrack: " .. tostring(err_a) .. "\n") end
+		local ok_a, res = pcall(M._assoc_poll, blob)
+		if ok_a then evs = res
+		else io.stderr:write("inform: assoctrack: " .. tostring(res) .. "\n") end
 	end
+	-- Before the rrm_on return: a radar hit is reported whether or not 802.11k
+	-- enrichment is on, and the monitors that produce it run on the DFS gate.
+	-- `evs` is the walk _assoc_poll already did over these same lines: with
+	-- connection tracking on, the radar records come out of it instead of a
+	-- second gmatch pass over the blob. Nothing drained, nothing to look at.
+	if blob and blob ~= "" then pcall(M._dfs_poll, blob, evs) end
 	if not rrm_on then return true end
 	-- Lines _idle drained since the last heartbeat were ingested there; the
 	-- beacon reports among them are still the harvest's.
@@ -5630,7 +6647,10 @@ function M._rrm_tick(cfg, st)
 		blob, M._pre_blob = table.concat(chunks), nil
 	end
 
-	local ok, fresh, reporters = pcall(rrm.harvest, blob)
+	-- `blob or ""`, never a bare nil: harvest drains the file itself when it is
+	-- handed nothing, which would undo the size gate above (and re-read a file
+	-- a failed drain has already emptied).
+	local ok, fresh, reporters = pcall(rrm.harvest, blob or "")
 	if ok then
 		for _, n in ipairs(fresh or {}) do
 			-- Keyed by BSSID so a neighbour two clients both saw is carried
@@ -5772,6 +6792,131 @@ function M._write_status(st, fields)
 	return os.rename(tmp, M.STATUS_FILE) and true or false
 end
 
+-- ─── dfs-reset ───────────────────────────────────────────────────────────────
+-- The controller's 02:00 cron job, pushed whenever the site has a 5 GHz radio
+-- pinned to a fixed DFS channel (the gate is decompiled in
+-- PROTOCOL-VALIDATION.md, "Axis 4"). What it is for: a radar hit takes the
+-- radio off that channel and nothing brings it back, so the carefully planned
+-- cell quietly stays on whatever channel the driver picked -- until the next
+-- Force Provision, which may be months away.
+--
+-- U7LR 6.8.2's own dfs_reset is the model, verb for verb (bin/syswrapper.sh):
+-- for each 5 GHz radio's first VAP in Master mode, compare the live channel
+-- against the one the controller configured, skip `auto` and `0`, skip when
+-- they already agree, skip while the configured channel is still on the
+-- non-occupancy list ("still in nol_channel, wait next time"), and otherwise
+-- put the radio back. The firmware uses `radartool chknol` and `iwconfig
+-- channel`; the equivalents here are mac80211's per-channel DFS state and a
+-- CSA through hostapd's control socket.
+--
+-- Deliberately a channel switch announcement rather than a `wifi reload`: the
+-- BSS is never torn down, associated clients are told where it is going, and
+-- UCI is not touched (it already holds the configured channel -- that is what
+-- makes this a *reset*). The radio still goes quiet for the CAC on arrival,
+-- which is the price of a DFS channel and the reason this runs at 02:00.
+M.DFS_RESET_REQUEST_FILE = "/tmp/openuf-dfs-reset-request"
+-- A request the daemon never saw (it was down, or the whole AP was) is not
+-- carried out hours later, when the clock has moved on and the controller
+-- would schedule a fresh one the next night anyway.
+M.DFS_RESET_MAX_AGE = 1800
+
+-- True when the hook left a request that is still fresh. The file is removed
+-- either way, so one request is served at most once.
+function M._dfs_reset_requested()
+	local raw = M._read_file(M.DFS_RESET_REQUEST_FILE)
+	if not raw then return false end
+	os.remove(M.DFS_RESET_REQUEST_FILE)
+	local at = tonumber(raw:match("%d+"))
+	if not at then return false end
+	local late = M._time() - at
+	if late > M.DFS_RESET_MAX_AGE or late < -60 then
+		io.stderr:write("inform: ignoring a stale dfs-reset request\n")
+		return false
+	end
+	return true
+end
+
+-- One radio: put it back on `want` if it is somewhere else and allowed to be
+-- there. Returns "moved", or nil plus the reason it was left alone.
+function M._dfs_reset_radio(radio, ifname)
+	local rrm, si = M._rrmscan, M._sysinfo
+	local want = tonumber(radio.channel)
+	if not want then return nil, "channel is not pinned" end
+
+	local caps = si.radio_caps(ifname) or {}
+	local live = tonumber(caps.channel)
+	if not live then return nil, "no live channel" end
+	if live == want then return nil, nil end
+
+	if rrm.is_dfs_channel(want) then
+		local states = rrm.parse_dfs_states(si.phy_channels(ifname))
+		if rrm.channel_in_nol(states, want) then
+			local s = states[want] or {}
+			io.stderr:write(("inform: dfs-reset: %s is on channel %d, wants %d,"
+				.. " but %d is still on the non-occupancy list%s -- waiting for"
+				.. " the next run\n"):format(ifname, live, want, want,
+				s.secs and (" for another " .. s.secs .. " s") or ""))
+			return nil, "in the non-occupancy list"
+		end
+	end
+
+	local args = rrm.chan_switch_args(want, caps.width)
+	if not args then
+		io.stderr:write(("inform: dfs-reset: %s: cannot express channel %d at %s"
+			.. " MHz as a channel switch -- leaving it on %d\n")
+			:format(ifname, want, tostring(caps.width), live))
+		return nil, "not expressible as a channel switch"
+	end
+	local cmd = "hostapd_cli -i " .. ifname .. " chan_switch "
+		.. rrm.CS_COUNT .. " " .. args
+	local out = M._run_cmd(cmd .. " 2>&1") or ""
+	if not out:find("OK", 1, true) then
+		io.stderr:write(("inform: dfs-reset: %s: hostapd refused the switch to"
+			.. " channel %d (%s): %s\n"):format(ifname, want, args,
+			(out:gsub("%s+$", ""))))
+		return nil, "hostapd refused the switch"
+	end
+	io.stderr:write(("inform: dfs-reset: %s switching back from channel %d to"
+		.. " the configured %d (%s)\n"):format(ifname, live, want, args))
+	return "moved"
+end
+
+-- Serve a pending dfs-reset request. Returns how many radios were moved.
+function M._maybe_service_dfs_reset(cfg)
+	if not M._dfs_reset_requested() then return 0 end
+	local ufuci, rrm, si = M._ucihelper, M._rrmscan, M._sysinfo
+	if not (ufuci and rrm and si and si.phy_channels) then return 0 end
+	local ok_r, radios = pcall(ufuci.get_radio_table, cfg and cfg.uap and cfg.uap.hwassign)
+	if not ok_r or type(radios) ~= "table" then return 0 end
+	local moved = 0
+	for _, radio in ipairs(radios) do
+		-- 5 GHz only, as the firmware's own list_first_vaps_ifs 5 does: no
+		-- other band has DFS, so no other band can have been pushed off a
+		-- channel by radar.
+		if radio.radio == "na" and not radio.disabled then
+			local ok_if, ifname = pcall(ufuci.get_ifname_for_radio, radio.name)
+			if ok_if and ifname then
+				local ok_m, what = pcall(M._dfs_reset_radio, radio, ifname)
+				if ok_m and what == "moved" then moved = moved + 1 end
+			end
+		end
+	end
+	return moved
+end
+
+-- One heartbeat: build, send, dispatch. Returns the number of seconds the
+-- caller should wait before the next one -- 0 means "again, now", the
+-- config-applied case, where a real AP re-informs immediately. ctx carries the
+-- loop's own state (interval, backoff, last_mtime) so run() is nothing but
+-- `while true do wait(_tick()) end`, and the error boundaries and the backoff
+-- can be exercised without a socket.
+--
+-- Every stage is pcall-wrapped, and that is the point of the split. build_json
+-- shells out to a dozen tools and does arithmetic on their output; one nil in
+-- one field takes the whole daemon down, and procd's respawn turns that into a
+-- crash loop every five seconds that reports no statistics and logs nothing
+-- beyond a traceback. A bad cycle now costs one heartbeat and one log line,
+-- and the next cycle gets another go.
 -- Send queued STA_ASSOC_TRACKER notifs, each as its own inform POST:
 -- inform_as_notif/notif_reason/notif_payload next to the device identity.
 -- The controller answers a bare noop (no interval) from its notif branch,
@@ -5800,6 +6945,116 @@ local function post_notifs(st, batch, requeue)
 	return #batch, true
 end
 
+-- Device events, as opposed to the per-station notifs above: same envelope
+-- (notif_reason "event"), but the payload is an `event_string` the
+-- controller's own event registry dispatches on, and the device identity is
+-- all the rest it needs. The controller logs the event under its site and
+-- raises the matching alert.
+--
+-- Of the eleven EVT_AP_* strings 10.6.106 has a handler for, exactly one is
+-- sent by the AP: EVT_AP_RadarDetected. The other ten (ChannelChanged,
+-- DetectRogueAP, Isolated, PossibleInterference, AcsTriggerComplete,
+-- QuickScanEvent, LocationEvent, AfcEvent, RestartProc, RestartedUnknown)
+-- appear nowhere in U7LR 6.8.2's binaries: the controller raises them itself
+-- from what it already knows, so there is nothing for a device to send.
+-- Conversely EVT_AP_WirelessEvent and EVT_AP_Notification, which 6.8.2 does
+-- emit, have no handler in 10.6.106 at all.
+M.MAX_EVENTS = 16
+M._event_queue = {}
+
+-- Two BSSes on the same radio both see the same radar hit, and hostapd prints
+-- the event on each BSS's control socket -- so the same detection arrives
+-- once per BSS. Collapsed on (channel, second): the controller would
+-- otherwise log one alert per VAP for one radar.
+M.EVENT_DEDUP_S = 5
+M._event_seen = {}
+
+function M.queue_event(p)
+	if type(p) ~= "table" or not p.event_string then return false end
+	if p.dedup_key then
+		local now, key = M._time(), p.dedup_key
+		local last = M._event_seen[key]
+		if last and now - last < M.EVENT_DEDUP_S then return false end
+		M._event_seen[key] = now
+		for k, v in pairs(M._event_seen) do
+			if now - v > M.EVENT_DEDUP_S * 4 then M._event_seen[k] = nil end
+		end
+		p.dedup_key = nil
+	end
+	if #M._event_queue >= M.MAX_EVENTS then return false end
+	M._event_queue[#M._event_queue + 1] = p
+	return true
+end
+
+-- The radar detections in one drained collector blob, queued as the
+-- controller's own event. `vap` is the interface hostapd reported it on,
+-- which is what 6.8.2 sends beside channel and freq; the handler reads
+-- channel (as a string) and freq (as a number) and ignores the event if
+-- either is missing.
+--
+-- `evs` is assoctrack.parse_events' output over the same blob, when connection
+-- tracking has already walked it: its radar records are turned into the same
+-- {t, ifname, freq, channel} rows by rrmscan.radar_of, so the blob is walked
+-- once per drain rather than once per consumer. Without it (DFS only, nothing
+-- else reading the file) parse_dfs does the walk itself.
+function M._dfs_poll(blob, evs)
+	local rrm = M._rrmscan
+	if not (rrm and rrm.parse_dfs) then return 0 end
+	local hits
+	if evs then
+		hits = {}
+		for _, e in ipairs(evs) do
+			if e.ev == "radar" then
+				local d = rrm.radar_of(e.t, e.ifname, e.freq)
+				if d then hits[#hits + 1] = d end
+			end
+		end
+	else
+		hits = rrm.parse_dfs(blob)
+	end
+	local n = 0
+	for _, d in ipairs(hits) do
+		if M.queue_event{
+			event_string = "EVT_AP_RadarDetected",
+			channel      = tostring(d.channel),
+			freq         = d.freq,
+			vap          = d.ifname,
+			dedup_key    = "radar/" .. tostring(d.channel),
+		} then
+			n = n + 1
+			-- Worth a line of its own: a radar hit takes the radio off that
+			-- channel for 30 minutes, and this is the only record openUF
+			-- leaves of why.
+			io.stderr:write(string.format(
+				"inform: DFS radar detected on channel %d (%d MHz) on %s"
+				.. " -- reported to the controller\n",
+				d.channel, d.freq, tostring(d.ifname)))
+		end
+	end
+	return n
+end
+
+local function take_events(n)
+	local out = {}
+	for i = 1, math.min(n, #M._event_queue) do out[i] = M._event_queue[i] end
+	for _ = 1, #out do table.remove(M._event_queue, 1) end
+	return out
+end
+
+local function requeue_events(list)
+	for i = #list, 1, -1 do table.insert(M._event_queue, 1, list[i]) end
+end
+
+-- Device events ride no capability: unlike the station notifs they are not
+-- gated on notif-assoc-stat, since the controller asked for nothing and the
+-- event is the AP telling it something it has no other way to learn.
+function M._send_events(st)
+	if not (st and st.adopted) or not M._notif_identity then return 0 end
+	if #M._event_queue == 0 then return 0 end
+	local n = post_notifs(st, take_events(M.MAX_EVENTS), requeue_events)
+	return n
+end
+
 -- Roam reports first: they are the ones a delay spoils.
 function M._send_notifs(st)
 	local at = M._assoctrack
@@ -5815,11 +7070,7 @@ end
 function M._roam_poll()
 	local rrm, at, st = M._rrmscan, M._assoctrack, M._roam_st
 	if not (rrm and at and rrm.drain) then return end
-	local f = io.open(rrm.EVENT_FILE, "r")
-	if not f then return end
-	local size = f:seek("end")
-	f:close()
-	if not size or size == 0 then return end
+	if not M._events_pending(rrm) then return end
 	local blob = rrm.drain()
 	if not blob or blob == "" then return end
 	if M._roam_keep then
@@ -5830,11 +7081,19 @@ function M._roam_poll()
 	local evs = at.parse_events(blob)
 	at.ingest(evs)
 	at.roam_ingest(evs, M._vap_by_ifname)
+	-- This drain is the only one these lines get, so the radar events in it
+	-- are queued here too; they go out with the next heartbeat. Off the walk
+	-- parse_events just did, not a second one over the same blob.
+	pcall(M._dfs_poll, blob, evs)
 	-- Only the roam reports: the funnel's keep the heartbeat's cadence.
 	if #at._roam_queue > 0 and st and st.adopted and M._notif_identity then
 		post_notifs(st, at.take_roams(at.MAX_ROAMS), at.requeue_roams)
 	end
 end
+
+-- Logged once per pending-adoption spell: the controller answers HTTP 404 to
+-- every inform from a device it has not adopted, until Adopt is clicked.
+M._logged_pending = false
 
 -- One heartbeat: build, send, dispatch. Returns the number of seconds the
 -- caller should wait before the next one -- 0 means "again, now", the
@@ -5877,6 +7136,9 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- inform so the reply's mapped address rides out on it.
 	pcall(M._stun_tick, st)
 	M._maybe_scan_neighbours(cfg, ctx)
+	-- The controller's nightly dfs-reset (syswrapper.sh dfs-reset), the same
+	-- request-file handshake as the 11k scan above.
+	pcall(M._maybe_service_dfs_reset, cfg)
 	-- One chunk of whatever sweep is queued (a command's, or the 11k-scan's),
 	-- before build_json so this inform carries what it found.
 	pcall(M._scan_job_tick)
@@ -5891,7 +7153,6 @@ function M._tick(st, cfg, ufhw, ctx)
 	pcall(M._block_resync, st)
 	pcall(M._sched_resync, st)
 	pcall(M._rrbguard_tick)
-	pcall(M._rrb_peers_tick, st, cfg)
 	-- The address this inform reports, read now rather than at startup (see
 	-- _refresh_net_info: a DHCP lease that arrived after the daemon did).
 	pcall(M._refresh_net_info, st, cfg)
@@ -5920,6 +7181,19 @@ function M._tick(st, cfg, ufhw, ctx)
 
 	local body, err = M.http_post(st.inform_url, pkt)
 	if not body then
+		-- A controller answers HTTP 404 to every inform from a device it has
+		-- not adopted, until someone clicks Adopt. That is its normal answer,
+		-- not a fault: backing off to 60 s would leave the first inform after
+		-- the click, the one that picks up the new key, up to a minute away.
+		if not st.adopted and err == "HTTP 404" then
+			if not M._logged_pending then
+				io.stderr:write("inform: pending adoption (HTTP 404 until adopted in the controller)\n")
+				M._logged_pending = true
+			end
+			ctx.interval = ctx.base_interval
+			ctx.backoff  = ctx.interval
+			return ctx.interval
+		end
 		io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
 		if dump_tx then M._debug_append(cfg, "ERR", tostring(err)) end
 		M._warn_http_400(err, st, cfg)
@@ -5927,12 +7201,20 @@ function M._tick(st, cfg, ufhw, ctx)
 		-- Doubles from the CURRENT cadence, capped at 60 s -- or at the
 		-- controller's own interval when that is longer, since a failure
 		-- must never make the device poll faster than it was asked to.
-		ctx.backoff = math.min(math.max(ctx.backoff, ctx.interval) * 2,
-			math.max(60, ctx.interval))
+		local cap = math.max(60, ctx.interval)
+		-- HTTP 503 is the controller shedding inform load ("Server is busy"
+		-- on 10.6): the wait goes straight to the cap rather than doubling
+		-- through 20 s and 40 s of more requests.
+		if err == "HTTP 503" then
+			ctx.backoff = cap
+			return ctx.backoff
+		end
+		ctx.backoff = math.min(math.max(ctx.backoff, ctx.interval) * 2, cap)
 		return ctx.backoff
 	end
 	ctx.backoff = ctx.interval
 	M._warned_400 = false
+	M._logged_pending = false
 
 	local parse_ok, json_body = pcall(M.parse_packet, body, st)
 	if not parse_ok then
@@ -5953,6 +7235,9 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- heard from this AP, and a notif from a device it considers lost is
 	-- discarded anyway.
 	if M._assoc_enabled(st, cfg) then pcall(M._send_notifs, st) end
+	-- Device events (EVT_AP_RadarDetected, _dfs_poll): the same notif
+	-- envelope, queued by the heartbeat's and the roam poll's drains.
+	pcall(M._send_events, st)
 	-- The controller's requested cadence, or the device's own when the last
 	-- noop named none. The backoff was reset to the old cadence above, before
 	-- this response could move it; follow it here too, or the first failure
@@ -6030,6 +7315,8 @@ function M.run(cfg, ufhw)
 	end
 	M._warn_debug_overrides(cfg)
 	M._sync_bootstrap_account(st.adopted, cfg and cfg.config and cfg.config.bootstrap_adopt_user)
+	M._reconcile_plugins(st, cfg)
+	M._migrate_legacy_rrb(st, cfg)
 	-- Blocked-client nft rules are live kernel state, not persisted UCI --
 	-- reapply from state.json on every fresh start (mirrors the bootstrap
 	-- account reconciliation just above).

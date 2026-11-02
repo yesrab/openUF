@@ -188,7 +188,7 @@ local test_files = {
 	"tests/test_meshvlan.lua",
 	"tests/test_uciconf.lua",
 	"tests/test_probe.lua",
-	"tests/test_ftinterop.lua",
+	"tests/test_plugins.lua",
 }
 
 for _, filepath in ipairs(test_files) do

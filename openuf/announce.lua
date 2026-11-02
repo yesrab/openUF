@@ -11,6 +11,15 @@
 	version 2 / command 9, the same TLVs in both). openUF only ever
 	broadcast, so those tools listed a bare host with no model, name or
 	firmware next to it -- "no extra info" where a real AP shows all three.
+	Since 2026-11-02 (upstream's 2026-10-25 reading of the same traffic) the
+	targeted v1 request `01 04 00 06 <mac>` is answered for this device's
+	own MAC (firmware-confirmed for UAP BZ2 4.0.15, mcad), the process joins
+	the discovery multicast group 233.89.188.1 on its LAN address so the
+	probes a UCG also sends there arrive, and one asker gets one reply per
+	request type per REPLY_MIN_GAP: the reply is ~100x the probe, so an
+	answering AP would otherwise be a UDP reflector. IPv6 (WiFiman also
+	probes ff02::1) is not served: no device, the UCG included, answered a
+	v6 probe upstream, so there is no reply format to copy.
 
 	Can be loaded as a module (returns M) or run as a standalone script.
 	When run as a script, call M.run(cfg) at the bottom of this file.
@@ -59,10 +68,18 @@ local function make_blob_17_1a(adopted)
 end
 
 -- Packet headers: version byte, command byte. ANNOUNCE is the unsolicited
--- broadcast; the other two answer the matching discovery request.
-M.HDR_ANNOUNCE = {0x02, 0x06}
-M.HDR_REPLY_V1 = {0x01, 0x00}
-M.HDR_REPLY_V2 = {0x02, 0x09}
+-- broadcast; the others answer the matching discovery request (reply_for).
+M.HDR_ANNOUNCE     = {0x02, 0x06}
+M.HDR_REPLY_V1     = {0x01, 0x00}
+M.HDR_REPLY_V2     = {0x02, 0x09}
+M.HDR_REPLY_TARGET = {0x01, 0x04}
+
+-- The same request from the same asker inside this many seconds gets no
+-- second reply. Keyed on asker AND request type: the UniFi app sends
+-- `01 00 00 00` and `02 08 00 00` back to back from one address and port,
+-- once a second (upstream's capture, 2026-10-25), and needs an answer to
+-- each -- keyed on the address alone one AP lost the app's "AP" badge.
+M.REPLY_MIN_GAP = 0.5
 
 -- Build a complete announce packet as a Lua binary string. `hdr` is one of
 -- the headers above (default ANNOUNCE); the TLVs are the same whichever.
@@ -166,17 +183,59 @@ end
 
 -- The reply a received datagram deserves, or nil for anything that is not
 -- a discovery request: our own broadcast echoed back, another AP's announce,
--- a controller's reply, noise. A request is exactly four bytes -- version,
--- command, and a zero length -- with version 1 command 0 or version 2
--- command 8 (0x08 is "request"; the UCG's answer carries 0x09).
+-- a controller's reply, noise. A bare request is exactly four bytes --
+-- version, command, and a zero length -- with version 1 command 0 or
+-- version 2 command 8 (0x08 is "request"; the UCG's answer carries 0x09).
+-- The targeted v1 request, `01 04 00 06 <mac>`, is answered with header
+-- 01 04 when the MAC is this device's own (the AP firmware's mcad does so;
+-- the UCG ignores it) and for no other MAC. Pure.
 function M.reply_for(data, cfg)
-	if type(data) ~= "string" or #data ~= 4 then return nil end
-	local ver, cmd = data:byte(1), data:byte(2)
-	if data:byte(3) ~= 0 or data:byte(4) ~= 0 then return nil end
-	if ver == 0x01 and cmd == 0x00 then return M.build_packet(cfg, M.HDR_REPLY_V1) end
-	if ver == 0x02 and cmd == 0x08 then return M.build_packet(cfg, M.HDR_REPLY_V2) end
+	if type(data) ~= "string" then return nil end
+	local ver, cmd, l1, l2 = data:byte(1, 4)
+	if not (ver and l1 and l1 == 0) then return nil end
+	if #data == 4 and l2 == 0 then
+		if ver == 0x01 and cmd == 0x00 then return M.build_packet(cfg, M.HDR_REPLY_V1) end
+		if ver == 0x02 and cmd == 0x08 then return M.build_packet(cfg, M.HDR_REPLY_V2) end
+	elseif #data == 10 and ver == 0x01 and cmd == 0x04 and l2 == 6 and cfg.mac then
+		local want = {}
+		for i = 1, 6 do want[i] = string.char(cfg.mac[i] or 0) end
+		if data:sub(5, 10) == table.concat(want) then
+			return M.build_packet(cfg, M.HDR_REPLY_TARGET)
+		end
+	end
 	return nil
 end
+
+-- Join the discovery multicast group on the LAN address, so requests sent
+-- to 233.89.188.1:10001 arrive too: the UCG sends its probes there as well
+-- as to the broadcast address, and the firmware's mcad joins the same
+-- group. Idempotent: a no-op while the address is unchanged, a re-join when
+-- it moves (DHCP renewal, a pushed static address), a retry on the next
+-- call when the join failed. A failure is logged once per distinct error.
+-- IPv4 only.
+M._joined = nil
+M._join_err = nil
+function M._join_multicast(udpl, cfg)
+	local ip = cfg.ip and table.concat(cfg.ip, ".") or "0.0.0.0"
+	if M._joined == ip then return end
+	if M._joined then
+		pcall(udpl.setoption, udpl, "ip-drop-membership",
+			{multiaddr = M.MULTICAST_ADDR, interface = M._joined})
+		M._joined = nil
+	end
+	local ok, err = udpl:setoption("ip-add-membership",
+		{multiaddr = M.MULTICAST_ADDR, interface = ip})
+	if ok then
+		M._joined, M._join_err = ip, nil
+	elseif M._join_err ~= tostring(err) then
+		M._join_err = tostring(err)
+		io.stderr:write("announce: cannot join " .. M.MULTICAST_ADDR .. " on " .. ip
+			.. " (" .. M._join_err .. "); multicast requests go unanswered\n")
+	end
+end
+
+-- Last reply time per asker address and request type (REPLY_MIN_GAP).
+M._last_reply = {}
 
 -- Read MAC address from sysfs for the given interface.
 -- Returns a 6-element byte table or nil on failure.
@@ -409,6 +468,7 @@ function M.run(cfg)
 		-- _refresh replaces it with the real figure whenever it can.
 		cfg.uptime = (cfg.uptime or 0) + interval
 		M._refresh(cfg)
+		if udpl then M._join_multicast(udpl, cfg) end
 
 		local ok, err = udpb:sendto(M.build_packet(cfg), M.BROADCAST_ADDR, M.PORT)
 		if not ok then
@@ -420,9 +480,12 @@ end
 
 -- Wait out one interval on the listener, answering every discovery request
 -- that arrives meanwhile (from port 10001, to the asker's own address and
--- port, as a real device does). Our own broadcast comes back through this
--- socket too; reply_for() returns nil for it. With no listener this is the
--- plain sleep the loop always had.
+-- port, as a real device does), one reply per asker and request type per
+-- REPLY_MIN_GAP, with fresh figures (IP, uptime, adoption) in the reply
+-- itself. Our own broadcast comes back through this socket too; reply_for()
+-- returns nil for it. A request that arrives as a broadcast and a multicast
+-- copy is answered once, by the gap. With no listener this is the plain
+-- sleep the loop always had.
 function M._serve_requests(udpl, cfg, interval, socket)
 	if not udpl then
 		socket.select(nil, nil, interval)
@@ -435,9 +498,22 @@ function M._serve_requests(udpl, cfg, interval, socket)
 		local readable = socket.select({udpl}, nil, remaining)
 		if readable and readable[1] then
 			local data, ip, port = udpl:receivefrom()
-			if data then
-				local reply = M.reply_for(data, cfg)
+			if data and ip then
+				local now = socket.gettime()
+				local key = ip .. "/" .. tostring(data:byte(1)) .. "." .. tostring(data:byte(2))
+				local last = M._last_reply[key]
+				local reply
+				if not (last and now - last < M.REPLY_MIN_GAP) and M.reply_for(data, cfg) then
+					M._refresh(cfg)
+					reply = M.reply_for(data, cfg)
+				end
 				if reply then
+					-- Bounded: the table is per asker, and a LAN sweep is
+					-- the only thing that grows it.
+					local n = 0
+					for _ in pairs(M._last_reply) do n = n + 1 end
+					if n > 64 then M._last_reply = {} end
+					M._last_reply[key] = now
 					local sent, serr = udpl:sendto(reply, ip, port)
 					if not sent then
 						io.stderr:write("announce: reply to " .. tostring(ip) .. ":"
