@@ -367,8 +367,29 @@ Other things to preserve:
   (a veth cannot break the LAN) and puts the plugin into `/etc/openuf/plugins/` + `plugins.enabled`
   itself, because a package release from before the `/opt/openuf` symlink is invisible to the
   tool. `--unifi-roaming`/`--no-unifi-roaming`, `RRB_UNIFI_RELEASE_URL`, `RRB_UNIFI_DIR`,
-  `RRB_UNIFI_FALLBACK_TAG` (v1.5, the version checked against this tree). A download failure
-  skips the plugin with the manual steps printed; it never fails the install.
+  `RRB_UNIFI_FALLBACK_TAG` is gone: **the install is PINNED** (`RRB_UNIFI_TAG` defaults to
+  `RRB_UNIFI_PINNED_TAG`, v1.5; `latest` is an explicit opt-in that installs unverified), the
+  pinned plugin's sha256 is checked (`RRB_UNIFI_PLUGIN_SHA256`; `RRB_UNIFI_UNVERIFIED=1`
+  overrides), and any tag's plugin must declare `api = 1`. A download failure skips the plugin
+  with the manual steps printed; it never fails the install.
+- **The rrb-unifi pin is a contract in three places that must agree, and a tool keeps it
+  honest.** `tests/fixtures/rrb-unifi/` holds the pinned plugin and its `VERSION` (tag +
+  sha256); `setup.sh` carries the same tag and sha; `tests/test_rrb_unifi_compat.lua` runs
+  that plugin through THIS tree's `plugins.lua` and `apply_config` on every suite run (his
+  assertions mirrored: mobility domain `5de5` for "corp", `ft_psk_generate_local 0`, the
+  wildcard key holders, `nasid`, `ft_iface=vft0` only with the veth, a non-FT WLAN untouched,
+  every `ctx.*` field his source names present) and fails when the three places disagree.
+  **d-malinowski can change what his plugin expects of openUF, and this tree can change what
+  it hands him; `sh tools/rrb-unifi-compat.sh` is the check in both directions**: it runs HIS
+  `tests/run.lua --openuf` against this tree and OUR contract test against HIS latest plugin
+  (`RRB_UNIFI_PLUGIN=<file>` points the test at any copy), then prints the contract-surface
+  lines that changed between the pinned and the latest tag for a human read. `--bump` moves
+  the pin (fixture, VERSION, setup.sh) once both pass. Run it whenever `plugins.lua`,
+  `ucihelper`'s 802.11r block or the ctx a plugin sees changes, and when a new rrb-unifi
+  release appears; `.github/workflows/rrb-unifi-compat.yml` runs it weekly and on dispatch
+  and fails when the latest release is newer and either side breaks. His tests need a `bit`
+  library: the tool writes a LuaBitOp-shaped shim for a 5.3+ dev Lua (CI and the device run
+  5.1 with luabitop).
 - **Value-taking options** must go through `need_val`, or a forgotten value silently
   configures the empty string.
 

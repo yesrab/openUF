@@ -53,11 +53,20 @@ OPENUF_SELF_URL=${OPENUF_SELF_URL:-"https://raw.githubusercontent.com/$OPENUF_RE
 # on the device instead of downloading any.
 OPENUF_RELEASE_URL=${OPENUF_RELEASE_URL:-"https://api.github.com/repos/$OPENUF_REPO/releases/latest"}
 # d-malinowski's rrb-unifi: the 802.11r translator for genuine UniFi APs and
-# its openUF plugin (USAGE.md § 6). Fetched from its latest GitHub release; the
-# fallback tag is the version this openUF was last checked against.
+# its openUF plugin (USAGE.md § 6). A PINNED release is installed, the one this
+# openUF's test suite runs the plugin of (tests/fixtures/rrb-unifi/VERSION and
+# tools/rrb-unifi-compat.sh keep the pin honest): the plugin edits every FT
+# WLAN openUF provisions, so a release that changed what it expects of openUF
+# must not reach a device before this tree was checked against it.
+# RRB_UNIFI_TAG=latest asks GitHub for the newest release instead (its plugin
+# must still declare api 1); any other tag is taken as given.
 RRB_UNIFI_REPO=${RRB_UNIFI_REPO:-d-malinowski/unifi-openwrt-roaming}
 RRB_UNIFI_RELEASE_URL=${RRB_UNIFI_RELEASE_URL:-"https://api.github.com/repos/$RRB_UNIFI_REPO/releases/latest"}
-RRB_UNIFI_FALLBACK_TAG=${RRB_UNIFI_FALLBACK_TAG:-v1.5}
+RRB_UNIFI_TAG=${RRB_UNIFI_TAG:-v1.5}
+# sha256 of openuf-plugin/rrb-unifi.lua at the pinned tag: a re-tagged or
+# tampered archive refuses to install (RRB_UNIFI_UNVERIFIED=1 overrides).
+RRB_UNIFI_PLUGIN_SHA256=b17b3904c66fa6626d0220db3b62ba1cdbf0318ef0bf346cdb8835ff3fd0ae84
+RRB_UNIFI_PINNED_TAG=v1.5
 RRB_UNIFI_DIR=${RRB_UNIFI_DIR:-}
 OPENUF_PKG_DIR=${OPENUF_PKG_DIR:-}
 export OPENUF_REPO OPENUF_REF OPENUF_TARBALL_URL OPENUF_SELF_URL OPENUF_RELEASE_URL
@@ -246,8 +255,9 @@ is asked interactively (or takes its default under --yes).
 Environment: OPENUF_REPO, OPENUF_REF, OPENUF_SRC, OPENUF_TARBALL_URL,
              OPENUF_RELEASE_URL (which release the packages come from),
              OPENUF_PKG_DIR (package files already on the device),
-             RRB_UNIFI_RELEASE_URL (which rrb-unifi release; default: the
-             latest, falling back to $RRB_UNIFI_FALLBACK_TAG),
+             RRB_UNIFI_TAG (which rrb-unifi release: the pinned
+             $RRB_UNIFI_PINNED_TAG by default, the one this openUF was checked
+             against; "latest" for the newest; or any tag),
              RRB_UNIFI_DIR (an unpacked rrb-unifi tree already on the device)
 EOF
 }
@@ -1082,12 +1092,16 @@ if [ "$OPT_ROAMING" = 1 ]; then
 	else
 		RRB_WORK=${WORK:-/tmp/openuf-setup-$$}/rrb-unifi
 		mkdir -p "$RRB_WORK" || die "cannot create $RRB_WORK"
-		_tag=""
-		if fetch "$RRB_UNIFI_RELEASE_URL" "$RRB_WORK/release.json"; then
-			_tag=$(tr ',' '\n' < "$RRB_WORK/release.json" \
-				| sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+		_tag=$RRB_UNIFI_TAG
+		if [ "$_tag" = latest ]; then
+			_tag=""
+			if fetch "$RRB_UNIFI_RELEASE_URL" "$RRB_WORK/release.json"; then
+				_tag=$(tr ',' '\n' < "$RRB_WORK/release.json" \
+					| sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+			fi
+			[ -n "$_tag" ] || { _tag=$RRB_UNIFI_PINNED_TAG; info "could not read the latest rrb-unifi release; using the pinned $_tag"; }
+			[ "$_tag" = "$RRB_UNIFI_PINNED_TAG" ] || warn "rrb-unifi $_tag is newer than the pinned $RRB_UNIFI_PINNED_TAG this openUF was checked against; its plugin is installed unverified"
 		fi
-		[ -n "$_tag" ] || { _tag=$RRB_UNIFI_FALLBACK_TAG; info "could not read the latest rrb-unifi release; using $_tag"; }
 		_url="https://github.com/$RRB_UNIFI_REPO/archive/refs/tags/$_tag.tar.gz"
 		info "fetching rrb-unifi $_tag"
 		if fetch "$_url" "$RRB_WORK/rrb-unifi.tar.gz" && tar -xzf "$RRB_WORK/rrb-unifi.tar.gz" -C "$RRB_WORK" 2>/dev/null; then
@@ -1104,6 +1118,23 @@ if [ "$OPT_ROAMING" = 1 ]; then
 		for _f in rrb-unifi.uc rrb-unifi.init rrb-unifi.config openuf-plugin/rrb-unifi.lua; do
 			[ -f "$RRB_SRC/$_f" ] || { warn "rrb-unifi tree is missing $_f; the roaming plugin is skipped"; OPT_ROAMING=0; RRB_SRC=""; break; }
 		done
+	fi
+	if [ -n "$RRB_SRC" ]; then
+		# The plugin must speak this openUF's hook (api 1), whatever the tag;
+		# at the pinned tag its bytes must be the ones the suite was run with.
+		if ! grep -qE 'api[[:space:]]*=[[:space:]]*1[^0-9]' "$RRB_SRC/openuf-plugin/rrb-unifi.lua"; then
+			warn "rrb-unifi's openUF plugin does not declare api 1, which is what this openUF speaks;"
+			warn "the roaming plugin is skipped (RRB_UNIFI_TAG=$RRB_UNIFI_PINNED_TAG installs the checked release)"
+			OPT_ROAMING=0; RRB_SRC=""
+		elif [ "${_tag:-$RRB_UNIFI_PINNED_TAG}" = "$RRB_UNIFI_PINNED_TAG" ] && [ -z "$RRB_UNIFI_DIR" ] \
+				&& [ "$RRB_UNIFI_UNVERIFIED" != 1 ]; then
+			_sha=$(sha256sum "$RRB_SRC/openuf-plugin/rrb-unifi.lua" 2>/dev/null | cut -d' ' -f1)
+			if [ "$_sha" != "$RRB_UNIFI_PLUGIN_SHA256" ]; then
+				warn "rrb-unifi $RRB_UNIFI_PINNED_TAG's plugin is not the one this openUF was checked against"
+				warn "(sha256 ${_sha:-unreadable}); the roaming plugin is skipped. RRB_UNIFI_UNVERIFIED=1 installs it anyway"
+				OPT_ROAMING=0; RRB_SRC=""
+			fi
+		fi
 	fi
 	[ -n "$RRB_SRC" ] && ok "rrb-unifi $(sed -n 's/^VERSION=\(.*\)/\1/p' "$RRB_SRC/rrb-unifi-setup" | head -1) ready in $RRB_SRC"
 fi

@@ -1,0 +1,29 @@
+name: rrb-unifi compatibility
+
+# Is d-malinowski's latest rrb-unifi release still compatible with this tree?
+# setup.sh installs a pinned release; this job runs his contract tests against
+# this tree and our contract test against his latest plugin, weekly and on
+# demand, and fails when the latest release is newer and either side breaks --
+# the signal to run `sh tools/rrb-unifi-compat.sh --bump` (or to fix the hook).
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  compat:
+    name: latest rrb-unifi vs this tree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.1 and the suite's dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y lua5.1 lua-bitop luarocks openssl liblua5.1-dev libssl-dev
+          sudo ln -sf /usr/bin/lua5.1 /usr/local/bin/lua
+          sudo luarocks --lua-version 5.1 install lua-cjson LUA_INCDIR=/usr/include/lua5.1
+          sudo luarocks --lua-version 5.1 install openssl LUA_INCDIR=/usr/include/lua5.1
+
+      - name: Check the latest release against this tree
+        run: sh tools/rrb-unifi-compat.sh

@@ -10,7 +10,9 @@ The hook and its contract are jonasevcik/openUF's (`api = 1`, 2026-10-25), taken
 so that a plugin written for upstream runs here unchanged. The first one on real hardware is
 d-malinowski's [rrb-unifi](https://github.com/d-malinowski/unifi-openwrt-roaming) plugin,
 802.11r fast roaming with genuine UniFi access points, which `setup.sh` offers to install
-(USAGE.md § 6). Status here: unit-tested through `apply_config`; the rrb-unifi plugin ran on
+(USAGE.md § 6) at a pinned release: `tests/test_rrb_unifi_compat.lua` runs that plugin through
+this tree's hook on every suite run, and `tools/rrb-unifi-compat.sh` checks his latest release
+both ways before the pin moves. Status here: unit-tested through `apply_config`; the rrb-unifi plugin ran on
 its author's BT Home Hub 5A against a U7 Lite. ⚠️ No plugin has run on this tree's own APs yet.
 
 ## The contract

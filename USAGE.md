@@ -1257,11 +1257,17 @@ bridge; nothing on the UniFi AP changes), and since its release 1.4 ships an **o
 | `reassociation_deadline` | 3000 | OpenWrt's default |
 
 **Installing it.** `setup.sh` asks (question 7, default yes) and runs the project's own
-`rrb-unifi-setup install --yes` from its latest GitHub release, confirms the tool's network
-watchdog, and puts the plugin in `/etc/openuf/plugins/rrb-unifi.lua` with its name in
-`/etc/openuf/plugins.enabled`. `--unifi-roaming` / `--no-unifi-roaming` answer the question
-up front; `RRB_UNIFI_RELEASE_URL` picks another release and `RRB_UNIFI_DIR` an unpacked tree
-already on the device. On an existing device the same thing by hand:
+`rrb-unifi-setup install --yes` from a **pinned** release (v1.5, the one this openUF's test
+suite runs the plugin of: the plugin rewrites every 802.11r WLAN, so a release that changed
+what it expects of openUF must not reach a device before this tree was checked against it),
+confirms the tool's network watchdog, and puts the plugin in `/etc/openuf/plugins/rrb-unifi.lua`
+with its name in `/etc/openuf/plugins.enabled`. The pinned plugin's sha256 is verified and any
+release's plugin must declare `api 1`. `--unifi-roaming` / `--no-unifi-roaming` answer the
+question up front; `RRB_UNIFI_TAG=latest` installs the newest release unverified (or any tag by
+name), `RRB_UNIFI_DIR` an unpacked tree already on the device. Whether a newer release is still
+compatible, and moving the pin, is `tools/rrb-unifi-compat.sh` (it runs his contract tests
+against this tree and ours against his latest plugin; CI runs it weekly). On an existing device
+the same thing by hand:
 
 ```sh
 # on the AP, with internet

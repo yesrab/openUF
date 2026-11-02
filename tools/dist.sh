@@ -124,6 +124,10 @@ if [ "$1" = "--verify" ]; then
 	# (tools/cfg-coverage.lua, since 2026-11-02), so the verify tree needs it
 	# present -- upstream's release workflow caught exactly this on a tag.
 	cp -r tools "$BUILD/verify/tools"
+	# setup.sh is not shipped in the tarball either, but
+	# tests/test_rrb_unifi_compat.lua reads its rrb-unifi pin to check it
+	# against the fixture's (same reason, same remedy).
+	cp setup.sh "$BUILD/verify/"
 	if ! ( cd "$BUILD/verify" && lua tests/run_tests.lua ); then
 		echo ""
 		echo "  FAIL tests do not pass against the stripped tree -- not packaging."
