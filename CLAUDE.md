@@ -368,7 +368,7 @@ Other things to preserve:
   itself, because a package release from before the `/opt/openuf` symlink is invisible to the
   tool. `--unifi-roaming`/`--no-unifi-roaming`, `RRB_UNIFI_RELEASE_URL`, `RRB_UNIFI_DIR`,
   `RRB_UNIFI_FALLBACK_TAG` is gone: **the install is PINNED** (`RRB_UNIFI_TAG` defaults to
-  `RRB_UNIFI_PINNED_TAG`, v1.5; `latest` is an explicit opt-in that installs unverified), the
+  `RRB_UNIFI_PINNED_TAG`, v1.5.1; `latest` is an explicit opt-in that installs unverified), the
   pinned plugin's sha256 is checked (`RRB_UNIFI_PLUGIN_SHA256`; `RRB_UNIFI_UNVERIFIED=1`
   overrides), and any tag's plugin must declare `api = 1`. A download failure skips the plugin
   with the manual steps printed; it never fails the install.
@@ -966,7 +966,7 @@ C5; this tree's lab is a JioRouter AX6000, DSA, `lan_cpueth = "br-lan"`). Upstre
 work from here (their 2026-09-25 commits were our 09-15 sysconf/l2guard/interval work,
 credited to this repo), so diff before assuming a commit is new.
 
-- **Last review point: `db5e92b` (upstream v0.13.0), sync 5 on 2026-11-02.** Earlier: the
+- **Last review point: `db5e92b` (re-checked 2026-11-13: upstream unchanged, so the next review still starts there) (upstream v0.13.0), sync 5 on 2026-11-02.** Earlier: the
   fork point `677f732`; sync 1 (2026-09-06) to `d7d7e21`; sync 2 (2026-09-13) to `12b4db0`;
   sync 3 (2026-09-28) to `08d0003` (v0.9.3); sync 4 (2026-10-18) to `2f263f3` (v0.11.0).
   Not adopted from syncs 4 and 5 and still waiting: the guest portal and its walled garden

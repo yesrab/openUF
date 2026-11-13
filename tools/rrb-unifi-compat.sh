@@ -113,12 +113,17 @@ local f = load([[return {
 return f()
 LUA
 fi
-export LUA_PATH="$WORK/shim/?.lua;${LUA_PATH:-;}"
+# Only HIS runner sees the shim. Our suite must run with the Lua and the bit
+# library the device has: lib.lua's bit() prefers require("bit") when it
+# loads, and the shim's 64-bit arithmetic is not luabitop's -- exported for
+# both steps, it failed ten packet and _tick tests of ours (2026-11-13) and
+# the tool blamed his release.
+HIS_LUA_PATH="$WORK/shim/?.lua;${LUA_PATH:-;}"
 
 status=0
 say ""
 say "== 1. his contract tests ($TAG) against this tree"
-if ( cd "$ROOT" && lua "$LATEST/tests/run.lua" --openuf ) > "$WORK/his.log" 2>&1; then
+if ( cd "$ROOT" && LUA_PATH="$HIS_LUA_PATH" lua "$LATEST/tests/run.lua" --openuf ) > "$WORK/his.log" 2>&1; then
 	ok "$(tail -1 "$WORK/his.log")"
 else
 	fail "his suite: $(tail -1 "$WORK/his.log")"; grep -a "^FAIL\|^ERROR" "$WORK/his.log" | head -10 >&2; status=1

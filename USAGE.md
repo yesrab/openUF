@@ -1257,7 +1257,7 @@ bridge; nothing on the UniFi AP changes), and since its release 1.4 ships an **o
 | `reassociation_deadline` | 3000 | OpenWrt's default |
 
 **Installing it.** `setup.sh` asks (question 7, default yes) and runs the project's own
-`rrb-unifi-setup install --yes` from a **pinned** release (v1.5, the one this openUF's test
+`rrb-unifi-setup install --yes` from a **pinned** release (v1.5.1, the one this openUF's test
 suite runs the plugin of: the plugin rewrites every 802.11r WLAN, so a release that changed
 what it expects of openUF must not reach a device before this tree was checked against it),
 confirms the tool's network watchdog, and puts the plugin in `/etc/openuf/plugins/rrb-unifi.lua`
@@ -1271,21 +1271,21 @@ the same thing by hand:
 
 ```sh
 # on the AP, with internet
-wget -qO /tmp/rrb.tgz https://github.com/d-malinowski/unifi-openwrt-roaming/archive/refs/tags/v1.5.tar.gz
+wget -qO /tmp/rrb.tgz https://github.com/d-malinowski/unifi-openwrt-roaming/archive/refs/tags/v1.5.1.tar.gz
 cd /tmp && tar xzf rrb.tgz && cd unifi-openwrt-roaming-*/
 sh rrb-unifi-setup install          # packages, translator, veth, the openUF plugin, a restart of openUF
 rrb-unifi-setup verify              # after the controller's next push (Force Provision makes it now)
 rrb-unifi-setup uninstall           # the safe order: plugin out, re-push, then the veth and the daemon
 ```
 
-The tool finds openUF under `/opt/openuf`, upstream's documented detection path; on a package
-install `setup.sh` links that path to `/usr/lib/openuf` before running the tool, and the
-package's postinst makes the same link from its next release on (an existing link is kept). On
-a package device set up before 2026-11-02, make it by hand first -- `ln -s /usr/lib/openuf
-/opt/openuf` -- or the tool installs the translator but not the plugin, and its `verify` and
-`uninstall` run in the no-openUF mode (a pull request to probe `/usr/lib/openuf` too is open
-on the project). `setup.sh` also places the plugin itself and starts the translator in case
-the tool ran in that mode anyway. The controller then
+The tool finds openUF under `/opt/openuf`, upstream's documented detection path, and since
+release 1.5.1 (2026-11-03; our pull request, merged) under `/usr/lib/openuf` as well, where the
+openuf package puts it. 1.5.1 also reads the package's UCI `list plugin` form of the plugin list,
+so it neither enables the plugin twice nor uninstalls past it. On a package install `setup.sh`
+still links `/opt/openuf` to `/usr/lib/openuf` before running the tool (upstream's guide and any
+older tool look only there), and the package's postinst makes the same link (an existing link is
+kept). `setup.sh` also places the plugin itself and starts the translator in case an older tool
+ran in its no-openUF mode. The controller then
 pushes the WLANs again within a few informs, because openUF notices the new plugin (the
 fingerprint in `state.json`, see "Plugins" below); Fast Roaming must be on for the WLAN in
 UniFi, or the controller sends no `iapp_key` and the plugin logs that. Only WPA2-PSK with

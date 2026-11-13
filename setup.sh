@@ -62,11 +62,11 @@ OPENUF_RELEASE_URL=${OPENUF_RELEASE_URL:-"https://api.github.com/repos/$OPENUF_R
 # must still declare api 1); any other tag is taken as given.
 RRB_UNIFI_REPO=${RRB_UNIFI_REPO:-d-malinowski/unifi-openwrt-roaming}
 RRB_UNIFI_RELEASE_URL=${RRB_UNIFI_RELEASE_URL:-"https://api.github.com/repos/$RRB_UNIFI_REPO/releases/latest"}
-RRB_UNIFI_TAG=${RRB_UNIFI_TAG:-v1.5}
+RRB_UNIFI_TAG=${RRB_UNIFI_TAG:-v1.5.1}
 # sha256 of openuf-plugin/rrb-unifi.lua at the pinned tag: a re-tagged or
 # tampered archive refuses to install (RRB_UNIFI_UNVERIFIED=1 overrides).
 RRB_UNIFI_PLUGIN_SHA256=b17b3904c66fa6626d0220db3b62ba1cdbf0318ef0bf346cdb8835ff3fd0ae84
-RRB_UNIFI_PINNED_TAG=v1.5
+RRB_UNIFI_PINNED_TAG=v1.5.1
 RRB_UNIFI_DIR=${RRB_UNIFI_DIR:-}
 OPENUF_PKG_DIR=${OPENUF_PKG_DIR:-}
 export OPENUF_REPO OPENUF_REF OPENUF_TARBALL_URL OPENUF_SELF_URL OPENUF_RELEASE_URL
@@ -1591,9 +1591,10 @@ fi
 # Its own tool does the work: packages (already in), the translator files, the
 # veth pair, sysupgrade.conf, and -- where it finds openUF under /opt/openuf --
 # the plugin, a restart of openUF and the translator's start. Its detection
-# path is /opt/openuf (upstream's documented one), so on a PACKAGE install
-# that path is linked to /usr/lib/openuf first: the openuf package's postinst
-# makes the same link from its next release on and keeps one that exists.
+# path is /opt/openuf (upstream's documented one) and, since its release 1.5.1,
+# /usr/lib/openuf too; on a PACKAGE install the first is still linked to the
+# second before the tool runs, for upstream's guide and any older tool: the
+# openuf package's postinst makes the same link and keeps one that exists.
 # The veth needs a network reload, which the tool guards with a 120 s watchdog
 # that restores /etc/config/network unless confirmed: confirmed here at once,
 # the LAN bridge is untouched by a veth. The plugin is also put in place by
@@ -1604,7 +1605,7 @@ if [ "$OPT_ROAMING" = 1 ] && [ -n "$RRB_SRC" ]; then
 	if [ "$HEADLESS" = 0 ] && [ ! -e /opt/openuf ] && [ ! -L /opt/openuf ] && [ -f "$PKG_DIR/inform.lua" ]; then
 		mkdir -p /opt && ln -s "$PKG_DIR" /opt/openuf \
 			&& ok "/opt/openuf -> $PKG_DIR (where rrb-unifi-setup looks for openUF)" \
-			|| warn "could not link /opt/openuf to $PKG_DIR; rrb-unifi-setup will not see openUF"
+			|| warn "could not link /opt/openuf to $PKG_DIR; an rrb-unifi-setup older than 1.5.1 will not see openUF"
 	fi
 	if ( cd "$RRB_SRC" && sh ./rrb-unifi-setup install --yes ); then
 		[ -x /usr/sbin/rrb-unifi-setup ] && /usr/sbin/rrb-unifi-setup confirm >/dev/null 2>&1
