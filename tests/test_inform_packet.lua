@@ -3831,14 +3831,48 @@ return {
 		end
 	},
 	{
-		name = "inform packet: handle_response upgrade stores version/url only",
+		name = "inform packet: handle_response accepts an upgrade virtually: version recorded, reported, two stage notifs queued",
 		fn = function()
 			local st = sample_state()
-			local resp = '{"_type":"upgrade","version":"6.6.99","url":"http://unifi/fw.bin"}'
+			inform._event_queue = {}
+			local resp = '{"_type":"upgrade","version":"8.8.14.20179","url":"http://unifi/fw.bin"}'
 			local result = inform.handle_response(resp, st)
-			assert_eq(st.upgrade_requested_version, "6.6.99", "version stored")
+			assert_eq(st.upgrade_requested_version, "8.8.14.20179", "version stored")
 			assert_eq(st.upgrade_requested_url, "http://unifi/fw.bin", "url stored")
-			assert_false(result, "upgrade does not trigger a follow-up inform")
+			assert_eq(st.fw_version, "8.8.14.20179", "the offered version is now the reported one")
+			assert_true(result, "a follow-up inform carries the new version at once")
+			assert_eq(#inform._event_queue, 2, "the two UpgradeReady stages are queued")
+			assert_eq(inform._event_queue[1].event_string, "Upgrade", "event_string")
+			assert_eq(inform._event_queue[1].up_stage, "FWDownloading", "first stage")
+			assert_eq(inform._event_queue[2].up_stage, "FWCheckOK", "second stage")
+			assert_eq(inform._fw_version(st, {fw = {ver = "6.8.2.15592"}}), "8.8.14.20179", "build_json reports it over the identity")
+			inform._event_queue = {}
+		end
+	},
+	{
+		name = "inform packet: an upgrade whose version is not bare M.m.p.build is stored only, as before",
+		fn = function()
+			local st = sample_state()
+			inform._event_queue = {}
+			local result = inform.handle_response('{"_type":"upgrade","version":"U6IW.6.6.99","url":"http://unifi/fw.bin"}', st)
+			assert_eq(st.upgrade_requested_version, "U6IW.6.6.99", "still recorded")
+			assert_eq(st.fw_version, nil, "not reported: the controller would never match it")
+			assert_false(result, "no follow-up inform")
+			assert_eq(#inform._event_queue, 0, "no stage notifs")
+			assert_eq(inform._fw_version(st, {fw = {ver = "6.8.2.15592"}}), "6.8.2.15592", "the identity's version stays")
+		end
+	},
+	{
+		name = "inform packet: a setparam's interval moves the cadence like a noop's",
+		fn = function()
+			local st = sample_state()
+			local o_ci = inform._controller_interval
+			inform._controller_interval = 30
+			inform.handle_response('{"_type":"setparam","interval":7}', st)
+			assert_eq(inform._controller_interval, 7, "setparam interval adopted")
+			inform.handle_response('{"_type":"setparam"}', st)
+			assert_eq(inform._controller_interval, 7, "a setparam without one leaves it")
+			inform._controller_interval = o_ci
 		end
 	},
 	{

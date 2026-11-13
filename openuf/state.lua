@@ -51,6 +51,7 @@ local function defaults()
 		use_gcm                  = false,
 		upgrade_requested_version = "",
 		upgrade_requested_url     = "",
+		fw_version                = "",
 		blocked_stas             = {},
 	}
 end
@@ -76,6 +77,7 @@ local TYPED = {
 	use_gcm                   = "boolean",
 	upgrade_requested_version = "string",
 	upgrade_requested_url     = "string",
+	fw_version                = "string",
 	blocked_stas              = "table",
 	-- Identity, re-derived at startup by inform's _populate_net_info. Kept
 	-- so the PREVIOUS run's values are readable at that moment: M.run

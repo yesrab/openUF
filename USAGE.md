@@ -727,8 +727,14 @@ The modelmap sets:
 ### Device identity (`openuf/ufmodel/*.lua`)
 
 The U6-InWall identity is configured in `ufmodel/u6iw.lua`.  The firmware version
-(`fw.ver`) must be accepted by your controller.  If the controller rejects the
-device with "firmware too old" or similar, increment `fw.ver` and try again.
+(`fw.ver`) is where a fresh device starts; from there it follows the controller.  When the
+controller offers a firmware update (a real one from Ubiquiti's catalog, which openUF never
+downloads or flashes), openUF accepts it virtually and reports the offered version from the
+next inform on (`fw_version` in `state.json`), so the "Update Available" badge clears the way
+it does for a genuine AP: at the next automatic update window (03:00 by default) or when you
+click Update.  The controller then re-provisions the device, as after a real AP's reboot: one
+radio reload, a second or two without WiFi.  Only if the controller rejects the device outright
+("firmware too old") does `fw.ver` need a hand edit.
 
 ```lua
 uap = {
@@ -736,7 +742,7 @@ uap = {
     model    = "U6IW",
     fw = {
         pre        = "U6IW.",
-        ver        = "6.6.55",    -- tune this if the controller rejects the device
+        ver        = "8.8.14.20179",  -- the catalog's release entry when the file was written
         buildtime  = "230801.1200",
         factoryver = "6.5.28"
     },
@@ -750,8 +756,9 @@ than the WiFi 6 ones it would push at a U6-InWall and openUF would have to clamp
 `platform`/`model` are `UHDIW`, and its `fw.ver` (`6.7.57.15670`) is the release-channel entry
 of Ubiquiti's firmware catalog for that platform — the value the controller compares the
 reported version against with a strict string equality, so it must stay bare (`M.m.p.build`,
-no model prefix) and must track the catalog.  When the controller shows a spurious "Update
-Available" for the device, re-read the catalog URL in the file's header and update `fw.ver`.
+no model prefix) and must track the catalog.  An "Update
+Available" for the device clears itself once the controller sends the update and openUF
+accepts it virtually (above); `fw.ver` only matters for a fresh install's first contact.
 ⚠️ No controller has adopted a device under this identity yet; if adoption stalls, set
 `ufmodel = "u6iw"` in the modelmap and report what the controller did.
 
@@ -1942,7 +1949,7 @@ grep -o '"mac":"[^"]*"' /etc/openuf/state.json # openUF's identity
 | Adoption fails with SSH error | SSH not reachable from controller, or root password not set — run `passwd root` on the device, or reinstall with `--bootstrap-adopt` |
 | Mobile app or controller asks for root credentials ("advanced adoption") although the `ubnt` account exists | `logread` shows `User 'ubnt' has invalid shell, rejected`: the account's forced shell is not in `/etc/shells`, which dropbear checks before the password. Run `openuf bootstrap-account`, or `sh install.sh install --bootstrap-adopt` on a file install — both register it for an existing account |
 | Device stays stuck at "Adopting" forever | No AES-GCM backend — `lua-openssl` missing or built without AEAD support. The CLI `openssl-util` fallback is CBC-only and will not work (see § 1) |
-| Controller rejects device ("firmware incompatible") | Adjust `fw.ver` in `ufmodel/u6iw.lua` |
+| Controller rejects device ("firmware incompatible") | Adjust `fw.ver` in `ufmodel/u6iw.lua`. An "Update Available" badge is not this: it clears after the controller's next update push, which openUF accepts virtually |
 | hostapd fails: "unknown configuration item 'bss_transition'" | A `wpad-basic-*` build is installed — replace it with `apk add wpad-wolfssl` |
 | Band Steering has no effect | `usteer` not installed or not running — `/etc/init.d/usteer status` |
 | Clients are steered 2.4 → 5 GHz with Band Steering off | `ubus call usteer get_config` must show `band_steering_interval: 0`. Any other value means usteer's default applies, and it steers. openUF writes the 0 on the next WiFi config push. Force Provision if it is missing |

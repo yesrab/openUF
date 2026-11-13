@@ -713,6 +713,17 @@ return {
 		end
 	},
 	{
+		name = "inform json: version is the identity's fw.ver until a controller upgrade was accepted, then state's fw_version",
+		fn = function()
+			local d0 = build({})
+			assert_eq(d0.version, "6.6.55", "the fixture identity's fw.ver, verbatim")
+			local d = build({st = {fw_version = "8.8.14.20179"}})
+			assert_eq(d.version, "8.8.14.20179", "the accepted upgrade's version is reported")
+			local d2 = build({st = {fw_version = "U6IW.8.8.14"}})
+			assert_eq(d2.version, d0.version, "a non-bare state value is ignored")
+		end
+	},
+	{
 		name = "inform json: a second WLAN on the same radio does not inherit the first's clients",
 		fn = function()
 			-- The live bug: with "Home LAN" and a brand-new "Home IoT" both on

@@ -777,6 +777,25 @@ end
 -- st: current state table
 -- cfg: device configuration (from conf.lua)
 -- ufhw: ufmodel table
+-- The firmware version this device reports. The identity's fw.ver is where
+-- a fresh device starts; a controller `upgrade` the device accepted
+-- (handle_response) moves it to the offered version, kept in state.json as
+-- fw_version so it survives restarts and the updater. Bare M.m.p.build only:
+-- the controller's offer gate is a verbatim string compare (see the version
+-- field's comment in build_json), so anything else in the state is ignored
+-- rather than reported. The last value handed out is kept for the status
+-- file (`openuf status`).
+M.FW_VERSION_PAT = "^%d+%.%d+%.%d+%.%d+$"
+M._last_version = nil
+function M._fw_version(st, uap)
+	local v = st and st.fw_version
+	if not (type(v) == "string" and v:match(M.FW_VERSION_PAT)) then
+		v = uap and uap.fw and uap.fw.ver or "6.6.55"
+	end
+	M._last_version = v
+	return v
+end
+
 function M.build_json(st, cfg, ufhw)
 	local uap = ufhw and ufhw.uap or {}
 
@@ -2108,7 +2127,9 @@ function M.build_json(st, cfg, ufhw)
 		-- device is permanently shown as needing an update. `fw.pre` (e.g.
 		-- "U6IW.") is a separate, correct field used only by announce.lua's
 		-- L2 discovery "firmware version verbose" TLV -- do not reuse it here.
-		version          = uap.fw and uap.fw.ver or "6.6.55",
+		-- Since 2026-11-13 the value is st.fw_version once a controller upgrade
+		-- was accepted (handle_response), the identity's fw.ver before that.
+		version          = M._fw_version(st, uap),
 		required_version = uap.required_version or "6.0.0",
 		bootrom_version  = uap.bootver or "",
 		country_code     = st.country_code or derived_country or 840,
@@ -4257,7 +4278,11 @@ local KNOWN_TOP_FIELDS = {
 	            -- does not record a field no AP can act on.
 	            live_update = true},
 	setparam = {_type = true, mgmt_cfg = true, system_cfg = true,
-	            server_time_in_utc = true, include_blocks = true, cfgversion = true},
+	            server_time_in_utc = true, include_blocks = true, cfgversion = true,
+	            -- Both read by the setparam branch (the ledger counted them
+	            -- 50 times on each lab AP before 2026-11-13): the cadence,
+	            -- as on a noop, and the blocked-client list.
+	            interval = true, blocked_sta = true},
 }
 
 -- pcall'd: the ledger is a diagnostic and must never cost a heartbeat.
@@ -4523,6 +4548,12 @@ function M.handle_response(json_str, st, cfg)
 	end
 
 	if _type == "setparam" then
+		-- The cadence field a noop carries rides the setparam too (10.6.109
+		-- puts it on the blocked_sta push, 11.0 on every one); a setparam
+		-- without it leaves the cadence as it was.
+		if resp.interval ~= nil then
+			M._controller_interval = M._sane_interval(resp.interval) or M._controller_interval
+		end
 		-- mgmt_cfg is a newline-delimited key=value string (real controller format,
 		-- confirmed by amd989/unifi-gateway _parse_mgmt_cfg).
 		local mgmt_raw = resp.mgmt_cfg
@@ -4929,16 +4960,42 @@ function M.handle_response(json_str, st, cfg)
 	end
 
 	if _type == "upgrade" then
-		-- Store only -- never download/verify/flash/reboot. A real controller's
-		-- upgrade URL targets genuine Ubiquiti firmware; applying it to this
-		-- (non-Ubiquiti) hardware would brick it. See amd989/unifi-gateway,
-		-- which handles this identically (log + store, no real upgrade path).
-		st.upgrade_requested_version = tostring(resp.version or "")
+		-- Never download/verify/flash/reboot: the URL names genuine Ubiquiti
+		-- firmware, and applying it to this hardware would brick it. The offer
+		-- is accepted VIRTUALLY instead (2026-11-13): the offered version
+		-- becomes the one this device reports (st.fw_version, read by
+		-- build_json), the way a real AP comes back from its reboot with the
+		-- new one. The controller (10.6.109, decompiled: devmgr.c.h, the
+		-- upgrade tracker) marks the device UPGRADING with a timer when it
+		-- sends this and clears it -- `upgradable` false, the "Update
+		-- Available" badge gone -- once an inform reports a version that
+		-- satisfies `upgrade_to_firmware`; its offer gate is a verbatim string
+		-- compare, so the version is kept exactly as sent. The stored-only
+		-- answer this replaces left the controller to time the upgrade out,
+		-- and with auto-upgrade on (the default) it tried again every night.
+		-- A real AP also sends `Upgrade` notifications on the way (up_type
+		-- UpgradeReady, up_stage FWDownloading then FWCheckOK), which the
+		-- controller turns into its progress states; one of each goes out
+		-- after this heartbeat so the UI walks the same stages. Returns true:
+		-- the next heartbeat, the first with the new version, goes out at once.
+		local version = tostring(resp.version or "")
+		st.upgrade_requested_version = version
 		st.upgrade_requested_url     = tostring(resp.url or "")
-		io.stderr:write("inform: upgrade requested (version=" .. st.upgrade_requested_version
-			.. ") -- stored only, not applying\n")
+		if not version:match(M.FW_VERSION_PAT) then
+			io.stderr:write("inform: upgrade requested (version=" .. version
+				.. ") -- not a bare M.m.p.build version; stored only, still reporting "
+				.. tostring(M._last_version) .. "\n")
+			M._state.save(st)
+			return false
+		end
+		st.fw_version = version
+		io.stderr:write("inform: upgrade requested (version=" .. version
+			.. ") -- accepted virtually: nothing downloaded or flashed; this version"
+			.. " is reported from the next inform on\n")
 		M._state.save(st)
-		return false
+		M.queue_event({event_string = "Upgrade", up_type = "UpgradeReady", up_stage = "FWDownloading"})
+		M.queue_event({event_string = "Upgrade", up_type = "UpgradeReady", up_stage = "FWCheckOK"})
+		return true
 	end
 
 	if _type == "cmd" then
@@ -6805,6 +6862,7 @@ function M._write_status(st, fields)
 		"cfgversion="    .. tostring(st and st.cfgversion or ""),
 		"mac="           .. tostring(st and st.mac or ""),
 		"inform_url="    .. tostring(st and st.inform_url or ""),
+		"version="       .. tostring(M._last_version or ""),
 		"build="         .. build_stamp(),
 	}
 	local tmp = M.STATUS_FILE .. ".tmp"

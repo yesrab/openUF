@@ -28,7 +28,7 @@ Most rows below marked ✅ were verified by driving the real controller UI again
 | Zero-touch bootstrap adoption | ✅ Optional (`install.sh install --bootstrap-adopt`) — a locked-down, non-root SSH account auto-disabled after adoption |
 | Forget device / factory reset | ✅ Working (`syswrapper.sh reset-inform`) |
 | Restart / reboot command | ✅ Working |
-| Firmware upgrade requests | Stored (version/url), never applied — flashing controller-supplied firmware onto non-Ubiquiti hardware would brick it |
+| Firmware upgrade requests | Accepted virtually (2026-11-13): never downloaded or flashed — controller-supplied firmware would brick non-Ubiquiti hardware — but the offered version becomes the one the device reports, so the controller's "Update Available" clears as it does for a real AP |
 
 ### WiFi provisioning
 

@@ -392,6 +392,21 @@ function M.adopted(state_file)
 	return nil
 end
 
+-- The firmware version the discovery packet names: the one state.json says
+-- the device reports since a controller upgrade was accepted (inform.lua's
+-- fw_version), nil when there is none, which leaves the identity's fw.ver.
+function M.fw_version(state_file)
+	local st = state_module()
+	if not st then return nil end
+	if state_file then st._state_file = state_file end
+	local ok, s = pcall(st.load)
+	if ok and type(s) == "table" and type(s.fw_version) == "string"
+			and s.fw_version:match("^%d+%.%d+%.%d+%.%d+$") then
+		return s.fw_version
+	end
+	return nil
+end
+
 -- Re-read, before each broadcast, the facts that change while the
 -- broadcaster runs. The packet used to be built from startup values for the
 -- life of the process: the IsDefault TLV said "unadopted" forever (run() was
@@ -415,6 +430,11 @@ function M._refresh(cfg)
 	if secs then cfg.uptime = math.floor(secs) end
 	local adopted = M.adopted(cfg.state_file)
 	if adopted ~= nil then cfg.adopted = adopted end
+	-- The firmware version follows state.json too (a controller upgrade
+	-- accepted virtually, inform.lua); the identity's value stays while the
+	-- state names none.
+	local fw_ver = M.fw_version(cfg.state_file)
+	if fw_ver then cfg.fw_ver = fw_ver end
 	return cfg
 end
 
@@ -559,7 +579,7 @@ if not OPENUF_TEST_MODE then
 			state_file    = state_file,
 			platform      = ufhw.uap.platform,
 			fw_pre        = ufhw.uap.fw.pre,
-			fw_ver        = ufhw.uap.fw.ver,
+			fw_ver        = M.fw_version(state_file) or ufhw.uap.fw.ver,
 			fw_buildtime  = ufhw.uap.fw.buildtime,
 			fw_factoryver = ufhw.uap.fw.factoryver,
 			version_suffix = M.VERSION_SUFFIX,

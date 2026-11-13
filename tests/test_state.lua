@@ -181,20 +181,23 @@ return {
 				st.blocked_stas = {"aa:bb:cc:dd:ee:ff"}
 				st.upgrade_requested_version = "6.8.2"
 				st.upgrade_requested_url = "http://x/fw.bin"
+				st.fw_version = "8.8.14.20179"
 				state.save(st)
 				local loaded = state.load()
 				assert_eq(loaded.blocked_stas[1], "aa:bb:cc:dd:ee:ff", "block list round-trips")
 				assert_eq(loaded.upgrade_requested_version, "6.8.2", "version round-trips")
 				assert_eq(loaded.upgrade_requested_url, "http://x/fw.bin", "url round-trips")
+				assert_eq(loaded.fw_version, "8.8.14.20179", "fw_version round-trips")
 
 				local f = io.open(TMP, "w")
 				f:write('{"adopted":false,"blocked_stas":"not-a-table",'
-					.. '"upgrade_requested_version":42}')
+					.. '"upgrade_requested_version":42,"fw_version":7}')
 				f:close()
 				local bad = state.load()
 				assert_eq(type(bad.blocked_stas), "table", "wrong-typed block list -> default table")
 				assert_eq(#bad.blocked_stas, 0, "default block list is empty")
 				assert_eq(bad.upgrade_requested_version, "", "wrong-typed version -> default")
+				assert_eq(bad.fw_version, "", "wrong-typed fw_version -> default (the identity's version is reported)")
 			end)
 		end
 	},

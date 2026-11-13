@@ -326,7 +326,9 @@ Rarer than a modelmap, and the facts come from Ubiquiti, not OpenWrt:
   returns `"platform": "UHDIW", "version": "v6.7.57+15670"`. `fw.ver` is that version
   **bare**, `6.7.57.15670` -- the controller compares the inform's `version` to its catalog
   entry with a strict string equality, so a prefix or a `+` is a permanent "Update
-  Available" (PROTOCOL-VALIDATION.md, "Why version must be bare").
+  Available" (PROTOCOL-VALIDATION.md, "Why version must be bare"). Since 2026-11-13 `fw.ver`
+  is only the starting value: a controller `upgrade` is accepted virtually (`st.fw_version`,
+  reported by `build_json` and `announce.lua`), so the badge clears without a hand edit.
 - **`buildtime` and `factoryver` are cosmetic**: they reach only the L2 discovery TLVs. Say
   in the file where the values came from rather than making them look captured.
 - **What the model registry says about the code cannot be read from the device side.**

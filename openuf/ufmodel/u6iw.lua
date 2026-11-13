@@ -1,9 +1,15 @@
 --[[
 	U6-InWall device identity.
 
-	fw.ver may need adjustment to match the firmware versions accepted by your
-	controller version. Identify a compatible range by checking the controller's
-	device firmware list or by capturing announce packets from a real U6-InWall.
+	fw.ver is the version a fresh device reports: the release-channel entry of
+
+	Ubiquiti's catalog for U6IW when this file was last refreshed:
+
+	https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-firmware&filter=eq~~platform~~U6IW&filter=eq~~channel~~release
+
+	It needs no tuning afterwards: a controller firmware update is accepted
+
+	virtually (inform.lua) and the offered version is reported from then on.
 ]]--
 
 local uap = {}
@@ -19,7 +25,7 @@ uap = {
 		-- is available") during Stage 2c validation. An older ver here
 		-- makes the controller show a spurious "device has an update"
 		-- offer for a fake AP with no real firmware to install.
-		ver			= "6.8.2.15592",	-- format M.m.p.build — tune for your controller
+		ver			= "8.8.14.20179",	-- bare M.m.p.build; the catalog's v8.8.14+20179 of 2026-11-12
 		buildtime	= "260211.2010",	-- format YYMMDD.HHMM
 		factoryver	= "6.5.28"
 	},
