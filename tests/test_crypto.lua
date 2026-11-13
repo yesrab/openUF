@@ -1,6 +1,6 @@
 -- Tests for openuf/crypto.lua (AES-128-CBC/GCM wrappers).
 -- Run from project root: lua tests/run_tests.lua
--- Requires: lua-openssl or luacrypto (or the openssl CLI for CBC fallback)
+-- Requires: lua-openssl or luacrypto (there is no openssl CLI fallback)
 
 local crypto = dofile("openuf/crypto.lua")
 
@@ -282,6 +282,85 @@ return {
 			package.path, package.preload.openssl = path, preload
 			package.loaded.openssl, package.loaded.crypto = had_ossl, had_crypto
 			if not ok then error(err, 0) end
+		end
+	},
+	-- L19: backends other than lua-openssl, loaded as a fresh copy of the
+	-- module with lua-openssl absent and `lc` (nil = nothing) as luacrypto.
+	{
+		name = "crypto: luacrypto's raw-or-base64 answer is decided by length, not guessed from the bytes",
+		fn = function()
+			-- Raw ciphertext whose bytes are all base64 letters: the old
+			-- guess decoded it. mime is stubbed so the guess is visible.
+			local raw = string.rep("A", 16)
+			local lc_answer
+			local lc = {encrypt = function(_, _, _, _, rawflag)
+				if rawflag ~= nil then error("no raw flag in this build") end
+				return lc_answer
+			end, decrypt = function() end}
+			local saved = {po = package.preload.openssl, pc = package.preload.crypto,
+				lo = package.loaded.openssl, lcr = package.loaded.crypto, mime = package.loaded.mime}
+			package.loaded.openssl, package.loaded.crypto = nil, nil
+			package.preload.openssl = function() error("lua-openssl absent") end
+			package.preload.crypto = function() return lc end
+			package.loaded.mime = {unb64 = function(s)
+				return s == "b64form" and string.rep("Z", 16) or "short"
+			end}
+			local ok, err = pcall(function()
+				local c = dofile("openuf/crypto.lua")
+				lc_answer = raw
+				assert_eq(c.aes_cbc_encrypt(NIST_KEY, FIXED_IV, "hello"), raw,
+					"16 bytes for 16 padded bytes: raw, kept as is")
+				lc_answer = "b64form"
+				assert_eq(c.aes_cbc_encrypt(NIST_KEY, FIXED_IV, "hello"), string.rep("Z", 16),
+					"any other length: base64, decoded")
+				lc_answer = "junk"
+				assert_false(pcall(c.aes_cbc_encrypt, NIST_KEY, FIXED_IV, "hello"),
+					"neither: refused")
+			end)
+			lc_answer = nil
+			package.preload.openssl, package.preload.crypto = saved.po, saved.pc
+			package.loaded.openssl, package.loaded.crypto, package.loaded.mime = saved.lo, saved.lcr, saved.mime
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "crypto: with no AES binding CBC refuses instead of running the openssl CLI",
+		fn = function()
+			local saved = {po = package.preload.openssl, pc = package.preload.crypto,
+				lo = package.loaded.openssl, lcr = package.loaded.crypto}
+			package.loaded.openssl, package.loaded.crypto = nil, nil
+			package.preload.openssl = function() error("lua-openssl absent") end
+			package.preload.crypto = function() error("luacrypto absent") end
+			local o_exec, cmds = os.execute, {}
+			os.execute = function(c) cmds[#cmds + 1] = c; return 1 end
+			local ok, err = pcall(function()
+				local c = dofile("openuf/crypto.lua")
+				local ok_e, e = pcall(c.aes_cbc_encrypt, NIST_KEY, FIXED_IV, "hello")
+				local ok_d = pcall(c.aes_cbc_decrypt, NIST_KEY, FIXED_IV, string.rep("\0", 16))
+				assert_false(ok_e, "encrypt refused")
+				assert_true(tostring(e):find("no AES binding", 1, true) ~= nil, "and says why")
+				assert_false(ok_d, "decrypt refused")
+			end)
+			os.execute = o_exec
+			package.preload.openssl, package.preload.crypto = saved.po, saved.pc
+			package.loaded.openssl, package.loaded.crypto = saved.lo, saved.lcr
+			if not ok then error(err, 0) end
+			assert_eq(#cmds, 0, "no shell command (the key never reaches a command line)")
+		end
+	},
+	{
+		name = "crypto: random_iv with /dev/urandom unreadable fails rather than seeding from the clock",
+		fn = function()
+			local o_open, o_rb = io.open, crypto._random_bytes
+			crypto._random_bytes = nil
+			io.open = function(p, m)
+				if p == "/dev/urandom" then return nil, "denied" end
+				return o_open(p, m)
+			end
+			local ok, err = pcall(crypto.random_iv, 16)
+			io.open, crypto._random_bytes = o_open, o_rb
+			assert_false(ok, "no IV")
+			assert_true(tostring(err):find("urandom", 1, true) ~= nil, "and says why")
 		end
 	},
 }

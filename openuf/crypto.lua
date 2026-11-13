@@ -43,11 +43,9 @@ function M.random_iv(len)
 		f:close()
 		if bytes and #bytes == len then return bytes end
 	end
-	-- Last resort: math.random (weak, only if /dev/urandom unavailable)
-	math.randomseed(os.time())
-	local t = {}
-	for i = 1, len do t[i] = string.char(math.random(0, 255)) end
-	return table.concat(t)
+	-- No fallback to math.random seeded from os.time(): an IV anyone can
+	-- guess from the clock is worse than an inform that is not sent.
+	error("crypto: /dev/urandom unreadable -- no IV")
 end
 
 -- PKCS#7 pad to block boundary
@@ -90,42 +88,13 @@ if not _ossl_ok then
 	_crypto_ok = _crypto_ok and type(_lcrypto) == "table" and type(_lcrypto.encrypt) == "function"
 end
 
--- Internal: unpredictable temp path for the openssl(1) CLI fallback. Names in
--- the old code were "/tmp/uf_cbc_in_<os.time()>" — guessable to any local user,
--- inviting symlink pre-creation and disclosure of the plaintext inform payload
--- written there. The normal path is now lua-openssl (in-process, no temp file);
--- this CLI branch only runs when no binding is present at all.
-local function _tmp_path(tag)
-	local rnd = M.bin_to_hex(M.random_iv(8))
-	return "/tmp/uf_" .. tag .. "_" .. rnd
-end
-
--- Internal: AES-128-CBC via openssl CLI (fallback when no Lua binding is present)
-local function _openssl_cbc(decrypt, key_hex, iv_hex, data)
-	local tmpIn  = _tmp_path("cbc_in")
-	local tmpOut = _tmp_path("cbc_out")
-	local fIn = io.open(tmpIn, "wb")
-	if not fIn then error("crypto: cannot write temp file") end
-	fIn:write(data)
-	fIn:close()
-	local dcflag = decrypt and "-d " or ""
-	local cmd = string.format(
-		"openssl enc -aes-128-cbc %s-K %s -iv %s -nopad -nosalt -in %s -out %s 2>/dev/null",
-		dcflag, key_hex, iv_hex, tmpIn, tmpOut
-	)
-	local rc = os.execute(cmd)
-	local result
-	if rc == 0 or rc == true then
-		local fOut = io.open(tmpOut, "rb")
-		if fOut then
-			result = fOut:read("*a")
-			fOut:close()
-		end
-	end
-	os.remove(tmpIn)
-	os.remove(tmpOut)
-	if not result then error("crypto: openssl enc failed") end
-	return result
+-- No AES binding at all. There used to be an openssl(1) CLI fallback here; it
+-- put the authkey on a command line (readable in /proc by any local user) and
+-- the plaintext inform in /tmp. lua-openssl is a hard dependency (Makefile
+-- DEPENDS, install.sh), so its absence is a broken install and is said so.
+local function _no_binding()
+	error("crypto: no AES binding (install lua-openssl) -- refusing the openssl CLI, "
+		.. "which would expose the key on a command line")
 end
 
 -- AES-128-CBC encrypt
@@ -149,15 +118,21 @@ function M.aes_cbc_encrypt(key_hex, iv, plaintext)
 		if not ok then
 			-- Some versions don't take the raw flag; try without
 			result = _lcrypto.encrypt("aes-128-cbc", padded, key, iv)
-			-- Decode base64 if returned as base64
-			if result and result:find("[A-Za-z0-9+/=]") and not result:find("[\0-\31]") then
-				local ok2, dec = pcall(require("mime").unb64, result)
-				if ok2 then result = dec end
+			-- Raw or base64, decided by length, not by guessing from the
+			-- bytes: with no padding added, raw ciphertext is exactly as long
+			-- as the padded input, and its bytes can by chance all be
+			-- base64 letters. Anything else must decode to that length.
+			if type(result) == "string" and #result ~= #padded then
+				local ok2, dec = pcall(function() return require("mime").unb64(result) end)
+				if not (ok2 and type(dec) == "string" and #dec == #padded) then
+					error("crypto: luacrypto returned neither raw nor base64 ciphertext")
+				end
+				result = dec
 			end
 		end
 		return result
 	else
-		return _openssl_cbc(false, key_hex, M.bin_to_hex(iv), padded)
+		_no_binding()
 	end
 end
 
@@ -179,8 +154,7 @@ function M.aes_cbc_decrypt(key_hex, iv, ciphertext)
 		end
 		return pkcs7_unpad(result)
 	else
-		local raw = _openssl_cbc(true, key_hex, M.bin_to_hex(iv), ciphertext)
-		return pkcs7_unpad(raw)
+		_no_binding()
 	end
 end
 
