@@ -404,4 +404,46 @@ return {
 			end)
 		end
 	},
+	{
+		-- state.json holds the authkey. A save makes a new file (temp +
+		-- rename), which took the daemon's umask: 0644, world-readable.
+		name = "state: a saved state.json is 0600",
+		fn = function()
+			with_tmp(function()
+				state.share_gid = nil
+				state.save({adopted = true, authkey = "aabbccddeeff00112233445566778899",
+					cfgversion = "", inform_url = "http://x/inform"})
+				local h = io.popen("stat -c %a '" .. TMP .. "'")
+				local mode = h:read("*l"); h:close()
+				assert_eq(mode, "600", "owner only")
+			end)
+		end
+	},
+	{
+		-- The SSH bootstrap account reads and writes state.json through its
+		-- group (openuf-bootstrap.sh: root:<gid> 0660). A save must keep that.
+		name = "state: with a bootstrap group the file is 0660 in that group, before the rename",
+		fn = function()
+			with_tmp(function()
+				local o_exec, cmds = state._execute, {}
+				local sizes = {}
+				state._execute = function(c)
+					cmds[#cmds + 1] = c
+					local h = io.open(TMP .. ".tmp"); sizes[#sizes + 1] = h and #h:read("*a") or -1
+					if h then h:close() end
+					return 0
+				end
+				state.share_gid = 900
+				local ok, err = pcall(state.save, {adopted = false, authkey = "aabbccddeeff00112233445566778899",
+					cfgversion = "", inform_url = "http://x/inform"})
+				state._execute, state.share_gid = o_exec, nil
+				if not ok then error(err, 0) end
+				assert_eq(#cmds, 1, "one command")
+				assert_eq(sizes[1], 0, "set on the empty temp file, before the authkey is written")
+				local q = "'" .. TMP .. ".tmp'"
+				assert_eq(cmds[1], "chgrp 900 " .. q .. " && chmod 660 " .. q .. " || chmod 600 " .. q,
+					"on the temp file, and owner-only when the group is gone")
+			end)
+		end
+	},
 }

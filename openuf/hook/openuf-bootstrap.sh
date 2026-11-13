@@ -151,8 +151,8 @@ chmod g+w "$STATE_DIR"
 # existing file for writing needs permission on the file itself.
 [ -f "$STATE_DIR/state.json" ] || : > "$STATE_DIR/state.json"
 chgrp "$GID" "$STATE_DIR/state.json"
-# 660, not 664: the authkey stays off world read. (state.save replaces the
-# file by rename, so later copies take the writer's umask.)
+# 660, not 664: the authkey stays off world read. state.save replaces the
+# file by rename and sets the same mode and group on each copy (share_gid).
 chmod 660 "$STATE_DIR/state.json"
 
 # Tell the daemon the account exists, so it locks and unlocks it with the
