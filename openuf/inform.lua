@@ -347,7 +347,22 @@ end
 -- is already locked" to auth.err, and this runs on every config push, so an
 -- adopted AP's log filled with it (seen on AP2, 2026-09-15). When the state
 -- cannot be read the command is issued regardless, as before.
+-- The primary gid of `user` from /etc/passwd, nil when it is not there.
+M.PASSWD_FILE = "/etc/passwd"
+function M._account_gid(user)
+	local passwd = M._read_file(M.PASSWD_FILE)
+	if not passwd then return nil end
+	for line in passwd:gmatch("[^\n]+") do
+		local name, gid = line:match("^([^:]+):[^:]*:%d+:(%d+):")
+		if name == user then return tonumber(gid) end
+	end
+	return nil
+end
+
+-- Also hands state.save the account's group, so state.json stays root:<gid>
+-- 0660 while the account exists and goes back to 0600 when it does not.
 function M._sync_bootstrap_account(adopted, user)
+	if M._state then M._state.share_gid = user and M._account_gid(user) or nil end
 	if not user then return end
 	local locked = M._account_locked(user)
 	if adopted then

@@ -197,6 +197,12 @@ function M.load()
 	-- Security invariant: never use a custom key when not adopted
 	if not st.adopted then
 		st.authkey = M.DEFAULT_KEY
+	elseif not st.authkey:match("^%x+$") or #st.authkey ~= 32 then
+		-- An AES-128 key is 32 hex digits; anything else cannot encrypt an
+		-- inform. Said out loud: the controller will see a key it never gave.
+		io.stderr:write("state: " .. M._state_file .. " authkey is not 32 hex digits -- "
+			.. "using the default key; the device will need adopting again\n")
+		st.authkey = M.DEFAULT_KEY
 	end
 
 	return st
@@ -215,6 +221,30 @@ end
 -- A side effect worth knowing: the bootstrap account now needs write
 -- permission on the DIRECTORY, not on the previous file.
 --
+-- The saved file's mode. state.json holds the authkey, and a save makes a
+-- new file (temp + rename) that would otherwise take the writer's umask --
+-- 0644 under procd, world-readable. share_gid is the SSH bootstrap
+-- account's group while that account exists (openuf-bootstrap.sh makes
+-- the file root:<gid> 0660 so the account can adopt): inform sets it from
+-- /etc/passwd, and a save keeps it. Set on the temp file, before the rename,
+-- so state.json never exists with another mode, and on the EMPTY temp file,
+-- before the body (the authkey) is written into it. Not a umask on the
+-- daemon: hostapd runs as user network and reads files the daemon writes.
+M.share_gid = nil
+M._execute  = os.execute
+local function protect(path)
+	local q = "'" .. path:gsub("'", "'\\''") .. "'"
+	local gid = tonumber(M.share_gid)
+	if gid then
+		-- A gone group (the account removed since /etc/passwd was read) falls
+		-- back to owner-only, never to the writer's umask.
+		M._execute("chgrp " .. math.floor(gid) .. " " .. q .. " && chmod 660 " .. q
+			.. " || chmod 600 " .. q)
+	else
+		M._execute("chmod 600 " .. q)
+	end
+end
+
 -- M.last_written keeps the exact bytes, so inform's change detection can tell
 -- this process's own write from syswrapper's: without it every save was read
 -- back on the next heartbeat as an out-of-process change, and the full reload
@@ -231,9 +261,18 @@ function M.save(st)
 			error("state.save: cannot write to " .. tmp)
 		end
 	end
+	protect(tmp)
 	local body = cjson.encode(st)
-	f:write(body)
-	f:close()
+	-- A full overlay fails the write or the close, not the open. Renaming that
+	-- short file over the good one cost the adoption on the next start (the
+	-- load falls back to defaults), so the old file stays until a write lands.
+	local wrote, werr = f:write(body)
+	local closed, cerr = f:close()
+	if not (wrote and closed) then
+		os.remove(tmp)
+		error("state.save: cannot write " .. tmp .. ": " .. tostring(werr or cerr)
+			.. " -- keeping the previous state file")
+	end
 	local ok, err = os.rename(tmp, M._state_file)
 	if not ok then
 		os.remove(tmp)

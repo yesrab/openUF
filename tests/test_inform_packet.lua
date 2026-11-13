@@ -6593,6 +6593,31 @@ return {
 		end
 	},
 	{
+		-- state.save keeps state.json in the bootstrap account's group (0660)
+		-- only while that account is configured; its gid comes from /etc/passwd.
+		name = "inform: _sync_bootstrap_account hands state the account's group, and takes it back",
+		fn = function()
+			local o_run, o_read, o_gid = inform._run_cmd, inform._read_file, inform._state.share_gid
+			inform._run_cmd = function() return "" end
+			inform._read_file = function(path)
+				if path == inform.PASSWD_FILE then
+					return "root:x:0:0:root:/root:/bin/ash\nubnt:x:901:902:openUF bootstrap:/var:/opt/openuf/hook/adopt-shell.sh\n"
+				end
+				return nil
+			end
+			local ok, err = pcall(function()
+				inform._sync_bootstrap_account(false, "ubnt")
+				assert_eq(inform._state.share_gid, 902, "the account's primary gid")
+				inform._sync_bootstrap_account(true, nil)
+				assert_nil(inform._state.share_gid, "no account configured: owner-only again")
+				inform._sync_bootstrap_account(false, "nobody-here")
+				assert_nil(inform._state.share_gid, "an account not in /etc/passwd: owner-only")
+			end)
+			inform._run_cmd, inform._read_file, inform._state.share_gid = o_run, o_read, o_gid
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform: _sync_bootstrap_account skips passwd when /etc/shadow already shows the wanted state",
 		fn = function()
 			local o_run, o_read = inform._run_cmd, inform._read_file
