@@ -43,6 +43,17 @@ return {
 			assert_false(sw.is_hex32("ba86f2bbe107c7c57eb5f26907_5c712"), "underscore")
 		end
 	},
+	{
+		name = "syswrapper: state.lua is looked for next to the script and in the install prefixes, never in the cwd",
+		fn = function()
+			assert_not_nil(sw._state_paths, "the search list is inspectable")
+			local paths = sw._state_paths()
+			assert_eq(paths[1], "openuf/state.lua", "this script's own tree first (loaded as openuf/hook/syswrapper.lua)")
+			assert_eq(paths[2], "/usr/lib/openuf/state.lua", "then the package prefix")
+			assert_eq(paths[3], "/opt/openuf/state.lua", "then install.sh's")
+			assert_nil(paths[4], "and nothing else -- no bare state.lua in the working directory")
+		end
+	},
 	-- ── is_url ────────────────────────────────────────────────────────────
 	{
 		name = "syswrapper: is_url accepts http and https",
