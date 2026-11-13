@@ -839,6 +839,8 @@ return {
 			-- Names off the event file never reach a shell unchecked.
 			assert_nil(rrmscan.iface_bssid("phy0;reboot"), "bad ifname refused")
 			assert_nil(rrmscan.sta_signal("phy0-ap1", "x; reboot"), "bad station refused")
+			assert_nil(rrmscan.iface_bssid("-h"), "an option-like ifname refused")
+			assert_nil(rrmscan.sta_signal("-h", "aa:bb:cc:dd:ee:ff"), "an option-like ifname refused")
 		end
 	},
 	{

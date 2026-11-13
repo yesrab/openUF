@@ -123,17 +123,14 @@ end
 -- This interface's BSSID and hostapd's averaged signal for one station on it.
 -- Both names come off the event file, so they are checked before reaching a
 -- shell.
-local IFNAME_SAFE = "^[%w_%.%-]+$"
-local MAC_SAFE = "^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$"
 function M.iface_bssid(ifname)
-	if type(ifname) ~= "string" or not ifname:match(IFNAME_SAFE) then return nil end
+	if not util.valid_ifname(ifname) then return nil end
 	local out = M._popen("iw dev " .. ifname .. " info 2>/dev/null") or ""
 	local mac = out:match("addr (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
 	return mac and mac:lower()
 end
 function M.sta_signal(ifname, sta)
-	if type(ifname) ~= "string" or not ifname:match(IFNAME_SAFE)
-	   or type(sta) ~= "string" or not sta:match(MAC_SAFE) then
+	if not (util.valid_ifname(ifname) and util.is_mac(sta)) then
 		return nil
 	end
 	local out = M._popen("iw dev " .. ifname .. " station get " .. sta .. " 2>/dev/null") or ""
@@ -463,7 +460,7 @@ local RRM_BEACON_ACTIVE  = 0x20  -- bit 5
 -- refused by hostapd itself with "does not support passive beacon report",
 -- before anything reaches the air.
 function M.capable_stations(ifname)
-	if not ifname then return {} end
+	if not util.valid_ifname(ifname) then return {} end
 	local out = M._popen("ubus call hostapd." .. ifname .. " get_clients 2>/dev/null") or ""
 	local stations = {}
 	for mac, block in out:gmatch('"(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)":%s*(%b{})') do
