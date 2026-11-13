@@ -4575,7 +4575,14 @@ function M.handle_response(json_str, st, cfg)
 						-- the very next routine setparam cycle after adoption,
 						-- breaking the inform loop for good (http-only builds have
 						-- no luasec, so switching to that https URL is fatal).
-						if v ~= "" then st.inform_url = v end
+						-- An http(s) URL only, as syswrapper set-inform checks:
+						-- anything else would end the inform loop on the next tick.
+						if v ~= "" and v:match("^https?://%S+$") then
+							st.inform_url = v
+						elseif v ~= "" then
+							io.stderr:write(("inform: mgmt_cfg inform_url %q is not an http(s) URL -- kept %s\n")
+								:format(v, tostring(st.inform_url)))
+						end
 					elseif k == "capability" then
 						-- "notif,notif-assoc-stat" from every 10.x controller:
 						-- the request for per-connection STA_ASSOC_TRACKER
@@ -5336,6 +5343,10 @@ end
 
 -- ─── HTTP POST ───────────────────────────────────────────────────────────────
 
+-- Largest inform response read, headers included. A full config push is tens
+-- of KB; this leaves wide room and still stops a runaway peer.
+M.HTTP_MAX_RESPONSE = 2 * 1024 * 1024
+
 -- POST a binary payload to the inform URL.
 -- Returns the raw response body or nil, error_msg.
 function M.http_post(url, body)
@@ -5402,11 +5413,18 @@ function M.http_post(url, body)
 	-- always smaller than one read, so the body lives entirely in that `partial`
 	-- third value — it must be captured or every response is silently lost
 	-- ("HTTP nil") and adoption never completes.
-	local response = {}
+	-- Bounded: a peer that never stops sending would otherwise grow this
+	-- until the AP runs out of memory.
+	local response, got = {}, 0
 	while true do
 		local chunk, recv_err, partial = tcp:receive(4096)
 		if chunk then
 			response[#response + 1] = chunk
+			got = got + #chunk
+			if got > M.HTTP_MAX_RESPONSE then
+				tcp:close()
+				return nil, ("response over %d bytes -- dropped"):format(M.HTTP_MAX_RESPONSE)
+			end
 		else
 			if partial and #partial > 0 then
 				response[#response + 1] = partial
