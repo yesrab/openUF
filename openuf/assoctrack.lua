@@ -51,6 +51,11 @@ M.NFT_TABLE  = M.NFT_FAMILY .. " " .. M.NFT_NAME
 -- reference the parser subtracts `expires` from.
 M.SET_TIMEOUT = 120
 
+-- Element cap per set. Without one a dynamic set grows with every source MAC
+-- the bridge forwards (spoofed ones included) for as long as the timeout
+-- keeps them; when full, `add` simply adds nothing and the frame passes.
+M.SET_SIZE = 4096
+
 -- How long a station has after association to finish the handshake.
 M.AUTH_WINDOW = 10
 -- How long a station has after authorization to show DHCP/DNS evidence.
@@ -75,7 +80,8 @@ function M.nft_script()
 	}
 	for _, s in ipairs(M.SETS) do
 		lines[#lines + 1] = string.format(
-			"  set %s { type ether_addr; flags dynamic,timeout; timeout %ds; counter; }", s, t)
+			"  set %s { type ether_addr; flags dynamic,timeout; timeout %ds; size %d; counter; }",
+			s, t, M.SET_SIZE)
 	end
 	local rules = {
 		-- Client -> server: the station asked for a lease.
@@ -105,10 +111,19 @@ M.SCRIPT_PATH = "/tmp/openuf-assoc.nft"
 -- Install the table if it is not there. Checked rather than rebuilt every
 -- cycle: a rebuild empties the sets, which would erase the evidence of any
 -- connection in flight.
+--
+-- The exception: a table an older openUF left behind (an upgrade without a
+-- reboot) keeps that version's set shape -- before SET_SIZE, the kernel's
+-- default 65535. Its shape is checked once per process, so that rebuild
+-- empties the sets at most once, at startup.
 function M.ensure_table()
 	if exec_ok(M._exec("nft list table " .. M.NFT_TABLE .. " >/dev/null 2>&1")) then
-		return true
+		if M._shape_checked then return true end
+		M._shape_checked = true
+		local set = M._popen("nft list set " .. M.NFT_TABLE .. " " .. M.SETS[1] .. " 2>/dev/null") or ""
+		if set:find("size " .. M.SET_SIZE, 1, true) then return true end
 	end
+	M._shape_checked = true
 	local f = io.open(M.SCRIPT_PATH, "w")
 	if not f then return false end
 	f:write(M.nft_script())
