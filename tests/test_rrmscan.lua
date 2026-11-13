@@ -727,6 +727,16 @@ return {
 		end
 	},
 	{
+		name = "rrmscan: a request with an ifname or station that is not one runs nothing",
+		fn = function()
+			with_exec(function(cmds)
+				assert_false(rrmscan.request("phy1-ap0;reboot", "00:00:5e:00:53:10"), "bad ifname")
+				assert_false(rrmscan.request("phy1-ap0", "00:00:5e:00:53:10\"}' ; reboot ; '"), "bad station")
+				assert_eq(#cmds, 0, "no shell command")
+			end)
+		end
+	},
+	{
 		name = "rrmscan: a request asks for an ACTIVE all-channel measurement",
 		fn = function()
 			with_exec(function(cmds)

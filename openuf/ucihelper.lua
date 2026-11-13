@@ -3463,6 +3463,9 @@ end
 -- to reconcile on restart since this is fully re-derived every inform cycle
 -- from live UCI config + sta_table.
 function M.kick_station(ifname, mac)
+	-- Both go into a shell command line: anything but a netdev name and a
+	-- MAC is refused rather than quoted.
+	if not (util.valid_ifname(ifname) and util.is_mac(mac)) then return false end
 	M._run_cmd("hostapd_cli -i " .. ifname .. " deauthenticate " .. mac .. " 2>/dev/null")
 	return true
 end

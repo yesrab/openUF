@@ -489,7 +489,8 @@ end
 -- Fire-and-forget by design: the report comes back asynchronously as a ubus
 -- notification minutes-to-never later, and is picked up by harvest().
 function M.request(ifname, sta, opts)
-	if not ifname or not sta then return false end
+	-- Both are spliced into a shell command (and the JSON inside it).
+	if not (util.valid_ifname(ifname) and util.is_mac(sta)) then return false end
 	opts = opts or {}
 	local cmd = string.format(
 		"ubus call hostapd.%s rrm_beacon_req " ..
