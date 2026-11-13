@@ -727,6 +727,16 @@ return {
 		end
 	},
 	{
+		name = "rrmscan: a request with an ifname or station that is not one runs nothing",
+		fn = function()
+			with_exec(function(cmds)
+				assert_false(rrmscan.request("phy1-ap0;reboot", "00:00:5e:00:53:10"), "bad ifname")
+				assert_false(rrmscan.request("phy1-ap0", "00:00:5e:00:53:10\"}' ; reboot ; '"), "bad station")
+				assert_eq(#cmds, 0, "no shell command")
+			end)
+		end
+	},
+	{
 		name = "rrmscan: a request asks for an ACTIVE all-channel measurement",
 		fn = function()
 			with_exec(function(cmds)
@@ -829,6 +839,8 @@ return {
 			-- Names off the event file never reach a shell unchecked.
 			assert_nil(rrmscan.iface_bssid("phy0;reboot"), "bad ifname refused")
 			assert_nil(rrmscan.sta_signal("phy0-ap1", "x; reboot"), "bad station refused")
+			assert_nil(rrmscan.iface_bssid("-h"), "an option-like ifname refused")
+			assert_nil(rrmscan.sta_signal("-h", "aa:bb:cc:dd:ee:ff"), "an option-like ifname refused")
 		end
 	},
 	{
