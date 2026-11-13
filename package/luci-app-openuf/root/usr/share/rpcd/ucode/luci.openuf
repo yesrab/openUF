@@ -129,8 +129,7 @@ function public_status() {
 		last_failure: h.last_fail ?? null,
 		now: s.now ?? time(),
 		uptime: up ? int(split(up, ' ')[0]) : null,
-		running: shell_ok('/etc/init.d/openuf running'),
-		configured: s.config_error == null
+		running: shell_ok('/etc/init.d/openuf running')
 	};
 	public_at = time();
 	return public_cache;
