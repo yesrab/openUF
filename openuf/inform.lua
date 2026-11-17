@@ -362,7 +362,7 @@ end
 -- Also hands state.save the account's group, so state.json stays root:<gid>
 -- 0660 while the account exists and goes back to 0600 when it does not.
 function M._sync_bootstrap_account(adopted, user)
-	if M._state then M._state.share_gid = user and M._account_gid(user) or nil end
+	if M._state then M._state.share_gid = user and M._account_gid(user) or false end
 	if not user then return end
 	local locked = M._account_locked(user)
 	if adopted then

@@ -6609,9 +6609,9 @@ return {
 				inform._sync_bootstrap_account(false, "ubnt")
 				assert_eq(inform._state.share_gid, 902, "the account's primary gid")
 				inform._sync_bootstrap_account(true, nil)
-				assert_nil(inform._state.share_gid, "no account configured: owner-only again")
+				assert_eq(inform._state.share_gid, false, "no account configured: owner-only again")
 				inform._sync_bootstrap_account(false, "nobody-here")
-				assert_nil(inform._state.share_gid, "an account not in /etc/passwd: owner-only")
+				assert_eq(inform._state.share_gid, false, "an account not in /etc/passwd: owner-only")
 			end)
 			inform._run_cmd, inform._read_file, inform._state.share_gid = o_run, o_read, o_gid
 			if not ok then error(err, 0) end

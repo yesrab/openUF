@@ -226,15 +226,34 @@ end
 -- 0644 under procd, world-readable. share_gid is the SSH bootstrap
 -- account's group while that account exists (openuf-bootstrap.sh makes
 -- the file root:<gid> 0660 so the account can adopt): inform sets it from
--- /etc/passwd, and a save keeps it. Set on the temp file, before the rename,
+-- /etc/passwd, and a save keeps it; false = no account, owner-only. nil =
+-- this process does not know (syswrapper set-inform / reset-inform, run as
+-- root): keep the group of the state.json in place, when it is
+-- group-readable, or a root save would lock the account out of the file
+-- until the daemon next saves. Set on the temp file, before the rename,
 -- so state.json never exists with another mode, and on the EMPTY temp file,
 -- before the body (the authkey) is written into it. Not a umask on the
 -- daemon: hostapd runs as user network and reads files the daemon writes.
 M.share_gid = nil
 M._execute  = os.execute
+M._popen    = io.popen
+-- `ls -ln`: GNU, BusyBox and BSD all print mode, links, uid, gid first.
+-- gid 0 is not the account's: an old 0644 root:root file stays owner-only.
+local function current_gid(q)
+	local h = M._popen("ls -ln " .. q .. " 2>/dev/null")
+	if not h then return nil end
+	local line = h:read("*l")
+	h:close()
+	local gid = tonumber(line and line:match("^%-...r%S*%s+%d+%s+%d+%s+(%d+)%s"))
+	return gid ~= 0 and gid or nil
+end
 local function protect(path)
 	local q = "'" .. path:gsub("'", "'\\''") .. "'"
-	local gid = tonumber(M.share_gid)
+	local gid = M.share_gid
+	if gid == nil then
+		gid = current_gid("'" .. M._state_file:gsub("'", "'\\''") .. "'")
+	end
+	gid = tonumber(gid)
 	if gid then
 		-- A gone group (the account removed since /etc/passwd was read) falls
 		-- back to owner-only, never to the writer's umask.
