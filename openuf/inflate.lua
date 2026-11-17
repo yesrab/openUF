@@ -143,12 +143,22 @@ end
 
 -- ─── Block inflation ─────────────────────────────────────────────────────────
 
+-- Largest output inflated, in bytes. A config push is tens of KB; DEFLATE
+-- expands up to ~1000x, so a few KB from a hostile or broken peer could
+-- otherwise take every byte of an AP's RAM.
+M.MAX_OUTPUT = 8 * 1024 * 1024
+
+local function too_big()
+	error(("inflate: output over %d bytes -- refused"):format(M.MAX_OUTPUT))
+end
+
 local function inflate_block(bs, lithuff, disthuff, out)
 	while true do
 		local sym = decode_sym(bs, lithuff)
 		if sym == 256 then
 			return
 		elseif sym < 256 then
+			if #out >= M.MAX_OUTPUT then too_big() end
 			out[#out + 1] = char(sym)
 		else
 			sym = sym - 256              -- 1-based into LEN_BASE
@@ -157,6 +167,7 @@ local function inflate_block(bs, lithuff, disthuff, out)
 			local dist   = DIST_BASE[dsym] + bs.getbits(DIST_EXTRA[dsym])
 			local start  = #out - dist + 1
 			if start < 1 then error("inflate: distance too far back") end
+			if #out + length > M.MAX_OUTPUT then too_big() end
 			for i = 0, length - 1 do
 				out[#out + 1] = out[start + i]   -- overlap-safe (appends as it reads)
 			end
@@ -208,6 +219,7 @@ function M.inflate(data)
 			bs.align()
 			local len  = bs.getbyte() + bs.getbyte() * 256
 			bs.getbyte(); bs.getbyte()          -- NLEN (one's complement, unchecked)
+			if #out + len > M.MAX_OUTPUT then too_big() end
 			for _ = 1, len do out[#out + 1] = char(bs.getbyte()) end
 		elseif btype == 1 then
 			local lit, dist = fixed_tables()

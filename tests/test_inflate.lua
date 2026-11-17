@@ -182,4 +182,23 @@ return {
 				"and names the reason")
 		end
 	},
+	{
+		name = "inflate: output past MAX_OUTPUT is refused (a zlib bomb, and a stored block)",
+		fn = function()
+			-- zlib.compress(b"a"*100000, 9): 113 bytes that expand to 100 KB.
+			local bomb = unhex("78daedc13101000000c2a0aceb5fc21a1e4001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000af0679660b4d")
+			assert_eq(#inflate.zlib_decompress(bomb), 100000, "under the cap it inflates")
+			local o_max = inflate.MAX_OUTPUT
+			inflate.MAX_OUTPUT = 4096
+			local ok, err = pcall(inflate.zlib_decompress, bomb)
+			-- Stored block: bfinal=1 btype=0, LEN 5000, NLEN, 5000 bytes.
+			local stored = string.char(0x01, 0x88, 0x13, 0x77, 0xec) .. string.rep("b", 5000)
+			local ok2, err2 = pcall(inflate.inflate, stored)
+			inflate.MAX_OUTPUT = o_max
+			assert_false(ok, "the bomb is refused")
+			assert_true(tostring(err):find("output over 4096", 1, true) ~= nil, "and says why")
+			assert_false(ok2, "an oversized stored block is refused")
+			assert_true(tostring(err2):find("output over 4096", 1, true) ~= nil, "and says why")
+		end
+	},
 }

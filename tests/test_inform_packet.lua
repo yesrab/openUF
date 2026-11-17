@@ -401,6 +401,18 @@ return {
 		end
 	},
 	{
+		name = "inform packet: setparam ignores an inform_url that is not an http(s) URL",
+		fn = function()
+			local st = sample_state({inform_url = "http://192.0.2.10:8080/inform"})
+			local out = with_stderr(function()
+				inform.handle_response('{"_type":"setparam","mgmt_cfg":"inform_url=unifi:8080\\n"}', st)
+				inform.handle_response('{"_type":"setparam","mgmt_cfg":"inform_url=http://x/a b\\n"}', st)
+			end)
+			assert_eq(st.inform_url, "http://192.0.2.10:8080/inform", "the working URL is kept")
+			assert_contains(out, "not an http(s) URL", "and the refusal is logged")
+		end
+	},
+	{
 		name = "inform packet: handle_response setparam does NOT update inform_url from mgmt_url",
 		fn = function()
 			-- Confirmed live against a real controller (2026-07-14): mgmt_url is
@@ -7261,6 +7273,31 @@ return {
 			inform._notif_identity = o_ident
 			inform._event_queue, inform._event_seen = {}, {}
 			assert_eq(posts, 1, "exactly one POST reached the controller")
+		end
+	},
+	{
+		name = "inform: http_post stops reading a response past HTTP_MAX_RESPONSE",
+		fn = function()
+			local o_sock, o_max, o_hp = package.loaded.socket, inform.HTTP_MAX_RESPONSE, inform._http_post
+			local reads, closed = 0, false
+			local tcp = {
+				settimeout = function() end, connect = function() return 1 end,
+				send = function() return 1 end, close = function() closed = true end,
+				receive = function(_, n)
+					reads = reads + 1
+					if reads > 1000 then return nil, "closed", "" end  -- safety stop for the old code
+					return ("x"):rep(n)
+				end,
+			}
+			package.loaded.socket = {tcp = function() return tcp end}
+			inform.HTTP_MAX_RESPONSE, inform._http_post = 16384, nil
+			local ok, resp, err = pcall(inform.http_post, "http://192.0.2.10:8080/inform", "body")
+			package.loaded.socket, inform.HTTP_MAX_RESPONSE, inform._http_post = o_sock, o_max, o_hp
+			assert_true(ok, tostring(resp))
+			assert_nil(resp, "no body for an oversized response")
+			assert_contains(tostring(err), "over 16384 bytes", "said why")
+			assert_true(reads <= 5, "stopped reading once over the cap")
+			assert_true(closed, "and closed the socket")
 		end
 	},
 	{
