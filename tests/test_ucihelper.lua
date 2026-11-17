@@ -3644,6 +3644,19 @@ Wiphy phy2
 		end
 	},
 	{
+		name = "ucihelper: kick_station refuses an ifname or MAC that is not one, running nothing",
+		fn = function()
+			with_ucihelper(function(db)
+				local calls = {}
+				ucihelper._run_cmd = function(cmd) calls[#calls + 1] = cmd; return true end
+				assert_false(ucihelper.kick_station("wlan0;reboot", "aa:bb:cc:dd:ee:ff"), "bad ifname")
+				assert_false(ucihelper.kick_station("wlan0", "aa:bb:cc:dd:ee:ff;reboot"), "bad mac")
+				assert_false(ucihelper.kick_station(nil, "aa:bb:cc:dd:ee:ff"), "no ifname")
+				assert_eq(#calls, 0, "no shell command run")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: changing a WLAN's VLAN tears the old L2 down",
 		fn = function()
 			-- Confirmed live: moving the IoT network from VLAN 20 to 10 in
