@@ -6418,6 +6418,114 @@ return {
 		end
 	},
 	{
+		name = "inform: a setparam with the syslog block keeps the target in state and syncs remotelog",
+		fn = function()
+			local orig, real = inform._remotelog, dofile("openuf/remotelog.lua")
+			local synced = {}
+			inform._remotelog = {parse = real.parse, is_valid_hash_id = real.is_valid_hash_id,
+				line_tag = real.line_tag,
+				new_hash_id = function() return "00005e0053100001" end,
+				sync = function(t, ident) synced[#synced + 1] = {t = t, ident = ident}; return "x" end}
+			local st = sample_state()
+			local key = string.rep("ab", 32)
+			local ok, err = pcall(function()
+				with_stderr(function()
+					inform.handle_response('{"_type":"setparam","system_cfg":"syslog.status=enabled\\n'
+						.. 'syslog.remote.status=enabled\\nsyslog.remote.encrypt=enabled\\n'
+						.. 'syslog.remote.ip=192.0.2.10\\nsyslog.remote.port=5514\\n'
+						.. 'syslog.remote.key=' .. key .. '\\n"}', st, {net = {lan_cpueth = "eth0"}})
+				end)
+				assert_eq(#synced, 1, "synced once")
+				assert_eq(st.remotelog.ip, "192.0.2.10", "target kept for the next start")
+				assert_eq(st.remotelog.key, key, "with its key")
+				assert_eq(st.hash_id, "00005e0053100001", "an encrypted target makes the hash_id")
+				assert_eq(synced[1].ident.hash_id, "00005e0053100001", "and the forwarder is told it")
+				assert_eq(synced[1].ident.host, "testap", "with the hostname")
+				-- Turned off on the controller: the block arrives disabled.
+				with_stderr(function()
+					inform.handle_response('{"_type":"setparam","system_cfg":"syslog.status=disabled\\n"}',
+						st, {net = {lan_cpueth = "eth0"}})
+				end)
+				assert_nil(st.remotelog, "target gone from state")
+				assert_nil(synced[2].t, "remotelog told to stop")
+				-- A push without the block changes nothing.
+				st.remotelog = {ip = "192.0.2.10", port = 514}
+				with_stderr(function()
+					inform.handle_response('{"_type":"setparam","system_cfg":"radio.1.channel=6\\n"}',
+						st, {net = {lan_cpueth = "eth0"}})
+				end)
+				assert_eq(#synced, 2, "no sync")
+				assert_eq(st.remotelog.ip, "192.0.2.10", "state untouched")
+			end)
+			inform._remotelog = orig
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: the syslog keys remotelog reads are recognised; any other syslog key stays in the ledger",
+		fn = function()
+			local function known(k)
+				for _, pat in ipairs(inform.RECOGNIZED_SYSTEM_CFG) do
+					if k:match(pat) then return true end
+				end
+				return false
+			end
+			for _, k in ipairs({"syslog.status", "syslog.remote.status", "syslog.remote.encrypt",
+				"syslog.remote.ip", "syslog.remote.port", "syslog.remote.key"}) do
+				assert_true(known(k), k .. " is read")
+			end
+			assert_false(known("syslog.file.status"), "a key nothing reads is not claimed as handled")
+			assert_false(known("syslog.level"), "a key nothing reads is not claimed as handled")
+		end
+	},
+	{
+		name = "inform: forgetting the controller stops remote logging",
+		fn = function()
+			local orig = inform._remotelog
+			local got = "unset"
+			inform._remotelog = {sync = function(t) got = t end}
+			local ok, err = pcall(function() with_stderr(function() inform._forget_controller({}, {}) end) end)
+			inform._remotelog = orig
+			if not ok then error(err, 0) end
+			assert_nil(got, "sync(nil): forwarder stopped, the board's own server back")
+		end
+	},
+	{
+		name = "inform: _remotelog_resync restarts a lost forwarder once a minute, and only for an encrypted target",
+		fn = function()
+			local orig, o_time, o_next, o_save = inform._remotelog, inform._time, inform._remotelog_next, inform._state.save
+			local real = dofile("openuf/remotelog.lua")
+			local syncs, saves, now = 0, 0, 1000
+			inform._remotelog = {is_valid_hash_id = real.is_valid_hash_id, line_tag = real.line_tag,
+				new_hash_id = function() return "00005e0053100002" end,
+				supported = function() return true end,
+				sync = function() syncs = syncs + 1; return "encrypted" end}
+			inform._time = function() return now end
+			inform._remotelog_next = 0
+			inform._state.save = function() saves = saves + 1 end
+			local ok, err = pcall(function()
+				local st = sample_state()
+				assert_false(inform._remotelog_resync(st, {config = {}}), "no target: nothing")
+				st.remotelog = {ip = "192.0.2.20", port = 514}
+				assert_false(inform._remotelog_resync(st, {config = {}}), "plain target: logd keeps itself running")
+				assert_eq(syncs, 0, "no sync")
+				st.remotelog = {ip = "192.0.2.10", port = 5514, encrypt = true, key = string.rep("ab", 32)}
+				assert_true(inform._remotelog_resync(st, {config = {}}), "encrypted: checked")
+				assert_eq(syncs, 1, "synced")
+				assert_eq(st.hash_id, "00005e0053100002", "hash_id made on the way")
+				assert_eq(saves, 1, "and saved")
+				now = now + 30
+				inform._remotelog_resync(st, {config = {}})
+				assert_eq(syncs, 1, "not again within the minute")
+				now = now + 31
+				inform._remotelog_resync(st, {config = {}})
+				assert_eq(syncs, 2, "again after it")
+			end)
+			inform._remotelog, inform._time, inform._remotelog_next, inform._state.save = orig, o_time, o_next, o_save
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform: a setparam with the ebtables block records the intent in state and reconciles l2guard on the AP VAPs",
 		fn = function()
 			local orig_l2, real_uci = inform._l2guard, inform._ucihelper

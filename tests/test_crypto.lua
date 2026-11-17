@@ -215,6 +215,46 @@ return {
 		end
 	},
 	{
+		-- remotelog.lua seals the controller's encrypted syslog with this.
+		-- The vector is test case 14 of the GCM specification (McGrew &
+		-- Viega): a 256-bit zero key, a 96-bit zero IV, one zero block.
+		name = "crypto: AES-256-GCM known-answer vector, and the AAD is authenticated",
+		fn = function()
+			if not crypto.gcm256_available() then
+				if os.getenv("OPENUF_REQUIRE_GCM") == "1" then
+					error("OPENUF_REQUIRE_GCM=1 but no AES-256-GCM backend -- CI must install lua-openssl")
+				end
+				print("SKIP  AES-256-GCM known-answer vector (no backend -- luarocks install --local openssl)")
+				return
+			end
+			local key = string.rep("0", 64)
+			local iv  = string.rep("\0", 12)
+			local ct, tag = crypto.aes256_gcm_encrypt(key, iv, string.rep("\0", 16))
+			assert_eq(crypto.bin_to_hex(ct), "cea7403d4d606b6e074ec5d3baf39d18", "ciphertext")
+			assert_eq(crypto.bin_to_hex(tag), "d0d1c8a799996bf0265b98b5d48ab919", "tag")
+			local aad = string.rep("\1", 29)
+			ct, tag = crypto.aes256_gcm_encrypt(key, iv, "a syslog line", aad)
+			assert_eq(crypto.aes256_gcm_decrypt(key, iv, ct, tag, aad), "a syslog line", "round trip with AAD")
+			assert_error(function()
+				crypto.aes256_gcm_decrypt(key, iv, ct, tag, string.rep("\2", 29))
+			end, "other AAD fails the tag")
+			assert_error(function() crypto.aes256_gcm_encrypt(string.rep("0", 32), iv, "x") end,
+				"a 128-bit key is refused, not silently used")
+		end
+	},
+	{
+		name = "crypto: AES-256-GCM without lua-openssl raises rather than falling back",
+		fn = function()
+			if crypto.gcm256_available() then
+				print("SKIP  no-backend contract (lua-openssl is installed here)")
+				return
+			end
+			local ok, err = pcall(crypto.aes256_gcm_encrypt, string.rep("0", 64), string.rep("\0", 12), "x")
+			assert_false(ok, "no cipher, no datagram")
+			assert_contains(tostring(err), "needs lua-openssl", "actionable")
+		end
+	},
+	{
 		name = "crypto: GCM without a backend raises a clear error (never silent garbage)",
 		fn = function()
 			if crypto.gcm_available() then

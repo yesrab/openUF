@@ -3196,6 +3196,53 @@ return {
 		end
 	},
 	{
+		-- Opt-in: the bit and the format behind it are antoniocosta/unifi-openwrt's
+		-- finding, not this tree's (remotelog.lua).
+		name = "inform json: fw_caps 0x1000000 and hash_id only with encrypted_syslog on a board that can seal",
+		fn = function()
+			local o_rl, o_probe = inform._remotelog, inform._enc_syslog_probe
+			local real = dofile("openuf/remotelog.lua")
+			local can = true
+			inform._remotelog = {is_valid_hash_id = real.is_valid_hash_id,
+				supported = function() return can end}
+			local st = {authkey = state.DEFAULT_KEY, inform_url = "http://10.0.0.1:8080/inform",
+				mac = "aa:bb:cc:dd:ee:ff", hash_id = "00005e0053100001"}
+			local ok, err = pcall(function()
+				inject_sysinfo()
+				inform._enc_syslog_probe = nil
+				local base = cjson.decode(inform.build_json(st, {config = {}}, ufhw))
+				assert_nil(base.hash_id, "default: no hash_id on the wire")
+				inform._enc_syslog_probe = nil
+				local d = cjson.decode(inform.build_json(st, {config = {encrypted_syslog = true}}, ufhw))
+				assert_eq(d.fw_caps - base.fw_caps, 0x1000000, "opted in: the bit, and only the bit")
+				assert_eq(d.hash_id, "00005e0053100001", "and the hash_id the key is filed under")
+				-- Asked for on a board with no cipher: said once, not claimed.
+				can, inform._enc_syslog_probe = false, nil
+				local real_err, buf = io.stderr, {}
+				io.stderr = {write = function(_, x) buf[#buf + 1] = x end}
+				local ok2, d2 = pcall(function()
+					inform.build_json(st, {config = {encrypted_syslog = true}}, ufhw)
+					return cjson.decode(inform.build_json(st, {config = {encrypted_syslog = true}}, ufhw))
+				end)
+				io.stderr = real_err
+				if not ok2 then error(d2, 0) end
+				assert_eq(d2.fw_caps, base.fw_caps, "cannot seal: no claim")
+				assert_nil(d2.hash_id, "and no hash_id")
+				local _, n = table.concat(buf):gsub("cannot seal", "")
+				assert_eq(n, 1, "warned once for the process, not per inform")
+				-- A running encrypted target reports hash_id even without the option
+				-- (the controller sent the key: it needs the id to use it).
+				inform._enc_syslog_probe = nil
+				st.remotelog = {ip = "192.0.2.10", port = 5514, encrypt = true}
+				local d3 = cjson.decode(inform.build_json(st, {config = {}}, ufhw))
+				assert_eq(d3.hash_id, "00005e0053100001", "hash_id while encrypted syslog runs")
+				assert_eq(d3.fw_caps, base.fw_caps, "but no bit without the option")
+			end)
+			inform._remotelog, inform._enc_syslog_probe = o_rl, o_probe
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "inform json: satisfaction follows the firmware's terms through real counters",
 		fn = function()
 			inform._sta_stats_cache = {}

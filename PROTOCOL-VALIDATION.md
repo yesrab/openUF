@@ -2438,6 +2438,36 @@ The commits, in order:
 | `dcfe0df` | HTTP 503 waits the cap at once; 404 on an unadopted device keeps the cadence, logged once | Adopted; the guest-selfrun line of that hunk left out |
 | `db5e92b` | The set-adopt form Network 10.6 is reported to send (absolute path, trailing device MAC; a foreign MAC refused) | Adopted (clean). Relevant here: both APs adopt into a 10.6 UCG Ultra and AP2's bootstrap adoption is the open item of 2026-10-25 |
 
+## Adopted from antoniocosta/unifi-openwrt, 2026-11-17
+
+[antoniocosta/unifi-openwrt](https://github.com/antoniocosta/unifi-openwrt) (GPL-2.0-or-later, a
+Go daemon; read at `6d5a30d`) reaches the same goal from scratch. Its author compared the two
+projects and named five things of theirs openUF lacked. Four were re-implemented here in Lua —
+their code was read, none was copied — and the fifth (the guest portal) is upstream's to adopt
+(REVERSE-ENGINEERING.md backlog row 24). **Their evidence is theirs**: one TP-Link OnHub
+(TGR1900) on OpenWrt 25.12, adopted as a UAP-AC-Pro into UniFi Network 10.6 on a UniFi Express
+7, with decompilation of Network 10.6.109. This tree's own evidence is the OpenWrt 25.12.6 test
+VM (two hwsim radios, real hostapd, dropbear, logd, lua-openssl): **nothing below has run on
+AP1/AP2 or against a controller push.** The suite went from 1266 to 1337 tests.
+
+| What | Theirs | Here | Own evidence (test VM, 2026-11-17) |
+|---|---|---|---|
+| Remote syslog, plain | `internal/translate/syslog.go`: `log_ip`/`log_port`/`log_proto` | `remotelog.apply_plain`, plus stamps and restore (`openuf_log_managed`, `openuf_log_*_orig`) | Real UCI: written, logd restarted, restored to exactly the previous options |
+| Remote syslog, encrypted | `internal/device/syslog.go` and `docs/internals.md`: magic `AB CD DC BA 01 00 00 00 01`, 8-byte `hash_id`, 12-byte nonce, AES-256-GCM with bytes 0–28 as AAD; UDP 5514; line tag `MODEL,mac12,version:`; sent only to a device with `fw_caps` `0x1000000`; `hash_id` reported in the inform | `remotelog.seal`/`format_line`, `logfwd.lua`, `crypto.aes256_gcm_encrypt`; bit and `hash_id` behind `encrypted_syslog` | AES-256-GCM known-answer vector (GCM spec test case 14) under real lua-openssl; a listener holding the key opened a line written with `logger`; key file 0600, no key in any command line; stop leaves no process behind (the first version left `logread -f`) |
+| Rollback | `internal/openwrt/apply.go`: backup, 20 s health check on `network.wireless status`, 5-minute detached timer | `applyguard.lua`: copy on flash incl. `state.json`, verdict from hostapd + an answered inform, resume after a restart, rebuild by restarting the daemon | A radio set to channel 209 on 2.4 GHz: **netifd still reported `up: true`** with the interface listed while hostapd logged `add_iface failed`, so their rule (and this module's first version) confirmed a dead radio. Asking hostapd (`ubus list hostapd.*`, `get_status`) detects it; restore brought the radio back on channel 6 |
+| 802.11k neighbour list | `internal/openwrt/rrm.go`: element = BSSID, info `0x08af` (+`0x1000` on 5 GHz), 20 MHz operating class 81/115/118/121/125, channel, PHY 7/9; siblings matched by BSSID bytes to LAN hosts | `nrlist.lua`: same element; siblings are scan entries carrying the site's beacon IE (`peer_mac`); inert where openUF runs usteer | Real hostapd: `rrm_nr_set` accepted the list, a repeat wrote nothing, an empty list cleared it |
+| Device SSH Authentication | `internal/openwrt/users.go`: uid 0, `/bin/ash`, only accounts it created (a file ledger) | `devlogin.lua`: same account shape, ledger in `state.json`, **only from a response sealed with the adoption key**, files replaced by rename | dropbear accepted a pushed `$1$` hash (login as uid 0); after removal `/etc/passwd` and `/etc/shadow` were byte-identical to before and the login was refused |
+
+Not taken: their SNMP agent, LED colour, Locate beep and spare-radio scanning (no demand here),
+and their inform/adoption path (this tree's is older and validated on two controllers).
+
+Owed on hardware, cheapest first: a plain syslog server pushed by the controller (does the block
+arrive with the six keys `remotelog.parse` reads, and nothing it needs under another name); the
+`encrypted_syslog` claim on **one** AP (does the controller then send `syslog.remote.key`, and
+does its log show the AP's lines); `device_login` on AP2 with a throwaway device password;
+`apply_rollback` on AP2 with a deliberately bad channel pushed from the controller; a client's
+Neighbor Report on a WLAN with 802.11k on and steering off.
+
 ## Feature matrix
 
 Every controller-UI control exercised against a live openUF device. "Confirmed" means driven

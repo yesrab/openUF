@@ -787,7 +787,7 @@ address; see § 2, "The device page".
 |---|---|
 | `modelmap` | `auto` (the shipped profile that declares this board), a profile name from `/usr/lib/openuf/modelmap/`, or `custom` (the `device`, `port`, `vlan`, `swport` and `radio` sections) |
 | `ufmodel` | `auto` (the profile's own identity), a name from `/usr/lib/openuf/ufmodel/`, or `custom` (the `identity` section) |
-| `inform_url`, `use_only_unifi_wlan`, `keep_wlan_section` (a list), `l2_announce`, `neighbour_scan_interval`, `rrm_enrichment`, `rrm_request_interval`, `assoc_tracker`, `roam_assist_diff_db`, `country_override`, `bootstrap_adopt_user`, `debug_dump_file`, `debug_dump_requests`, `debug_dump_max_bytes`, `state_file`, `unhandled_file` | The `conf.lua` option of the same name, below. Booleans are `1`/`0`; an empty string clears an optional one |
+| `inform_url`, `use_only_unifi_wlan`, `keep_wlan_section` (a list), `l2_announce`, `neighbour_scan_interval`, `rrm_enrichment`, `rrm_request_interval`, `assoc_tracker`, `neighbour_list`, `apply_rollback`, `device_login`, `encrypted_syslog`, `roam_assist_diff_db`, `country_override`, `bootstrap_adopt_user`, `debug_dump_file`, `debug_dump_requests`, `debug_dump_max_bytes`, `state_file`, `unhandled_file` | The `conf.lua` option of the same name, below. Booleans are `1`/`0`; an empty string clears an optional one |
 
 A custom hardware profile is the modelmap's fields as UCI sections -- one `port` section
 per RJ45 socket (`idx`, then `ifname` on DSA or `swport` on swconfig), a `vlan` section
@@ -829,6 +829,10 @@ config = {
     rrm_enrichment = true,       -- ask 802.11k clients to report neighbours (see below)
     rrm_request_interval = 600,  -- seconds between those requests, one client at a time
     assoc_tracker = true,        -- AirView Connectivity/Roaming reports when the controller asks
+    neighbour_list = true,       -- 802.11k neighbour reports name the site's other APs (§ 6d)
+    apply_rollback = false,      -- undo a config push that takes the AP off the air (§ 6d)
+    device_login = false,        -- create the controller's Device SSH login (§ 6d)
+    encrypted_syslog = false,    -- claim "this controller, encrypted" remote logging (§ 6d)
     roam_assist_diff_db = 8,     -- Roaming Assistant: dB another AP must hear a client louder
     country_override = nil,      -- see below
     bootstrap_adopt_user = nil,  -- see below
@@ -1860,6 +1864,55 @@ backlog row 23). Each is on by default and needs nothing in `conf.lua`.
   the bridge hairpin flag is re-asserted on BSSes OpenWrt force-isolates (Multicast
   Enhancement, Proxy ARP), the nightly 11k-scan runs at two random times in the hour, and
   beacon requests go out hourly.
+
+## 6d. What was added on 2026-11-17 (from antoniocosta/unifi-openwrt)
+
+Four things [antoniocosta/unifi-openwrt](https://github.com/antoniocosta/unifi-openwrt) does that
+openUF did not, re-implemented here. Each was run on the OpenWrt test VM; **none has run on a
+production AP or against a controller push yet**, which is why three of the four are off until
+you turn them on.
+
+**Remote Logging.** Nothing to configure for a syslog server of your own: when the controller
+pushes one (Settings → System → Remote Logging), openUF writes it to logd
+(`system.@system[0].log_ip` / `log_port` / `log_proto`) and restarts logd; what was there is
+stamped (`openuf_log_managed`, `openuf_log_*_orig`) and comes back when the controller turns
+remote logging off or forgets the device. The other kind, **"this controller, encrypted"**,
+needs `encrypted_syslog = true`: the controller sends that configuration only to a device
+claiming a capability bit, and that bit and the datagram format come from the other project's
+reading of the controller, not from this tree's own. With it on, openUF reports a `hash_id`,
+and once the controller pushes its key a forwarder (`logread -f | lua logfwd.lua`) seals every
+log line with AES-256-GCM and sends it to the controller's listener (UDP 5514), at most 50
+lines a second after a burst of 100. Check it with `pgrep -af logfwd` and `logread -e remotelog`;
+the key is in `/var/run/openuf-logfwd.conf` (mode 600) and nowhere else. Needs `lua-openssl`.
+
+**Rollback (`apply_rollback = true`).** A push that leaves a radio off the air, or leaves the AP
+unable to reach the controller, is undone after four minutes: the wireless and network
+configuration and `state.json` from before the push are restored from `/etc/openuf/rollback`
+and the daemon restarts. `logread -e openuf | grep -i roll` shows it, `/tmp/openuf-status` gains
+`rollback=` and `rollback_msg=`, and the daemon repeats the note at every start until a later
+push is confirmed. After a rollback the AP runs the old configuration while reporting the new
+`cfgversion` — on purpose, so the controller does not send the same push again every few
+minutes; change the setting on the controller to have it tried again. Two things to know before
+turning it on: it will also undo a push that was **meant** to move the AP somewhere the
+controller cannot follow at once (a new management VLAN before the switch port is ready), and
+it cannot act if the daemon itself hangs.
+
+**802.11k neighbour list (`neighbour_list`, on).** On a WLAN with 802.11k enabled a client can
+ask the AP which other APs it could move to. openUF now answers with the site's other BSSes on
+that SSID — siblings it has scanned (other openUF APs and genuine UniFi APs) and its own BSS on
+the other band — instead of with itself alone. `ubus call hostapd.<ifname> rrm_nr_list` shows
+the list. It does nothing while Band Steering or Roaming Assistant is on, because openUF then
+runs usteer and usteer maintains the same list itself (with OpenWrt siblings only). A sibling is
+remembered for an hour after it was last scanned, so the list fills as scans happen
+(`neighbour_scan_interval`, the nightly `11k-scan`, client beacon reports).
+
+**Device SSH Authentication (`device_login = true`).** Creates the login set under Settings →
+System → Advanced → Device Authentication, with the password the controller pushes (as a hash),
+and removes it when the controller stops pushing it, forgets the AP, or you switch the option
+off. The account is root in all but name. openUF only creates it from a response sealed with
+the AP's own adoption key, never touches an account that already exists (`root`, the bootstrap
+account, your own), and lists what it made in `state.json` (`device_logins`). Whether dropbear
+accepts password logins is still your setting (`uci show dropbear`).
 
 ## 7. LLDP topology
 

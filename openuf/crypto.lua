@@ -246,6 +246,54 @@ function M.aes_gcm_decrypt(key_hex, iv, ciphertext, tag, aad)
 	error("aes_gcm_decrypt: no GCM backend (install lua-openssl)")
 end
 
+-- AES-256-GCM, for UniFi's encrypted remote syslog (remotelog.lua): a 32-byte
+-- key (64 hex digits, the controller's syslog.remote.key), a 12-byte nonce and
+-- the datagram header as additional data. lua-openssl only: luacrypto's AEAD
+-- has no dependable AAD call, and a datagram sealed without its header as AAD
+-- is one the controller's listener throws away.
+-- Returns: ciphertext, 16-byte tag.
+function M.aes256_gcm_encrypt(key_hex, iv, plaintext, aad)
+	if not _ossl_ok then error("aes256_gcm_encrypt: needs lua-openssl") end
+	local key = M.hex_to_bin(key_hex)
+	if #key ~= 32 then error("aes256_gcm_encrypt: key must be 64 hex digits") end
+	local C   = _ossl.cipher
+	local ctx = C.get("aes-256-gcm"):encrypt_new()
+	ctx:ctrl(C.EVP_CTRL_GCM_SET_IVLEN, #iv)
+	ctx:init(key, iv)
+	ctx:padding(false)
+	if aad and #aad > 0 then ctx:update(aad, true) end
+	local ct  = ctx:update(plaintext) .. ctx:final()
+	local tag = ctx:ctrl(C.EVP_CTRL_GCM_GET_TAG, 16)
+	return ct, tag
+end
+
+-- The other direction, for the tests and for anything that wants to read a
+-- datagram back. Raises when the tag does not verify.
+function M.aes256_gcm_decrypt(key_hex, iv, ciphertext, tag, aad)
+	if not _ossl_ok then error("aes256_gcm_decrypt: needs lua-openssl") end
+	local key = M.hex_to_bin(key_hex)
+	if #key ~= 32 then error("aes256_gcm_decrypt: key must be 64 hex digits") end
+	local C   = _ossl.cipher
+	local ctx = C.get("aes-256-gcm"):decrypt_new()
+	ctx:ctrl(C.EVP_CTRL_GCM_SET_IVLEN, #iv)
+	ctx:init(key, iv)
+	ctx:padding(false)
+	if aad and #aad > 0 then ctx:update(aad, true) end
+	local pt = ctx:update(ciphertext)
+	ctx:ctrl(C.EVP_CTRL_GCM_SET_TAG, tag)
+	local final = ctx:final()
+	if not final then error("aes256_gcm_decrypt: authentication tag verification failed") end
+	return pt .. final
+end
+
+-- True when aes256_gcm_encrypt can run here: lua-openssl, and a libcrypto
+-- that carries the cipher (every OpenWrt build of it does; asked, not assumed).
+function M.gcm256_available()
+	if not _ossl_ok then return false end
+	local ok, c = pcall(_ossl.cipher.get, "aes-256-gcm")
+	return ok and c ~= nil
+end
+
 -- Returns true if GCM is supported by the available backend
 function M.gcm_available()
 	return (_ossl_ok and _ossl.cipher ~= nil)

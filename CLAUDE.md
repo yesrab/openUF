@@ -543,6 +543,35 @@ at startup. `install.sh uninstall` still removes both.
   from the uplink socket traverse it -- a bridge-wide rule kills the IoT WLAN's uplink. The
   uplink socket is a runtime detection that is refused when unsure, so the rule stays on
   the interfaces the controller's other eight rules name: the VAPs.
+- **Four modules of 2026-11-17 follow antoniocosta/unifi-openwrt, and three of them are opt-in
+  for a reason** (PROTOCOL-VALIDATION.md § Adopted from antoniocosta/unifi-openwrt has what is
+  theirs and what was run here: the test VM only).
+  - `remotelog.lua` + `logfwd.lua`: the `syslog.*` block. Plain goes to logd's UCI options,
+    stamped and reversible. Encrypted is a forwarder process (`logread -f | lua logfwd.lua
+    <conf>`), an orphan like rrmscan's collector: started by `_remotelog_resync` (once a minute
+    while `st.remotelog.encrypt`, which is also what restarts it after a reboot), stopped by a
+    push that turns it off, `_forget_controller` and the init script. **`forwarder_stop` kills the
+    wrapper's children first** (`pgrep -P`): `logread -f` names nothing of ours and outlived its
+    reader on the VM. The key reaches the forwarder through a 0600 file made empty, chmod'ed, then
+    written; `probe.lua` strips it from the state it shows. `fw_caps 0x1000000` and `hash_id` are
+    behind `encrypted_syslog` because the bit is not this tree's own finding.
+  - `applyguard.lua` (`apply_rollback`): the copy in `/etc/openuf/rollback` is the last
+    CONFIRMED configuration, so a second push while one is undecided must not replace it
+    (`_applyguard_begin`). **netifd's `up` is not evidence**: it stayed true for a radio hostapd
+    had refused; `radio_state` counts AP interfaces whose `hostapd.<ifname>` object is on ubus
+    and not DISABLED (a CAC in progress is alive). A rollback restores three files, reloads, and
+    ENDS THE DAEMON (`M._exit`) so the startup reapply list rebuilds everything; it keeps the
+    undone push's cfgversion on purpose (reporting the old one is a push/rollback loop).
+    `_applyguard_tick` is the one tick stage whose error is printed rather than swallowed.
+  - `nrlist.lua` (`neighbour_list`, on): does nothing where `usteer.filter_wanted()` is true,
+    because usteer writes the same hostapd list. Siblings come from `scan_table`'s `peer_mac`
+    via `observe` in `build_json`; `_deny_reloaded` brings the next sync forward because
+    hostapd forgets the list with the BSS. "No own neighbour entry" is both "802.11k off" and
+    "BSS not up yet", so it is retried only for three minutes after a reload.
+  - `devlogin.lua` (`device_login`): a uid-0 account from controller data. The trust flag is
+    read at the TOP of the setparam branch (`trusted_response`), before the response can adopt
+    the device; never move that read below the mgmt_cfg parse. Only names in
+    `st.device_logins` are ever changed; `_forget_controller` needs `prev` for that ledger.
 - **`sysconf` installs only commands in `CRON_COMMANDS`.** A pushed cron line is a string
   crond runs as root; the controller's is `syswrapper.sh 11k-scan`, and that maps to the
   verb this tree ships. Extend the table only alongside a new verb, never to "pass through".
@@ -1057,6 +1086,17 @@ openuf/
   sysconf.lua       controller-managed system settings: system.timezone and ntpclient.*
                     into UCI (stamped, reversible), cron.* into a marked block of
                     /etc/crontabs/root (allow-listed commands only: `syswrapper.sh 11k-scan`)
+  remotelog.lua     the syslog.* block: a plain server into logd's UCI options (stamped),
+                    "this controller, encrypted" as AES-256-GCM datagrams; the forwarder's
+                    start/stop and its 0600 key file
+  logfwd.lua        that forwarder: `logread -f | lua logfwd.lua <conf>`, rate-limited
+  applyguard.lua    rollback of a config push that broke the AP (opt-in): the copy in
+                    /etc/openuf/rollback, the verdict (hostapd serving + an answered inform),
+                    the restore
+  nrlist.lua        the 802.11k neighbour list: scanned siblings and the other band into
+                    hostapd's rrm_nr_set; inert where usteer runs
+  devlogin.lua      Device SSH Authentication (opt-in): the pushed users.* login as a uid-0
+                    account, only after adoption, only accounts it made
   l2guard.lua       the ebtables.* block as nft `bridge openuf_l2guard`: BPDU and 802.1Q
                     drop on the AP VAPs only; intent + names in state.json for the reboot
   backhaul.lua      the mesh (wireless uplink): plan of the WDS downlink/uplink sections,
