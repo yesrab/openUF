@@ -720,7 +720,12 @@ at startup. `install.sh uninstall` still removes both.
   multicast are not sent any more; a test that expects them is wrong.
 - **AES-GCM is mandatory for adoption.** UniFi 10.4.57 will not finish provisioning a
   device that has never sent a genuine GCM inform; a CBC-only device sticks at "Adopting"
-  forever. Needs a GCM-capable `lua-openssl`; the `openssl` CLI fallback is CBC-only.
+  forever. Needs a GCM-capable `lua-openssl`. There is no `openssl` CLI fallback any more
+  (PR #6: it put the authkey on a command line); with no binding `crypto.lua` uses
+  `aeslua.lua`, AES-128-CBC in plain Lua, which is what lets the suite run on a dev machine
+  whose Lua has no lua-openssl rock (Lua 5.5 has none) and is CBC-only, slow and not
+  constant-time -- a device that reaches it has a broken install and says so on stderr.
+  Byte-identical to lua-openssl on the test VM, both directions.
 - **`openuf_` is a UCI section name, not an SSID filter.** Sections are
   `openuf_<radio>_<sanitized ssid>`; the broadcast SSID is exactly what the controller
   sent, and every pushed WLAN is provisioned whatever it is called. The prefix only marks
@@ -1061,6 +1066,7 @@ openuf/
   inform.lua        TNBU inform loop, response dispatch, payload assembly (the core)
   announce.lua      L2 UDP discovery broadcasts (port 10001)
   crypto.lua        AES-128-CBC/GCM            inflate.lua  pure-Lua zlib inflate
+  aeslua.lua        AES-128-CBC in plain Lua: crypto.lua's path when no binding is installed
   ucihelper.lua     all wireless UCI writes (VAPs, radios, VLAN networks)
   sysinfo.lua       /proc, iw, swconfig and bridge-fdb parsing; the per-payload lookup
                     pass and the 300 s uplink cache; the nft MAC-tap reader

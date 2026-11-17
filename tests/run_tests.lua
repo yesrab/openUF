@@ -182,6 +182,7 @@ local test_files = {
 	"tests/test_inflate.lua",
 	"tests/test_unhandled.lua",
 	"tests/test_sysconf.lua",
+	"tests/test_aeslua.lua",
 	"tests/test_remotelog.lua",
 	"tests/test_applyguard.lua",
 	"tests/test_nrlist.lua",
