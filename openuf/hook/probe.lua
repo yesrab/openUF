@@ -165,6 +165,27 @@ local function read_state(path)
 		st.remotelog = {ip = st.remotelog.ip, port = st.remotelog.port,
 			encrypt = st.remotelog.encrypt and true or false}
 	end
+	-- The guest portal (guestportal.lua): whether it is on and how many
+	-- guests it has let through, not who they are. The ledger is the guests'
+	-- MAC addresses with the time each logged in, the token is what the
+	-- controller's portal knows this AP by, and neither is the page's to show.
+	if st.guest_authorized ~= nil or st.guest_portal ~= nil or st.guest_token ~= nil
+	   or st.guest_wlans ~= nil or st.guest_wg_ips ~= nil then
+		local function count(t)
+			local n = 0
+			if type(t) == "table" then for _ in pairs(t) do n = n + 1 end end
+			return n
+		end
+		st.guest = {
+			portal     = type(st.guest_portal) == "table" and st.guest_portal.enabled == true,
+			wlans      = count(st.guest_wlans),
+			authorized = count(st.guest_authorized),
+			selfrun    = st.guest_selfrun,
+			wlans_down = count(st.guest_vaps_down),
+		}
+		st.guest_authorized, st.guest_token, st.guest_portal = nil, nil, nil
+		st.guest_wlans, st.guest_wg_ips, st.guest_vaps_down, st.guest_selfrun = nil, nil, nil, nil
+	end
 	if type(st.l2guard) == "table" then
 		st.l2guard = {bpdu = st.l2guard.bpdu, tagdrop = st.l2guard.tagdrop,
 			vaps = type(st.l2guard.ifnames) == "table" and #st.l2guard.ifnames or 0}

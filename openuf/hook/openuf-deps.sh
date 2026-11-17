@@ -87,10 +87,10 @@ libuci-lua|file:/usr/lib/lua/uci.so|yes|every wireless read and write
 iw|cmd:iw|yes|radio and client statistics
 lldpd|cmd:lldpd|no|topology: the parent device shown in the controller
 ip-bridge|cmd:bridge|no|wired clients behind the sockets, per-port VLANs on DSA boards
-hostapd-utils|cmd:hostapd_cli|no|client kick, minimum RSSI, WiFi Experience ceilings
+hostapd-utils|cmd:hostapd_cli|no|client kick, minimum RSSI, WiFi Experience ceilings, guest portal disconnects
 usteer|cmd:usteerd|no|band steering, roaming assistant
 nftables|cmd:nft|no|client blocking, multicast/broadcast blocker, L2 hardening
-kmod-nft-bridge|kmod:nft_meta_bridge|no|the blocker and L2 hardening rules
+kmod-nft-bridge|kmod:nft_meta_bridge|no|the blocker, L2 hardening and guest portal rules
 tc-tiny|cmd:tc|no|WiFi speed limit
 kmod-ifb|kmod:ifb|no|the upload half of the WiFi speed limit, queued
 kmod-sched-act-police|kmod:act_police|no|the upload half of the WiFi speed limit, policed when there is no IFB'

@@ -114,10 +114,10 @@ function M.parsers(inform, mods)
 			-- level bandsteering.* block), so it has to run on this same
 			-- table, in handle_response's order, to be covered at all.
 			inform._steering_flags(vap_table, blob)
-			-- _guest_wlans is the guest portal's (not carried here): without
-			-- it the wifi parser's output is the two tables alone.
+			-- _guest_wlans reads is_guest and redirector.status: part of what
+			-- the wifi pass derives from a push.
 			return {radio_table, vap_table,
-				inform._guest_wlans and inform._guest_wlans(vap_table, blob) or nil}
+				inform._guest_wlans(vap_table, blob)}
 		end},
 		{"bandsteering", function(blob) return inform._parse_bandsteering_system_cfg(blob) end},
 		{"switch",       function(blob) return inform._parse_switch_system_cfg(blob) end},
