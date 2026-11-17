@@ -6710,11 +6710,14 @@ function M._applyguard_tick(st, cfg)
 		:format(tostring(undone), tostring(why), tostring(undone)))
 	local restored = M._applyguard.restore(M._state._state_file, function(old)
 		local ok_d, t = pcall(cjson.decode, old or "")
-		if not ok_d or type(t) ~= "table" then return nil end
+		if not ok_d or type(t) ~= "table" then return false end
 		t.cfgversion  = undone
 		t.apply_guard = nil
 		t.rollback    = {at = now, cfgversion = undone, reason = why}
-		return cjson.encode(t)
+		-- Through state.save, not a plain write: it keeps state.json's mode
+		-- and the bootstrap account's group.
+		M._state.save(t)
+		return true
 	end)
 	if not restored then
 		-- Half a restore is not retried every heartbeat: said once, and the
