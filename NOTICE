@@ -19,6 +19,15 @@ It contains work by several copyright holders:
     not part of this repository any more: setup.sh offers to install it from
     its own releases, where its openUF plugin lives.
 
+  Four features (remotelog.lua and logfwd.lua, applyguard.lua, nrlist.lua,
+    devlogin.lua) re-implement, in this project's own code, things first
+    built by antoniocosta/unifi-openwrt
+    (https://github.com/antoniocosta/unifi-openwrt, GPL-2.0-or-later,
+    Copyright its authors): the encrypted remote-syslog datagram, the
+    rollback of a configuration push, the 802.11k neighbour element and the
+    controller's device login. No source code was copied; each file's header
+    says what is theirs and what is not.
+
   luci-theme-halo (package/luci-theme-halo) follows widget mechanics from
     luci-theme-bootstrap, Copyright 2012 Nut & Bolt / 2011 Twitter, Inc.,
     Apache License 2.0, as its cascade.css says; that package keeps its own

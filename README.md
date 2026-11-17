@@ -200,7 +200,10 @@ thing.
 openUF began as a fork of [jonasevcik/openUF](https://github.com/jonasevcik/openUF) and
 still exchanges work with it. Fast roaming with genuine UniFi APs is
 [d-malinowski/unifi-openwrt-roaming](https://github.com/d-malinowski/unifi-openwrt-roaming),
-whose translator and openUF plugin the installer offers to set up. The protocol groundwork
+whose translator and openUF plugin the installer offers to set up. Remote logging, the rollback
+of a bad config push, the 802.11k neighbour list and the device login follow
+[antoniocosta/unifi-openwrt](https://github.com/antoniocosta/unifi-openwrt), a Go daemon with the
+same goal. The protocol groundwork
 came from [amd989/unifi-gateway](https://github.com/amd989/unifi-gateway),
 [jeffreykog/unifi-inform-protocol](https://github.com/jeffreykog/unifi-inform-protocol) and
 [fxkr/unifi-protocol-reverse-engineering](https://github.com/fxkr/unifi-protocol-reverse-engineering).

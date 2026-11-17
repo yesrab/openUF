@@ -136,6 +136,28 @@ local TYPED = {
 	-- The tagged SSIDs' VLANs carried over the mesh hop on a swconfig board
 	-- ({bridge, vids}, meshvlan.lua): kernel state, rebuilt at startup.
 	meshvlan                  = "table",
+	-- Guest portal: the WLANs that need it ({wlanconf_id = true}, from the
+	-- last system_cfg) and the guests the controller authorized
+	-- ({mac = epoch s}, from authorize-guest). Only carried by pushes and
+	-- one-shot cmds, so both have to outlive a restart.
+	guest_wlans               = "table",
+	guest_authorized          = "table",
+	-- The portal's enforcement facts (guestportal.parse) while it is on;
+	-- the nft tables are rebuilt from it at startup.
+	guest_portal              = "table",
+	-- mgmt_cfg selfrun_guest_mode: "pass" lets guests through while the
+	-- controller is unreachable, "off" takes the guest WLANs down.
+	guest_selfrun             = "string",
+	-- The guest VAP ifnames selfrun_guest_mode=off took down, until they
+	-- are brought back up (also after a restart in between).
+	guest_vaps_down           = "table",
+	-- Reported as guest_token while the portal is on (32 hex).
+	guest_token               = "string",
+	-- The walled garden's domain half, resolved: {allowed = {name = {ip, ...}},
+	-- restricted = {...}}. Kept so a reboot rebuilds the chains from the last
+	-- good answers instead of waiting on DNS, and so a name that stops
+	-- resolving keeps the addresses it had (guestportal.resolve_garden).
+	guest_wg_ips              = "table",
 }
 -- Exported for tests and tooling that check what survives a restart (upstream
 -- names the same table FIELDS).

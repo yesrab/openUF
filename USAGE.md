@@ -44,7 +44,7 @@ apk add lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw lldpd nftable
 | `lldpd` | LLDP topology announcement and neighbor discovery |
 | `openssl-util` | `openssl` CLI — last-resort AES-**CBC** fallback if `lua-openssl` is unavailable. This path cannot do GCM, so it is not sufficient to complete adoption on its own |
 | `nftables` | Client block/unblock (`openuf/firewall.lua`) **and** the Multicast/Broadcast Blocker (`openuf/bcfilter.lua`). ~490 KB with its kernel modules — the first thing that won't fit on a small-flash board, which leaves both features unavailable (openUF logs that rather than pretending) |
-| `kmod-nft-bridge` | The Multicast/Broadcast Blocker and the L2 hardening (`bridge openuf_l2guard`, § 6a). `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally, and the control reports success while filtering nothing. openUF now logs the rejection and names this package. Client block/unblock matches on `ether saddr` alone and does not need it |
+| `kmod-nft-bridge` | The Multicast/Broadcast Blocker, the L2 hardening (`bridge openuf_l2guard`, § 6a) and the guest portal (`bridge openuf_guest`, § Guest portal). `nftables` does not pull it in, and without `nft_meta_bridge` the bridge family has no `meta` expression — so the blocker's drop rule is rejected while its table, chain and allow-list set all build normally, and the control reports success while filtering nothing. openUF now logs the rejection and names this package. Client block/unblock matches on `ether saddr` alone and does not need it |
 | `kmod-ifb` | The **upload** half of WiFi Speed Limit, queued: each SSID's ingress is redirected to an IFB device and shaped there per client, the way the download side is. Without it openUF falls back to policing (excess dropped, not queued) and says so |
 | `kmod-sched-act-police` | The policing fallback for the upload half when there is no `kmod-ifb`. `tc-tiny` brings `sch_htb` but the ingress `police` action is a separate module a stock filogic image lacks; openUF logs the rejection and names this package |
 | `kmod-leds-gpio` | Only on a board whose device tree declares GPIO LEDs the image has no driver for (an AX3000T registers nothing but its radio LEDs, which are wired to nothing). `install.sh` adds it when it sees that situation |
@@ -787,7 +787,7 @@ address; see § 2, "The device page".
 |---|---|
 | `modelmap` | `auto` (the shipped profile that declares this board), a profile name from `/usr/lib/openuf/modelmap/`, or `custom` (the `device`, `port`, `vlan`, `swport` and `radio` sections) |
 | `ufmodel` | `auto` (the profile's own identity), a name from `/usr/lib/openuf/ufmodel/`, or `custom` (the `identity` section) |
-| `inform_url`, `use_only_unifi_wlan`, `keep_wlan_section` (a list), `l2_announce`, `neighbour_scan_interval`, `rrm_enrichment`, `rrm_request_interval`, `assoc_tracker`, `roam_assist_diff_db`, `country_override`, `bootstrap_adopt_user`, `debug_dump_file`, `debug_dump_requests`, `debug_dump_max_bytes`, `state_file`, `unhandled_file` | The `conf.lua` option of the same name, below. Booleans are `1`/`0`; an empty string clears an optional one |
+| `inform_url`, `use_only_unifi_wlan`, `keep_wlan_section` (a list), `l2_announce`, `neighbour_scan_interval`, `rrm_enrichment`, `rrm_request_interval`, `assoc_tracker`, `neighbour_list`, `apply_rollback`, `device_login`, `encrypted_syslog`, `roam_assist_diff_db`, `country_override`, `bootstrap_adopt_user`, `debug_dump_file`, `debug_dump_requests`, `debug_dump_max_bytes`, `state_file`, `unhandled_file` | The `conf.lua` option of the same name, below. Booleans are `1`/`0`; an empty string clears an optional one |
 
 A custom hardware profile is the modelmap's fields as UCI sections -- one `port` section
 per RJ45 socket (`idx`, then `ifname` on DSA or `swport` on swconfig), a `vlan` section
@@ -829,6 +829,10 @@ config = {
     rrm_enrichment = true,       -- ask 802.11k clients to report neighbours (see below)
     rrm_request_interval = 600,  -- seconds between those requests, one client at a time
     assoc_tracker = true,        -- AirView Connectivity/Roaming reports when the controller asks
+    neighbour_list = true,       -- 802.11k neighbour reports name the site's other APs (§ 6d)
+    apply_rollback = false,      -- undo a config push that takes the AP off the air (§ 6d)
+    device_login = false,        -- create the controller's Device SSH login (§ 6d)
+    encrypted_syslog = false,    -- claim "this controller, encrypted" remote logging (§ 6d)
     roam_assist_diff_db = 8,     -- Roaming Assistant: dB another AP must hear a client louder
     country_override = nil,      -- see below
     bootstrap_adopt_user = nil,  -- see below
@@ -1709,6 +1713,187 @@ The contract, the guard rails and the uninstall order are in [PLUGINS.md](PLUGIN
 
 ---
 
+### Guest portal (Hotspot): ⚠️ lab-validated only
+
+> **Adopted from upstream (jonasevcik/openUF) on 2026-11-17**, after two reviews that left it
+> out. Everything in this section is upstream's text and upstream's evidence (their Docker lab;
+> an Archer C5 and an AX3000T for the timings). In this tree it has run through the suite and
+> on the OpenWrt test VM only — **never on AP1/AP2 and never with a guest WLAN on this site's
+> controller**. It switches itself on only when the controller pushes a guest WLAN with the
+> portal enabled.
+
+Never run against a real guest WLAN on hardware; treat it as a preview. It turns on by
+itself when the controller pushes a guest WLAN with the portal enabled
+(`redirector.status=enabled` plus the guest `ebtables.*` rules). It turns off, removing
+everything, when the portal or the guest WLAN goes away, or on a factory reset.
+
+**What runs.** `guestportal.lua` builds two nftables tables from the pushed rules.
+
+`bridge openuf_guest` hooks every live netdev of the guest WLANs. For an unauthorized guest:
+- **Allowed:** EAPOL, the portal's ports on the controller, broadcast DHCP, ARP and DNS.
+- **Dropped:** IPv6, other broadcast, multicast, and the restricted subnets
+  (`10/8`, `172.16/12`, `192.168/16` by default).
+- **Plain HTTP:** marked and handed to the bridge's own IP stack.
+- **Everything else:** dropped.
+
+A MAC in the `authorized` set (filled from `state.json`'s `guest_authorized`) may reach
+any host other than the AP, but the restricted subnets still apply.
+
+**The walled garden ("Pre-Authorization Access").** The controller splits the site's
+`allowed_subnet_<n>` / `restricted_subnet_<n>` list by what each entry *looks like*, not
+by which list it is in, and sends the two halves by different routes:
+
+| Entry | How it arrives | What openUF does |
+|---|---|---|
+| IP or CIDR | `ebtables.<n>.cmd` — `-I GUESTIN -p 0x800 --ip-dst <net> -j ACCEPT` and its `-I GUESTOUT … --ip-src` twin, or `-A GUESTIN … -j DROP` for a restricted one | one `ip daddr … accept` / `ip saddr … accept` / `ip daddr … drop`, above every drop (allowed) or among the restricted-subnet drops |
+| domain name | `dnsmasq.walled_garden.1.site.<n>.{allowed,restricted}`, plus empty `ALLOWED_DOMAIN_IN` / `ALLOWED_DOMAIN_OUT` / `RESTRICTED_DOMAIN_IN` chains the firmware would fill | resolved on the AP with `nslookup`, then the same rules inline |
+
+Two traps worth knowing:
+
+- **An IP entry carries no port**, unlike the portal's own accepts (`8880`, `8843`,
+  `8881`). A parser that requires one reads both the entry and the egress rule that lets
+  its replies back as unknown shapes and silently enforces neither.
+- **Re-resolution is on the controller's own cadence.** Along with the garden it pushes
+  `*/10 * * * *  syswrapper.sh refresh-walled-garden 1`. openUF does that work in the
+  inform loop (`GUEST_WG_INTERVAL`, 600 s) and on every config push, so `sysconf.lua`
+  installs no crontab line for the job — the same treatment `syswrapper.sh
+  schedule-action` gets. Each name is asked twice per round, as the firmware's
+  `walled_action.sh` does, so a round-robin record does not shrink the set.
+
+`nslookup` **blocks**, and the inform loop is single-threaded, so the garden is bounded
+on three sides — a dead resolver must not cost the AP its heartbeat:
+
+| Bound | Value | What it does |
+|---|---|---|
+| `guestportal.WG_MAX_SITES` | 32 per list | names past it are dropped with a log line naming the first one |
+| `inform.GUEST_WG_BUDGET` | 5 s per pass | past it no further name is asked; the rest keep their last answer, exactly as a name that failed to resolve does. One name can overrun by a single lookup |
+| the name list's signature | — | a push repeats the whole garden whether or not it changed, and a Force Provision loop repeats it every few seconds. An unchanged list inside the refresh window is not re-asked at all |
+
+A pass that ran out of time opens a two-minute window (`GUEST_WG_RETRY`) instead of the
+usual ten, so the names it never reached are picked up soon — without letting the pushes
+in between re-ask. On the Archer C5 a blackholed lookup takes 5 s (musl's resolver cap),
+so the worst a push can cost is about 10 s.
+
+The answers live in `state.json` as `guest_wg_ips` (`{allowed = {name = {ip, …}},
+restricted = …}`), which makes two things true: a reboot rebuilds the rules from the last
+good answers instead of waiting on DNS, and a name that *stops* resolving keeps the
+addresses it had. A name that has never resolved is simply not enforced, and the log says
+which one.
+
+`ip openuf_guest` redirects the marked HTTP to port **8820**. The inform daemon answers
+there between heartbeats with a `302` to the controller's portal, adding:
+- `?id=<guest MAC>`, looked up in `/proc/net/arp`;
+- `&ap=<AP MAC>`;
+- `&t=<now>`: the controller refuses a `t` more than 60 s off its own clock, so the AP's clock must be right;
+- `&url=<what the guest asked for>`;
+- `&ssid=…`.
+
+Logging in on the portal makes the controller send `authorize-guest`. The guest is let
+through within one heartbeat.
+
+When a guest's authorization ends (`unauthorize-guest`: an admin revoked it, it expired or
+it went over its quota), openUF takes the MAC out of the `authorized` set and disconnects the
+guest from every SSID, as UniFi firmware does. On reconnecting, the device's
+captive-portal check runs again and shows the portal. A repeat for the same MAC within 60 s
+is not kicked again.
+
+**Per-guest speed limit.** When a guest is authorized with a limit (a REST
+`authorize-guest` with `up`/`down` in kbps, or the guest's user group), the controller
+sends `rate-update` right after `authorize-guest`, and again whenever the guest reconnects.
+It is a client's own WiFi Speed Limit like any other (see "WiFi Speed Limit" above): a
+queue per direction for that MAC, `-1` meaning unlimited that way.
+
+**Without the controller (`selfrun_guest_mode`).** Every `mgmt_cfg` carries
+`selfrun_guest_mode`. It is `pass` unless the site's `config.properties` sets
+`config.selfrun_guest_mode` to something else, and then it is `off`. openUF does what
+UniFi firmware does (read from its `mcad` and `syswrapper.sh`, builds 3.9.27–4.0.15):
+selfrun starts after **3 informs in a row** go unanswered (`GUEST_SELFRUN_FAILS`). With the
+backoff (10, 20, 40 s) that is about 70 s after the last answer, or about 130 s when the
+controller answered HTTP 503 (it is shedding load, so the wait goes to 60 s at once). Selfrun ends with the first
+answer, and it only does anything while the portal is on.
+- **`pass`, or never received:** openUF adds `meta pkttype other accept` to the `selfrun`
+  chain. Every guest then gets through, as an authorized one would: the restricted subnets
+  and the AP itself stay behind the portal's rules. Nobody could log in meanwhile, because
+  the portal is the controller's. The first answer empties the chain again.
+- **`off`:** the guest WLANs are taken down (`ip link set <vap> down`) and brought back up
+  with the first answer: the netdev comes up and hostapd is told to start its beacon again
+  (`hostapd_cli raw STOP_AP` + `update_beacon`, as when a Blackout Schedule ends). Their
+  names are kept in `st.guest_vaps_down`, so a daemon restart in between leaves them down
+  until the controller answers, and then brings them up. One whose beacon does not restart
+  goes down again and stays in that list, and every later answer tries again.
+- One deliberate difference: when the controller comes back, UniFi firmware forgets every
+  authorized guest and waits for the controller to re-authorize them. openUF keeps its
+  list, and the controller re-sends `authorize-guest` for the same guests anyway.
+- `off` is tested on hardware (ath9k, ath10k, mt76) on its own, with a temporary WLAN; the
+  rest of the guest portal has not run on hardware. Without `hostapd-utils` the WLANs cannot
+  come back on the air: they stay down, and the log says so once.
+
+The daemon also reports a random `guest_token`. Without one, the controller refuses
+every portal login on the AP and logs "Missing Guest Token in AP[…] during guest
+authorization".
+
+**Where it differs from UniFi firmware, on purpose:**
+- **DNS passes for every guest.** UniFi firmware answers an unauthorized guest's DNS
+  itself; openUF runs no resolver.
+- **HTTPS is dropped, not answered.** The client's plain-HTTP connectivity check is what
+  finds the portal.
+- **The redirect needs an IPv4 address on the guest network's bridge.** The answer
+  leaves from there. A guest WLAN on a VLAN where the AP has no address keeps its
+  guests blocked, and they never see the portal.
+- **The walled garden is IPv4 only and resolved on the AP.** AAAA answers are
+  discarded, because both the firmware's chains and openUF's are IPv4. A name whose
+  answer differs from the client's — a CDN, geo-DNS, short-TTL round robin — can be
+  reachable at an address openUF never saw, and the ten-minute refresh is the only thing
+  that catches up. UniFi firmware has exactly the same limit; a DNS-intercepting garden
+  would need a resolver on the AP, which openUF does not run.
+- **A domain-only restricted list never arrives.** The controller emits the whole
+  `dnsmasq.walled_garden` block only when the *allowed* list contains at least one
+  domain (10.6.106), so restricted domains alone are dropped on its side. Put one
+  allowed domain in the list, or express the restriction as a subnet.
+
+**Needs** `kmod-nft-bridge` (for `iifname`/`oifname`), and `kmod-nft-nat` for the
+redirect. firewall4 already pulls in `kmod-nft-nat`.
+
+**Check it:**
+
+    nft list table bridge openuf_guest      # selfrun is empty unless guests are let through
+    nft list table ip openuf_guest
+    netstat -lnt | grep 8820
+
+**Log lines and what they mean:**
+- `guestportal: … not bridged`: those guests are blocked but not redirected.
+- `nft rejected …`: a rule failed. The log says which one and why.
+- `guestportal: 3 informs unanswered, selfrun_guest_mode=pass -- letting guests through`:
+  the portal is open until the controller answers again
+  (`… guest portal enforced again`).
+- `guestportal: 3 informs unanswered, selfrun_guest_mode=off -- guest WLANs down (…)`:
+  the guest WLANs are down until the controller answers again
+  (`guestportal: guest WLANs back up (…)`).
+- `guestportal: unrecognised guest rule shape`: the controller pushed a rule openUF
+  doesn't know. It was not applied.
+- `guestportal: walled garden: <name> did not resolve -- keeping the last N address(es)`:
+  DNS failed for that name this round; the rules it had still stand.
+- `guestportal: walled garden: <name> did not resolve and has no earlier answer -- not
+  enforced`: that site is not in the garden at all. Check the AP's own resolver
+  (`nslookup <name>` on the device) before blaming openUF.
+- `guestportal: ignoring malformed walled-garden site`: the name did not pass openUF's
+  check (spaces, an IPv4 literal, a label over 63 characters). It never reaches a
+  command line.
+- `guestportal: walled garden: out of time at <name> -- the names from here on keep
+  their last answer until the next refresh`: the pass spent its `GUEST_WG_BUDGET`. The
+  usual cause is a resolver that is not answering; check `nslookup <name>` on the
+  device. The remaining names are retried two minutes later.
+- `guestportal: walled garden: more than 32 allowed sites pushed`: the list is longer
+  than `WG_MAX_SITES`. Express the tail as subnets instead.
+- `guestportal: walled-garden addresses changed -- rebuilding`: the ten-minute refresh
+  found a different address set and rebuilt the chains.
+
+**Check the garden:**
+
+    nft list chain bridge openuf_guest guestin | head -20   # allowed sites, above every drop
+    nft list chain bridge openuf_guest guestout             # their replies
+    grep -o '"guest_wg_ips":[^}]*}}' /etc/openuf/state.json # the last good answers
+
 ## 6a. Controller-managed system settings and hardening
 
 Three `system_cfg` blocks the controller sends on every full push are applied to the
@@ -1723,8 +1908,8 @@ device itself rather than to WiFi (confirmed live 2026-09-15, PROTOCOL-VALIDATIO
 
 The controller pushes exactly four cron verbs (upstream read every `syswrapper.sh` string out of
 the 10.6.106 jar): `schedule-action` and `refresh-walled-garden` need no crontab line here (the
-WiFi Blackout Schedule is re-checked on every heartbeat; the walled garden is not implemented, so
-that one is logged as `not a command this build provides`), `dfs-reset` (02:00, for a 5 GHz radio
+WiFi Blackout Schedule is re-checked on every heartbeat; the guest portal's walled garden is
+re-resolved on the same ten minutes by the inform loop, § Guest portal), `dfs-reset` (02:00, for a 5 GHz radio
 pinned to a DFS channel, § 6) and `11k-scan` are installed. `syswrapper.sh 11k-scan` — what the
 controller's nightly 04:00 job runs — does not scan
 itself: it leaves a dated request in `/tmp/openuf-scan-request` that the running daemon
@@ -1860,6 +2045,55 @@ backlog row 23). Each is on by default and needs nothing in `conf.lua`.
   the bridge hairpin flag is re-asserted on BSSes OpenWrt force-isolates (Multicast
   Enhancement, Proxy ARP), the nightly 11k-scan runs at two random times in the hour, and
   beacon requests go out hourly.
+
+## 6d. What was added on 2026-11-17 (from antoniocosta/unifi-openwrt)
+
+Four things [antoniocosta/unifi-openwrt](https://github.com/antoniocosta/unifi-openwrt) does that
+openUF did not, re-implemented here. Each was run on the OpenWrt test VM; **none has run on a
+production AP or against a controller push yet**, which is why three of the four are off until
+you turn them on.
+
+**Remote Logging.** Nothing to configure for a syslog server of your own: when the controller
+pushes one (Settings → System → Remote Logging), openUF writes it to logd
+(`system.@system[0].log_ip` / `log_port` / `log_proto`) and restarts logd; what was there is
+stamped (`openuf_log_managed`, `openuf_log_*_orig`) and comes back when the controller turns
+remote logging off or forgets the device. The other kind, **"this controller, encrypted"**,
+needs `encrypted_syslog = true`: the controller sends that configuration only to a device
+claiming a capability bit, and that bit and the datagram format come from the other project's
+reading of the controller, not from this tree's own. With it on, openUF reports a `hash_id`,
+and once the controller pushes its key a forwarder (`logread -f | lua logfwd.lua`) seals every
+log line with AES-256-GCM and sends it to the controller's listener (UDP 5514), at most 50
+lines a second after a burst of 100. Check it with `pgrep -af logfwd` and `logread -e remotelog`;
+the key is in `/var/run/openuf-logfwd.conf` (mode 600) and nowhere else. Needs `lua-openssl`.
+
+**Rollback (`apply_rollback = true`).** A push that leaves a radio off the air, or leaves the AP
+unable to reach the controller, is undone after four minutes: the wireless and network
+configuration and `state.json` from before the push are restored from `/etc/openuf/rollback`
+and the daemon restarts. `logread -e openuf | grep -i roll` shows it, `/tmp/openuf-status` gains
+`rollback=` and `rollback_msg=`, and the daemon repeats the note at every start until a later
+push is confirmed. After a rollback the AP runs the old configuration while reporting the new
+`cfgversion` — on purpose, so the controller does not send the same push again every few
+minutes; change the setting on the controller to have it tried again. Two things to know before
+turning it on: it will also undo a push that was **meant** to move the AP somewhere the
+controller cannot follow at once (a new management VLAN before the switch port is ready), and
+it cannot act if the daemon itself hangs.
+
+**802.11k neighbour list (`neighbour_list`, on).** On a WLAN with 802.11k enabled a client can
+ask the AP which other APs it could move to. openUF now answers with the site's other BSSes on
+that SSID — siblings it has scanned (other openUF APs and genuine UniFi APs) and its own BSS on
+the other band — instead of with itself alone. `ubus call hostapd.<ifname> rrm_nr_list` shows
+the list. It does nothing while Band Steering or Roaming Assistant is on, because openUF then
+runs usteer and usteer maintains the same list itself (with OpenWrt siblings only). A sibling is
+remembered for an hour after it was last scanned, so the list fills as scans happen
+(`neighbour_scan_interval`, the nightly `11k-scan`, client beacon reports).
+
+**Device SSH Authentication (`device_login = true`).** Creates the login set under Settings →
+System → Advanced → Device Authentication, with the password the controller pushes (as a hash),
+and removes it when the controller stops pushing it, forgets the AP, or you switch the option
+off. The account is root in all but name. openUF only creates it from a response sealed with
+the AP's own adoption key, never touches an account that already exists (`root`, the bootstrap
+account, your own), and lists what it made in `state.json` (`device_logins`). Whether dropbear
+accepts password logins is still your setting (`uci show dropbear`).
 
 ## 7. LLDP topology
 

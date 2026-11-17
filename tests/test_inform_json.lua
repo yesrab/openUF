@@ -904,6 +904,41 @@ return {
 		end
 	},
 	{
+		name = "inform json: sta authorized follows the guest ledger on a portal WLAN only",
+		fn = function()
+			-- The controller unauthorizes any station on a portal WLAN that
+			-- reports authorized without a guest record, and treats an absent
+			-- `authorized` as true (PROTOCOL-VALIDATION.md, "Guest portal").
+			local by_mac = function(d)
+				local out = {}
+				for _, s in ipairs(d.vap_table[1].sta_table) do out[s.mac] = s.authorized end
+				return out
+			end
+			local ledger = {["aa:bb:cc:dd:ee:ff"] = 1700000000}
+			local a = by_mac(build({with_uci = true, with_clients = true, vap_id = "w1",
+				st = {guest_wlans = {w1 = true}, guest_authorized = ledger}}))
+			assert_eq(a["aa:bb:cc:dd:ee:ff"], true, "authorized guest reports true")
+			assert_eq(a["11:22:33:44:55:66"], false, "unknown guest reports false, not absent")
+			local b = by_mac(build({with_uci = true, with_clients = true, vap_id = "w1",
+				st = {guest_wlans = {other = true}, guest_authorized = {}}}))
+			assert_eq(b["11:22:33:44:55:66"], true, "a WLAN without the portal reports true")
+			local c = by_mac(build({with_uci = true, with_clients = true}))
+			assert_eq(c["11:22:33:44:55:66"], true, "no guest record at all reports true")
+		end
+	},
+	{
+		name = "inform json: guest_token is reported while the portal is on, only",
+		fn = function()
+			-- Without it the controller refuses every portal login on this AP
+			-- ("Missing Guest Token in AP[..] during guest authorization").
+			local tok = string.rep("ab", 16)
+			local on = build({st = {guest_portal = {enabled = true}, guest_token = tok}})
+			assert_eq(on.guest_token, tok, "portal on")
+			local off = build({st = {guest_token = tok}})
+			assert_eq(off.guest_token, nil, "portal off: not reported")
+		end
+	},
+	{
 		name = "inform json: vap_table nests connected clients as sta_table",
 		fn = function()
 			inform._sta_stats_cache = {}
@@ -3193,6 +3228,53 @@ return {
 			assert_eq(d.wifi_caps2, 0x4020F2, "asked: claimed")
 			d = cjson.decode(inform.build_json(st, {config = {assoc_tracker = false}}, ufhw))
 			assert_eq(d.wifi_caps2, 0x4000F2, "assoc_tracker = false: no claim")
+		end
+	},
+	{
+		-- Opt-in: the bit and the format behind it are antoniocosta/unifi-openwrt's
+		-- finding, not this tree's (remotelog.lua).
+		name = "inform json: fw_caps 0x1000000 and hash_id only with encrypted_syslog on a board that can seal",
+		fn = function()
+			local o_rl, o_probe = inform._remotelog, inform._enc_syslog_probe
+			local real = dofile("openuf/remotelog.lua")
+			local can = true
+			inform._remotelog = {is_valid_hash_id = real.is_valid_hash_id,
+				supported = function() return can end}
+			local st = {authkey = state.DEFAULT_KEY, inform_url = "http://10.0.0.1:8080/inform",
+				mac = "aa:bb:cc:dd:ee:ff", hash_id = "00005e0053100001"}
+			local ok, err = pcall(function()
+				inject_sysinfo()
+				inform._enc_syslog_probe = nil
+				local base = cjson.decode(inform.build_json(st, {config = {}}, ufhw))
+				assert_nil(base.hash_id, "default: no hash_id on the wire")
+				inform._enc_syslog_probe = nil
+				local d = cjson.decode(inform.build_json(st, {config = {encrypted_syslog = true}}, ufhw))
+				assert_eq(d.fw_caps - base.fw_caps, 0x1000000, "opted in: the bit, and only the bit")
+				assert_eq(d.hash_id, "00005e0053100001", "and the hash_id the key is filed under")
+				-- Asked for on a board with no cipher: said once, not claimed.
+				can, inform._enc_syslog_probe = false, nil
+				local real_err, buf = io.stderr, {}
+				io.stderr = {write = function(_, x) buf[#buf + 1] = x end}
+				local ok2, d2 = pcall(function()
+					inform.build_json(st, {config = {encrypted_syslog = true}}, ufhw)
+					return cjson.decode(inform.build_json(st, {config = {encrypted_syslog = true}}, ufhw))
+				end)
+				io.stderr = real_err
+				if not ok2 then error(d2, 0) end
+				assert_eq(d2.fw_caps, base.fw_caps, "cannot seal: no claim")
+				assert_nil(d2.hash_id, "and no hash_id")
+				local _, n = table.concat(buf):gsub("cannot seal", "")
+				assert_eq(n, 1, "warned once for the process, not per inform")
+				-- A running encrypted target reports hash_id even without the option
+				-- (the controller sent the key: it needs the id to use it).
+				inform._enc_syslog_probe = nil
+				st.remotelog = {ip = "192.0.2.10", port = 5514, encrypt = true}
+				local d3 = cjson.decode(inform.build_json(st, {config = {}}, ufhw))
+				assert_eq(d3.hash_id, "00005e0053100001", "hash_id while encrypted syslog runs")
+				assert_eq(d3.fw_caps, base.fw_caps, "but no bit without the option")
+			end)
+			inform._remotelog, inform._enc_syslog_probe = o_rl, o_probe
+			if not ok then error(err, 0) end
 		end
 	},
 	{

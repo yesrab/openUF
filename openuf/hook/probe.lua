@@ -159,6 +159,12 @@ local function read_state(path)
 	local st = json_decode(M._read_file(path))
 	if not st then return nil end
 	st.authkey = nil
+	-- The second secret: the encrypted-syslog key (remotelog.lua). The page
+	-- gets where the log goes and how, not what it is sealed with.
+	if type(st.remotelog) == "table" then
+		st.remotelog = {ip = st.remotelog.ip, port = st.remotelog.port,
+			encrypt = st.remotelog.encrypt and true or false}
+	end
 	if type(st.l2guard) == "table" then
 		st.l2guard = {bpdu = st.l2guard.bpdu, tagdrop = st.l2guard.tagdrop,
 			vaps = type(st.l2guard.ifnames) == "table" and #st.l2guard.ifnames or 0}

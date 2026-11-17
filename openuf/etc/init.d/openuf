@@ -94,6 +94,12 @@ stop_service() {
 	# same reasons: this must not block a stop.
 	(cd "$OPENUF_DIR" 2>/dev/null && lua -e 'dofile("rrmscan.lua").collector_stop()') \
 		>/dev/null 2>&1
+	# The encrypted-syslog forwarder is the same kind of orphan (remotelog.lua
+	# starts `logread -f | lua logfwd.lua` with a trailing &). Stopped the same
+	# way and for the same reason; the inform loop starts it again within a
+	# minute of coming back. Its key file goes with it.
+	(cd "$OPENUF_DIR" 2>/dev/null && lua -e 'dofile("remotelog.lua").forwarder_stop()') \
+		>/dev/null 2>&1
 	return 0
 }
 

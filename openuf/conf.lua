@@ -192,6 +192,52 @@ config = {
 	-- remove the table.
 	assoc_tracker = true,
 
+	-- 802.11k neighbour reports that name the site's other APs. On a WLAN
+	-- with 802.11k on, a client may ask the AP where else it could go; without
+	-- this hostapd answers with the AP itself and nothing more. openUF fills
+	-- the list with the sibling BSSes it has scanned (other openUF APs and
+	-- genuine UniFi APs carrying the same SSID) and its own BSS on the other
+	-- band, and keeps it filled across WiFi reloads. Where openUF runs usteer
+	-- (Band Steering or Roaming Assistant on) usteer keeps the list instead,
+	-- and this does nothing. Set false to leave hostapd's list alone.
+	neighbour_list = true,
+
+	-- Device SSH Authentication (controller: Settings -> System -> Advanced ->
+	-- Device Authentication). true creates the site's device login on this
+	-- AP with the password the controller pushes (as a hash), and removes it
+	-- when the controller stops pushing it or forgets the device. The
+	-- account is root in all but name (uid 0, /bin/ash): that is what a
+	-- UniFi device login is. Off by default for exactly that reason. It is
+	-- only ever created from a response sealed with this device's own
+	-- adoption key, never before adoption, and an account that already
+	-- exists on the AP is never touched (devlogin.lua). Whether dropbear
+	-- accepts password logins at all stays your setting.
+	device_login = false,
+
+	-- Undo a controller config push that takes the AP off the air. Before a
+	-- push is applied openUF copies the wireless and network configuration
+	-- (and its own state) to /etc/openuf/rollback; if, four minutes later, a
+	-- radio that was up has not come back or the controller has not answered
+	-- once, the copy is restored and the daemon restarts. The device then
+	-- keeps reporting the undone push's version so the controller does not
+	-- send it again, and says so in the log and in /tmp/openuf-status
+	-- (applyguard.lua has the whole story). Off by default: it has run on the
+	-- test VM only, and it will also undo a push that was MEANT to move the
+	-- device somewhere the controller cannot follow at once (a new management
+	-- VLAN before the switch port is ready).
+	apply_rollback = false,
+
+	-- Remote Logging to "this controller, encrypted" (controller: Settings ->
+	-- System -> Remote Logging). A syslog server of your own needs nothing
+	-- here: openUF hands it to logd whenever the controller pushes one. The
+	-- encrypted kind is different: the controller only sends it to a device
+	-- that claims the capability, and that claim plus the datagram format are
+	-- taken from antoniocosta/unifi-openwrt (UniFi Network 10.6), not yet run
+	-- against a controller from this tree. true claims it (fw_caps 0x1000000)
+	-- and reports a hash_id; logs then leave through a small forwarder
+	-- (logfwd.lua) sealed with the controller's key. Needs lua-openssl.
+	encrypted_syslog = false,
+
 	-- Roaming Assistant (controller: WLAN -> Advanced, 5 GHz): how much louder,
 	-- in dB, another AP must hear a weak client before openUF moves it there.
 	-- The threshold itself comes from the controller.
