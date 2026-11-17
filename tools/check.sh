@@ -79,7 +79,7 @@ echo ""
 
 # ── System tools ─────────────────────────────────────────────────────────────
 echo "[ System tools ]"
-for cmd in iw ip uci openssl; do
+for cmd in iw ip uci; do
 	if command -v "$cmd" > /dev/null 2>&1; then
 		ok "$cmd"
 	else
@@ -127,16 +127,15 @@ done
 echo ""
 
 # ── OpenSSL AES test ─────────────────────────────────────────────────────────
+# Through lua-openssl, the same call crypto.lua makes: openUF no longer falls
+# back to the openssl(1) CLI, so the CLI working proves nothing.
 echo "[ AES-128-CBC smoke test ]"
-PT=$(printf "0123456789abcdef")
-CT=$(printf "%s" "$PT" | openssl enc -aes-128-cbc \
-	-K ba86f2bbe107c7c57eb5f2690775c712 \
-	-iv 00000000000000000000000000000000 \
-	-nosalt -nopad 2>/dev/null | wc -c)
+CT=$(lua -e "local c = require('openssl').cipher.get('aes-128-cbc'):new(true, ('\0'):rep(16), ('\0'):rep(16))
+c:padding(false) io.write(#(c:update('0123456789abcdef') .. c:final()))" 2>/dev/null)
 if [ "$CT" -eq 16 ] 2>/dev/null; then
-	ok "openssl AES-128-CBC produces 16-byte output"
+	ok "lua-openssl AES-128-CBC produces 16-byte output"
 else
-	fail "openssl AES-128-CBC failed (ct_len=$CT)"
+	fail "lua-openssl AES-128-CBC failed (ct_len=$CT)"
 fi
 echo ""
 

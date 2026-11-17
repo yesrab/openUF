@@ -6,8 +6,7 @@
 	     on OpenWrt 25.12+. In-process, supports both CBC and GCM.
 	  2. luacrypto  (require "crypto")   — legacy. Only on older OpenWrt where the
 	     "luacrypto" package still exists (dropped from the 25.12 feeds).
-	  3. openssl(1) CLI                  — last resort when neither binding is
-	     present. CBC only; GCM is unavailable on this path.
+	Neither binding: an error. No openssl(1) CLI fallback (see below).
 
 	All keys and IVs are passed as 32-char hex strings (16 raw bytes).
 	Plaintext and ciphertext are Lua binary strings.
