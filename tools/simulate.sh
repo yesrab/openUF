@@ -10,7 +10,7 @@
 # Requirements:
 #   - python3 with pycryptodome (pip install pycryptodome)
 #   - lua with lua-cjson (luarocks install --local lua-cjson)
-#   - openssl in PATH
+#   - lua-openssl, the AES binding (luarocks install --local openssl)
 #
 # Exit code: 0 = success, 1 = failure
 
