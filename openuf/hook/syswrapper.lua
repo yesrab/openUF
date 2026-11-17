@@ -58,13 +58,24 @@ local function uci_state_file()
 	return present, path
 end
 
+-- Where state.lua is looked for: this script's own tree (hook/..), then the
+-- two install prefixes (the package's /usr/lib/openuf, install.sh's
+-- /opt/openuf). Never the working directory: syswrapper runs as root from
+-- wherever its caller stands (the controller's SSH adoption), and a
+-- state.lua found there was run as root.
+local function state_paths()
+	local src = debug.getinfo(1, "S").source or ""
+	local dir = src:match("^@(.-)hook/[^/]*$")
+	local paths = {}
+	if dir then paths[#paths + 1] = dir .. "state.lua" end
+	paths[#paths + 1] = "/usr/lib/openuf/state.lua"
+	paths[#paths + 1] = "/opt/openuf/state.lua"
+	return paths
+end
+
 local function load_state()
 	if state then return state end
-	-- Try relative paths: called from openuf/ dir, or from either install
-	-- prefix (the package's /usr/lib/openuf, install.sh's /opt/openuf).
-	local paths = {"state.lua", "openuf/state.lua", "/usr/lib/openuf/state.lua",
-		"/opt/openuf/state.lua"}
-	for _, p in ipairs(paths) do
+	for _, p in ipairs(state_paths()) do
 		local f = io.open(p, "r")
 		if f then
 			f:close()
@@ -304,4 +315,5 @@ return {
 	is_url   = is_url,
 	_set_state = function(s) state = s end,
 	_conf_state_file = conf_state_file,
+	_state_paths = state_paths,
 }
