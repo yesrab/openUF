@@ -29,6 +29,17 @@ inform._sysconf = {parse = function() return nil end, apply = function() return 
 -- them install their own.
 inform._meshvlan = {record = function() return nil end, reconcile = function() return true end,
 	resync = function() return true end}
+-- And the guest portal (nft, a listening socket); guest tests stub their own.
+inform._guestportal._exec = function() return 0 end
+inform._guestportal.listen = function() return {close = function() end} end
+-- The guest code asks for LuaSocket (M._socket) before it reaches the stubs
+-- above. CI has it (apt's luarocks brings lua-socket); a dev machine may not,
+-- and the suite must not need it: a stand-in, only where the real one is absent.
+if not pcall(require, "socket") then
+	inform._socket = function()
+		return {gettime = os.time, select = function() return {} end, dns = {}}
+	end
+end
 
 -- Deterministic IV for the TEST FILE's own crypto instance -- affects only
 -- tests that call crypto.* directly (e.g. the zlib round-trip). inform's
@@ -203,6 +214,8 @@ local function real_parsers()
 		l2guard     = inform._l2guard,
 		guestportal = inform._guestportal,
 		airtime     = inform._airtime,
+		remotelog   = inform._remotelog,
+		devlogin    = inform._devlogin,
 	})
 end
 
@@ -4095,6 +4108,70 @@ return {
 		end
 	},
 	{
+		name = "inform packet: authorize-guest / unauthorize-guest drive the guest ledger",
+		fn = function()
+			local st = sample_state()
+			local saved = 0
+			local save = inform._state.save
+			inform._state.save = function() saved = saved + 1 end
+			local ok, err = pcall(function()
+				local r = inform.handle_response(
+					'{"_type":"cmd","cmd":"authorize-guest","mac":"AA:BB:CC:DD:EE:01"}', st)
+				assert_true(r, "re-inform so the controller sees authorized at once")
+				assert_not_nil(st.guest_authorized["aa:bb:cc:dd:ee:01"], "recorded, lowercased")
+				assert_eq(saved, 1, "persisted")
+				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest","mac":"x;reboot"}', st)
+				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest"}', st)
+				local n = 0
+				for _ in pairs(st.guest_authorized) do n = n + 1 end
+				assert_eq(n, 1, "a malformed or missing mac records nothing")
+				inform.handle_response(
+					'{"_type":"cmd","cmd":"unauthorize-guest","mac":"aa:bb:cc:dd:ee:01"}', st)
+				assert_eq(next(st.guest_authorized), nil, "unauthorize-guest drops it")
+			end)
+			inform._state.save = save
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: the guest ledger is capped, oldest authorization first",
+		fn = function()
+			local st = sample_state({guest_authorized = {}})
+			local max = inform.GUEST_LEDGER_MAX
+			for i = 1, max do
+				st.guest_authorized[("02:00:00:00:%02x:%02x"):format(math.floor(i / 256), i % 256)] = 1000 + i
+			end
+			inform._guest_authorize(st, "aa:bb:cc:dd:ee:01", true)
+			local n = 0
+			for _ in pairs(st.guest_authorized) do n = n + 1 end
+			assert_eq(n, max, "held at the cap")
+			assert_eq(st.guest_authorized["02:00:00:00:00:01"], nil, "the oldest went")
+			assert_not_nil(st.guest_authorized["aa:bb:cc:dd:ee:01"], "the new one stays")
+		end
+	},
+	{
+		name = "inform packet: system_cfg records the portal WLANs; portal off clears them",
+		fn = function()
+			-- Shape from the 10.4.57 lab capture (PROTOCOL-VALIDATION.md,
+			-- "Guest portal"): wireless.<n>.is_guest per WLAN, one
+			-- redirector.status for the site, "disabled" when off.
+			local function push(st, portal)
+				local sys = "aaa.1.id=w1\nwireless.1.ssid=g\nwireless.1.parent=wifi0\n"
+					.. "wireless.1.is_guest=true\naaa.2.id=w2\nwireless.2.ssid=h\n"
+					.. "wireless.2.parent=wifi0\nwireless.2.is_guest=false\n"
+					.. "redirector.status=" .. portal .. "\n"
+				inform.handle_response('{"_type":"setparam","system_cfg":"' .. sys .. '"}',
+					st, {net = {lan_cpueth = "eth0"}})
+			end
+			local st = sample_state()
+			push(st, "enabled")
+			assert_true(st.guest_wlans.w1, "the guest WLAN needs the portal")
+			assert_eq(st.guest_wlans.w2, nil, "the other WLAN does not")
+			push(st, "disabled")
+			assert_eq(next(st.guest_wlans), nil, "portal off: no WLAN needs it")
+		end
+	},
+	{
 		name = "inform packet: setparam blocked_sta replaces the ledger, reconciles, deauths only new MACs",
 		fn = function()
 			-- The wire form captured from 10.4.57: the site's blocked
@@ -6320,14 +6397,15 @@ return {
 			led._reset("/tmp/openuf_test_unhandled_inform.json")
 			local st = sample_state({adopted = true})
 			local resp = '{"_type":"setparam","mgmt_cfg":"cfgversion=abc\nstun_url=stun://192.0.2.4:3478/\n'
-				.. 'selfrun_guest_mode=pass\n'
+				.. 'selfrun_guest_mode=pass\nmesh_roam_mode=pass\n'
 				.. 'capability=notif,notif-assoc-stat\nradius_secret=hunter2\nauthkey=00112233445566778899aabbccddeeff\nuse_aes_gcm=true\n"}'
 			inform.handle_response(resp, st)
-			-- selfrun_guest_mode belongs to the guest portal, which this tree
-			-- does not implement: the honest state is "counted as ignored".
-			local e = led.entry("mgmt_cfg", "selfrun_guest_mode")
-			assert_not_nil(e, "selfrun_guest_mode recorded")
-			assert_eq(e.payload.sample, "selfrun_guest_mode", "example key")
+			-- selfrun_guest_mode is the guest portal's since 2026-11-17 and is
+			-- read; a key nothing reads (made up here) is counted as ignored.
+			assert_nil(led.entry("mgmt_cfg", "selfrun_guest_mode"), "selfrun_guest_mode is read now")
+			local e = led.entry("mgmt_cfg", "mesh_roam_mode")
+			assert_not_nil(e, "an unread key is recorded")
+			assert_eq(e.payload.sample, "mesh_roam_mode", "example key")
 			assert_eq(e.payload.value, "pass", "value kept -- it is the research target")
 			assert_eq(e.payload.occurrences, 1, "occurrences in that blob")
 			assert_nil(led.entry("mgmt_cfg", "stun_url"),
@@ -6350,6 +6428,7 @@ return {
 			local st = sample_state()
 			local resp = '{"_type":"setparam","system_cfg":"guest.1.status=enabled\nguest.2.status=enabled\n'
 				.. 'guest.1.token=zzz\nredirector.url=http://192.0.2.4/guest/s/default/\n'
+				.. 'sshd.auth.passwd=enabled\n'
 				.. 'aaa.1.wpa.psk=hunter2\nradio.1.channel=6\n"}'
 			with_stderr(function() inform.handle_response(resp, st, {net = {lan_cpueth = "eth0"}}) end)
 			local e = led.entry("system_cfg", "guest.<n>.status")
@@ -6358,8 +6437,9 @@ return {
 			assert_eq(e.payload.sample, "guest.1.status", "first full key kept")
 			assert_eq(e.payload.value, "enabled", "with its value")
 			assert_eq(led.entry("system_cfg", "guest.<n>.token").payload.value, "<redacted>", "token redacted")
-			assert_eq(led.entry("system_cfg", "redirector.url").payload.value,
-				"http://192.0.2.4/guest/s/default/", "a plain unknown key keeps its value")
+			assert_nil(led.entry("system_cfg", "redirector.url"), "the guest portal reads redirector.url now")
+			assert_eq(led.entry("system_cfg", "sshd.auth.passwd").payload.value,
+				"enabled", "a plain unknown key keeps its value")
 			assert_nil(led.entry("system_cfg", "aaa.<n>.wpa.psk"), "recognized prefixes are never recorded")
 			assert_nil(led.entry("system_cfg", "radio.<n>.channel"), "nor radio.*")
 			led._reset()
@@ -6929,12 +7009,11 @@ return {
 				now = now + 20
 				inform._stun_tick(st)
 				assert_eq(#sent, 2, "again at 30 s")
-				-- No longer managed (a Forget): the socket goes. (Upstream also
-				-- closes it during guest selfrun, which this tree has not adopted.)
-				st.adopted = false
+				-- Selfrun: GUEST_SELFRUN_FAILS informs unanswered.
+				inform._inform_fails = inform.GUEST_SELFRUN_FAILS
 				inform._stun_tick(st)
-				assert_eq(closed, 1, "not adopted any more: closed")
-				st.adopted = true
+				assert_eq(closed, 1, "selfrun: closed")
+				inform._inform_fails = inform.GUEST_SELFRUN_FAILS - 1
 				inform._stun_tick(st)
 				assert_eq(opened, 2, "managed again: reopened")
 			end)
@@ -7789,8 +7868,15 @@ return {
 				assert_eq(saves, 2, "saved")
 				assert_true(log:find("up: phy0-ap1", 1, true) ~= nil, "said so")
 
-				-- (Upstream also checks that a guest WLAN selfrun holds down stays
-				-- down when its schedule ends; the guest portal is not adopted here.)
+				-- selfrun_guest_mode=off holds it too: the schedule's end leaves it down.
+				now = mon_2300
+				with_stderr(function() inform._sched_resync(st) end)
+				st.guest_vaps_down = {"phy0-ap1"}
+				now = tue_0700
+				with_stderr(function() inform._sched_resync(st) end)
+				assert_false(links["phy0-ap1"], "selfrun still holds it")
+				assert_nil(st.sched_vaps_down, "but the schedule no longer does")
+				st.guest_vaps_down = nil
 
 				-- The schedule removed while it held a WLAN down: brought back up.
 				now = mon_2300
@@ -8747,6 +8833,622 @@ return {
 			inform._ucihelper, inform._sysinfo = orig.uci, orig.si
 			inform._run_cmd, inform._read_file = orig.run, orig.read
 			inform._time, io.stderr = orig.time, orig.stderr
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: a portal push enforces it; portal off tears it down",
+		fn = function()
+			local real = inform._guestportal
+			local calls = {reconcile = {}, listen = 0, closed = 0}
+			inform._guestportal = {
+				parse = real.parse, is_guest_rule = real.is_guest_rule, PORT = real.PORT,
+				garden_ips = real.garden_ips, resolve_garden = real.resolve_garden,
+				bridge_mac = function(ifname) return ifname == "phy0-ap1" and "02:00:00:00:00:aa" or nil end,
+				reconcile = function(spec, vaps, macs, selfrun)
+					calls.reconcile[#calls.reconcile + 1] = {spec = spec, vaps = vaps, macs = macs,
+						selfrun = selfrun}
+					return 1
+				end,
+				listen = function()
+					calls.listen = calls.listen + 1
+					return {close = function() calls.closed = calls.closed + 1 end}
+				end,
+			}
+			local asked_ids
+			inform._ucihelper = {wlanconf_ifnames = function(ids)
+				asked_ids = ids
+				return {{ifname = "phy0-ap1", ssid = "g"}, {ifname = "phy1-ap1", ssid = "g"}}
+			end}
+			local save = inform._state.save
+			inform._state.save = function() end
+			local function push(st, portal)
+				local sys = "aaa.1.id=w1\nwireless.1.ssid=g\nwireless.1.parent=wifi0\n"
+					.. "wireless.1.is_guest=true\nredirector.status=" .. portal .. "\n"
+					.. "redirector.url=http://192.0.2.2:8880/guest/s/default/\n"
+					.. "ebtables.7.cmd=-t nat -A PREROUTING --in-interface ath0 -j GUESTIN\n"
+				inform.handle_response(cjson.encode({_type = "setparam", system_cfg = sys}),
+					st, {net = {lan_cpueth = "eth0"}})
+			end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
+				push(st, "enabled")
+				assert_true(st.guest_portal and st.guest_portal.enabled, "the portal's facts kept")
+				assert_eq(st.guest_portal.unknown, nil, "the report is not persisted")
+				assert_true(type(st.guest_token) == "string" and st.guest_token:match("^%x+$") ~= nil
+					and #st.guest_token == 32, "a guest_token to report")
+				assert_true(asked_ids.w1, "the guest WLAN's netdevs were asked for")
+				local r = calls.reconcile[1]
+				assert_eq(#r.vaps, 2, "both guest netdevs")
+				assert_eq(r.vaps[1].bridge_mac, "02:00:00:00:00:aa", "with their bridge MAC")
+				assert_eq(table.concat(r.macs, ","), "de:ad:be:ef:00:02", "and the ledger")
+				assert_false(r.selfrun, "the controller is there: no selfrun")
+				inform._guest_selfrun_on = true
+				inform._guest_enforce(st)
+				inform._guest_selfrun_on = false
+				assert_true(calls.reconcile[2].selfrun, "a rebuild while in selfrun keeps guests let through")
+				table.remove(calls.reconcile, 2)
+				assert_eq(calls.listen, 1, "listening")
+				assert_eq(inform._guest_ctx.url, "http://192.0.2.2:8880/guest/s/default/", "the answer's target")
+				local token = st.guest_token
+				push(st, "enabled")
+				assert_eq(calls.listen, 1, "a second push does not listen again")
+				assert_eq(st.guest_token, token, "nor change the token")
+				push(st, "disabled")
+				assert_eq(st.guest_portal, nil, "off")
+				assert_eq(calls.reconcile[3].spec, nil, "tables torn down")
+				assert_eq(calls.closed, 1, "listener closed")
+				assert_eq(inform._guest_server, nil, "and forgotten")
+				assert_eq(inform._guest_built, nil, "nothing built")
+			end)
+			inform._guestportal, inform._ucihelper, inform._state.save = real, nil, save
+			inform._guest_server, inform._guest_built, inform._guest_ctx = nil, nil, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: authorize-guest refills the nft set only while the portal is built",
+		fn = function()
+			local real = inform._guestportal
+			local filled
+			inform._guestportal = {set_authorized = function(macs) filled = macs end}
+			local save = inform._state.save
+			inform._state.save = function() end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
+				inform._guest_built = nil
+				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest","mac":"de:ad:be:ef:00:03"}', st)
+				assert_eq(filled, nil, "no portal: the ledger only")
+				inform._guest_built = "phy0-ap1=x"
+				inform.handle_response('{"_type":"cmd","cmd":"authorize-guest","mac":"de:ad:be:ef:00:04"}', st)
+				assert_eq(table.concat(filled, ","), "de:ad:be:ef:00:02,de:ad:be:ef:00:03,de:ad:be:ef:00:04",
+					"the whole ledger, sorted")
+				inform.handle_response('{"_type":"cmd","cmd":"unauthorize-guest","mac":"de:ad:be:ef:00:02"}', st)
+				assert_eq(table.concat(filled, ","), "de:ad:be:ef:00:03,de:ad:be:ef:00:04", "and on unauthorize")
+			end)
+			inform._guestportal, inform._state.save, inform._guest_built = real, save, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: l2guard leaves the guest rules to guestportal",
+		fn = function()
+			local real = inform._l2guard
+			inform._l2guard = {
+				parse = function() return {unknown = {
+					"-t nat -A PREROUTING --in-interface ath0 -j GUESTIN", "-t nat -A X -j NEWTHING"}} end,
+				spec_from = function() return {} end, reconcile = function() return 0 end,
+			}
+			local log
+			local ok, err = pcall(function()
+				log = with_stderr(function() inform._l2guard_apply_push("x", sample_state()) end)
+			end)
+			inform._l2guard = real
+			if not ok then error(err, 0) end
+			assert_eq(log:find("GUESTIN", 1, true), nil, "the guest hook is not reported")
+			assert_true(log:find("NEWTHING", 1, true) ~= nil, "a real unknown still is")
+		end
+	},
+	{
+		name = "inform packet: _guest_resync rebuilds only when the guest netdevs changed",
+		fn = function()
+			local real, rt = inform._guestportal, inform._time
+			local built = 0
+			inform._guestportal = {
+				bridge_mac = function() return "02:00:00:00:00:aa" end,
+				garden_ips = real.garden_ips,
+				reconcile = function() built = built + 1; return 1 end,
+				listen = function() return {close = function() end} end, PORT = 1,
+			}
+			local live = {}
+			inform._ucihelper = {wlanconf_ifnames = function() return live end}
+			local now = 1000
+			inform._time = function() return now end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_portal = {enabled = true, url = "http://192.0.2.2/"},
+					guest_token = "00"})
+				inform._guest_enforce(st)          -- startup: wireless not up yet
+				assert_eq(built, 1, "built once (with nothing to hook)")
+				inform._guest_next = 0
+				assert_false(inform._guest_resync(st), "still nothing live: no rebuild")
+				live = {{ifname = "phy0-ap1", ssid = "g"}}
+				assert_false(inform._guest_resync(st), "not before the interval")
+				now = now + inform.GUEST_RESYNC_INTERVAL
+				with_stderr(function() assert_true(inform._guest_resync(st), "the VAP came up: rebuilt") end)
+				assert_eq(built, 2, "rebuilt once")
+				now = now + inform.GUEST_RESYNC_INTERVAL
+				assert_false(inform._guest_resync(st), "unchanged: left alone")
+				assert_false(inform._guest_resync(sample_state()), "portal off: nothing to do")
+			end)
+			inform._guestportal, inform._time, inform._ucihelper = real, rt, nil
+			inform._guest_server, inform._guest_built, inform._guest_ctx, inform._guest_next = nil, nil, nil, 0
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: _idle sleeps plainly, or answers guests until the deadline",
+		fn = function()
+			local t = 0
+			local selects = {}
+			local sock = {
+				gettime = function() return t end,
+				select = function(r, _, timeout)
+					selects[#selects + 1] = (r and "R" or "-") .. timeout
+					-- Two guests arrive a second apart, then nobody.
+					if r and #selects <= 2 then t = t + 1; return {r[1]} end
+					t = t + timeout
+					return {}
+				end,
+			}
+			inform._guest_server = nil
+			inform._idle(sock, 10)
+			assert_eq(table.concat(selects, ","), "-10", "no portal: one plain sleep")
+			local real = inform._guestportal
+			local served = 0
+			inform._guestportal = {serve_one = function(server, ctx)
+				assert_eq(type(ctx.arp), "function", "the answer can look the guest up")
+				served = served + 1
+				return true
+			end}
+			inform._guest_server = {}
+			inform._guest_ctx = {url = "http://192.0.2.2/", ap = "00:00:5e:00:53:02", vaps = {}}
+			selects, t = {}, 0
+			local ok, err = pcall(inform._idle, sock, 10)
+			inform._guestportal = real
+			if not ok then
+				inform._guest_server, inform._guest_ctx = nil, nil
+				error(err, 0)
+			end
+			assert_eq(served, 2, "two guests answered")
+			assert_eq(table.concat(selects, ","), "R10,R9,R8", "waits only for what is left")
+			-- Readable with nothing to accept: rest out the wait, do not spin.
+			inform._guestportal = {serve_one = function() return false end}
+			selects, t = {}, 0
+			ok, err = pcall(inform._idle, sock, 10)
+			inform._guestportal = real
+			inform._guest_server, inform._guest_ctx = nil, nil
+			if not ok then error(err, 0) end
+			assert_eq(table.concat(selects, ","), "R10,-9", "one try, then a plain sleep")
+		end
+	},
+	{
+		name = "inform packet: forgetting the controller tears the guest portal down",
+		fn = function()
+			local real = inform._guestportal
+			local torn, closed = false, false
+			inform._guestportal = {reconcile = function(spec) torn = (spec == nil) end}
+			inform._guest_server = {close = function() closed = true end}
+			inform._guest_built = "x"
+			local ok, err = pcall(inform._forget_controller)
+			inform._guestportal = real
+			local left = inform._guest_server
+			inform._guest_server, inform._guest_built = nil, nil
+			if not ok then error(err, 0) end
+			assert_true(torn, "tables deleted")
+			assert_true(closed and left == nil, "listener closed")
+		end
+	},
+	{
+		name = "inform packet: unauthorize-guest disconnects the guest after closing the portal on it",
+		fn = function()
+			local real_fw, real_gp, real_time = inform._firewall, inform._guestportal, inform._time
+			local save = inform._state.save
+			local order, kicks = {}, {}
+			local now = 1000
+			inform._time = function() return now end
+			inform._state.save = function() end
+			inform._firewall = {reconcile = function() end, hostapd_sockets = function() return "" end, deny_sync = function() return false end,
+				deauth = function(mac, ifnames)
+					kicks[#kicks + 1] = {mac = mac, ifnames = ifnames}; order[#order + 1] = "deauth"
+				end}
+			inform._guestportal = {set_authorized = function() order[#order + 1] = "nft" end}
+			inform._ucihelper = bss_mock()
+			inform._guest_kicked = {}
+			local ok, err = pcall(function()
+				local st = sample_state({guest_authorized = {["de:ad:be:ef:00:02"] = 1}})
+				inform._guest_built = "phy0-ap1=x"
+				local function cmd(c, mac)
+					return inform.handle_response(cjson.encode({_type = "cmd", cmd = c, mac = mac}), st)
+				end
+				assert_true(cmd("unauthorize-guest", "DE:AD:BE:EF:00:02"), "re-inform")
+				assert_eq(#kicks, 1, "one deauth")
+				assert_eq(kicks[1].mac, "de:ad:be:ef:00:02", "of that guest, lowercased")
+				assert_eq(table.concat(kicks[1].ifnames, ","), "phy0-ap0,phy0-ap1,phy1-ap0",
+					"on every BSS: the firmware kicks on every user and guest VAP")
+				assert_eq(table.concat(order, ","), "nft,deauth",
+					"out of the authorized set first, so it reconnects to the portal")
+				cmd("authorize-guest", "de:ad:be:ef:00:03")
+				cmd("unauthorize-guest", "x;reboot")
+				cmd("unauthorize-guest", nil)
+				assert_eq(#kicks, 1, "authorize-guest and a malformed mac kick nobody")
+				-- A MAC openUF had no record of is still kicked: the controller
+				-- only asks when the station reports authorized.
+				cmd("unauthorize-guest", "de:ad:be:ef:00:09")
+				assert_eq(#kicks, 2, "kicked without a ledger entry, as the firmware does")
+				now = now + inform.GUEST_KICK_HOLD - 1
+				cmd("unauthorize-guest", "de:ad:be:ef:00:02")
+				assert_eq(#kicks, 2, "a repeat inside the hold is not kicked again")
+				now = now + 1
+				cmd("unauthorize-guest", "de:ad:be:ef:00:02")
+				assert_eq(#kicks, 3, "after the hold it is")
+				now = 10
+				cmd("unauthorize-guest", "de:ad:be:ef:00:02")
+				assert_eq(#kicks, 4, "a clock step backwards does not hold it forever")
+				inform._guest_built = nil
+				cmd("unauthorize-guest", "de:ad:be:ef:00:05")
+				assert_eq(#kicks, 5, "no portal built: still kicked")
+			end)
+			inform._firewall, inform._guestportal, inform._time = real_fw, real_gp, real_time
+			inform._state.save, inform._ucihelper, inform._guest_built = save, nil, nil
+			inform._guest_kicked = {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: selfrun_guest_mode is kept from mgmt_cfg",
+		fn = function()
+			local save = inform._state.save
+			inform._state.save = function() end
+			local ok, err = pcall(function()
+				local st = sample_state()
+				inform.handle_response(cjson.encode({_type = "setparam",
+					mgmt_cfg = "capability=notif\nselfrun_guest_mode=pass\ncfgversion=abc\n"}), st)
+				assert_eq(st.guest_selfrun, "pass", "pass")
+				inform.handle_response(cjson.encode({_type = "setparam",
+					mgmt_cfg = "selfrun_guest_mode=off\n"}), st)
+				assert_eq(st.guest_selfrun, "off", "off")
+				inform.handle_response(cjson.encode({_type = "setparam",
+					mgmt_cfg = "selfrun_guest_mode=weird\n"}), st)
+				assert_eq(st.guest_selfrun, "pass", "like the firmware, only off is off")
+				inform.handle_response(cjson.encode({_type = "setparam",
+					mgmt_cfg = "selfrun_guest_mode=off\n"}), st)
+				inform.handle_response(cjson.encode({_type = "setparam", mgmt_cfg = "cfgversion=x\n"}), st)
+				assert_eq(st.guest_selfrun, "off", "absent: unchanged")
+			end)
+			inform._state.save = save
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: selfrun starts after 3 unanswered informs; pass opens the portal, off takes the guest WLANs down",
+		fn = function()
+			local orig = {
+				build_json = inform.build_json, build_packet = inform.build_packet,
+				http_post = inform.http_post, parse_packet = inform.parse_packet,
+				handle_response = inform.handle_response,
+				reload = inform._reload_if_changed, rrm = inform._rrm_tick,
+				stderr = io.stderr, gp = inform._guestportal, vaps = inform._guest_vaps,
+				save = inform._state.save, ws = inform._wlansched,
+			}
+			local logged = {}
+			io.stderr = {write = function(_, s) logged[#logged + 1] = s end}
+			inform._reload_if_changed = function(_, _, last) return last end
+			inform._rrm_tick = function() return false end
+			inform.build_json = function() return "{}" end
+			inform.build_packet = function() return "pkt" end
+			inform.parse_packet = function() return '{"_type":"noop"}' end
+			inform.handle_response = function() return false end
+			local saves = 0
+			inform._state.save = function() saves = saves + 1 end
+			local calls, links = {}, {}
+			inform._guestportal = {set_selfrun = function(pass) calls[#calls + 1] = pass end}
+			local link = {["phy0-ap1"] = true, ["phy1-ap1"] = true}
+			inform._wlansched = setmetatable({
+				set_bss = function(n, up)
+					links[#links + 1] = (up and "up " or "down ") .. n
+					link[n] = up
+					return true
+				end,
+				is_up = function(n) return link[n] end,
+			}, {__index = orig.ws})
+			inform._guest_vaps = function() return {{ifname = "phy0-ap1"}, {ifname = "phy1-ap1"}} end
+			inform._inform_fails, inform._guest_selfrun_on, inform._guest_built = 0, false, "phy0-ap1=x"
+			local ok, err = pcall(function()
+				local ctx = {interval = 10, backoff = 10}
+				local st = {inform_url = "http://unifi:8080/inform", guest_portal = {enabled = true}}
+				local function tick(up)
+					inform.http_post = up and function() return "body" end
+						or function() return nil, "connection refused" end
+					inform._tick(st, nil, nil, ctx)
+				end
+				-- never told: pass
+				tick(true); tick(false); tick(false)
+				assert_eq(#calls, 0, "two failures: the portal holds")
+				tick(false)
+				assert_eq(calls[1], true, "the third: guests let through")
+				tick(false)
+				assert_eq(#calls, 1, "once")
+				assert_eq(#links, 0, "pass leaves the WLANs up")
+				tick(true)
+				assert_eq(calls[2], false, "the first answer closes it again")
+				tick(false); tick(false); tick(true); tick(false); tick(false)
+				assert_eq(#calls, 2, "the count restarts at each answer")
+				tick(true)
+
+				st.guest_selfrun = "off"
+				tick(false); tick(false)
+				assert_eq(#links, 0, "off: nothing before the third failure")
+				tick(false)
+				assert_eq(table.concat(links, ", "), "down phy0-ap1, down phy1-ap1", "off: the guest WLANs go down")
+				assert_eq(#calls, 2, "off never opens the portal")
+				assert_eq(table.concat(st.guest_vaps_down, " "), "phy0-ap1 phy1-ap1", "kept for a restart")
+				local saved = saves
+				assert_true(saved > 0, "the ledger is saved")
+				tick(false); tick(false)
+				assert_eq(#links, 2, "once")
+				-- a daemon restart while down: module state is fresh, the ledger is not
+				inform._inform_fails, inform._guest_selfrun_on = 0, false
+				tick(false)
+				assert_eq(#links, 2, "still no controller after the restart: they stay down")
+				tick(true)
+				assert_eq(links[3] .. ", " .. links[4], "up phy0-ap1, up phy1-ap1", "the answer brings them back up")
+				assert_nil(st.guest_vaps_down, "ledger cleared")
+				assert_eq(#calls, 2, "and the portal was never opened")
+
+				st.guest_selfrun = "pass"
+				st.guest_portal = nil
+				tick(false); tick(false); tick(false)
+				assert_eq(#calls, 2, "no portal: nothing to open")
+				st.guest_portal = {enabled = true}
+				inform._guest_built = nil
+				tick(false)
+				assert_eq(#calls, 2, "no tables yet: remembered, not applied")
+				assert_true(inform._guest_selfrun_on, "for the next reconcile")
+				local all = table.concat(logged)
+				assert_true(all:find("letting guests through", 1, true) ~= nil, "said: pass")
+				assert_true(all:find("guest WLANs down (phy0-ap1 phy1-ap1)", 1, true) ~= nil, "said: off")
+				assert_true(all:find("guest WLANs back up", 1, true) ~= nil, "said: back up")
+			end)
+			io.stderr = orig.stderr
+			inform.build_json, inform.build_packet, inform.http_post,
+				inform.parse_packet, inform.handle_response,
+				inform._reload_if_changed, inform._rrm_tick, inform._guestportal =
+				orig.build_json, orig.build_packet, orig.http_post,
+				orig.parse_packet, orig.handle_response, orig.reload, orig.rrm, orig.gp
+			inform._guest_vaps, inform._state.save, inform._wlansched = orig.vaps, orig.save, orig.ws
+			inform._inform_fails, inform._guest_selfrun_on, inform._guest_built = 0, false, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: the walled garden is resolved on the push and every ten minutes after",
+		fn = function()
+			local real, rt, save = inform._guestportal, inform._time, inform._state.save
+			local orig_resolve = real._resolve
+			local built, saved, passed = 0, 0, nil
+			local answers = {["a.example"] = {"198.51.100.20"}}
+			-- resolve_garden is the real one, so the resolver seam is replaced on
+			-- the real module: that is what its closure reaches.
+			real._resolve = function(n) return answers[n] or {} end
+			inform._guestportal = {
+				bridge_mac = function() return "02:00:00:00:00:aa" end,
+				garden_ips = real.garden_ips, resolve_garden = real.resolve_garden,
+				reconcile = function(_, _, _, _, garden)
+					built = built + 1
+					passed = garden
+					return 1
+				end,
+				listen = function() return {close = function() end} end, PORT = 1,
+			}
+			inform._state.save = function() saved = saved + 1 end
+			inform._ucihelper = {wlanconf_ifnames = function() return {} end}
+			local now = 1000
+			inform._time = function() return now end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_token = "00", guest_portal = {enabled = true,
+					url = "http://192.0.2.2/", wg_allowed = {"a.example"}, wg_restricted = {}}})
+				inform._guest_wg_next = 0
+				assert_true(inform._guest_wg_resolve(st), "first resolve: an address appeared")
+				assert_eq(table.concat(st.guest_wg_ips.allowed["a.example"], ","), "198.51.100.20",
+					"kept in state, so a reboot rebuilds without waiting on DNS")
+				assert_eq(saved, 1, "written once")
+				inform._guest_enforce(st)
+				assert_eq(table.concat(passed.allowed, ","), "198.51.100.20",
+					"and handed to reconcile as addresses")
+				built, saved = 0, 0
+				assert_false(inform._guest_wg_resync(st), "not before the interval")
+				assert_eq(built, 0, "no rebuild")
+				answers["a.example"] = {"198.51.100.22"}
+				now = now + inform.GUEST_WG_INTERVAL
+				with_stderr(function()
+					assert_true(inform._guest_wg_resync(st), "the record moved: re-resolved and rebuilt")
+				end)
+				assert_eq(built, 1, "rebuilt once")
+				assert_eq(table.concat(passed.allowed, ","), "198.51.100.22", "with the new address")
+				now = now + inform.GUEST_WG_INTERVAL
+				assert_false(inform._guest_wg_resync(st), "an unchanged answer rebuilds nothing")
+				assert_eq(built, 1, "still one rebuild")
+				-- A garden that empties takes its addresses with it.
+				st.guest_portal.wg_allowed = {}
+				inform._guest_wg_next = 0
+				assert_true(inform._guest_wg_resolve(st), "the garden emptied")
+				assert_nil(st.guest_wg_ips, "and state no longer carries addresses")
+				assert_false(inform._guest_wg_resync(st), "nothing to refresh")
+				assert_false(inform._guest_wg_resync(sample_state()), "portal off: nothing to do")
+				-- A portal with no garden at all: the fields are absent, not
+				-- empty, which is the case the guard is measured in (it used
+				-- to allocate an empty table per field per heartbeat to take
+				-- a length of). Still nothing resolved and nothing rebuilt.
+				built = 0
+				inform._guest_wg_next = 0
+				assert_false(inform._guest_wg_resync(sample_state({guest_token = "00",
+					guest_portal = {enabled = true, url = "http://192.0.2.2/"}})),
+					"no garden: no refresh")
+				assert_eq(built, 0, "and no rebuild")
+			end)
+			inform._guestportal, inform._time, inform._state.save = real, rt, save
+			real._resolve = orig_resolve
+			inform._ucihelper = nil
+			inform._guest_server, inform._guest_built, inform._guest_ctx = nil, nil, nil
+			inform._guest_wg_next, inform._guest_wg_sig = 0, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: a push does not re-ask DNS for a garden whose names did not move",
+		fn = function()
+			local real, rt, save = inform._guestportal, inform._time, inform._state.save
+			local orig_resolve = real._resolve
+			local asked = 0
+			real._resolve = function() asked = asked + 1; return {"198.51.100.20"} end
+			inform._guestportal = {
+				garden_ips = real.garden_ips, resolve_garden = real.resolve_garden,
+			}
+			inform._state.save = function() end
+			local now = 1000
+			inform._time = function() return now end
+			local ok, err = pcall(function()
+				local spec = {enabled = true, url = "http://192.0.2.2/",
+					wg_allowed = {"a.example"}, wg_restricted = {}}
+				local st = sample_state({guest_token = "00", guest_portal = spec})
+				inform._guest_wg_next, inform._guest_wg_sig = 0, nil
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 2, "the first push resolves: one name, asked twice")
+				-- The controller repeats the whole garden on every push, and
+				-- each name costs two blocking nslookups.
+				inform._guest_wg_resolve(st)
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 2, "two more pushes with the same names ask nothing")
+				spec.wg_allowed = {"a.example", "b.example"}
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 6, "a changed name list resolves both names")
+				spec.wg_allowed = {"b.example", "a.example"}
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 10, "so does a reordering: that is the order they are asked in")
+				now = now + inform.GUEST_WG_INTERVAL
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 14, "and the ten-minute window reopens it")
+			end)
+			inform._guestportal, inform._time, inform._state.save = real, rt, save
+			real._resolve = orig_resolve
+			inform._guest_wg_next, inform._guest_wg_sig = 0, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: a garden pass that runs out of time is retried in two minutes",
+		fn = function()
+			local real, rt, save = inform._guestportal, inform._time, inform._state.save
+			local orig_resolve, orig_now = real._resolve, real._now
+			local clock, asked = 0, 0
+			real._now = function() return clock end
+			real._resolve = function()
+				asked = asked + 1
+				clock = clock + 5
+				return {"198.51.100.20"}
+			end
+			inform._guestportal = {
+				garden_ips = real.garden_ips, resolve_garden = real.resolve_garden,
+			}
+			inform._state.save = function() end
+			local now = 1000
+			inform._time = function() return now end
+			local ok, err = pcall(function()
+				local st = sample_state({guest_token = "00", guest_portal = {enabled = true,
+					url = "http://192.0.2.2/", wg_allowed = {"a.example", "b.example"},
+					wg_restricted = {}}})
+				inform._guest_wg_next, inform._guest_wg_sig = 0, nil
+				with_stderr(function() inform._guest_wg_resolve(st) end)
+				assert_eq(asked, 1, "the budget is spent inside the first name")
+				assert_eq(inform._guest_wg_next, now + inform.GUEST_WG_RETRY,
+					"so the heartbeat comes back in two minutes, not ten")
+				asked, clock = 0, 0
+				inform._guest_wg_resolve(st)
+				assert_eq(asked, 0, "a push inside the retry window asks nothing")
+				now = now + inform.GUEST_WG_RETRY
+				with_stderr(function() inform._guest_wg_resolve(st) end)
+				assert_true(asked > 0, "the retry window reopens it")
+			end)
+			inform._guestportal, inform._time, inform._state.save = real, rt, save
+			real._resolve, real._now = orig_resolve, orig_now
+			inform._guest_wg_next, inform._guest_wg_sig = 0, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: selfrun's return leaves a WLAN its blackout schedule holds down",
+		fn = function()
+			local orig = {ws = inform._wlansched, save = inform._state.save}
+			local ups = {}
+			inform._wlansched = setmetatable({
+				set_bss = function(n, up) if up then ups[#ups + 1] = n end return true end,
+				is_up = function() return false end,
+			}, {__index = orig.ws})
+			inform._state.save = function() end
+			inform._inform_fails, inform._guest_selfrun_on = 0, false
+			local ok, err = pcall(function()
+				local st = {guest_portal = {enabled = true}, guest_selfrun = "off",
+					guest_vaps_down = {"phy0-ap1", "phy1-ap1"}, sched_vaps_down = {"phy1-ap1"}}
+				with_stderr(function() inform._guest_selfrun(st, true) end)
+				assert_eq(table.concat(ups, " "), "phy0-ap1", "only the one the schedule does not hold")
+				assert_nil(st.guest_vaps_down, "selfrun's ledger cleared")
+				assert_eq(table.concat(st.sched_vaps_down, " "), "phy1-ap1", "the schedule's kept")
+			end)
+			inform._wlansched, inform._state.save = orig.ws, orig.save
+			inform._inform_fails, inform._guest_selfrun_on = 0, false
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: selfrun's return retries a guest WLAN whose beacon did not restart",
+		fn = function()
+			local orig = {ws = inform._wlansched, save = inform._state.save}
+			local link = {["phy0-ap1"] = false, ["phy1-ap1"] = false, ["phy0-ap2"] = true}
+			local beacon_ok, tried = {["phy0-ap1"] = true, ["phy1-ap1"] = false}, {}
+			inform._wlansched = setmetatable({
+				set_bss = function(n, up)
+					tried[#tried + 1] = n
+					if up and beacon_ok[n] then link[n] = true return true end
+					return false
+				end,
+				is_up = function(n) return link[n] end,
+			}, {__index = orig.ws})
+			local saves = 0
+			inform._state.save = function() saves = saves + 1 end
+			inform._inform_fails, inform._guest_selfrun_on = 0, false
+			local ok, err = pcall(function()
+				local st = {guest_portal = {enabled = true}, guest_selfrun = "off",
+					guest_vaps_down = {"phy0-ap1", "phy1-ap1", "phy0-ap2", "gone0"}}
+				local log = with_stderr(function() assert_true(inform._guest_selfrun(st, true), "changed") end)
+				assert_eq(table.concat(tried, " "), "phy0-ap1 phy1-ap1", "only the ones still down")
+				assert_eq(table.concat(st.guest_vaps_down, " "), "phy1-ap1", "the failure stays in the ledger")
+				assert_eq(saves, 1, "saved")
+				assert_true(log:find("back up (phy0-ap1)", 1, true) ~= nil, "said what came up")
+				assert_true(log:find("on the air (phy1-ap1)", 1, true) ~= nil, "said what did not")
+				tried = {}
+				log = with_stderr(function() inform._guest_selfrun(st, true) end)
+				assert_eq(table.concat(tried, " "), "phy1-ap1", "retried")
+				assert_nil(log:find("on the air", 1, true), "said once, not on every retry")
+				tried, beacon_ok["phy1-ap1"] = {}, true
+				with_stderr(function() inform._guest_selfrun(st, true) end)
+				assert_eq(table.concat(tried, " "), "phy1-ap1", "the next answer retries it")
+				assert_nil(st.guest_vaps_down, "then the ledger is gone")
+				tried = {}
+				with_stderr(function() inform._guest_selfrun(st, true) end)
+				assert_eq(#tried, 0, "and nothing more is done")
+			end)
+			inform._wlansched, inform._state.save = orig.ws, orig.save
+			inform._inform_fails, inform._guest_selfrun_on = 0, false
 			if not ok then error(err, 0) end
 		end
 	},

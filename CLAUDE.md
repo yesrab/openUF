@@ -572,6 +572,16 @@ at startup. `install.sh uninstall` still removes both.
     read at the TOP of the setparam branch (`trusted_response`), before the response can adopt
     the device; never move that read below the mgmt_cfg parse. Only names in
     `st.device_logins` are ever changed; `_forget_controller` needs `prev` for that ledger.
+- **The guest portal is upstream's code at upstream's head, and it is in three places.**
+  `guestportal.lua` (the nft tables `bridge openuf_guest` + the HTTP redirector + the walled
+  garden's parser and resolver), the `_guest_*` section of `inform.lua`, and `_idle`, which now
+  selects on the portal's listening socket as well as the STUN socket. It builds nothing until
+  a push carries a guest WLAN with `redirector.status=enabled`. `nslookup` blocks and the loop
+  is single-threaded: the garden's resolver is bounded (`GUEST_WG_BUDGET`, `WG_MAX_SITES`, the
+  name list's signature) and those bounds are why. `_guest_selfrun` counts unanswered informs
+  (`M._inform_fails`) and STUN stops in selfrun, as the firmware's does. `M._socket()` is
+  evaluated BEFORE the pcall around `gp.listen`, so tests need LuaSocket or the harness's
+  stand-in. Lab-validated only upstream; nothing of it has run on AP1/AP2.
 - **`sysconf` installs only commands in `CRON_COMMANDS`.** A pushed cron line is a string
   crond runs as root; the controller's is `syswrapper.sh 11k-scan`, and that maps to the
   verb this tree ships. Extend the table only alongside a new verb, never to "pass through".
@@ -1000,9 +1010,10 @@ credited to this repo), so diff before assuming a commit is new.
 - **Last review point: `db5e92b` (re-checked 2026-11-13: upstream unchanged, so the next review still starts there) (upstream v0.13.0), sync 5 on 2026-11-02.** Earlier: the
   fork point `677f732`; sync 1 (2026-09-06) to `d7d7e21`; sync 2 (2026-09-13) to `12b4db0`;
   sync 3 (2026-09-28) to `08d0003` (v0.9.3); sync 4 (2026-10-18) to `2f263f3` (v0.11.0).
-  Not adopted from syncs 4 and 5 and still waiting: the guest portal and its walled garden
-  (`e6395d7`, `afd7b32`; REVERSE-ENGINEERING.md backlog row 24), their `docs/WIRE-REFERENCE.md`
-  split (`5f521bf`; our docs keep their own shape) and the GitHub issue templates.
+  The guest portal and its walled garden, left out of syncs 4 and 5, were adopted on 2026-11-17
+  from upstream's head (PROTOCOL-VALIDATION.md § Adopted from upstream, 2026-11-17: the guest
+  portal). Still not adopted: their `docs/WIRE-REFERENCE.md` split (`5f521bf`; our docs keep
+  their own shape) and the GitHub issue templates.
   Each sync is a row in REVERSE-ENGINEERING.md's session log and an "Adopted from upstream,
   <date>" section in PROTOCOL-VALIDATION.md -- update both, and move this line.
 - **A third fork is a remote too: `dmalinowski` → d-malinowski/openUF**, and his roaming
@@ -1022,8 +1033,7 @@ credited to this repo), so diff before assuming a commit is new.
   hardcodes `OUF=/opt/openuf`, and probing `/usr/lib/openuf` too would make the symlink
   unnecessary.
 - **Mechanics that worked in syncs 3 and 4:** `git add -A` first, then per commit **in
-  upstream's order** `git show --format= <c> -- openuf/ tests/ ':!openuf/guestportal.lua'
-  ':!tests/test_guestportal.lua' | git apply --3way` (the fetch puts their blobs in our
+  upstream's order** `git show --format= <c> -- openuf/ tests/ | git apply --3way` (the fetch puts their blobs in our
   object store; applying out of order makes later hunks miss their context). `inform.lua`
   has diverged enough that a hunk often lands as a "displaced block" (ours N lines, theirs
   a whole unrelated region): resolve those as ours and port the change by hand. Test files:
@@ -1086,6 +1096,9 @@ openuf/
   sysconf.lua       controller-managed system settings: system.timezone and ntpclient.*
                     into UCI (stamped, reversible), cron.* into a marked block of
                     /etc/crontabs/root (allow-listed commands only: `syswrapper.sh 11k-scan`)
+  guestportal.lua   the guest portal (Hotspot): nft `bridge openuf_guest` holding
+                    unauthorized guests, the HTTP redirector served from `_idle`, the walled
+                    garden by address and by resolved domain (upstream's, lab-validated only)
   remotelog.lua     the syslog.* block: a plain server into logd's UCI options (stamped),
                     "this controller, encrypted" as AES-256-GCM datagrams; the forwarder's
                     start/stop and its 0600 key file

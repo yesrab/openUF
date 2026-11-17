@@ -102,9 +102,10 @@ local M = {}
 
 -- Every pure system_cfg parser in openUF, as a list of {label, fn(blob)}.
 -- Keep this in step with handle_response: a parser missing here makes its keys
--- look ignored. A module this tree does not carry (mods.<x> nil: the guest
--- portal, deliberately not adopted) is left out of the list rather than
--- raising on every key, so its keys count as ignored, which is the truth here.
+-- look ignored. A module the caller does not hand over (mods.<x> nil) is left
+-- out of the list rather than raising on every key, so its keys count as
+-- ignored. (That was the guest portal's state until it was adopted on
+-- 2026-11-17.)
 function M.parsers(inform, mods)
 	local list = {
 		{"wifi", function(blob)
@@ -125,6 +126,8 @@ function M.parsers(inform, mods)
 		{"l2guard",      function(blob) return mods.l2guard.parse(blob) end},
 		{"guestportal",  function(blob) return mods.guestportal.parse(blob) end},
 		{"airtime",      function(blob) return mods.airtime.parse(blob) end},
+		{"remotelog",    function(blob) return mods.remotelog.parse(blob) end},
+		{"devlogin",     function(blob) return mods.devlogin.parse(blob) end},
 	}
 	local out = {}
 	for _, p in ipairs(list) do
@@ -322,6 +325,8 @@ if arg and arg[0] and arg[0]:match("cfg%-coverage%.lua$") then
 		l2guard     = inform._l2guard,
 		guestportal = inform._guestportal,
 		airtime     = inform._airtime,
+		remotelog   = inform._remotelog,
+		devlogin    = inform._devlogin,
 	}
 	local report = M.analyse(blob, M.parsers(inform, mods), inform.RECOGNIZED_SYSTEM_CFG)
 	print(M.format(report, {values = WANT_VALUES, shapes = WANT_SHAPES}))

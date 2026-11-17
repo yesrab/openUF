@@ -186,6 +186,7 @@ local test_files = {
 	"tests/test_applyguard.lua",
 	"tests/test_nrlist.lua",
 	"tests/test_devlogin.lua",
+	"tests/test_guestportal.lua",
 	"tests/test_l2guard.lua",
 	"tests/test_roamassist.lua",
 	"tests/test_airtime.lua",

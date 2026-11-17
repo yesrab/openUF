@@ -65,6 +65,7 @@ local stun      = _require_sibling("stun")
 local shaper    = _require_sibling("shaper")
 local rrbguard  = _require_sibling("rrbguard")
 local plugins   = _require_sibling("plugins")
+local guestportal = _require_sibling("guestportal")
 
 local M = {}
 local util = package.loaded["openuf.util"]
@@ -111,6 +112,7 @@ M._satisfaction = satisfaction
 M._stun      = stun
 M._rrbguard  = rrbguard
 M._plugins   = plugins
+M._guestportal = guestportal
 
 -- In-memory only: 802.11k beacon-report neighbours, keyed by BSSID, plus the
 -- flat list build_json merges from. Clients report asynchronously and only
@@ -1603,6 +1605,8 @@ function M.build_json(st, cfg, ufhw)
 					serialno = sta.serialno,
 					active     = true,
 					mac        = sta.mac,
+					-- Guest portal state; see M._guest_sta_authorized.
+					authorized = M._guest_sta_authorized(st, vap, sta.mac),
 					ap_mac     = mac_str,
 					channel    = vap.channel,
 					radio      = vap.radio,
@@ -2387,6 +2391,11 @@ function M.build_json(st, cfg, ufhw)
 		spectrum_scanning       = M._scan_job_active("spectrum-scan"),
 		quickscan_scanning      = M._scan_job_active("quick-scan"),
 		spectrum_scan_timestamp = spectrum_scan_timestamp,
+		-- Guest portal: the controller refuses to authorize a guest on an AP
+		-- that reported no guest_token ("Missing Guest Token in AP[..]
+		-- during guest authorization"). Only while the portal is on.
+		guest_token      = (type(st.guest_portal) == "table" and st.guest_portal.enabled)
+			and st.guest_token or nil,
 		-- Real devices report this under the hyphenated key "system-stats"
 		-- with {cpu, mem, uptime} as percentage/uptime strings -- confirmed
 		-- against a real captured USG inform payload (stephanlascar/
@@ -3725,6 +3734,11 @@ function M._parse_wifi_system_cfg(sys_raw)
 				-- one, taking the nested sta_table -- and thus every wireless
 				-- client -- with them).
 				wlanconf_id           = a.id,
+				-- wireless.<n>.is_guest: the WLAN is a guest network
+				-- (PROTOCOL-VALIDATION.md, "Guest portal (Hotspot)").
+				-- Always present, "true"/"false". Read by _guest_wlans,
+				-- not by UCI.
+				is_guest              = _wire_bool(w.is_guest) or false,
 				-- An EAP WLAN has no passphrase. The controller leaves
 				-- aaa.<n>.wpa.psk absent on one, but forcing nil here keeps a
 				-- stray key from ever reaching an EAP BSS.
@@ -4469,11 +4483,19 @@ local RECOGNIZED_SYSTEM_CFG = {
 	-- is not read and stays in the ledger.
 	"^ebtables%.status$",
 	"^ebtables%.%d+%.cmd$",
+	-- Guest portal on/off (M._guest_wlans) and where it is (guestportal.lua).
+	"^redirector%.status$",
+	"^redirector%.url$",
+	-- The walled garden's domain half (guestportal.parse). dnsmasq.status and
+	-- dnsmasq.<n>.* are not here: those ask for a local DNS answerer openUF
+	-- does not run, so they stay in the report.
+	"^dnsmasq%.walled_garden%.%d+%.status$",
+	"^dnsmasq%.walled_garden%.%d+%.site%.%d+%.",
 }
 
 local RECOGNIZED_MGMT_CFG = {
 	"^inform_url$", "^use_aes_gcm$", "^cfgversion$", "^led_enabled$", "^authkey$",
-	"^capability$", "^stun_url$",
+	"^capability$", "^selfrun_guest_mode$", "^stun_url$",
 }
 
 -- Exported for tools/cfg-coverage.lua, which cross-checks these CLAIMS against
@@ -4650,6 +4672,10 @@ function M.handle_response(json_str, st, cfg)
 						if v ~= "" then stun_url = v end
 					elseif k == "use_aes_gcm" then
 						st.use_gcm = (v == "true")
+					elseif k == "selfrun_guest_mode" then
+						-- The controller sends "pass" or "off"; like the
+						-- firmware, only "off" is off.
+						st.guest_selfrun = (v == "off") and "off" or "pass"
 					elseif k == "cfgversion" then
 						if v ~= "" then st.cfgversion = v end
 					elseif k == "led_enabled" then
@@ -4772,6 +4798,10 @@ function M.handle_response(json_str, st, cfg)
 			-- the wifi branch left that consumer reading a nil table -- an
 			-- empty trunk list that fails silently.
 			local radio_table, vap_table, backhaul_entries = M._parse_wifi_system_cfg(sys_raw)
+			-- Which WLANs a station must pass the guest portal on. Every
+			-- system_cfg lists every WLAN and redirector.status, so this
+			-- replaces the record outright.
+			st.guest_wlans = M._guest_wlans(vap_table, sys_raw)
 			-- Mesh backhaul: the plan ucihelper.apply_config writes, or nil when the
 			-- push carries no enabled mesh block (the wired, non-meshing case).
 			local mesh_cfg = M._parse_mesh_system_cfg(sys_raw)
@@ -4998,6 +5028,16 @@ function M.handle_response(json_str, st, cfg)
 				end
 			end
 
+			-- The guest portal's own ebtables rules (guestportal.lua), after
+			-- the WiFi pass for the same reason; _guest_resync covers a
+			-- guest VAP whose netdev is not up yet.
+			if M._guestportal then
+				local ok_gp, err_gp = pcall(M._guest_apply_push, sys_raw, st)
+				if not ok_gp then
+					io.stderr:write("inform: guestportal: " .. tostring(err_gp) .. "\n")
+				end
+			end
+
 			-- The push is in: from here the heartbeat decides whether it
 			-- stays (_applyguard_tick). Saved with the state below, so a
 			-- restart or a power cycle resumes the decision.
@@ -5178,6 +5218,17 @@ function M.handle_response(json_str, st, cfg)
 			if type(resp.mac) == "string" then
 				M._firewall.deauth(resp.mac, M._bss_ifnames())
 			end
+		elseif cmd == "authorize-guest" or cmd == "unauthorize-guest" then
+			-- Guest portal: {"cmd":"(un)authorize-guest","mac":...}
+			-- (PROTOCOL-VALIDATION.md, "Guest portal (Hotspot)"). The
+			-- ledger build_json reports `authorized` from, and the nft set
+			-- that lets the guest past the portal.
+			M._guest_authorize(st, resp.mac, cmd == "authorize-guest")
+			M._state.save(st)
+			if M._guest_built then
+				pcall(M._guestportal.set_authorized, M._guest_macs(st))
+			end
+			if cmd == "unauthorize-guest" then M._guest_kick(resp.mac) end
 		elseif cmd == "rate-update" then
 			-- {"cmd":"rate-update","mac":...,"ul_max":kbps,"dl_max":kbps,
 			-- ...}: one client's WiFi Speed Limit, its own profile (or a
@@ -5261,6 +5312,415 @@ end
 -- whichever SSID it is on. One interface per radio missed every SSID after the
 -- first on that radio. A VLAN netdev folds into its BSS (hostapd has no
 -- control socket on it).
+-- Guest portal (PROTOCOL-VALIDATION.md, "Guest portal (Hotspot)").
+--
+-- On a guest WLAN with the portal on, the controller compares each station's
+-- reported `authorized` with its own guest records on every inform: a
+-- station it has no record for but that reports authorized gets
+-- unauthorize-guest, and a station it has a record for that reports
+-- unauthorized gets authorize-guest. An absent `authorized` counts as true,
+-- so before this every station on such a WLAN drew an unauthorize-guest per
+-- inform and authorize-guest was never sent at all.
+
+-- Cap on st.guest_authorized. Past it the oldest authorization goes first;
+-- the controller re-sends authorize-guest for any guest it still has a
+-- record for, so a dropped entry costs one inform, not access.
+M.GUEST_LEDGER_MAX = 512
+
+-- Set of wlanconf ids (vap.wlanconf_id) on which stations must pass the
+-- portal: guest WLANs while redirector.status=enabled. Without the portal a
+-- guest WLAN is only isolated, and the controller does not check
+-- `authorized` there.
+function M._guest_wlans(vap_table, sys_raw)
+	local out = {}
+	if type(sys_raw) ~= "string"
+			or not ("\n" .. sys_raw .. "\n"):find("\nredirector%.status=enabled\n") then
+		return out
+	end
+	for _, vap in ipairs(vap_table or {}) do
+		if vap.is_guest and vap.wlanconf_id then out[vap.wlanconf_id] = true end
+	end
+	return out
+end
+
+-- Record or drop one guest authorization. A malformed MAC is ignored.
+function M._guest_authorize(st, mac, authorized)
+	mac = type(mac) == "string" and mac:lower():match("^%s*(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
+	if not mac then return end
+	st.guest_authorized = st.guest_authorized or {}
+	if not authorized then
+		st.guest_authorized[mac] = nil
+		return
+	end
+	st.guest_authorized[mac] = os.time()
+	local n, oldest, oldest_t = 0, nil, nil
+	for m, t in pairs(st.guest_authorized) do
+		n = n + 1
+		if not oldest_t or t < oldest_t then oldest, oldest_t = m, t end
+	end
+	if n > M.GUEST_LEDGER_MAX then
+		st.guest_authorized[oldest] = nil
+	end
+end
+
+-- Disconnect a guest whose authorization ended, as UniFi firmware does
+-- (syswrapper.sh unauthorize-guest: drop the MAC, then kick_sta on every
+-- user and guest VAP; firmware-confirmed for 3.9.27 to 4.0.15). Associated
+-- and unauthorized, the guest's OS never re-runs its captive-portal check,
+-- so it sits behind the portal with no page to log in on. On reconnecting
+-- it reports authorized false, which the controller leaves alone.
+--
+-- The firmware reports `authorized` from the very list it just changed, so
+-- one unauthorize-guest is all it ever gets. openUF reports it only on the
+-- WLANs st.guest_wlans names, and true elsewhere; if that ever disagreed with
+-- the controller, unauthorize-guest would come on every inform. One kick per
+-- MAC per GUEST_KICK_HOLD seconds keeps that from becoming a deauth storm.
+M.GUEST_KICK_HOLD = 60
+M._guest_kicked = {}
+
+function M._guest_kick(mac)
+	mac = type(mac) == "string" and mac:lower():match("^%s*(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)%s*$")
+	if not mac then return false end
+	local now = M._time()
+	for m, t in pairs(M._guest_kicked) do
+		if now - t >= M.GUEST_KICK_HOLD or now < t then M._guest_kicked[m] = nil end
+	end
+	if M._guest_kicked[mac] then return false end
+	M._guest_kicked[mac] = now
+	M._firewall.deauth(mac, M._bss_ifnames())
+	return true
+end
+
+-- The `authorized` a station on this vap reports: the ledger's word on a
+-- portal WLAN, true everywhere else (what the controller assumes anyway).
+function M._guest_sta_authorized(st, vap, mac)
+	local wlans = st and st.guest_wlans
+	if not (wlans and vap and vap.id and wlans[vap.id]) then return true end
+	return (st.guest_authorized or {})[mac] ~= nil
+end
+
+-- ─── Guest portal enforcement (guestportal.lua) ─────────────────────────────
+
+-- The ledger as a sorted list, for the nft set.
+function M._guest_macs(st)
+	local out = {}
+	for mac in pairs(st.guest_authorized or {}) do out[#out + 1] = mac end
+	table.sort(out)
+	return out
+end
+
+-- The portal WLANs' live netdevs, each with its SSID and bridge MAC.
+function M._guest_vaps(st)
+	local ufuci = M._ucihelper
+	if not (ufuci and ufuci.wlanconf_ifnames) then return {} end
+	local ok, vaps = pcall(ufuci.wlanconf_ifnames, st.guest_wlans)
+	if not ok or type(vaps) ~= "table" then return {} end
+	for _, v in ipairs(vaps) do v.bridge_mac = M._guestportal.bridge_mac(v.ifname) end
+	return vaps
+end
+
+local function guest_vaps_key(vaps)
+	local parts = {}
+	for _, v in ipairs(vaps) do parts[#parts + 1] = v.ifname .. "=" .. tostring(v.bridge_mac) end
+	return table.concat(parts, " ")
+end
+
+-- While the portal is on: the listening socket (served from M._idle), what
+-- the answer needs, and the VAP list the tables were built for.
+M._guest_server = nil
+M._guest_ctx    = nil
+M._guest_built  = nil
+
+-- The walled garden's resolved domain half as reconcile wants it. Empty when
+-- the push carries no garden domains, so the rules simply are not there.
+function M._guest_garden(st)
+	local store = type(st.guest_wg_ips) == "table" and st.guest_wg_ips or {}
+	return {
+		allowed    = M._guestportal.garden_ips(store.allowed),
+		restricted = M._guestportal.garden_ips(store.restricted),
+	}
+end
+
+-- Resolve the garden's domains and keep the answers in state. Driven on every
+-- push and then on the controller's own cadence for the job it asks the device
+-- to run (`*/10 * * * *  syswrapper.sh refresh-walled-garden 1`, which
+-- sysconf.lua therefore installs no crontab line for). Returns true when the
+-- address set changed, i.e. when the chains have to be rebuilt.
+--
+-- Each name costs two blocking nslookups and a blackholed resolver takes 5 s
+-- per lookup, so this is the one path on which the controller can stall the
+-- daemon: it runs inline in handle_response, and three missed informs is what
+-- puts a genuine AP into selfrun. Two bounds, since neither is enough alone:
+--
+--  * the NAME LIST's signature, against the refresh window the last pass
+--    opened. A push repeats the whole garden whether or not it changed (a
+--    Force Provision loop repeats it every few seconds), and re-asking DNS
+--    for an unchanged list inside that window buys nothing: the ten-minute
+--    refresh is what catches an address that moved. The signature is held in
+--    memory, not state.json, because the window is: a restart re-resolves
+--    once, which is also when the chains are rebuilt from scratch anyway.
+--  * a wall-clock budget per pass. Past it no further name is asked and the
+--    rest keep their last answer, which is what a name that stops resolving
+--    already does. One name can overrun by a single lookup, so the worst case
+--    is BUDGET + 5 s.
+M.GUEST_WG_INTERVAL = 600
+-- After a pass that ran out of time, rather than ten minutes.
+M.GUEST_WG_RETRY = 120
+M.GUEST_WG_BUDGET = 5
+M._guest_wg_next = 0
+M._guest_wg_sig = nil
+
+-- The signature of one push's garden names: the two lists in push order, which
+-- is the order they are resolved in, so a reordering is a different list.
+local function guest_wg_sig(names)
+	local parts = {}
+	for _, which in ipairs({"allowed", "restricted"}) do
+		parts[#parts + 1] = which .. "=" .. table.concat(names[which], ",")
+	end
+	return table.concat(parts, " ")
+end
+
+function M._guest_wg_resolve(st)
+	local gp, spec = M._guestportal, st.guest_portal
+	local names = {
+		allowed    = (type(spec) == "table" and spec.wg_allowed) or {},
+		restricted = (type(spec) == "table" and spec.wg_restricted) or {},
+	}
+	local now = M._time()
+	if #names.allowed == 0 and #names.restricted == 0 then
+		M._guest_wg_next = now + M.GUEST_WG_INTERVAL
+		M._guest_wg_sig = guest_wg_sig(names)
+		if st.guest_wg_ips == nil then return false end
+		st.guest_wg_ips = nil
+		M._state.save(st)
+		return true
+	end
+	local sig = guest_wg_sig(names)
+	if sig == M._guest_wg_sig and now < M._guest_wg_next then return false end
+	local store = type(st.guest_wg_ips) == "table" and st.guest_wg_ips or {}
+	local changed, partial = false, false
+	local out = {}
+	for _, which in ipairs({"allowed", "restricted"}) do
+		-- One budget for the pass, not one per list: what is left of it after
+		-- the allowed names is what the restricted ones get.
+		local left = M.GUEST_WG_BUDGET - (M._time() - now)
+		local map, _, diff, cut = gp.resolve_garden(names[which], store[which],
+			left > 0 and left or 0)
+		out[which] = map
+		changed = changed or diff
+		partial = partial or cut
+	end
+	M._guest_wg_sig = sig
+	-- A pass that ran out of time opens a shorter window, so the names it
+	-- never asked are picked up by the heartbeat in two minutes rather than
+	-- ten -- without letting every push in between re-ask.
+	M._guest_wg_next = M._time()
+		+ (partial and M.GUEST_WG_RETRY or M.GUEST_WG_INTERVAL)
+	if changed then
+		st.guest_wg_ips = out
+		M._state.save(st)
+	end
+	return changed
+end
+
+-- The ten-minute refresh itself, from the heartbeat.
+function M._guest_wg_resync(st)
+	local spec = st and st.guest_portal
+	if not (M._guestportal and type(spec) == "table" and spec.enabled) then return false end
+	-- Length without the `or {}` fallbacks: a portal with no garden is the
+	-- common case, and that is exactly when both fields are nil, so the guard
+	-- that exists to do nothing allocated two tables per heartbeat.
+	if (spec.wg_allowed and #spec.wg_allowed or 0) == 0
+		and (spec.wg_restricted and #spec.wg_restricted or 0) == 0 then return false end
+	if M._time() < M._guest_wg_next then return false end
+	if not M._guest_wg_resolve(st) then return false end
+	io.stderr:write("guestportal: walled-garden addresses changed -- rebuilding\n")
+	M._guest_enforce(st)
+	return true
+end
+
+-- Make the kernel and the listener match st.guest_portal.
+function M._guest_enforce(st, vaps)
+	local gp = M._guestportal
+	local spec = st.guest_portal
+	if not (type(spec) == "table" and spec.enabled) then
+		gp.reconcile(nil)
+		M._guest_built, M._guest_ctx = nil, nil
+		if M._guest_server then M._guest_server:close() end
+		M._guest_server = nil
+		return 0
+	end
+	-- The portal's guest_token (build_json). Its value would key the
+	-- controller's encrypted-cookie redirect, which openUF does not claim;
+	-- the plain id=/ap= redirect only needs one to exist.
+	if type(st.guest_token) ~= "string" then
+		local bytes = M._crypto.random_iv(16)
+		st.guest_token = (bytes:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+		M._state.save(st)
+	end
+	vaps = vaps or M._guest_vaps(st)
+	local n = gp.reconcile(spec, vaps, M._guest_macs(st), M._guest_selfrun_on,
+		M._guest_garden(st))
+	M._guest_built = guest_vaps_key(vaps)
+	M._guest_ctx = {url = spec.url, ap = st.mac, vaps = vaps}
+	if not M._guest_server then
+		local ok, server, err = pcall(gp.listen, M._socket())
+		if ok and server then
+			M._guest_server = server
+		else
+			io.stderr:write("guestportal: cannot listen on port " .. gp.PORT .. ": "
+				.. tostring(ok and err or server) .. "\n")
+		end
+	end
+	return n
+end
+
+M._socket = function() return require("socket") end
+
+-- A push's portal facts -> st.guest_portal, and the kernel made to match.
+-- A push without redirector.status (a partial one) leaves it alone.
+function M._guest_apply_push(sys_raw, st)
+	local spec = M._guestportal.parse(sys_raw)
+	if not spec then return false end
+	for _, u in ipairs(spec.unknown) do
+		io.stderr:write("guestportal: unrecognised guest rule shape, not applied: "
+			.. ("%q"):format(u) .. "\n")
+	end
+	spec.unknown = nil
+	st.guest_portal = spec.enabled and spec or nil
+	-- Before the rebuild, so this push's garden is enforced by it rather than
+	-- ten minutes later.
+	pcall(M._guest_wg_resolve, st)
+	M._guest_enforce(st)
+	return true
+end
+
+-- Once a minute while the portal is on: rebuild when the guest VAPs' netdevs
+-- changed (a push's `wifi reload` finishing, wireless coming up after the
+-- daemon). An empty list is "not answering yet" and changes nothing.
+M.GUEST_RESYNC_INTERVAL = 60
+M._guest_next = 0
+function M._guest_resync(st)
+	local spec = st and st.guest_portal
+	if not (M._guestportal and type(spec) == "table" and spec.enabled) then return false end
+	local now = M._time()
+	if now < M._guest_next then return false end
+	M._guest_next = now + M.GUEST_RESYNC_INTERVAL
+	local vaps = M._guest_vaps(st)
+	if #vaps == 0 or guest_vaps_key(vaps) == M._guest_built then return false end
+	io.stderr:write("guestportal: guest interfaces changed (" .. guest_vaps_key(vaps)
+		.. ") -- rebuilding\n")
+	M._guest_enforce(st, vaps)
+	return true
+end
+
+-- selfrun_guest_mode (mgmt_cfg, every push): what guests get while the AP
+-- runs without its controller, as the UniFi firmware does it (mcad +
+-- syswrapper.sh, BZ2 3.9.27-4.0.15). Selfrun starts after
+-- GUEST_SELFRUN_FAILS informs in a row went unanswered and ends with the
+-- first answer; it only matters while the portal is on. "pass" (or never
+-- told -- only "off" is off) lets every guest through
+-- (guestportal.set_selfrun), since nobody could log in meanwhile. "off"
+-- takes the guest WLANs down until the controller is back; the ifnames are
+-- kept in st.guest_vaps_down, so a restart in between still brings them up.
+-- Unlike the firmware, the authorized ledger is kept on return: the
+-- controller re-authorizes the same guests anyway.
+M.GUEST_SELFRUN_FAILS = 3
+M._inform_fails = 0
+M._guest_selfrun_on = false
+M._guest_up_failed = ""
+function M._guest_selfrun(st, contacted)
+	M._inform_fails = contacted and 0 or M._inform_fails + 1
+	local spec = st and st.guest_portal
+	-- WLANs left down before a restart stay down until an answer, rather
+	-- than flapping up for the first failures of the new count.
+	local selfrun = M._inform_fails >= M.GUEST_SELFRUN_FAILS
+		or (st.guest_vaps_down ~= nil and not contacted)
+	local mode
+	if type(spec) == "table" and spec.enabled == true and selfrun then
+		mode = (st.guest_selfrun == "off") and "off" or "pass"
+	end
+	local changed = false
+	if mode == "off" and not st.guest_vaps_down then
+		local names = {}
+		for _, v in ipairs(M._guest_vaps(st)) do names[#names + 1] = v.ifname end
+		for _, n in ipairs(names) do pcall(M._wlansched.set_bss, n, false) end
+		st.guest_vaps_down = names
+		M._state.save(st)
+		io.stderr:write("guestportal: " .. M._inform_fails .. " informs unanswered, "
+			.. "selfrun_guest_mode=off -- guest WLANs down (" .. table.concat(names, " ") .. ")\n")
+		changed = true
+	elseif mode ~= "off" and st.guest_vaps_down then
+		-- A WLAN its blackout schedule holds down stays down
+		-- (_sched_resync brings it up when the schedule ends). One whose
+		-- beacon did not restart (wlansched.set_bss) stays in the ledger,
+		-- down, and the next answered inform tries again.
+		local held, up, failed = {}, {}, {}
+		for _, n in ipairs(st.sched_vaps_down or {}) do held[n] = true end
+		for _, n in ipairs(st.guest_vaps_down) do
+			-- Already up (a wifi reload recreated it) or gone: nothing to do.
+			if not held[n] and M._wlansched.is_up(n) == false then
+				local ok, res = pcall(M._wlansched.set_bss, n, true)
+				if ok and res then up[#up + 1] = n else failed[#failed + 1] = n end
+			end
+		end
+		if #up > 0 then
+			io.stderr:write("guestportal: guest WLANs back up (" .. table.concat(up, " ") .. ")\n")
+		end
+		-- Said once per set of failures, not on every retry.
+		local said = table.concat(failed, " ")
+		if #failed > 0 and said ~= M._guest_up_failed then
+			io.stderr:write("guestportal: could not put guest WLANs back on the air ("
+				.. said .. ") -- retrying at every answer\n")
+		end
+		M._guest_up_failed = said
+		st.guest_vaps_down = (#failed > 0) and failed or nil
+		M._state.save(st)
+		changed = true
+	end
+	local pass = mode == "pass"
+	if pass ~= M._guest_selfrun_on then
+		M._guest_selfrun_on = pass
+		io.stderr:write(pass
+			and ("guestportal: " .. M._inform_fails .. " informs unanswered, "
+				.. "selfrun_guest_mode=pass -- letting guests through\n")
+			or "guestportal: controller answered -- guest portal enforced again\n")
+		if M._guest_built then pcall(M._guestportal.set_selfrun, pass) end
+		changed = true
+	end
+	return changed
+end
+
+-- The guest's SSID for the portal's ssid=: the only one, or the VAP that
+-- has the station.
+M._station_on = function(ifname, mac)
+	local p = io.popen("iw dev " .. ifname .. " station get " .. mac .. " 2>/dev/null")
+	if not p then return false end
+	local out = p:read("*a") or ""
+	p:close()
+	return out:find("Station", 1, true) ~= nil
+end
+
+function M._guest_ssid_for(vaps, mac)
+	local first, single = nil, true
+	for _, v in ipairs(vaps or {}) do
+		if first == nil then first = v.ssid elseif v.ssid ~= first then single = false end
+	end
+	if single then return first end
+	for _, v in ipairs(vaps) do
+		if v.ifname:match("^[%w%-%._]+$") and M._station_on(v.ifname, mac) then return v.ssid end
+	end
+	return first
+end
+
+M._read_arp = function()
+	local f = io.open("/proc/net/arp", "r")
+	if not f then return "" end
+	local s = f:read("*a")
+	f:close()
+	return s or ""
+end
+
 -- Replace the block ledger with the controller's list (setparam blocked_sta)
 -- and rebuild the nft set, but only when the set of MACs changed: reconcile
 -- drops and recreates the table, so redoing it on every push would open a
@@ -5684,6 +6144,7 @@ function M._forget_controller(prev, cfg)
 		M._deny_reloaded()   -- forget ran `wifi reload`
 	end
 	if M._l2guard then pcall(M._l2guard.reconcile, nil, {}) end
+	if M._guestportal then pcall(M._guest_enforce, {}) end
 	if M._sysconf then pcall(M._sysconf.apply_cron, {enabled = false, jobs = {}}) end
 	-- Nor does it receive this AP's log any more: the forwarder stopped, the
 	-- board's own syslog server (if it had one) back in UCI.
@@ -5943,8 +6404,11 @@ function M._l2guard_apply_push(sys_raw, st)
 	local eb = M._l2guard.parse(sys_raw)
 	if not eb then return false end
 	for _, u in ipairs(eb.unknown or {}) do
-		io.stderr:write("l2guard: unrecognised ebtables rule shape, not applied: "
-			.. ("%q"):format(u) .. "\n")
+		-- The guest portal's rules are guestportal.lua's to read.
+		if not (M._guestportal and M._guestportal.is_guest_rule(u)) then
+			io.stderr:write("l2guard: unrecognised ebtables rule shape, not applied: "
+				.. ("%q"):format(u) .. "\n")
+		end
 	end
 	local spec = M._l2guard.spec_from(eb)
 	local names = M._l2guard_live_ifnames()
@@ -6843,9 +7307,10 @@ function M._sched_resync(st)
 	if #vaps == 0 and not st.sched_vaps_down then return false end
 	local t = os.date("*t", M._time())
 	local down = M._wlansched.down_set(vaps, t.wday - 1, t.hour * 60 + t.min)
-	-- keep: VAPs something else holds down (upstream: guest selfrun; nothing
-	-- here yet), which the schedule must not bring back up.
+	-- keep: VAPs something else holds down (guest selfrun, _guest_selfrun),
+	-- which the schedule must not bring back up.
 	local keep = {}
+	for _, n in ipairs(st.guest_vaps_down or {}) do keep[n] = true end
 	local held, changed = M._wlansched.reconcile(down, st.sched_vaps_down, keep)
 	if #changed.down > 0 then
 		io.stderr:write("wlansched: outside the WLAN schedule -- down: "
@@ -6907,8 +7372,9 @@ function M._stun_tick(st)
 		c = M._stun.new(M._socket())
 		M._stun_c = c
 	end
-	-- The firmware runs STUN only while managed.
-	local active = st.adopted == true
+	-- The firmware runs STUN only while managed: not unadopted, and not in
+	-- selfrun (GUEST_SELFRUN_FAILS informs unanswered).
+	local active = st.adopted == true and M._inform_fails < M.GUEST_SELFRUN_FAILS
 	local ok, err = M._stun.sync(c, st.stun_url, active)
 	if ok then
 		local _, err2 = M._stun.send_due(c, M._time())
@@ -6938,20 +7404,43 @@ end
 -- to look at the collector's file (_roam_poll): the controller pairs a
 -- departure with an arrival only within 10 s, and calls the roam failed
 -- when the departure arrived more than a second ahead.
+-- While the guest portal listens (M._guest_server), its socket is in the same
+-- select: guests are answered between heartbeats (guestportal.serve_one).
 function M._idle(socket, wait)
 	local deadline = socket.gettime() + wait
+	local server_ok = true
+	-- Roam reports: wake every ROAM_POLL_S to look at the collector.
 	local fast = M._roam_fast
 	while true do
 		local left = deadline - socket.gettime()
 		if left <= 0 then return end
 		local step = fast and math.min(left, M.ROAM_POLL_S) or left
+		local server = server_ok and M._guest_server or nil
 		local stun_sock = M._stun_c and M._stun_c.sock
-		if not stun_sock then
+		if not server and not stun_sock then
 			socket.select(nil, nil, step)
 			if not fast then return end
 		else
-			local r = socket.select({stun_sock}, nil, step)
-			if r and r[1] == stun_sock and M._stun_wake() then return end
+			local list = {}
+			if server then list[#list + 1] = server end
+			if stun_sock then list[#list + 1] = stun_sock end
+			local r = socket.select(list, nil, step)
+			local server_r, stun_r = false, false
+			for _, s in ipairs(r or {}) do
+				if s == stun_sock then stun_r = true
+				elseif s == server then server_r = true end
+			end
+			if stun_r and M._stun_wake() then return end
+			if server_r then
+				local ctx = M._guest_ctx or {}
+				local ok, served = pcall(M._guestportal.serve_one, server, {
+					url = ctx.url, ap = ctx.ap,
+					ssid_for = function(mac) return M._guest_ssid_for(ctx.vaps, mac) end,
+					arp = M._read_arp, now = M._time,
+				})
+				-- Readable but nothing to accept: do not spin on it.
+				if not (ok and served) then server_ok = false end
+			end
 		end
 		if fast then pcall(M._roam_poll) end
 	end
@@ -7651,6 +8140,8 @@ function M._tick(st, cfg, ufhw, ctx)
 	-- rides out on THIS inform rather than waiting for the next.
 	pcall(M._rrm_tick, cfg, st)
 	pcall(M._l2guard_resync, st)
+	pcall(M._guest_resync, st)
+	pcall(M._guest_wg_resync, st)
 	pcall(M._remotelog_resync, st, cfg)
 	-- Not pcall'd away silently: a rollback ends the process on purpose.
 	pcall(M._nrlist_tick, st, cfg)
@@ -7707,6 +8198,7 @@ function M._tick(st, cfg, ufhw, ctx)
 		io.stderr:write("inform: POST failed: " .. tostring(err) .. "\n")
 		if dump_tx then M._debug_append(cfg, "ERR", tostring(err)) end
 		M._warn_http_400(err, st, cfg)
+		if M._guestportal then pcall(M._guest_selfrun, st, false) end
 		pcall(M._write_status, st, {last_fail = M._time(), last_fail_msg = tostring(err)})
 		-- Doubles from the CURRENT cadence, capped at 60 s -- or at the
 		-- controller's own interval when that is longer, since a failure
@@ -7725,6 +8217,7 @@ function M._tick(st, cfg, ufhw, ctx)
 	ctx.backoff = ctx.interval
 	M._warned_400 = false
 	M._logged_pending = false
+	if M._guestportal then pcall(M._guest_selfrun, st, true) end
 
 	local parse_ok, json_body = pcall(M.parse_packet, body, st)
 	if not parse_ok then
@@ -7929,6 +8422,11 @@ function M.run(cfg, ufhw)
 	-- ports after, from state.json's record. A VLAN bridge netifd has not
 	-- built yet gets its port on a later heartbeat.
 	pcall(M._meshvlan_resync, st, cfg)
+	-- The guest portal's tables, likewise (lab-validated only upstream; the
+	-- test VM here).
+	if M._guestportal and type(st.guest_portal) == "table" then
+		pcall(M._guest_enforce, st)
+	end
 
 	local socket = require("socket")
 	local ctx = {

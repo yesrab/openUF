@@ -904,6 +904,41 @@ return {
 		end
 	},
 	{
+		name = "inform json: sta authorized follows the guest ledger on a portal WLAN only",
+		fn = function()
+			-- The controller unauthorizes any station on a portal WLAN that
+			-- reports authorized without a guest record, and treats an absent
+			-- `authorized` as true (PROTOCOL-VALIDATION.md, "Guest portal").
+			local by_mac = function(d)
+				local out = {}
+				for _, s in ipairs(d.vap_table[1].sta_table) do out[s.mac] = s.authorized end
+				return out
+			end
+			local ledger = {["aa:bb:cc:dd:ee:ff"] = 1700000000}
+			local a = by_mac(build({with_uci = true, with_clients = true, vap_id = "w1",
+				st = {guest_wlans = {w1 = true}, guest_authorized = ledger}}))
+			assert_eq(a["aa:bb:cc:dd:ee:ff"], true, "authorized guest reports true")
+			assert_eq(a["11:22:33:44:55:66"], false, "unknown guest reports false, not absent")
+			local b = by_mac(build({with_uci = true, with_clients = true, vap_id = "w1",
+				st = {guest_wlans = {other = true}, guest_authorized = {}}}))
+			assert_eq(b["11:22:33:44:55:66"], true, "a WLAN without the portal reports true")
+			local c = by_mac(build({with_uci = true, with_clients = true}))
+			assert_eq(c["11:22:33:44:55:66"], true, "no guest record at all reports true")
+		end
+	},
+	{
+		name = "inform json: guest_token is reported while the portal is on, only",
+		fn = function()
+			-- Without it the controller refuses every portal login on this AP
+			-- ("Missing Guest Token in AP[..] during guest authorization").
+			local tok = string.rep("ab", 16)
+			local on = build({st = {guest_portal = {enabled = true}, guest_token = tok}})
+			assert_eq(on.guest_token, tok, "portal on")
+			local off = build({st = {guest_token = tok}})
+			assert_eq(off.guest_token, nil, "portal off: not reported")
+		end
+	},
+	{
 		name = "inform json: vap_table nests connected clients as sta_table",
 		fn = function()
 			inform._sta_stats_cache = {}

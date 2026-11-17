@@ -2443,12 +2443,14 @@ The commits, in order:
 [antoniocosta/unifi-openwrt](https://github.com/antoniocosta/unifi-openwrt) (GPL-2.0-or-later, a
 Go daemon; read at `6d5a30d`) reaches the same goal from scratch. Its author compared the two
 projects and named five things of theirs openUF lacked. Four were re-implemented here in Lua —
-their code was read, none was copied — and the fifth (the guest portal) is upstream's to adopt
-(REVERSE-ENGINEERING.md backlog row 24). **Their evidence is theirs**: one TP-Link OnHub
+their code was read, none was copied — and the fifth (the guest portal) was adopted from
+upstream the same day (the next section), since upstream's is the same code base in the same
+language. **Their evidence is theirs**: one TP-Link OnHub
 (TGR1900) on OpenWrt 25.12, adopted as a UAP-AC-Pro into UniFi Network 10.6 on a UniFi Express
 7, with decompilation of Network 10.6.109. This tree's own evidence is the OpenWrt 25.12.6 test
 VM (two hwsim radios, real hostapd, dropbear, logd, lua-openssl): **nothing below has run on
-AP1/AP2 or against a controller push.** The suite went from 1266 to 1337 tests.
+AP1/AP2 or against a controller push.** The suite went from 1266 to 1337 tests (1381 with the
+guest portal).
 
 | What | Theirs | Here | Own evidence (test VM, 2026-11-17) |
 |---|---|---|---|
@@ -2467,6 +2469,408 @@ arrive with the six keys `remotelog.parse` reads, and nothing it needs under ano
 does its log show the AP's lines); `device_login` on AP2 with a throwaway device password;
 `apply_rollback` on AP2 with a deliberately bad channel pushed from the controller; a client's
 Neighbor Report on a WLAN with 802.11k on and steering off.
+
+## Adopted from upstream (jonasevcik/openUF), 2026-11-17: the guest portal
+
+The guest portal (Hotspot) and its walled garden, left out of reviews 4 and 5
+(REVERSE-ENGINEERING.md backlog row 24: no guest WLAN on this site, about 2100 lines, and a
+controller-driven nft redirect), were adopted on 2026-11-17 at the user's request. Upstream has
+not moved since `db5e92b`, so the next review still starts there; this only removes the
+exception.
+
+How: upstream's first two commits (`61808d2`, `6db1885`) by three-way apply with the displaced
+blocks hand-placed; then, because the later commits rewrite what the earlier ones add,
+`guestportal.lua`, `wlansched.lua` and their tests taken at upstream's head, the guest section
+of `inform.lua` (`_guest_*`, selfrun, the walled garden's resolver) transplanted from upstream's
+head, the idle loop replaced by upstream's (this tree's STUN and roam-poll loop plus the portal's
+socket), and every remaining guest line placed by hand (`selfrun_guest_mode` in `mgmt_cfg`, the
+kick on `unauthorize-guest`, the schedule's `keep` set, STUN off in selfrun, the walled-garden
+cron pattern in `sysconf.lua`, five `state.lua` fields). Checked by listing every guest-related
+code line of upstream's head that this tree lacks: none. Their guest tests were ported by name
+(suite 1337 → 1381). Two of this tree's own ledger tests changed with it: `selfrun_guest_mode`
+and `redirector.url` are read now, so they no longer appear as unhandled.
+
+**Evidence: upstream's only** — their Docker lab against Network 10.4.57 and 10.6.106, "never
+run with a real guest WLAN there either", plus an Archer C5 for the DNS timings. This tree adds
+the suite and the OpenWrt 25.12.6 test VM (2026-11-17): the captured push below, with the lab's
+VAP names mapped to the VM's AP interface, built both nft tables on a real kernel
+(`bridge openuf_guest` and `ip openuf_guest`, 29 rules); the redirector answered a real HTTP
+client with `302` and the `Location` the controller's handler expects (`id=`, `ap=`, `t=`, `url=`,
+`ssid=`), and with `503` + `Retry-After` for a client whose MAC it could not find; teardown
+removed both tables. **No guest's traffic has crossed it**, and nothing has run on AP1/AP2 or
+against this site's controller.
+
+The two sections below are upstream's wire write-ups, as they stood before their docs were
+split into `docs/WIRE-REFERENCE.md`; the code's comments refer to them by these titles.
+
+#### Guest portal (Hotspot): what the controller pushes and expects
+
+Captured in the 10.4.57 lab on 2026-10-09 (C0 discovery). Setup: `guest_access.portal_enabled`
+on with `auth: none`, then `PUT rest/wlanconf/<id> {"is_guest":true}` on the lab WLAN. The
+`system_cfg` diff across that toggle (310 → 390 lines) is the whole of what the device is
+told. `<ctl>` is the controller's IP, and `ath0`/`ath1` are the guest WLAN's two VAPs.
+
+| Key | Off → on | Meaning |
+|---|---|---|
+| `wireless.<n>.is_guest`, `aaa.<n>.is_guest` | `false` → `true` | the VAP is a guest VAP |
+| `wireless.<n>.usage` | `user` → `guest` | same, the field the stats side keys on |
+| `wireless.<n>.l2_isolation` | `disabled` → `enabled` | forced client isolation (already mapped to `isolate`) |
+| `redirector.status`, `redirector.https.status` | `disabled` → `enabled` | the AP runs the redirect target |
+| `redirector.url`, `redirector.url_https` | (new) `http://<ctl>:8880/guest/s/default/` | where an unauthorized guest is sent |
+| `redirector.redirect_pattern` | (new) `http://<ctl>:8882` | |
+| `dnsmasq.status`, `dnsmasq.1.devname=br0`, `dnsmasq.1.status` | `disabled` → `enabled` | a local DNS answerer for unauthorized guests |
+| `iptables.status` + `iptables.1..3.cmd` | `disabled` → 3 rules | `-t nat -A PREROUTING -p tcp -m mark --mark 0x40000000/0xc0000000 -j REDIRECT --to-ports 80` (0x80000000 → 443; udp 53 → 53) |
+| `ebtables.5..51.cmd` | (new) 47 rules | the enforcement itself, below |
+| `ebtables.52..53.cmd` | (new) | `-t broute -A BROUTING -i ath<n> -p 802_1Q -j DROP` |
+| `qos.status` + `qos.ebt.*`, `qos.if.*`, `qos.vap.*`, `qos.mode=1` | `disabled` → enabled | per-VAP marks (`0x1000`, `0x2000`) and interface speeds: the shaping frame `rate-update` plugs into |
+
+The ebtables ruleset, condensed. These are all `-t nat` rules; `ath<n>` stands for each guest VAP:
+- `-N GUESTIN -P DROP`, `-N GUESTOUT -P ACCEPT`; `PREROUTING --in-interface ath<n> -j GUESTIN`,
+  `POSTROUTING --out-interface ath<n> -j GUESTOUT`.
+- GUESTIN accepts EAPOL (`--proto 0x888e`), DHCP requests (broadcast, udp 68→67) and ARP.
+  It also accepts tcp 8880/8843 to `<ctl>` (the portal) and tcp 8881 to `<ctl>`. Its first
+  rule (`-I`) sends tcp 8882 to `<ctl>` to `REDIRECT_HTTP`.
+- DNS (udp/tcp 53) goes to `GUEST_DNS` (`-P DROP`). That chain jumps to `AUTHORIZED_GUESTS`,
+  then to `REDIRECT_DNS` (mark `0x40000000`, `-j redirect`).
+- GUESTIN drops IPv6 (`0x86dd`), other broadcast, multicast `224.0.0.0/4`, and the three
+  `restricted_subnet_*` from `guest_access` (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`).
+- tcp 443 goes to `CAPTIVE_PORTAL` (`-P RETURN`, empty).
+- `-N AUTHORIZED_GUESTS -P RETURN` is **pushed empty**. `GUESTIN -p 0x800 --pkttype-type
+  otherhost -j AUTHORIZED_GUESTS` comes before `tcp 80 -j REDIRECT_HTTP` / `tcp 443 -j
+  REDIRECT_HTTPS` (marks `0x40000000`/`0x80000000`, `-j redirect`). The device fills the
+  chain itself from `authorize-guest`. Whatever leaves GUESTIN unmatched hits its DROP policy.
+- GUESTOUT accepts DHCP replies and ARP, and drops IPv6, other broadcast and multicast.
+
+So the controller ships its whole enforcement as ebtables + iptables. The device's own
+parts are the `AUTHORIZED_GUESTS` membership and a local HTTP/DNS answerer for the
+redirect marks. Until C2, openUF applied none of it. `l2guard` accepted only the BGA rule
+shapes and logged `l2guard: unrecognised ebtables rule shape, not applied` 47 times per push.
+
+**Station `authorized` is the portal state, and the controller reconciles it every inform.**
+`devmgr/dhdeXcHqLRBKMUZk` runs for each `vap_table[].sta_table[]` entry. When the VAP is a
+guest VAP and `guest_access.portal_enabled` is on:
+- no active guest record, and the station reports `authorized` true → `unauthorize-guest` +
+  `guest_kicks++` (`devmgr/l/MiVjHefaf:1448`);
+- an active guest record, and the station reports `authorized` not true → `authorize-guest`;
+- a guest record over its usage quota → `unauthorize-guest` and the record is ended;
+- otherwise nothing.
+
+`is("authorized", true)` defaults a **missing** key to true. openUF sends no `authorized`,
+so every guest-VAP station counts as authorized. Lab: with three mock stations on the guest
+WLAN, `unauthorize-guest` was queued for each of them on **every inform**, and `guest_kicks`
+reached 77 in about 10 minutes. On a guest WLAN, openUF's station entries must report
+`authorized` as the portal state.
+
+**openUF's answer (C1, lab-validated only, 2026-10-09).** Every `system_cfg` push records the
+portal WLANs: the `aaa.<n>.id` of each `wireless.<n>.is_guest=true` WLAN, while
+`redirector.status=enabled` (it reads `disabled` when the portal is off). This goes to
+`st.guest_wlans`. `authorize-guest` / `unauthorize-guest` add the MAC to / remove it from
+`st.guest_authorized`. Each `sta_table[]` entry now carries `authorized`: the ledger's answer
+on a portal WLAN and `true` elsewhere. Lab, same three mock stations:
+- After a force-provision, `guest_kicks` stayed at 1205 over 60 s; before, it rose on every
+  inform. `stat/sta` shows the three stations as `authorized: false`.
+- A REST `authorize-guest` for `…:01` brought **the first `authorize-guest` cmd ever seen**
+  on the next inform. The ledger took the MAC, `stat/sta` showed it `authorized: true`, and
+  no `rate-update` came (no `up`/`down` on the record).
+- A REST `unauthorize-guest` brought one `unauthorize-guest` (`guest_kicks` 1205 → 1206) and
+  nothing after it.
+- After an inform restart, an authorized guest stayed `true` and no command was resent.
+
+**The redirect the portal expects** (CFR, 10.4.57, `devmgr/IXbVCbWPDmZdkfbJ`). The initial
+redirect handler reads the guest from the query string:
+- `id`: the guest's MAC;
+- `ap`: the AP's MAC;
+- `url`: where the guest was going;
+- `ssid`;
+- `t`: the AP's epoch seconds. A `t` more than 60 s from the controller's clock is refused.
+
+It stores them in its encrypted `ec` cookie for the login. An `ec` query parameter replaces all of these with an
+encrypted cookie made by the AP (keyed by the AP's `guest_token`), but only on devices
+with `supportRedirectorInitialEC`, which `redirector.initialec=enabled` would announce.
+openUF does not get that key and uses the plain form.
+
+**`guest_token` is required anyway.** Every login path (`"guest authorization"`), and the
+`ec` paths, first checks that the AP's device record has a non-empty `guest_token`. If it
+doesn't, the controller logs `Missing Guest Token in AP[<mac>] in Site[…] during guest
+authorization` and refuses. The portal still answers the browser `{"authorized":true}`, but
+no guest record is written and no `authorize-guest` follows. Lab: exactly that, until openUF
+reported one. The record's `guest_token` is copied from the device's stats inform
+(`devmgr/PGOcbDWlbnYQdFW:1040`, `copyAttrsIfPresent(…, "guest_kicks", "guest_token")`), so
+the device names it. Its format is unverified, because macOS case-folding hides the
+decrypting class in this decompile. openUF sends 32 random hex characters, persisted, while
+the portal is on. The controller keeps the last value after the portal goes off, which is harmless.
+
+**openUF's enforcement (C2, lab-validated only, 2026-10-10).** `guestportal.lua` reads the
+facts from the guest rules:
+- the `(ip, port)` ACCEPTs (8880, 8843 and 8881 to `<ctl>`);
+- the `-I … -j REDIRECT_HTTP` intercept (8882 to `<ctl>`);
+- the `--ip-dst … -j DROP` subnets;
+- `redirector.url`.
+
+Every known guest rule shape is classified. Any other guest-chain rule is logged as
+unrecognised, and l2guard no longer reports them. From these facts it builds its own nft
+chains in the controller's order. The marked HTTP gets `ether daddr` set to the bridge MAC
+plus `pkttype host` (ebtables `redirect`), and is NAT-redirected to port 8820. The inform
+loop answers there with the `302` above. Lab, 2026-10-10, with a fake guest in its own
+network namespace behind a test bridge (MAC `de:ad:be:ef:00:03`, which is also a mock station on
+the guest WLAN), and a fake gateway serving `203.0.113.10`:
+- Unauthorized: `GET http://203.0.113.10/` → `302` to
+  `…/guest/s/default/?id=de%3Aad%3Abe%3Aef%3A00%3A03&ap=…&t=…&url=http%3A%2F%2F203.0.113.10%2F&ssid=probe-wlan`;
+  HTTPS timed out.
+- The controller accepted that link (`200`), and `POST /guest/s/default/login` answered
+  `{"authorized":true,"redirect_url":"http://203.0.113.10/"}`. Before openUF reported a
+  `guest_token`, that same answer came back but the login was refused, as above.
+- The next inform brought `authorize-guest` for `…:03`. The MAC was in the nft set within the
+  heartbeat, and the same `GET` returned the gateway's page (`200`). A `GET` to the AP's own
+  address was still redirected, and `10.9.9.9` stayed unreachable.
+- REST `unauthorize-guest` → the `unauthorize-guest` cmd → the MAC left the set, and the guest
+  was redirected again.
+- `is_guest:false` on the WLAN → `redirector.status=disabled` → both tables were deleted, the
+  listener closed and the guest was free. `is_guest:true` rebuilt everything.
+
+Throughout: `handle_response failed` = 0, and no unrecognised rule lines.
+
+Deliberate gaps: unauthorized DNS is passed rather than answered locally, marked HTTPS is
+dropped rather than answered, and the `redirect` needs an IPv4 address on the guest
+VAP's bridge.
+
+| Wire (all `{"_type":"cmd", …, "mac":"…"}`) | Sent when |
+|---|---|
+| `{"cmd":"authorize-guest","mac":…}` | only from the inform reconcile above (openUF: into `st.guest_authorized`). A REST `cmd/stamgr authorize-guest` just writes the guest record (`authorized_by: "api"`, `end`) and sends **nothing** while the station already reports authorized (lab: none queued) |
+| `{"cmd":"unauthorize-guest","mac":…}` | REST `cmd/stamgr unauthorize-guest` (ends the record, then the reconcile repeats it while the station still reports authorized: 3 in 30 s in the lab), plus the reconcile and quota paths above. openUF: out of `st.guest_authorized`, then a deauth on every BSS (see below) |
+| `{"cmd":"rate-update","mac":…,"ul_max":2048,"ul_min":64,"dl_max":4096,"dl_min":64}` | once per association (`qos_policy_applied` latch, reset on roam and reconnect), when the guest record has `qos_overwrite` (REST `authorize-guest` with `up`/`down` in kbps). The maxima come from the record's `qos_rate_max_up`/`_down`, defaulting to `-1` (no limit). Without an override, the client's own WiFi Speed Limit profile is sent instead, if it is not the site default (same sender). openUF applies it per client, see "`qos.*` — WiFi Speed Limit" |
+
+**`unauthorize-guest` disconnects the guest (lab-validated only, 2026-10-10).** UniFi
+firmware drops the MAC from `/var/run/guest.authorized` and the authorized ipset, then
+runs `kick_sta`: `iwpriv <ath> kickmac <mac>` on every VAP whose `/var/run/vapusage.<ath>`
+is `user` or `guest` (`syswrapper.sh` `unauthorize-guest`, `platdep_funcs.sh` `kick_sta`;
+firmware-confirmed for 3.9.27 to 4.0.15). It kicks unconditionally, with or without the
+portal. Without the kick, the guest stays associated and unauthorized, and its OS never
+re-runs captive-portal detection, so it never sees the portal again. openUF now does the
+same after updating the `authorized` set: `hostapd_cli deauthenticate` on every BSS, the
+path `kick-sta` uses. One difference: at most one kick per MAC per 60 s. The firmware
+reports `authorized` from the very list it just changed, so it gets one
+`unauthorize-guest`. openUF reports it only on the WLANs `st.guest_wlans` names. If that
+ever disagreed with the controller, the command would come on every inform, and the hold
+keeps it from becoming a deauth storm.
+
+Lab, 10.4.57, with a logging wrapper around `hostapd_cli`:
+- A REST `authorize-guest` for mock station `de:ad:be:ef:00:01` put it in the ledger and
+  `stat/sta` showed it `authorized: true`. Nothing was deauthenticated.
+- A REST `unauthorize-guest` brought the cmd on the next heartbeat (19 s later). While handling it,
+  openUF emptied the ledger and ran `hostapd_cli -i wlan0 deauthenticate de:ad:be:ef:00:01`, then
+  the same on `wlan1`.
+  `guest_kicks` went to 1 and stayed there. Over the next 60 s no other cmd came and nothing
+  else was deauthenticated. `handle_response failed` = 0.
+
+Hardware: deployed to both APs, which keep informing. The home site has no guest portal
+(`guest_wlans` empty), so the controller never sends `unauthorize-guest` there. The
+over-the-air kick is the deauth path `kick-sta` and `block-sta` already use.
+
+**`rate-update`, openUF's answer (C3, lab-validated only, 2026-10-10).** A REST
+`authorize-guest` with `"up":2048,"down":4096` for a mock station brought, on the next
+inform, `authorize-guest` and then
+`{"cmd":"rate-update","mac":"de:ad:be:ef:00:02","ul_max":2048,"ul_min":64,"dl_max":4096,"dl_min":64}`,
+in that order. The values are the REST `up`/`down` unchanged, so they are kbps.
+openUF keeps `ul_max`/`dl_max` in `st.guest_rates` for an authorized MAC only (dropped
+on `unauthorize-guest`; `-1` = no limit that way). It polices them in `bridge
+openuf_guest`: `rate_up` (`ether saddr <mac> limit rate over <kbps×125> bytes/second … drop`)
+is jumped before `guestin`, and `rate_down` (`ether daddr`) before `guestout`. They are
+not queued, because the VAP's tc root qdisc belongs to the per-WLAN speed limit (`shaper.lua`).
+Lab:
+- Full loop with `up:1024, down:3072`: the ledger got the limits and both chains got the rules.
+  They were rebuilt from `state.json` after an inform restart, and removed by the next
+  `unauthorize-guest`.
+- Data path, with the fake guest above limited to 2048 / 4096 kbps, using iperf3 through the
+  bridge to the fake gateway:
+
+  | Test | Limit | Result |
+  |---|---|---|
+  | TCP upload, 20 s | 2048 kbps | 2097 kbps |
+  | TCP download, 20 s | 4096 kbps | 4246 kbps |
+  | UDP flood, 10 Mbit/s offered | 2048 kbps | 2448 kbps passed (75 % dropped) |
+  | Rules flushed (baseline) | none | ~33 Gbit/s |
+
+`ul_min`/`dl_min` (64 kbps guaranteed) are not applied, since policing cannot guarantee a minimum.
+
+`mgmt_cfg` carries `selfrun_guest_mode=pass` in **every** push, guest WLAN or not. Its
+source is the site property `config.selfrun_guest_mode`, and any value other than `pass`
+goes out as `off` (`config/GWoWvNEX`). It is not in the 10.4.57 UI. The site properties
+are the per-site file `data/sites/<site name>/config.properties` (`config/bLwwMKkr` →
+the file service by site name), **not** `system.properties`. Lab, 10.4.57: a line in
+`system.properties` (restart included) left the wire at `pass`. Writing
+`config.selfrun_guest_mode=off` to `data/sites/default/config.properties` made the next
+push carry `selfrun_guest_mode=off`, with no restart needed.
+
+**What the AP does with it (UniFi firmware, BZ2 3.9.27 and 4.0.15).** Current firmware is
+encrypted. These builds are not, and their selfrun code is identical:
+- `/bin/mcad` enters SELFRUN (state 3, writes `/var/run/system.selfrun`, calls
+  `syswrapper.sh set_selfrun`) once its consecutive-failure count reaches 3 (`fail_count`
+  at object offset 0x264, `sltiu …, 3`). The first successful inform calls `unset_selfrun`.
+- `/usr/etc/syswrapper.sh` only acts while the portal is on (`redirector.status=enabled`).
+  `selfrun_guest()` reads the key from `/etc/persistent/cfg/mgmt`: only `off` is off, so any
+  other value, or none, means `pass`.
+- `pass`: `ebtables -t nat -F AUTHORIZED_GUESTS; ebtables -t nat -A AUTHORIZED_GUESTS -j
+  ACCEPT` ("bypass the guest authorization"). On return, `rm -f /var/run/guest.authorized`
+  plus `authorized_guests_updated`: every authorization is forgotten, and the controller
+  re-authorizes.
+- `off`: `ifconfig $ath down` for every guest VAP (`/var/run/guest_devnames`). The VAP
+  scheduler keeps them down while selfrun lasts. On return, `ifconfig $ath up`.
+
+**openUF's answer (C4; lab-validated, and `off` hardware-tested).** It keeps the value as `st.guest_selfrun`,
+where only `off` is off. Selfrun starts after 3 failed informs in a row
+(`GUEST_SELFRUN_FAILS`) and ends with the first answer. With `pass`, the `selfrun` chain
+(jumped from `guestin` right after the authorized accept) gets `meta pkttype other accept`,
+the same position as the firmware's AUTHORIZED_GUESTS accept. With `off`, the guest VAPs
+are taken down with `ip link set` and their names are kept in `st.guest_vaps_down`, so they
+come back up even across a daemon restart. On return openUF keeps its authorized list
+instead of clearing it, because the controller re-authorizes the same guests either way.
+Lab, with the controller cut off from the AP by an nft `reject` on :8080:
+- `pass`: three `POST failed`, then "3 informs unanswered, selfrun_guest_mode=pass …
+  letting guests through", and the chain held the accept. Once the cut was lifted: "guest
+  portal enforced again", and the chain was empty. The guest VAPs stayed up.
+- `off` (the guest VAPs `wlan0`/`wlan1` as dummy interfaces, since the lab has no radios):
+  after the third failure, "guest WLANs down (wlan0 wlan1)". Both went DOWN, the chain stayed
+  empty, and `guest_vaps_down` was saved. The daemon was then restarted mid-outage: two more
+  failures, and both stayed DOWN. With the cut lifted, "guest WLANs back up" appeared, both
+  were UP again, and the ledger was gone.
+- Data path, from the earlier 120 s run of this feature (the fake guest from C2, not
+  authorized): closed → HTTP redirected to the portal and :5201 blocked. Open →
+  `INTERNET-OK` and :5201 open, while a restricted subnet (10.9.9.9) still timed out.
+- `handle_response failed` = 0.
+- That run predates the beacon restart below. The lab has no hostapd, so the same run now
+  leaves both dummies DOWN after the answer, with the ledger kept and retried.
+
+**Hardware, 2026-10-11 (both APs, OpenWrt 25.12).** The guess above was wrong: on a real
+radio, `ip link set <bss> up` alone leaves the BSS off the air, as found for the WiFi
+Blackout Schedule (see that section). hostapd does not act on the link going down, so on
+the way up it only updates a beacon mac80211 has already stopped. Reproduced on the living
+room AP's ath10k: after `ip link set phy0-ap1 down; ip link set phy0-ap1 up`, `iw dev
+phy0-ap1 info` showed no SSID and no channel. openUF now brings a guest WLAN back through
+`wlansched.set_bss`: link up, then `hostapd_cli -i <bss> raw STOP_AP` and `update_beacon`.
+A BSS whose beacon does not restart goes down again and stays in `st.guest_vaps_down`, so
+the next answer retries it. On-device run of `_guest_selfrun` (`OPENUF_TEST_MODE`, the
+state save stubbed) against a temporary WPA2 WLAN on both radios of both APs (ath10k ch
+36, ath9k ch 1, mt76 ch 11 and ch 100 DFS): three missed informs → both BSSes DOWN with no
+SSID; one answer → "guest WLANs back up", ledger cleared, and `iw dev <bss> info` showed the
+SSID and its channel on all four. The temporary WLAN was deleted afterwards.
+
+#### The walled garden: two forms, split by what the entry looks like
+
+Settled from the controller (10.6.106 `internal-dependencies.jar`, CFR), the AP firmware
+(U7LR 6.8.2) and a lab capture, 2026-10-26. The site's guest settings hold one flat list
+per direction — `guest_access.allowed_subnet_<n>` and `restricted_subnet_<n>`, read until
+the first blank index — and `com/ubnt/service/config/hyFnQ` runs each entry through three
+different producers:
+
+| Producer | Keeps | Used by |
+|---|---|---|
+| `Cuhf.V4` | IPv4 addresses and CIDRs (a `/32` as a bare address, a `/0` split into `0.0.0.0/1` + `128.0.0.0/1`) | the ebtables rules |
+| `Cuhf.V6` | IPv6, same shapes | the ip6tables side openUF does not implement |
+| `OWIoHe.UGwcHSHUGpYtqo` | whatever Guava's `InternetDomainName.isValid` accepts | the `dnsmasq.walled_garden` keys |
+
+Guava's check rejects an all-digit rightmost label, so the two sets never overlap: **an
+entry is either an address or a name, and which list it is in does not decide how it
+travels.**
+
+**The IP half.** `ubntconf/YcZSaTCMOYFEMGE` emits, per allowed address:
+
+    -t nat -I GUESTIN  -p 0x800 --ip-dst <net> -j ACCEPT
+    -t nat -I GUESTOUT -p 0x800 --ip-src <net> -j ACCEPT
+
+and per restricted address `-t nat -A GUESTIN -p 0x800 --ip-dst <net> -j DROP`. **These
+carry no port**, unlike the portal's own accepts (`--ip-proto 6 --ip-dport 8880 --ip-dst
+<ctl>`), which is why openUF's C1 parser rejected both lines as unknown shapes and left an
+IP walled-garden entry silently unenforced until 2026-10-26. The egress rule matches on
+`--ip-src`, so the reply direction needed its own list (`spec.accept_out`).
+
+**The domain half.** Three empty chains and the jumps into them, gated on the site having
+any garden domain at all (`devmgr/kDxteQiUX`):
+
+    -t nat -N ALLOWED_DOMAIN_IN  -P RETURN   /  -t nat -I GUESTIN  -p 0x800 -j ALLOWED_DOMAIN_IN
+    -t nat -N ALLOWED_DOMAIN_OUT -P RETURN   /  -t nat -I GUESTOUT -p 0x800 -j ALLOWED_DOMAIN_OUT
+    -t nat -N RESTRICTED_DOMAIN_IN -P RETURN /  -t nat -A GUESTIN  -p 0x800 -j RESTRICTED_DOMAIN_IN
+
+plus the names themselves, and the job that keeps them fresh. Verbatim from the lab
+(10.6.106, 2026-10-26; site settings `allowed_subnet_1=www.example.net`,
+`allowed_subnet_2=198.51.100.7/32`, `allowed_subnet_3=example.com`,
+`restricted_subnet_1..3` the RFC1918 defaults, `restricted_subnet_4=ads.example.org`):
+
+    cron.status=enabled
+    cron.1.status=enabled
+    cron.1.user=root
+    cron.1.job.1.status=enabled
+    cron.1.job.1.schedule=*/10 * * * *
+    cron.1.job.1.cmd=syswrapper.sh refresh-walled-garden 1
+    dnsmasq.walled_garden.1.status=enabled
+    dnsmasq.walled_garden.1.site.1.allowed=www.example.net
+    dnsmasq.walled_garden.1.site.2.allowed=example.com
+    dnsmasq.walled_garden.1.site.1.restricted=ads.example.org
+
+Key shapes worth writing down:
+
+- The garden index is always `1`; the firmware's `if_seq` argument is that index
+  (`syswrapper.sh refresh-walled-garden 1` → `/tmp/allowed.1.txt`,
+  `/tmp/restricted.1.txt`).
+- `allowed` and `restricted` are indexed **independently, both from 1**. `site.1.allowed`
+  and `site.1.restricted` are two different sites.
+- The order is a Java `Set`'s iteration order, not the operator's: the capture above put
+  `www.example.net` (configured third) before `example.com`. The index is all there is.
+- The whole block is emitted only when the **allowed** domain set is non-empty
+  (`if (set.size() > 0)`), so a garden of restricted domains alone never reaches the
+  device, although the `RESTRICTED_DOMAIN_IN` chain is still pushed.
+- The allowed set is wider than the operator's list: it also carries the hosts each
+  enabled payment or social-login provider needs, and `images.unsplash.com` when the
+  portal's background gallery is on.
+
+**Which form openUF gets is a capability gate.** `ubntconf/jNUeeSBEuWe` emits an
+`ipset.status=enabled` block with hash sets instead, and the caller is explicit:
+
+    boolean bl8 = this.Gdhc.NvfcKfHPI(settings) && !hyFnQ2.supportIPSet();   // the cron job
+    ...
+    if (!hyFnQ2.supportIPSet()) { this.kCNoUwYXLXMAUl(stringBuilder, settings); }  // the dnsmasq block
+
+`supportIPSet()` is `hasFirmwareCapability(0x40000)`; openUF sends `fw_caps 0x1110`, so it
+is unclaimed and the `dnsmasq.walled_garden` form is what arrives. No capture of the ipset
+form is needed for that claim, and claiming the bit would swap a working encoding for one
+openUF does not implement.
+
+**What the firmware does with it (U7LR 6.8.2, `/bin/walled_action.sh`, plaintext).**
+`ubntbox` writes the names to `/tmp/allowed.1.txt` / `/tmp/restricted.1.txt` (the strings
+`dnsmasq.walled_garden.%d.status`, `dnsmasq.walled_garden.%d.site.`, `/tmp/allowed.%d.txt`
+are all in that binary). The script then flushes the three chains, runs `nslookup` over
+each name **twice** ("so we don't miss any ip" — round-robin records), dedupes the IPv4
+answers, and appends `--ip-dst … -j ACCEPT` / `--ip-src … -j ACCEPT` /
+`--ip-dst … -j DROP`. A failed lookup is logged to `/tmp/walled_action.log` and skipped,
+which leaves that site out of the garden entirely. It runs on `ipready` (IP acquisition)
+and from the pushed cron job.
+
+**openUF (2026-10-26).** `guestportal.parse` reads both halves; `M._resolve` is the
+resolver seam (`nslookup`, addresses taken only after the first `Name:` line, since the
+header gives the resolver's own address in the same shape); `resolve_garden` asks each name
+twice like the firmware and **keeps the last good answer** for a name that stops resolving,
+in `state.json`'s `guest_wg_ips`. `inform._guest_wg_resync` re-resolves on the pushed
+cadence (600 s) and rebuilds only when the address set actually moved, and
+`sysconf.CRON_IN_DAEMON_PATTERNS` therefore installs no crontab line for the job.
+
+Verification:
+- **Tier 1:** 8 new tests; the kept-answer branch, the port-less accept, the all-digit
+  label rule, the `Name:` cut and the two resolver passes were each mutation-tested red.
+- **Tier 2:** the capture above replayed through `parse` with 0 unknown shapes, then the
+  generated statements run against the lab's **real nft 1.0.9** on a dummy netdev — every
+  statement accepted, 37 rules, identical on a second run (idempotent). Then end to end:
+  the lab AP on the new code, a force-provision, `handle_response failed` = 0, no
+  unrecognised-rule lines (there were five per push before), the two resolvable names in
+  `guestin` as four `ip daddr … accept` rules above every drop, `ads.example.org` (NXDOMAIN)
+  logged as not enforced, and `dnsmasq.walled_garden.*` gone from the dropped-key report
+  (`dnsmasq.status` and `dnsmasq.<n>.*` stay: those ask for a local resolver openUF does
+  not run).
+- **Tier 3:** deployed to both APs and confirmed **inert** — the home site runs no guest
+  portal, so no `openuf_guest` tables exist, which is the same tier the rest of the guest
+  portal has. The resolver seam itself was run on both boards against their real resolver:
+  `example.com` → two addresses, `www.iana.org` → two, `nxdomain.invalid` → none, identical
+  on ath79 and filogic. No Passpoint-style claim is made for a real guest: no guest client
+  has ever reached a garden site through openUF.
 
 ## Feature matrix
 
