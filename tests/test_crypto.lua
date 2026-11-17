@@ -1,6 +1,7 @@
 -- Tests for openuf/crypto.lua (AES-128-CBC/GCM wrappers).
 -- Run from project root: lua tests/run_tests.lua
--- Requires: lua-openssl or luacrypto (there is no openssl CLI fallback)
+-- Runs with lua-openssl, luacrypto, or neither (aeslua.lua then; GCM tests skip).
+-- There is no openssl CLI fallback.
 
 local crypto = dofile("openuf/crypto.lua")
 
@@ -364,24 +365,32 @@ return {
 		end
 	},
 	{
-		name = "crypto: with no AES binding CBC refuses instead of running the openssl CLI",
+		-- PR #6 removed the openssl(1) fallback (the key on a command line,
+		-- the plaintext in /tmp). What a machine with no binding gets instead
+		-- is the same cipher in plain Lua: nothing leaves the process.
+		name = "crypto: with no AES binding CBC runs in plain Lua, never through a shell",
 		fn = function()
 			local saved = {po = package.preload.openssl, pc = package.preload.crypto,
 				lo = package.loaded.openssl, lcr = package.loaded.crypto}
 			package.loaded.openssl, package.loaded.crypto = nil, nil
 			package.preload.openssl = function() error("lua-openssl absent") end
 			package.preload.crypto = function() error("luacrypto absent") end
-			local o_exec, cmds = os.execute, {}
+			local o_exec, o_popen, cmds = os.execute, io.popen, {}
 			os.execute = function(c) cmds[#cmds + 1] = c; return 1 end
+			io.popen = function(c) cmds[#cmds + 1] = c; return nil end
 			local ok, err = pcall(function()
 				local c = dofile("openuf/crypto.lua")
-				local ok_e, e = pcall(c.aes_cbc_encrypt, NIST_KEY, FIXED_IV, "hello")
-				local ok_d = pcall(c.aes_cbc_decrypt, NIST_KEY, FIXED_IV, string.rep("\0", 16))
-				assert_false(ok_e, "encrypt refused")
-				assert_true(tostring(e):find("no AES binding", 1, true) ~= nil, "and says why")
-				assert_false(ok_d, "decrypt refused")
+				-- NIST SP 800-38A F.2.1, first block: the padding block follows it.
+				local key = "2b7e151628aed2a6abf7158809cf4f3c"
+				local iv  = c.hex_to_bin("000102030405060708090a0b0c0d0e0f")
+				local pt  = c.hex_to_bin("6bc1bee22e409f96e93d7e117393172a")
+				local ct  = c.aes_cbc_encrypt(key, iv, pt)
+				assert_eq(#ct, 32, "one block and its PKCS#7 padding block")
+				assert_eq(c.bin_to_hex(ct:sub(1, 16)), "7649abac8119b246cee98e9b12e9197d", "the standard's ciphertext")
+				assert_eq(c.aes_cbc_decrypt(key, iv, ct), pt, "and it decrypts, padding stripped")
+				assert_false(c.gcm_available(), "GCM is still lua-openssl's alone")
 			end)
-			os.execute = o_exec
+			os.execute, io.popen = o_exec, o_popen
 			package.preload.openssl, package.preload.crypto = saved.po, saved.pc
 			package.loaded.openssl, package.loaded.crypto = saved.lo, saved.lcr
 			if not ok then error(err, 0) end

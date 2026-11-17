@@ -12,9 +12,11 @@ local function fresh(files, status)
 	local rec = {files = files or {}, cmds = {}, status = status}
 	guard.DIR, guard.CONFIG_DIR = "/rb", "/cfg"
 	guard._read_file  = function(p) return rec.files[p] end
-	guard._write_file = function(p, c)
+	rec.private = {}
+	guard._write_file = function(p, c, private)
 		if rec.readonly and rec.readonly[p] then return false end
 		rec.files[p] = c
+		rec.private[p] = private and true or false
 		return true
 	end
 	guard._remove = function(p) rec.files[p] = nil end
@@ -162,11 +164,26 @@ return {
 			assert_true(guard.have_snapshot(), "complete")
 			rec.files["/cfg/wireless"], rec.files["/cfg/network"] = "W-new", "N-new"
 			rec.files["/st.json"] = '{"cfgversion":"new"}'
-			assert_true(guard.restore("/st.json", function(old) return old .. "+patched" end), "restored")
+			assert_true(rec.private["/rb/state.json"], "the copy of the state (it holds the authkey) is closed to others")
+			assert_false(rec.private["/rb/wireless"], "the config copies keep the config's own mode")
+			assert_true(guard.restore("/st.json", function(old)
+				rec.files["/st.json"] = old .. "+patched"
+				return true
+			end), "restored")
 			assert_eq(rec.files["/cfg/wireless"], "W-old", "wireless")
 			assert_eq(rec.files["/cfg/network"], "N-old", "network")
 			assert_eq(rec.files["/st.json"], '{"cfgversion":"old","adopted":true}+patched',
-				"the old state, as the caller patched it")
+				"the old state, as the caller wrote it")
+			-- No writer: the copy goes back as it is, and privately.
+			rec.files["/st.json"] = "junk"
+			assert_true(guard.restore("/st.json"), "restored without a writer")
+			assert_eq(rec.files["/st.json"], '{"cfgversion":"old","adopted":true}', "the copy itself")
+			assert_true(rec.private["/st.json"], "written closed")
+			-- A writer that fails is a failed restore.
+			local out = with_stderr(function()
+				assert_false(guard.restore("/st.json", function() return false end), "the writer said no")
+			end)
+			assert_contains(out, "cannot restore /st.json", "said")
 			assert_true(guard.have_snapshot(), "the copy outlives the restore until discarded")
 			guard.discard()
 			assert_false(guard.have_snapshot(), "gone")
@@ -285,7 +302,8 @@ return {
 				inform._status.last_ok, inform._exit, inform._write_status}
 			inform._applyguard, inform._state._state_file = guard, "/st.json"
 			local exited, status
-			inform._state.save = function() end
+			-- The restored state goes through state.save (mode and group kept).
+			inform._state.save = function(t) rec.files["/st.json"] = cjson.encode(t) end
 			inform._exit = function(code) exited = code end
 			inform._write_status = function(_, f) status = f end
 			inform._time = function() return 1000 + guard.WINDOW end

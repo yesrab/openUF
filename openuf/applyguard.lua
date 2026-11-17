@@ -59,10 +59,19 @@ M._exec      = os.execute
 M._popen     = util.popen
 M._read_file = util.read_file
 M._remove    = os.remove
-M._write_file = function(path, content)
+-- `private`: closed to everyone but root BEFORE anything is written into it.
+-- The copy of state.json holds the authkey; state.lua keeps the original
+-- 0600/0660 (PR #5), and a world-readable copy beside it would undo that.
+M._write_file = function(path, content, private)
 	local tmp = path .. ".tmp"
 	local f = io.open(tmp, "w")
 	if not f then return false end
+	if private then
+		f:close()
+		M._exec("chmod 600 '" .. tmp .. "'")
+		f = io.open(tmp, "w")
+		if not f then os.remove(tmp); return false end
+	end
 	local wrote = f:write(content)
 	local closed = f:close()
 	if not (wrote and closed) then os.remove(tmp); return false end
@@ -187,7 +196,7 @@ function M.snapshot(state_file)
 	files[#files + 1] = {from = state_file, to = copy_path(M.STATE_COPY)}
 	for _, f in ipairs(files) do
 		local content = M._read_file(f.from)
-		if content == nil or not M._write_file(f.to, content) then
+		if content == nil or not M._write_file(f.to, content, f.from == state_file) then
 			io.stderr:write("applyguard: cannot copy " .. tostring(f.from)
 				.. " aside -- this push is not guarded\n")
 			M.discard()
@@ -231,11 +240,16 @@ end
 
 -- ─── The rollback ────────────────────────────────────────────────────────────
 
--- Put the copies back. `patch_state(old_state_text)` returns the state file's
--- new contents (inform.lua stamps the undone push's cfgversion and the
--- rollback record into the old state there). Returns true when all three
--- files were written; the copies are kept until the caller discards them.
-function M.restore(state_file, patch_state)
+-- Put the copies back. The two config packages are written here. The state
+-- is the caller's to write: `write_state(old_state_text)` gets the copy's
+-- contents and returns true once the state file holds what it should
+-- (inform.lua stamps the undone push's cfgversion and the rollback record
+-- into it and saves through state.lua, which keeps the file's mode and the
+-- bootstrap account's group -- a plain write here would not). Without a
+-- writer the copy goes back as it is, closed to everyone but root. Returns
+-- true when all three were written; the copies are kept until the caller
+-- discards them.
+function M.restore(state_file, write_state)
 	if not M.have_snapshot() then
 		io.stderr:write("applyguard: nothing to roll back to (" .. M.DIR .. " is incomplete)\n")
 		return false
@@ -248,8 +262,14 @@ function M.restore(state_file, patch_state)
 		end
 	end
 	local old = M._read_file(copy_path(M.STATE_COPY))
-	local new = patch_state and patch_state(old) or old
-	if type(new) ~= "string" or not M._write_file(state_file, new) then
+	local wrote
+	if write_state then
+		local ok_w, res = pcall(write_state, old)
+		wrote = ok_w and res == true
+	else
+		wrote = M._write_file(state_file, old, true)
+	end
+	if not wrote then
 		io.stderr:write("applyguard: cannot restore " .. tostring(state_file) .. "\n")
 		ok = false
 	end

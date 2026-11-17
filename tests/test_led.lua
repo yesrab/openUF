@@ -189,6 +189,35 @@ return {
 		end
 	},
 	{
+		name = "led: a second locate_start keeps the first snapshot, not the blink",
+		fn = function()
+			-- A sysfs that follows the writes: after the first start the LED
+			-- really is on "timer".
+			local cur = "phy0tpt"
+			local orig_w, orig_r = led._write_file, led._read_file
+			led._write_file = function(path, v)
+				if path:find("/trigger$") then cur = v end
+				return true
+			end
+			led._read_file = function(path)
+				if path:find("/trigger$") then return "none [" .. cur .. "] timer phy0tpt\n" end
+				return nil
+			end
+			led._saved_trigger = {}
+			local ok, err = pcall(function()
+				local _, p1 = led.locate_start("mt76-phy0")
+				local _, p2 = led.locate_start("mt76-phy0")
+				assert_eq(p1, "phy0tpt", "first start: the trigger it took over")
+				assert_eq(p2, "phy0tpt", "second start hands back the same, not timer")
+				led.locate_stop("mt76-phy0")
+				assert_eq(cur, "phy0tpt", "one stop restores the original trigger")
+			end)
+			led._write_file, led._read_file = orig_w, orig_r
+			led._saved_trigger = {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
 		name = "led: locate_stop falls back to none when the trigger is unreadable",
 		fn = function()
 			-- Unknown previous state is the one case where the old blanket

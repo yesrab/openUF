@@ -5125,7 +5125,10 @@ return {
 				f:write('{"adopted":false,"cfgversion":"v3"}')
 				f:close()
 				inform._reload_if_changed(st, {config = {}}, token)
-				assert_eq(reconciles, 1, "an external write still reloads")
+				-- Twice: the reload itself, and -- since this write also
+				-- un-adopted the device -- the forget that lifts the
+				-- controller's blocks.
+				assert_eq(reconciles, 2, "an external write still reloads")
 				assert_eq(st.cfgversion, "v3", "external contents loaded")
 			end)
 			inform._firewall = orig_fw
@@ -5786,6 +5789,83 @@ return {
 			inform._led._write_file, inform._led._read_file = orig_w, orig_r
 			inform._led._saved_trigger = {}
 			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform packet: a second set-locate and an led_enabled push mid-Locate leave the LED right",
+		fn = function()
+			local st = sample_state({led_enabled = true})
+			local cur = "phy0tpt"
+			local writes = {}
+			local orig_w, orig_r = inform._led._write_file, inform._led._read_file
+			inform._led._write_file = function(path, v)
+				writes[#writes + 1] = {path = path, contents = v}
+				if path:find("/trigger$") then cur = v end
+				return true
+			end
+			inform._led._read_file = function(path)
+				if path:find("/trigger$") then return "none [" .. cur .. "] timer phy0tpt\n" end
+				return nil
+			end
+			inform._led._saved_trigger = {}
+			local cfg = {led = "/sys/class/leds/mt76-phy0"}
+			local ok, err = pcall(function()
+				inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st, cfg)
+				inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st, cfg)
+				assert_eq(st.locate_prev_trigger, "phy0tpt", "the second Locate keeps the first snapshot")
+				-- Restart between the two set-locates: no in-memory snapshot.
+				inform._led._saved_trigger = {}
+				inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st, cfg)
+				assert_eq(st.locate_prev_trigger, "phy0tpt", "nor does a restart lose it")
+				-- A config push mid-Locate repeats led_enabled.
+				inform.handle_response('{"_type":"setparam","mgmt_cfg":"led_enabled=false\\n"}', st, cfg)
+				assert_eq(cur, "timer", "the blink is not ended by the push")
+				assert_false(st.led_enabled, "the choice is recorded")
+				inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st, cfg)
+				assert_eq(cur, "none", "unset-locate applies the pushed off")
+				assert_eq(writes[#writes].contents, "0", "dark, as chosen")
+			end)
+			inform._led._write_file, inform._led._read_file = orig_w, orig_r
+			inform._led._saved_trigger = {}
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		-- The one promise of "stop locating": the blink ends. A snapshot that
+		-- cannot be restored (a trigger the kernel refuses, a write that does
+		-- not take) must not leave the LED blinking.
+		name = "inform packet: unset-locate ends the blink even when restoring the old trigger does not take",
+		fn = function()
+			local st = sample_state({led_enabled = nil})
+			local cur = "phy0tpt"
+			local orig_w, orig_r = inform._led._write_file, inform._led._read_file
+			inform._led._write_file = function(path, v)
+				-- This kernel no longer has the trigger the LED was on.
+				if path:find("/trigger$") and v ~= "phy0tpt" then cur = v end
+				return true
+			end
+			inform._led._read_file = function(path)
+				if path:find("/trigger$") then return "none [" .. cur .. "] timer\n" end
+				return nil
+			end
+			inform._led._saved_trigger = {}
+			local cfg = {led = "/sys/class/leds/mt76-phy0"}
+			local out
+			local ok, err = pcall(function()
+				out = with_stderr(function()
+					inform.handle_response('{"_type":"cmd","cmd":"set-locate"}', st, cfg)
+					assert_eq(cur, "timer", "blinking")
+					assert_true(st.locating, "and reported as locating")
+					inform.handle_response('{"_type":"cmd","cmd":"unset-locate"}', st, cfg)
+				end)
+				assert_eq(cur, "none", "the restore did not take, so the LED is put on none: no blink")
+				assert_false(st.locating, "and no longer reported as locating")
+			end)
+			inform._led._write_file, inform._led._read_file = orig_w, orig_r
+			inform._led._saved_trigger = {}
+			if not ok then error(err, 0) end
+			assert_contains(out, "Locate started", "the start is in the log")
+			assert_contains(out, "was still blinking", "and so is the forced stop")
 		end
 	},
 	{
@@ -7052,9 +7132,11 @@ return {
 		fn = function()
 			local t = 0
 			local queue = {}
-			local stun_sock = {receive = function()
+			-- receivefrom, and from the server's own address: stun.receive
+			-- ignores what anyone else sends.
+			local stun_sock = {receivefrom = function()
 				local p = table.remove(queue, 1)
-				if p then return p end
+				if p then return p, "192.0.2.4", 3478 end
 				return nil, "timeout"
 			end}
 			local selects = {}
@@ -7071,7 +7153,7 @@ return {
 			local wake = string.char(0x88, 0x88) .. string.rep(string.char(0), 18)
 			local junk = string.char(0x01, 0x11) .. string.rep(string.char(0), 18)
 			inform._guest_server = nil
-			inform._stun_c = {sock = stun_sock}
+			inform._stun_c = {sock = stun_sock, ip = "192.0.2.4"}
 			local ok, err = pcall(function()
 				queue = {wake}
 				inform._idle(sock, 10)
@@ -9475,6 +9557,78 @@ return {
 			inform._wlansched, inform._state.save = orig.ws, orig.save
 			inform._inform_fails, inform._guest_selfrun_on = 0, false
 			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "inform: a reboot saves state and the ledger first, and a failed reboot does not exit",
+		fn = function()
+			local o_reboot, o_exit, o_save, o_flush = inform._reboot, inform._exit,
+				inform._state.save, inform._unhandled.flush
+			local order, exited, rc = {}, nil, 1
+			inform._reboot = function() order[#order + 1] = "reboot"; return rc end
+			inform._exit = function(c) exited = c end
+			inform._state.save = function() order[#order + 1] = "save" end
+			inform._unhandled.flush = function(force) order[#order + 1] = "flush:" .. tostring(force) end
+			-- Never the real thing, whatever the code under test calls.
+			local o_osx, o_ose = os.execute, os.exit
+			os.execute = function(c) order[#order + 1] = "os:" .. tostring(c); return 1 end
+			os.exit = function() error("os.exit called") end
+			local res, out, order1
+			local ok, err = pcall(function()
+				out = with_stderr(function()
+					res = inform.handle_response('{"_type":"reboot"}', sample_state())
+				end)
+				order1 = table.concat(order, ",")
+				rc, order = 0, {}
+				with_stderr(function() inform.handle_response('{"_type":"reboot"}', sample_state()) end)
+			end)
+			os.execute, os.exit = o_osx, o_ose
+			inform._reboot, inform._exit, inform._state.save, inform._unhandled.flush =
+				o_reboot, o_exit, o_save, o_flush
+			if not ok then error(err, 0) end
+			assert_eq(order1, "save,flush:true,reboot", "state and ledger written before the reboot")
+			assert_false(res, "a failed reboot carries on")
+			assert_contains(out, "reboot failed", "and says so")
+			assert_eq(exited, 0, "an accepted reboot exits")
+		end
+	},
+	{
+		name = "inform: block-sta in upper case is lifted by unblock-sta in lower case",
+		fn = function()
+			local st = sample_state({blocked_stas = {}})
+			local o_fw = inform._firewall
+			inform._firewall = { reconcile = function() end, deauth = function() end,
+				hostapd_sockets = function() return "" end, deny_sync = function() return true end }
+			inform.handle_response('{"_type":"cmd","cmd":"block-sta","mac":"00:00:5E:00:53:0A"}', st)
+			assert_eq(table.concat(st.blocked_stas, ","), "00:00:5e:00:53:0a", "stored lower case")
+			inform.handle_response('{"_type":"cmd","cmd":"block-sta","mac":"00:00:5e:00:53:0a"}', st)
+			assert_eq(#st.blocked_stas, 1, "same MAC in the other case is not added twice")
+			inform.handle_response('{"_type":"cmd","cmd":"unblock-sta","mac":"00:00:5e:00:53:0a"}', st)
+			inform._firewall = o_fw
+			inform._deny_pending = false
+			assert_eq(#st.blocked_stas, 0, "the unblock lifts it")
+		end
+	},
+	{
+		name = "inform packet: forgetting the controller lifts its client blocks, rate limits and SSID holds",
+		fn = function()
+			local real_fw, real_sh = inform._firewall, inform._shaper
+			local blocked, shaped = "untouched", "untouched"
+			inform._firewall = {reconcile = function(l) blocked = l end}
+			inform._shaper = {sync = function(d) shaped = d end}
+			inform._guest_selfrun_on = true
+			inform._inform_fails = 99
+			local ok, err = pcall(inform._forget_controller,
+				{blocked_stas = {"00:00:5e:00:53:01"}, sta_rates = {}}, {})
+			inform._firewall, inform._shaper = real_fw, real_sh
+			local selfrun = inform._guest_selfrun_on
+			inform._guest_selfrun_on, inform._inform_fails = false, 0
+			if not ok then error(err, 0) end
+			assert_eq(type(blocked), "table", "the blocklist rebuilt")
+			assert_nil(next(blocked), "and empty")
+			assert_eq(type(shaped), "table", "tc synced")
+			assert_nil(next(shaped), "to nothing")
+			assert_false(selfrun, "guest selfrun hold released")
 		end
 	},
 }

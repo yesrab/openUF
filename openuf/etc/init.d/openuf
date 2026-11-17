@@ -21,6 +21,11 @@ start_service() {
 		echo "openuf: not installed (no /usr/lib/openuf or /opt/openuf)" >&2
 		return 1
 	fi
+	# A power cut during `uci commit` leaves libuci's temp file behind, one
+	# more per cut. Older than a minute is dead: a commit takes moments, so
+	# a younger one may be somebody's commit in progress. A find without
+	# -mmin removes nothing.
+	find /etc/config -maxdepth 1 -name '.*.uci-*' -mmin +1 -exec rm -f {} \; 2>/dev/null
 	# The Lua scripts (and conf.lua's modelmap dofile) load siblings with
 	# cwd-relative paths, but procd starts services with cwd "/". Run each from
 	# $OPENUF_DIR via `sh -c "cd ... && exec lua ..."` so those loads resolve.

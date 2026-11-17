@@ -722,4 +722,33 @@ return {
 			announce._joined, announce._join_err = saved_j, saved_e
 		end
 	},
+	{
+		-- audit F-7: an empty datagram raised in the reply key and killed the process
+		name = "announce: _serve_requests skips an empty or 1-byte datagram and keeps serving",
+		fn = function()
+			local now = 0
+			local queue = {
+				{"", "192.0.2.60", 40001},
+				{string.char(1), "192.0.2.61", 40002},
+				{string.char(1, 0, 0, 0), "192.0.2.62", 40003},
+			}
+			local sent = {}
+			local udpl = {
+				receivefrom = function() local q = table.remove(queue, 1); return q[1], q[2], q[3] end,
+				sendto = function(_, data, ip, port) sent[#sent + 1] = {data, ip, port}; return 1 end,
+			}
+			local fake = {
+				gettime = function() now = now + 0.01; return now end,
+				select = function() if #queue > 0 then return {udpl} end; now = now + 100; return {} end,
+			}
+			local saved_refresh, saved_last = announce._refresh, announce._last_reply
+			announce._refresh = function(c) return c end
+			announce._last_reply = {}
+			local ok, err = pcall(announce._serve_requests, udpl, sample_cfg(), 10, fake)
+			announce._refresh, announce._last_reply = saved_refresh, saved_last
+			assert_true(ok, "no Lua error: " .. tostring(err))
+			assert_eq(#sent, 1, "only the real request is answered")
+			assert_eq(sent[1][2], "192.0.2.62", "the asker after the short datagrams")
+		end
+	},
 }

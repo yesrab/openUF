@@ -47,6 +47,11 @@
 	     "disassoc" half of btm_disassoc, and it is the only way to move a
 	     client without 802.11v at all. The ban is hostapd's own, expires
 	     on its own and is not a block: see firewall.lua for that.
+	  5. A client that comes back to the BSS it was disassociated from
+	     refused the move (typically Lock to Access Point: every other AP
+	     denies it). It is left alone there until it is seen on another of
+	     our BSSes or unseen for FORGET, instead of a BAN_MS outage every
+	     COOLDOWN (Fantastic792/openUF 5f7874c).
 ]]--
 
 local M = {}
@@ -80,6 +85,7 @@ M.REASON_BTM       = 12
 --   acted_at:    last BTM or disassociation, for COOLDOWN
 --   checked_at:  last look for a better AP that found none, for RECHECK
 --   seen_at:     last heartbeat that observed it
+--   refused_on:  the BSS it was disassociated from and came back to (step 5)
 M._state = {}
 
 local warned = {}
@@ -182,6 +188,7 @@ function M.tick(observations, now, opts)
 		local cs = M._state[o.mac] or {}
 		M._state[o.mac] = cs
 		cs.seen_at = now
+		if cs.refused_on and cs.refused_on ~= o.ifname then cs.refused_on = nil end
 
 		-- A request this old was answered long ago: the client left and has
 		-- since come back on its own, which is not a refusal.
@@ -201,6 +208,7 @@ function M.tick(observations, now, opts)
 					actions = actions + 1
 				end
 				cs.pending, cs.acted_at, cs.below_since = nil, now, nil
+				cs.refused_on = o.ifname
 			elseif cs.pending.ifname ~= o.ifname then
 				cs.pending = nil
 			end
@@ -211,7 +219,8 @@ function M.tick(observations, now, opts)
 			if now - cs.below_since >= M.BELOW_HOLD
 				and (tonumber(o.connected_sec) or 0) >= M.MIN_CONNECTED
 				and (cs.acted_at == nil or now - cs.acted_at >= M.COOLDOWN)
-				and (cs.checked_at == nil or now - cs.checked_at >= M.RECHECK) then
+				and (cs.checked_at == nil or now - cs.checked_at >= M.RECHECK)
+				and cs.refused_on ~= o.ifname then
 				if nodes == nil then
 					nodes = {}
 					for _, method in ipairs({"local_info", "remote_info"}) do

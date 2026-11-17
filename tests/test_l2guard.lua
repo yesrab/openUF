@@ -266,4 +266,20 @@ return {
 			assert_contains(out, "could not set hairpin_mode on phy0-ap0", "and is reported")
 		end
 	},
+	{
+		name = "l2guard: _list_hostapd_confs globs every hostapd-*.conf, not only phy-named ones",
+		fn = function()
+			-- A board with renamed wiphys writes hostapd-wl0.conf; the old
+			-- hostapd-phy*.conf glob never saw it and no BSS there was checked.
+			local orig, cmd = io.popen, nil
+			io.popen = function(c)
+				cmd = c
+				return {lines = function() return function() return nil end end, close = function() end}
+			end
+			l2guard._list_hostapd_confs()
+			io.popen = orig
+			assert_contains(cmd, "/var/run/hostapd-*.conf", "any radio name")
+			assert_true(cmd:find("hostapd-phy", 1, true) == nil, "not just phyN")
+		end
+	},
 }

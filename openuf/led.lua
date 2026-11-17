@@ -89,7 +89,13 @@ function M.locate_start(led)
 	local led_path = _resolve(led)
 	if not led_path then return false end
 	local prev = active_trigger(led_path)
-	M._saved_trigger[led_path] = prev
+	if prev == "timer" and M._saved_trigger[led_path] ~= nil then
+		-- A second set-locate while the first still blinks: "timer" is the
+		-- blink itself. Keep (and hand back) the first snapshot.
+		prev = M._saved_trigger[led_path]
+	else
+		M._saved_trigger[led_path] = prev
+	end
 	M._write_file(led_path .. "/trigger", "timer")
 	M._write_file(led_path .. "/delay_on", "250")
 	M._write_file(led_path .. "/delay_off", "250")

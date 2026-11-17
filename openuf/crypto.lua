@@ -6,7 +6,10 @@
 	     on OpenWrt 25.12+. In-process, supports both CBC and GCM.
 	  2. luacrypto  (require "crypto")   — legacy. Only on older OpenWrt where the
 	     "luacrypto" package still exists (dropped from the 25.12 feeds).
-	Neither binding: an error. No openssl(1) CLI fallback (see below).
+	  3. aeslua.lua — AES-128-CBC in plain Lua, when there is neither: a
+	     development machine or a broken install. CBC only (GCM needs
+	     lua-openssl), slow, not constant-time, and announced on stderr. It
+	     is NOT the openssl(1) command, which this module never runs.
 
 	All keys and IVs are passed as 32-char hex strings (16 raw bytes).
 	Plaintext and ciphertext are Lua binary strings.
@@ -89,11 +92,33 @@ end
 
 -- No AES binding at all. There used to be an openssl(1) CLI fallback here; it
 -- put the authkey on a command line (readable in /proc by any local user) and
--- the plaintext inform in /tmp. lua-openssl is a hard dependency (Makefile
--- DEPENDS, install.sh), so its absence is a broken install and is said so.
-local function _no_binding()
-	error("crypto: no AES binding (install lua-openssl) -- refusing the openssl CLI, "
-		.. "which would expose the key on a command line")
+-- the plaintext inform in /tmp, and it was removed for that (PR #6,
+-- 2026-11-17). What stands in now is aeslua.lua: the same cipher in plain
+-- Lua, so the key never leaves the process and the code runs wherever Lua
+-- does -- which matters on a development machine, where no lua-openssl rock
+-- exists for a current Lua and the whole suite otherwise cannot encrypt.
+--
+-- lua-openssl is a hard dependency on a device (Makefile DEPENDS,
+-- install.sh), so a device that gets here has a broken install: said once,
+-- on stderr, because the plain-Lua cipher is slow and not constant-time and
+-- has no GCM, without which no controller finishes an adoption.
+local _aeslua, _aeslua_said = nil, false
+local function _fallback()
+	if not _aeslua then
+		for _, p in ipairs({"aeslua.lua", "openuf/aeslua.lua"}) do
+			local f = io.open(p, "r")
+			if f then f:close(); _aeslua = dofile(p); break end
+		end
+		if not _aeslua then
+			error("crypto: no AES binding (install lua-openssl), and aeslua.lua is not beside this file")
+		end
+	end
+	if not _aeslua_said and not OPENUF_TEST_MODE then
+		_aeslua_said = true
+		io.stderr:write("crypto: no AES binding -- using the built-in plain-Lua AES-128-CBC "
+			.. "(slow, not constant-time, no GCM). Install lua-openssl.\n")
+	end
+	return _aeslua
 end
 
 -- AES-128-CBC encrypt
@@ -131,7 +156,7 @@ function M.aes_cbc_encrypt(key_hex, iv, plaintext)
 		end
 		return result
 	else
-		_no_binding()
+		return _fallback().cbc_encrypt(key, iv, padded)
 	end
 end
 
@@ -153,7 +178,7 @@ function M.aes_cbc_decrypt(key_hex, iv, ciphertext)
 		end
 		return pkcs7_unpad(result)
 	else
-		_no_binding()
+		return pkcs7_unpad(_fallback().cbc_decrypt(key, iv, ciphertext))
 	end
 end
 

@@ -422,9 +422,11 @@ brew install lua luarocks      # macOS
 
 # Install test dependencies
 luarocks install --local lua-cjson
-# lua-openssl, the AES binding: crypto.lua has no openssl CLI fallback, so the
-# suite needs it (Debian/Ubuntu: apt install libssl-dev first; macOS:
-# luarocks install --local openssl OPENSSL_DIR=$(brew --prefix openssl))
+# lua-openssl, the AES binding (Debian/Ubuntu: apt install libssl-dev first;
+# macOS: luarocks install --local openssl OPENSSL_DIR=$(brew --prefix openssl)).
+# Optional for the suite: where the rock does not exist (there is none for
+# Lua 5.5) crypto.lua uses its plain-Lua AES-128-CBC (aeslua.lua) and the
+# AES-GCM tests skip, loudly. CI installs it and requires GCM.
 luarocks install --local openssl
 
 # Run unit tests

@@ -664,10 +664,23 @@ function M.location(ctx, mac, orig_url, ssid, now)
 end
 
 -- The request line and Host header, read with a bound: a guest is not
--- allowed to hold the inform loop.
+-- allowed to hold the inform loop. The bound is ONE deadline for the whole
+-- request, not a timeout per line: 32 lines at 1 s each let a guest that
+-- trickles headers hold the loop for ~32 s (Fantastic792/openUF f2893c8;
+-- the one place this file differs from upstream's).
+M.REQUEST_BUDGET = 1
+M._clock = (function()
+	local ok, socket = pcall(require, "socket")
+	if ok and type(socket) == "table" and socket.gettime then return socket.gettime end
+	return os.time
+end)()
 local function read_request(client)
 	local first, host
+	local deadline = M._clock() + M.REQUEST_BUDGET
 	for i = 1, 32 do
+		local left = deadline - M._clock()
+		if left <= 0 then break end
+		client:settimeout(left)
 		local line = client:receive("*l")
 		if not line or line == "" then break end
 		if i == 1 then

@@ -518,7 +518,10 @@ function M._serve_requests(udpl, cfg, interval, socket)
 		local readable = socket.select({udpl}, nil, remaining)
 		if readable and readable[1] then
 			local data, ip, port = udpl:receivefrom()
-			if data and ip then
+			-- Under 2 bytes is no request, and the key below needs both bytes:
+			-- an empty datagram raised there and ended the listener
+			-- (Fantastic792/openUF 4fb3796, their audit F-7).
+			if data and ip and #data >= 2 then
 				local now = socket.gettime()
 				local key = ip .. "/" .. tostring(data:byte(1)) .. "." .. tostring(data:byte(2))
 				local last = M._last_reply[key]
