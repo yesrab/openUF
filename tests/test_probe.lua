@@ -140,7 +140,13 @@ return {
 				unhandled_file = "/tmp/t-unhandled.json", debug_caps = {wifi_caps = 1}}
 			with_files({
 				["/tmp/t-state.json"] = '{"adopted":true,"authkey":"deadbeef","mac":"00:00:5e:00:53:01",'
-					.. '"inform_url":"http://c:8080/inform","cfgversion":"abc","l2guard":{"bpdu":true,"tagdrop":true,"ifnames":["a","b"]}}',
+					.. '"inform_url":"http://c:8080/inform","cfgversion":"abc","l2guard":{"bpdu":true,"tagdrop":true,"ifnames":["a","b"]},'
+					.. '"guest_portal":{"enabled":true,"url":"http://192.0.2.2:8880/guest/s/default/"},'
+					.. '"guest_wlans":{"w1":true},"guest_token":"00112233445566778899aabbccddeeff",'
+					.. '"guest_authorized":{"00:00:5e:00:53:21":1790000000,"00:00:5e:00:53:22":1790000001},'
+					.. '"guest_selfrun":"pass","guest_wg_ips":{"allowed":{"example.com":["198.51.100.7"]}},'
+					.. '"remotelog":{"ip":"192.0.2.10","port":5514,"encrypt":true,"key":"'
+					.. string.rep("ab", 32) .. '"}}',
 				["/tmp/t-unhandled.json"] = '{"entries":{"k1":{"count":1},"k2":{"count":3}}}',
 				[probe._status_file] = "last_ok=1790000000\nlast_type=noop\nlast_fail=0\nlast_fail_msg=\nadopted=true\n",
 				[probe._board_name_file] = "jiorouter,ax6000-jidu6101\n",
@@ -171,6 +177,16 @@ return {
 				assert_eq(d.state.adopted, true, "state read")
 				assert_nil(d.state.authkey, "the secret never leaves")
 				assert_eq(d.state.l2guard.vaps, 2, "l2guard summarised")
+				-- The guest portal: that it is on and how busy, never who or with what.
+				assert_true(d.state.guest.portal, "portal on")
+				assert_eq(d.state.guest.authorized, 2, "how many guests are through")
+				assert_eq(d.state.guest.wlans, 1, "on how many WLANs")
+				assert_eq(d.state.guest.selfrun, "pass", "the offline mode")
+				assert_nil(d.state.guest_authorized, "the guests' MAC addresses stay on the device")
+				assert_nil(d.state.guest_token, "so does the portal token")
+				assert_nil(d.state.guest_wg_ips, "and the resolved garden")
+				assert_nil(d.state.remotelog.key, "the syslog key never leaves either")
+				assert_eq(d.state.remotelog.ip, "192.0.2.10", "where the log goes does")
 				assert_eq(d.health.last_ok, 1790000000, "health numbers are numbers")
 				assert_true(type(d.now) == "number", "the device clock rides along for ages")
 				assert_eq(d.health.last_type, "noop", "health strings")

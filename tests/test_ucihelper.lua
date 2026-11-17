@@ -4424,6 +4424,7 @@ Wiphy phy2
 					local s = ucihelper.schedule_vaps()
 					local v = ucihelper.get_vap_table()
 					ucihelper.get_radio_table()
+					local w = ucihelper.wlanconf_ifnames({w2 = true})
 					assert_eq(cursors, 1, "one cursor for the pass")
 					assert_eq(walks, 1, "one walk of the wifi-iface sections")
 					assert_eq(#s, 1, "the schedule check still sees its one VAP")
@@ -4433,6 +4434,8 @@ Wiphy phy2
 						assert_eq(v[i].name, before_v[i].name, "in the same order")
 						assert_eq(v[i].id, before_v[i].id, "with the same ids")
 					end
+					assert_eq(#w, 1, "and the guest lookup filters the shared rows")
+					assert_eq(w[1].ssid, "b", "to the right VAP")
 
 					ucihelper.end_pass()
 					walks = 0

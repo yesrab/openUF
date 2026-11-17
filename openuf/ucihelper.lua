@@ -3438,8 +3438,10 @@ end
 function M.wlanconf_ifnames(ids)
 	local out = {}
 	if type(ids) ~= "table" or next(ids) == nil then return out end
-	local cursor = get_uci().cursor()
-	cursor:foreach("wireless", "wifi-iface", function(s)
+	-- each_iface, not a cursor of its own: _guest_resync asks this inside the
+	-- heartbeat's pass, where the wifi-iface rows are already read once
+	-- (upstream's form; the first port here opened a second cursor).
+	each_iface(function(s)
 		if s.disabled == "1" or not (s.openuf_wlanconf_id and ids[s.openuf_wlanconf_id]) then return end
 		local ok_if, ifnames = pcall(M.get_ifnames_for_vap, s.device, s.ssid)
 		if not ok_if then return end
