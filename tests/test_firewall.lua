@@ -62,6 +62,8 @@ return {
 				"nft add chain bridge openuf block { type filter hook forward priority 0; }",
 				"nft add rule bridge openuf block ether saddr @blocked_macs drop",
 				"nft add rule bridge openuf block ether daddr @blocked_macs drop",
+				"nft add chain bridge openuf block_in { type filter hook input priority 0; }",
+				"nft add rule bridge openuf block_in ether saddr @blocked_macs drop",
 			}, "\n"), "the old table goes in the same transaction that builds the new one")
 		end
 	},

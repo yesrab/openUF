@@ -4600,6 +4600,9 @@ end
 -- cfg: device configuration (from conf.lua; optional -- nil in tests, LED
 --      control becomes a no-op without cfg.led)
 -- Returns true if config was applied (caller should send follow-up inform).
+-- Injectable: the controller's reboot (the exit after it is M._exit).
+M._reboot = function() return os.execute("reboot") end
+
 function M.handle_response(json_str, st, cfg)
 	-- Tracks the config rather than latching on: a caller that stops passing
 	-- debug_dump_file stops getting dropped-key reports too.
@@ -4696,7 +4699,12 @@ function M.handle_response(json_str, st, cfg)
 					elseif k == "led_enabled" then
 						local enabled = (v == "true")
 						st.led_enabled = enabled
-						M._led.set_enabled(cfg and cfg.led, enabled)
+						-- Every config push repeats led_enabled. During a
+						-- Locate the blink owns the LED (set_enabled would end
+						-- it); unset-locate re-asserts this choice.
+						if not st.locating then
+							M._led.set_enabled(cfg and cfg.led, enabled)
+						end
 					elseif k == "authkey" then
 						-- Only trusted pre-adoption. Real L3 adoption has no SSH
 						-- step at all (controller logs "skip SSH adoption" for
@@ -5108,8 +5116,17 @@ function M.handle_response(json_str, st, cfg)
 
 	if _type == "reboot" then
 		io.stderr:write("inform: controller requested reboot\n")
-		os.execute("reboot")
-		os.exit(0)
+		-- What the reboot would lose goes to disk first: the state and the
+		-- unhandled ledger's unflushed repeat counts.
+		pcall(M._state.save, st)
+		if M._unhandled then pcall(M._unhandled.flush, true) end
+		-- os.execute is true (5.2+) or 0 (5.1) when reboot was accepted.
+		-- Anything else and the inform loop carries on rather than exiting
+		-- into a device that never went down (Fantastic792/openUF 95419ae).
+		local r = M._reboot()
+		if r == true or r == 0 then M._exit(0) end
+		io.stderr:write("inform: reboot failed (" .. tostring(r) .. ") -- carrying on\n")
+		return false
 	end
 
 	if _type == "upgrade" then
@@ -5164,10 +5181,26 @@ function M.handle_response(json_str, st, cfg)
 				-- a restart can easily land between them, and only this copy
 				-- then knows what to put back. See M.run's startup handling.
 				local _, prev = M._led.locate_start(led_path)
-				st.locate_prev_trigger = prev
+				-- A second set-locate finds the LED on the blink ("timer") or
+				-- unreadable: the first one's snapshot is the one to keep.
+				if not (st.locating and (prev == nil or prev == "timer")) then
+					st.locate_prev_trigger = prev
+				end
+				io.stderr:write("inform: Locate started -- the LED blinks until the controller's unset-locate\n")
 			else
 				M._led.locate_stop(led_path, st.locate_prev_trigger)
 				st.locate_prev_trigger = nil
+				-- Stop means stop. Whatever the snapshot said, an LED that is
+				-- still on the blink's trigger after the restore is put on
+				-- "none": a Locate that will not end is worse than an LED
+				-- that lost its activity pattern.
+				if M._led.locate_active(led_path) then
+					M._led.locate_stop(led_path, "none")
+					io.stderr:write("inform: Locate stopped -- the LED was still blinking after the "
+						.. "restore and was switched to a steady state\n")
+				else
+					io.stderr:write("inform: Locate stopped\n")
+				end
 				-- Restoring the TRIGGER is not the whole idle state. An LED
 				-- whose normal look is "trigger none, brightness on" -- which
 				-- is exactly what set_enabled leaves behind, and what a
@@ -5197,11 +5230,14 @@ function M.handle_response(json_str, st, cfg)
 					:format(cmd, mac))
 			end
 			if is_mac(mac) then
+				-- Lowercase like M._sync_blocked_stas, so a block sent in
+				-- upper case is lifted by an unblock in lower case.
+				mac = mac:lower()
 				st.blocked_stas = st.blocked_stas or {}
 				if cmd == "block-sta" then
 					local already = false
 					for _, m in ipairs(st.blocked_stas) do
-						if m == mac then already = true break end
+						if tostring(m):lower() == mac then already = true break end
 					end
 					if not already then
 						st.blocked_stas[#st.blocked_stas + 1] = mac
@@ -5209,7 +5245,7 @@ function M.handle_response(json_str, st, cfg)
 				else
 					local kept = {}
 					for _, m in ipairs(st.blocked_stas) do
-						if m ~= mac then kept[#kept + 1] = m end
+						if tostring(m):lower() ~= mac then kept[#kept + 1] = m end
 					end
 					st.blocked_stas = kept
 				end
@@ -5337,9 +5373,9 @@ end
 -- so before this every station on such a WLAN drew an unauthorize-guest per
 -- inform and authorize-guest was never sent at all.
 
--- Cap on st.guest_authorized. Past it the oldest authorization goes first;
--- the controller re-sends authorize-guest for any guest it still has a
--- record for, so a dropped entry costs one inform, not access.
+-- Cap on st.guest_authorized. Past it a departed guest goes first (see
+-- _guest_authorize); the controller re-sends authorize-guest for any guest
+-- it still has a record for, so a dropped entry costs at most one inform.
 M.GUEST_LEDGER_MAX = 512
 
 -- Set of wlanconf ids (vap.wlanconf_id) on which stations must pass the
@@ -5368,13 +5404,30 @@ function M._guest_authorize(st, mac, authorized)
 		return
 	end
 	st.guest_authorized[mac] = os.time()
-	local n, oldest, oldest_t = 0, nil, nil
+	-- Over the cap, a guest that has left (no netdev listed it at the last
+	-- complete heartbeat, M._shape_obs) goes first, oldest of those: it
+	-- uses no access now and the controller re-authorizes it on return.
+	-- Only when every entry is a guest still on the air is the oldest of
+	-- them dropped, and that is logged, since it cuts a guest off until the
+	-- next inform. The MAC just authorized is never the one dropped
+	-- (Fantastic792/openUF efbe5d7; upstream drops the oldest outright).
+	local obs = M._shape_obs
+	local seen = obs and obs.complete and obs.where or nil
+	local n, oldest, oldest_t, left, left_t = 0, nil, nil, nil, nil
 	for m, t in pairs(st.guest_authorized) do
 		n = n + 1
-		if not oldest_t or t < oldest_t then oldest, oldest_t = m, t end
+		if m ~= mac then
+			if not oldest_t or t < oldest_t then oldest, oldest_t = m, t end
+			if seen and not seen[m] and (not left_t or t < left_t) then left, left_t = m, t end
+		end
 	end
 	if n > M.GUEST_LEDGER_MAX then
-		st.guest_authorized[oldest] = nil
+		if not left and oldest then
+			io.stderr:write(("openuf: guest ledger full (%d): dropping %s, still associated; "
+				.. "it is blocked until the controller re-authorizes it\n")
+				:format(M.GUEST_LEDGER_MAX, oldest))
+		end
+		st.guest_authorized[left or oldest] = nil
 	end
 end
 
@@ -6180,6 +6233,25 @@ function M._forget_controller(prev, cfg)
 	if prev.led_enabled == false and M._led then
 		pcall(M._led.set_enabled, cfg and cfg.led, true)
 	end
+	-- The controller's client blocks and rate limits go with it: an empty
+	-- blocklist and no openUF tc on any netdev, not a reboot's worth of
+	-- dropped clients and caps nobody can see in a UI any more
+	-- (Fantastic792/openUF 97de795).
+	if M._firewall then
+		local ok, err = pcall(M._firewall.reconcile, {})
+		if not ok then io.stderr:write("inform: forget: blocklist: " .. tostring(err) .. "\n") end
+	end
+	if M._shaper then
+		local ok, err = pcall(M._shaper.sync, {})
+		if not ok then io.stderr:write("inform: forget: rate limits: " .. tostring(err) .. "\n") end
+	end
+	M._shape_obs = nil
+	-- What held SSIDs down for the controller's features starts over: the
+	-- reset cleared the persisted lists (sched_vaps_down, guest_vaps_down)
+	-- and forget removed the VAPs, so the in-memory switches follow -- a
+	-- re-adoption must not inherit an "off the air".
+	M._guest_selfrun_on = false
+	M._inform_fails = 0
 end
 
 -- Detects an out-of-process change to the on-disk state file -- written by

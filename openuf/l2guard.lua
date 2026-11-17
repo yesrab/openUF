@@ -183,7 +183,7 @@ end
 -- Nothing in OpenWrt re-checks the flags, so this does.
 
 M._list_hostapd_confs = function()
-	local p = io.popen("ls /var/run/hostapd-phy*.conf 2>/dev/null")
+	local p = io.popen("ls /var/run/hostapd-*.conf 2>/dev/null")
 	if not p then return {} end
 	local out = {}
 	for line in p:lines() do out[#out + 1] = line end

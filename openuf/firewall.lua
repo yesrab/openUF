@@ -58,6 +58,11 @@ function M.reconcile(blocked_macs)
 	stmts[#stmts + 1] = "add chain " .. T .. " block { type filter hook forward priority 0; }"
 	stmts[#stmts + 1] = "add rule " .. T .. " block ether saddr @blocked_macs drop"
 	stmts[#stmts + 1] = "add rule " .. T .. " block ether daddr @blocked_macs drop"
+	-- forward only sees bridged traffic between ports; a blocked client's
+	-- frames to the AP itself (DHCP, DNS, LuCI on br-lan) go through the
+	-- bridge input hook and were still being answered.
+	stmts[#stmts + 1] = "add chain " .. T .. " block_in { type filter hook input priority 0; }"
+	stmts[#stmts + 1] = "add rule " .. T .. " block_in ether saddr @blocked_macs drop"
 	util.nft_apply(T, stmts, M._exec)
 	return true
 end

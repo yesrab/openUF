@@ -31,6 +31,16 @@ M.PORT = 3478      -- the controller's STUN port, when stun_url names none
 M.INTERVAL = 30    -- seconds between Binding Requests
 M.RETRY = 5        -- seconds after a failed resolve or send
 M.DRAIN = 64       -- packets read per wake-up at most
+-- Binding Requests in a row without a Binding Response before the
+-- controller's name is resolved again. A UDP send to an address nobody
+-- answers on still succeeds, so a send failure alone would never notice a
+-- controller that moved (a new DHCP lease behind the same name).
+M.RESOLVE_AFTER = 3
+-- dns.toip blocks the inform loop for as long as the resolver takes, which
+-- with a dead DNS server is its full timeout. Failed lookups back off
+-- (RETRY, doubling, up to this), and a name that resolved once keeps its
+-- last address meanwhile. An address literal is never looked up.
+M.RESOLVE_BACKOFF_MAX = 300
 
 local T_BINDING_REQUEST  = 0x0001
 local T_BINDING_RESPONSE = 0x0101
@@ -88,7 +98,7 @@ end
 function M.close(c)
 	if c.sock then pcall(c.sock.close, c.sock) end
 	c.sock, c.ip, c.mapped_ip, c.mapped_port = nil, nil, nil, nil
-	c.next_send = nil
+	c.next_send, c.unanswered = nil, 0
 end
 
 -- Follow the wanted URL: open on a new one, close when there is none.
@@ -103,6 +113,7 @@ function M.sync(c, url, active)
 	if c.url ~= url then
 		M.close(c)
 		c.url, c.host, c.port = url, host, port
+		c.last_ip, c.resolve_fails, c.resolve_at = nil, 0, nil
 	end
 	if not c.sock then
 		local s, err = c.socket.udp()
@@ -115,13 +126,32 @@ function M.sync(c, url, active)
 	return true
 end
 
+-- The server's address: the host itself when it is an IPv4 literal, else a
+-- lookup, at most once per backoff step while lookups fail. nil when there
+-- is none to use.
+local function resolve(c, now)
+	if c.host:match("^%d+%.%d+%.%d+%.%d+$") then return c.host end
+	if c.resolve_at and now < c.resolve_at then return c.last_ip end
+	local ip = c.socket.dns and c.socket.dns.toip(c.host)
+	if ip then
+		c.last_ip, c.resolve_fails, c.resolve_at = ip, 0, nil
+		return ip
+	end
+	c.resolve_fails = (c.resolve_fails or 0) + 1
+	c.resolve_at = now + math.min(M.RETRY * 2 ^ (c.resolve_fails - 1), M.RESOLVE_BACKOFF_MAX)
+	return c.last_ip
+end
+
 -- Send the Binding Request when due. now is in seconds.
 function M.send_due(c, now)
 	if not c.sock or (c.next_send and now < c.next_send) then return false end
+	if c.ip and (c.unanswered or 0) >= M.RESOLVE_AFTER then
+		c.ip, c.unanswered = nil, 0
+	end
 	if not c.ip then
-		local ip = c.socket.dns and c.socket.dns.toip(c.host)
+		local ip = resolve(c, now)
 		if not ip then
-			c.next_send = now + M.RETRY
+			c.next_send = math.max(now + M.RETRY, c.resolve_at or 0)
 			return false, "cannot resolve " .. tostring(c.host)
 		end
 		c.ip = ip
@@ -135,28 +165,41 @@ function M.send_due(c, now)
 		return false, err
 	end
 	c.next_send = now + M.INTERVAL
+	c.unanswered = (c.unanswered or 0) + 1
 	return true
 end
 
 -- Read what is queued. Returns wake: true when the controller asked for an
 -- inform or this socket's mapped address changed.
+--
+-- Only what the STUN server's own address sent counts. The firmware checks
+-- no sender, so any LAN host could make an AP inform over and over with a
+-- stream of 0x8888 packets, or plant a connect_request address the
+-- controller then sends its wake-ups to (fonix232/openUF 168c362,
+-- COMPLETION-PLAN D3). Nothing can matter before the first Binding Request,
+-- and that one sets c.ip.
 function M.receive(c)
 	if not c.sock then return false end
 	local wake = false
+	local server = c.ip or c.last_ip
 	for _ = 1, M.DRAIN do
-		local pkt, err = c.sock:receive()
+		local pkt, from = c.sock:receivefrom()
 		if not pkt then
 			-- Anything but "nothing queued" ends this socket; sync opens a
 			-- new one on the next tick, as the firmware reinits.
-			if err ~= "timeout" then M.close(c) end
+			if from ~= "timeout" then M.close(c) end
 			break
 		end
-		local kind, ip, port = M.parse(pkt)
+		local kind, ip, port
+		if server and from == server then kind, ip, port = M.parse(pkt) end
 		if kind == "wake" then
 			wake = true
-		elseif kind == "mapped" and (ip ~= c.mapped_ip or port ~= c.mapped_port) then
-			c.mapped_ip, c.mapped_port = ip, port
-			wake = true
+		elseif kind == "mapped" then
+			c.unanswered = 0
+			if ip ~= c.mapped_ip or port ~= c.mapped_port then
+				c.mapped_ip, c.mapped_port = ip, port
+				wake = true
+			end
 		end
 	end
 	return wake

@@ -632,4 +632,67 @@ return {
 			assert_eq(table.concat(c.sent):find("url=", 1, true), nil, "no Host: no url=")
 		end
 	},
+	{
+		-- inform.lua's ledger (st.guest_authorized), the set serve_one's
+		-- guests are let through by.
+		name = "guest ledger: over the cap a departed guest goes, never one still on the air",
+		fn = function()
+			dofile("openuf/lib/lib.lua")
+			local inform = dofile("openuf/inform.lua")
+			local A, B, C, N = "00:00:5e:00:53:0a", "00:00:5e:00:53:0b", "00:00:5e:00:53:0c",
+				"00:00:5e:00:53:0d"
+			local function run(where)
+				local st = {guest_authorized = {[A] = 100, [B] = 200, [C] = 300}}
+				inform._shape_obs = {complete = true, where = where, conn = {}}
+				local said = {}
+				local real = io.stderr
+				io.stderr = {write = function(_, s) said[#said + 1] = s end}
+				local ok, err = pcall(inform._guest_authorize, st, N, true)
+				io.stderr = real
+				if not ok then error(err, 0) end
+				return st.guest_authorized, table.concat(said)
+			end
+			inform.GUEST_LEDGER_MAX = 3
+			local ok, err = pcall(function()
+				-- B has left; A is the oldest but still associated.
+				local l, said = run({[A] = "wlan0", [C] = "wlan0", [N] = "wlan0"})
+				assert_not_nil(l[A], "the oldest guest, still associated, keeps access")
+				assert_nil(l[B], "the departed guest is the one dropped")
+				assert_not_nil(l[N], "the new authorization is recorded")
+				assert_eq(said, "", "nothing to report")
+				-- Everyone is on the air: forced, oldest other than N, logged.
+				l, said = run({[A] = "wlan0", [B] = "wlan0", [C] = "wlan0", [N] = "wlan0"})
+				assert_nil(l[A], "forced: the oldest goes")
+				assert_not_nil(l[N], "never the MAC just authorized")
+				assert_contains(said, "guest ledger full", "a forced drop is logged")
+			end)
+			inform.GUEST_LEDGER_MAX, inform._shape_obs = 512, nil
+			if not ok then error(err, 0) end
+		end
+	},
+	{
+		name = "guestportal: serve_one gives the whole request one deadline, not one per line",
+		fn = function()
+			-- A guest trickling a header every 0.3 s: each line is inside a
+			-- per-line timeout, so only a whole-request deadline stops it.
+			local lines = {"GET / HTTP/1.1"}
+			for i = 1, 100 do lines[#lines + 1] = "X-Pad-" .. i .. ": y" end
+			local c = fake_client(lines, "198.51.100.50")
+			local t, read, waits = 1000, 0, {}
+			local recv = c.receive
+			c.receive = function(self) read = read + 1; t = t + 0.3; return recv(self) end
+			c.settimeout = function(self, s) waits[#waits + 1] = s end
+			local orig = gp._clock
+			gp._clock = function() return t end
+			local ok, err = pcall(gp.serve_one, {accept = function() return c end},
+				{url = "http://" .. CTL .. "/", ap = "", arp = function() return ARP end,
+				 now = function() return 1 end})
+			gp._clock = orig
+			if not ok then error(err, 0) end
+			assert_eq(read, 4, "reading stops once 1 s is spent")
+			for _, s in ipairs(waits) do assert_true(s <= 1, "no wait beyond the budget") end
+			assert_true(t - 1000 <= 1.3,"the loop was held about 1 s, not ~32 s")
+			assert_true(table.concat(c.sent):find("302", 1, true) ~= nil, "still answers")
+		end
+	},
 }

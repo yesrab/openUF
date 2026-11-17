@@ -42,11 +42,15 @@ local function fake_socket(opts)
 			f.sent[#f.sent + 1] = {data = data, to = ip .. ":" .. port}
 			return #data
 		end
-		function s:receive()
+		-- A queued string comes from the STUN server (f.server, or the
+		-- address the last send went to); {data=, from=} from anyone else.
+		function s:receivefrom()
 			local p = table.remove(f.queue, 1)
 			if p == nil then return nil, "timeout" end
-			if type(p) == "table" then return nil, p.err end
-			return p
+			if type(p) == "table" and p.err then return nil, p.err end
+			if type(p) == "table" then return p.data, p.from, 3478 end
+			local last = f.sent[#f.sent]
+			return p, f.server or (last and last.to:match("^(.-):%d+$")), 3478
 		end
 		function s:close() f.closed = f.closed + 1 end
 		return s
@@ -159,11 +163,65 @@ return {
 		end
 	},
 	{
+		name = "stun: blocking lookups are bounded: backoff, last address, literals skip DNS",
+		fn = function()
+			-- A dead DNS server: each toip blocks the inform loop for the
+			-- resolver's timeout, so lookups back off instead of every 5 s.
+			local f = fake_socket({no_dns = true})
+			local c = stun.new(f)
+			stun.sync(c, "stun://ctrl.example:3478/", true)
+			for t = 100, 1100 do stun.send_due(c, t) end
+			-- 5, 10, 20, ... 300: 100, 105, 115, 135, 175, 255, 415, 715, 1015
+			assert_eq(f.resolved, 9, "nine lookups in 1000 s, not two hundred")
+			assert_true(c.next_send - 1015 == 300, "capped at RESOLVE_BACKOFF_MAX")
+
+			-- A name that resolved once keeps its address while a re-resolve fails.
+			f = fake_socket()
+			c = stun.new(f)
+			stun.sync(c, "stun://ctrl.example:3478/", true)
+			stun.send_due(c, 100)
+			f.dns.toip = function() f.resolved = f.resolved + 1 return nil end
+			for t = 130, 220, 30 do stun.send_due(c, t) end  -- 3 unanswered -> re-resolve at 190
+			assert_eq(f.resolved, 2, "re-resolved once")
+			assert_eq(#f.sent, 5, "and kept sending")
+			assert_eq(f.sent[5].to, "192.0.2.10:3478", "to the last address it had")
+
+			-- An address literal never reaches the resolver.
+			f = fake_socket()
+			c = stun.new(f)
+			stun.sync(c, "stun://192.0.2.5:3478/", true)
+			assert_true(stun.send_due(c, 100), "sent")
+			assert_nil(f.resolved, "no lookup for a literal")
+			assert_eq(f.sent[1].to, "192.0.2.5:3478", "to the literal")
+		end
+	},
+	{
+		name = "stun: the name is resolved again after three requests go unanswered",
+		fn = function()
+			local f = fake_socket()
+			local c = stun.new(f)
+			stun.sync(c, "stun://ctrl.example:3478/", true)
+			stun.send_due(c, 100)
+			stun.send_due(c, 130)
+			f.queue = {response("192.0.2.3", 41234)}
+			stun.receive(c)
+			stun.send_due(c, 160)
+			stun.send_due(c, 190)
+			assert_eq(f.resolved, 1, "answered requests keep the address")
+			stun.send_due(c, 220)
+			assert_eq(f.resolved, 1, "three unanswered: not yet")
+			stun.send_due(c, 250)
+			assert_eq(f.resolved, 2, "the fourth send resolves the name again")
+			assert_eq(#f.sent, 6, "and still sends")
+		end
+	},
+	{
 		name = "stun: a response sets the fields and wakes once per change",
 		fn = function()
 			local f = fake_socket()
 			local c = stun.new(f)
 			stun.sync(c, "stun://192.0.2.4:3478/", true)
+			stun.send_due(c, 0)
 			assert_eq(stun.fields(c), nil, "nothing before a response")
 			assert_false(stun.receive(c), "nothing queued")
 			f.queue = {response("192.0.2.3", 41234)}
@@ -211,6 +269,26 @@ return {
 			assert_eq(c.sock, nil, "no URL: closed")
 			assert_false(stun.send_due(c, 1000), "and nothing sent")
 			assert_eq(stun.fields(nil), nil, "no client at all")
+		end
+	},
+	{
+		-- The firmware takes a wake or a mapping from anyone; a LAN host
+		-- could keep the AP informing, or redirect the controller's wake-ups.
+		name = "stun: only the STUN server's own address can wake or set the mapping",
+		fn = function()
+			local f = fake_socket()
+			local c = stun.new(f)
+			stun.sync(c, "stun://192.0.2.4:3478/", true)
+			f.queue = {WAKE}
+			assert_false(stun.receive(c), "before any request: nothing counts")
+			stun.send_due(c, 0)
+			f.queue = {{data = WAKE, from = "192.0.2.66"}}
+			assert_false(stun.receive(c), "a wake from another host is ignored")
+			f.queue = {{data = response("192.0.2.66", 4444), from = "192.0.2.66"}}
+			assert_false(stun.receive(c), "a mapping from another host is ignored")
+			assert_eq(stun.fields(c), nil, "and not reported")
+			f.queue = {{data = WAKE, from = "192.0.2.4"}}
+			assert_true(stun.receive(c), "the server's own wake counts")
 		end
 	},
 }

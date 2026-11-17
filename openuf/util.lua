@@ -62,7 +62,10 @@ end
 
 -- A netdev name safe to splice into a command: IFNAMSIZ allows 15 characters.
 function M.valid_ifname(s)
-	return type(s) == "string" and #s <= 15 and s:match("^[%w%-%._]+$") ~= nil
+	-- Never a leading "-", which ip/tc/iw would read as an option, nor "." or
+	-- "..", which the kernel refuses as names (and which are paths).
+	return type(s) == "string" and #s <= 15 and s:match("^[%w%._][%w%-%._]*$") ~= nil
+		and s ~= "." and s ~= ".."
 end
 
 -- band/bor/bxor/lshift/rshift: LuaBitOp, bit32, or 5.3+ integer operators.

@@ -310,4 +310,31 @@ return {
 			end)
 		end
 	},
+	{
+		name = "roamassist: a client that comes back to the BSS it was disassociated from is left alone",
+		fn = function()
+			-- The usual cause: the client is locked to this AP (Lock to Access
+			-- Point), so every other AP denies it and the "better" AP can
+			-- never take it. Kicking again would ban it for BAN_MS every
+			-- COOLDOWN for as long as it stays weak.
+			with_ra(sticky(), function(cmds, _, logs)
+				local t = 1000 + ra.BELOW_HOLD
+				run_until_decided(obs(), 1000)
+				ra.tick({obs()}, t + ra.GRACE)
+				assert_eq(#cmds, 2, "BTM request, then disassociated")
+				-- Gone for the ban, then back here, still weak, for ten minutes.
+				ra.tick({}, t + ra.GRACE + 1)
+				for s = 40, 600, 10 do ra.tick({obs()}, t + ra.GRACE + s) end
+				assert_eq(#cmds, 2, "no second BTM request or disassociation")
+				-- Seen on another BSS of ours: the refusal is forgotten there.
+				local other = obs()
+				other.ifname = "phy1-ap1"
+				local t2 = t + ra.GRACE + 700
+				ra.tick({other}, t2)
+				ra.tick({obs()}, t2 + 10)
+				ra.tick({obs()}, t2 + 10 + ra.BELOW_HOLD)
+				assert_eq(#cmds, 3, "steered again after it moved")
+			end)
+		end
+	},
 }
