@@ -158,7 +158,7 @@ troubleshooting.
 | [PROTOCOL-VALIDATION.md](PROTOCOL-VALIDATION.md) | What was confirmed against a live controller, with the wire evidence; it wins where other documents disagree |
 | [REVERSE-ENGINEERING.md](REVERSE-ENGINEERING.md) | What is not implemented yet, what is known about it, and the experiment plan |
 | [PACKAGING.md](PACKAGING.md) | The OpenWrt packages, the LuCI app, the theme and the release workflow |
-| [CLAUDE.md](CLAUDE.md) | Working notes for contributors: the constraints, the landmines, and how to add a hardware profile |
+| [CLAUDE.md](CLAUDE.md) | Working notes for contributors: the commands and constraints, and the index of the per-area notes in [docs/agents/](docs/agents/) (the landmines, how to add a hardware profile) |
 
 ## Contributing
 
@@ -171,7 +171,7 @@ showed.
 **Add a hardware profile.** The most useful contribution. On a DSA board the installer can
 generate one (`setup.sh`, or *Export* on the LuCI settings page); otherwise write
 `openuf/modelmap/<vendor>-<model>.lua` from the board's OpenWrt DTS and `board.d` entry,
-following [CLAUDE.md § Adding a new device map](CLAUDE.md#adding-a-new-device-map), and say
+following [Adding a new device map](docs/agents/device-maps.md#adding-a-new-device-map), and say
 in its header what was and was not confirmed on the hardware.
 
 **Change the code.** The daemon is Lua 5.1 as OpenWrt ships it, the installers are POSIX

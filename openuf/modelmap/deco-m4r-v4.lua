@@ -86,7 +86,7 @@ dev.openwrt_boards = {"tplink,deco-m4r-v4"}
 -- OpenWrt network layout.
 --
 -- lan_cpueth is "br-lan", the LAN BRIDGE, not a socket -- the DSA rule
--- (CLAUDE.md, "lan_cpueth decides the device's IDENTITY"), and on this board
+-- (docs/agents/device-maps.md, "lan_cpueth decides the device's IDENTITY"), and on this board
 -- it answers all three questions it decides:
 --
 --   1. IDENTITY. Its MAC is what the controller adopts the device under.

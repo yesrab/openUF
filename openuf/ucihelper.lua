@@ -1427,7 +1427,7 @@ end
 --
 -- Only ever acts when the two genuinely differ, so a board where they already
 -- agree is untouched and no reload is issued. This fork's JioRouter maps name
--- `br-lan` itself as lan_cpueth (CLAUDE.md: "lan_cpueth: bridge on DSA"), so
+-- `br-lan` itself as lan_cpueth (docs/agents/device-maps.md: "lan_cpueth: bridge on DSA"), so
 -- the bridge has no master and this is a no-op there; it protects any DSA map
 -- that names a socket instead. On a DHCP-addressed board the new L2 identity
 -- means a new lease and possibly a new address; openUF reports the change on
@@ -2449,7 +2449,7 @@ function M.apply_config(resp, cfg, opts)
 			-- calls iface_authentication_server() only from its EAP branch (and
 			-- from iface_ppsk), so on a PSK, SAE or open BSS the wifi-iface
 			-- options are stored and silently dropped -- exactly the trap
-			-- CLAUDE.md names -- and raw per-BSS lines are the only route.
+			-- docs/agents/wireless.md names -- and raw per-BSS lines are the only route.
 			-- iface_accounting_server() IS called unconditionally, so the
 			-- accounting servers always go through UCI.
 			local eap_bss = EAP_ENC[SECURITY_MAP[vap.security] or ""] or false

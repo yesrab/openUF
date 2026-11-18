@@ -42,8 +42,8 @@
 	switch. The 24.10 and 25.12 releases still use the old NSS dataplane:
 	the same five netdevs, made by nss-dp from the same DT labels, bridged
 	in software. openUF sees the same thing either way -- one netdev per
-	socket, all of them in br-lan -- which is the DSA shape (CLAUDE.md,
-	"Decide swconfig or DSA first"): lan_cpueth = br-lan, uplink_detect =
+	socket, all of them in br-lan -- which is the DSA shape
+	(docs/agents/device-maps.md, "Decide swconfig or DSA first"): lan_cpueth = br-lan, uplink_detect =
 	"fdb", no dev.conf.vlan.
 	⚠️ Per-port VLAN (a Native VLAN on a port) moves the socket into its
 	VLAN's bridge (switchvlan.dsa_apply). Verified upstream on an mt7530,
@@ -76,7 +76,7 @@ dev.openwrt_boards = {"dynalink,dl-wrx36"}
 -- OpenWrt network layout.
 --
 -- lan_cpueth is "br-lan", the LAN BRIDGE, not a socket -- the DSA rule
--- (CLAUDE.md, "lan_cpueth decides the device's IDENTITY"):
+-- (docs/agents/device-maps.md, "lan_cpueth decides the device's IDENTITY"):
 --
 --   1. IDENTITY. Its MAC is what the controller adopts the device under,
 --      and on an AP the cable may sit in any of the five sockets. Unlike on
