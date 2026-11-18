@@ -15,7 +15,7 @@
 #   2. back up /opt/openuf and /etc/openuf to a tarball in /tmp
 #   3. sh install.sh install  -- which KEEPS the device's conf.lua, and with it
 #      the modelmap, and with THAT the identity MAC the controller adopted the
-#      device under (CLAUDE.md, "lan_cpueth decides IDENTITY"). state.json is
+#      device under (docs/agents/device-maps.md, "lan_cpueth decides IDENTITY"). state.json is
 #      never touched. That is what makes this safe on an adopted AP: nothing
 #      to re-adopt, nothing to re-provision
 #   4. restart the service and WAIT for the new daemon to complete an inform

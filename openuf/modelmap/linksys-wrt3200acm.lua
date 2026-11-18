@@ -50,7 +50,7 @@
 	    and WPS lights
 
 	The stock image ships wpad-basic-mbedtls, which cannot run a
-	controller-pushed WLAN (CLAUDE.md, "wpad-basic"): setup.sh and
+	controller-pushed WLAN (docs/agents/installers.md, "wpad-basic"): setup.sh and
 	`openuf deps --install` swap it for the full build.
 
 	Radio order: radio0 = 5 GHz, radio1 = 2.4 GHz -- the OPPOSITE of the
@@ -89,7 +89,7 @@ dev.openwrt_boards = {"linksys,wrt3200acm"}
 -- OpenWrt network layout.
 --
 -- lan_cpueth is "br-lan", the LAN BRIDGE, not a socket -- the DSA rule
--- (CLAUDE.md, "lan_cpueth decides the device's IDENTITY"):
+-- (docs/agents/device-maps.md, "lan_cpueth decides the device's IDENTITY"):
 --
 --   1. IDENTITY. Its MAC is what the controller adopts the device under,
 --      and on an AP the cable may sit in any of the five sockets. board.d
@@ -201,8 +201,8 @@ dev.conf.led = "pca963x:rango:white:wps"
 -- the switch path, shelling out to a `swconfig` that is not installed; its
 -- absence is what keeps port reporting on the netdev path and per-port VLAN
 -- on the bridge move (switchvlan.dsa_apply; Native VLAN only).
--- ⚠️ That move, and the learning-off it depends on (CLAUDE.md, "A moved DSA
--- socket"), are verified upstream on an mt7530 and never ran on an
+-- ⚠️ That move, and the learning-off it depends on
+-- (docs/agents/network-and-switch.md, "A moved DSA socket"), are verified upstream on an mt7530 and never ran on an
 -- mv88e6xxx.
 
 -- UniFi configuration

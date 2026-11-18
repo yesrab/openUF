@@ -25,7 +25,7 @@
 
 	Two retail revisions, one board name. ubus reports "tplink,deco-m4r-v1"
 	on a v2 as well (there is no v2 DTS), so that single string is all this
-	map can claim -- the family rule in CLAUDE.md. The v4 is a different
+	map can claim -- the family rule in docs/agents/device-maps.md. The v4 is a different
 	board altogether (MediaTek MT7621, DSA) and has its own map,
 	modelmap/deco-m4r-v4.lua: everything openUF reads differs between the
 	two (switch backend, identity netdev, port shape, LED name), so they are
@@ -97,7 +97,7 @@ dev.openwrt_boards = {"tplink,deco-m4r-v1"}
 -- switch expects. Its MAC is the board's config-partition MAC (DTS:
 -- macaddr_config_8 +0, shared with the 2.4 GHz radio; the 5 GHz radio
 -- carries -1) and is the identity the controller adopts the device under --
--- see CLAUDE.md on lan_cpueth. The management IP lives on br-lan;
+-- see docs/agents/device-maps.md on lan_cpueth. The management IP lives on br-lan;
 -- announce.get_ip and sysinfo.lan_bridge follow the trunk to its bridge on
 -- their own.
 dev.conf.net = {

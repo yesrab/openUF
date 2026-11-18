@@ -45,8 +45,8 @@
 	its own carrier, speed and slice of the bridge FDB, all of them ports of
 	br-lan. Two plain ethernet MACs in a bridge are exactly that, with one
 	thing less to go wrong: the bridge is pure software, so the one-address-
-	table trap of a switch ASIC (CLAUDE.md, "A moved DSA socket") cannot
-	apply. Hence the bridge as lan_cpueth, uplink_detect = "fdb", and no
+	table trap of a switch ASIC (docs/agents/network-and-switch.md, "A moved
+	DSA socket") cannot apply. Hence the bridge as lan_cpueth, uplink_detect = "fdb", and no
 	dev.conf.vlan.
 	"eth0" and "eth1" are SOCKETS here, as on the Deco M4R v4, not the CPU
 	netdevs the generic maps mean by those names: a VLAN sub-device on
@@ -81,8 +81,8 @@ dev.openwrt_boards = {"openwrt,one"}
 
 -- OpenWrt network layout.
 --
--- lan_cpueth is "br-lan", the LAN BRIDGE, not a socket (CLAUDE.md,
--- "lan_cpueth decides the device's IDENTITY"):
+-- lan_cpueth is "br-lan", the LAN BRIDGE, not a socket
+-- (docs/agents/device-maps.md, "lan_cpueth decides the device's IDENTITY"):
 --
 --   1. IDENTITY. Its MAC is what the controller adopts the device under,
 --      and on an AP the cable may sit in either socket. board.d sets no MAC

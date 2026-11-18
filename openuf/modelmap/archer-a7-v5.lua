@@ -60,7 +60,7 @@ dev.openwrt_boards = {"tplink,archer-a7-v5", "tplink,archer-c7-v4", "tplink,arch
 -- VLAN 20 becomes eth0.20 beside the LAN's own eth0.1, which is what the
 -- switch expects. Its MAC is the board's label MAC (DTS: label-mac-device =
 -- &eth0) and is the identity the controller adopts the device under -- see
--- CLAUDE.md on lan_cpueth. The management IP lives on br-lan; announce.get_ip
+-- docs/agents/device-maps.md on lan_cpueth. The management IP lives on br-lan; announce.get_ip
 -- and sysinfo.lan_bridge follow the trunk to its bridge on their own.
 dev.conf.net = {
 	lan_name	= "lan",

@@ -97,7 +97,7 @@ dev.openwrt_boards = {"tplink,deco-m5-v1", "tplink,deco-m5-v2", "tplink,deco-m5-
 -- OpenWrt network layout.
 --
 -- lan_cpueth is "br-lan", the LAN BRIDGE, not a socket -- the DSA rule
--- (CLAUDE.md, "lan_cpueth decides the device's IDENTITY"), and on this board
+-- (docs/agents/device-maps.md, "lan_cpueth decides the device's IDENTITY"), and on this board
 -- it answers all three questions it decides:
 --
 --   1. IDENTITY. Its MAC is what the controller adopts the device under.
@@ -122,7 +122,7 @@ dev.openwrt_boards = {"tplink,deco-m5-v1", "tplink,deco-m5-v2", "tplink,deco-m5-
 --      "wan" moves "lan" OUT of br-lan (switchvlan.dsa_apply rewrites the
 --      bridge's ports list), netifd hands the primary to "wan", br-lan
 --      becomes +1, and every inform afterwards carries a MAC the controller
---      never adopted: HTTP 400 forever (CLAUDE.md, lan_cpueth). Pin the
+--      never adopted: HTTP 400 forever (docs/agents/device-maps.md, lan_cpueth). Pin the
 --      address BEFORE the first adoption, so that membership can never move
 --      it again. Check first that `cat /sys/class/net/br-lan/address`
 --      matches the sticker, then copy br-lan's OWN address -- never eth0's,

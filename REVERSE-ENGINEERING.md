@@ -100,7 +100,7 @@ grep -v '"_type":"noop"' /tmp/openuf-dump.txt                       # only the r
 
 To see both directions, add `debug_dump_requests = true`: every payload openUF sends is
 appended as a line tagged ` TX ` and every transport failure as ` ERR ` (an `ERR HTTP
-400` streak is the identity-MAC problem, see CLAUDE.md). Response lines stay untagged,
+400` streak is the identity-MAC problem, see docs/agents/device-maps.md). Response lines stay untagged,
 so the two recipes above keep working; `grep -v ' TX '` hides the requests again.
 
 ⚠️ The file contains PSKs and the `authkey`. It is on tmpfs (gone on reboot); set the

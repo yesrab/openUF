@@ -174,5 +174,5 @@ sed -i "s/^RRB_UNIFI_TAG=\${RRB_UNIFI_TAG:-$PINNED}/RRB_UNIFI_TAG=\${RRB_UNIFI_T
 grep -q "^RRB_UNIFI_PINNED_TAG=$TAG\$" "$SETUP" && grep -q "^RRB_UNIFI_PLUGIN_SHA256=$LATEST_SHA\$" "$SETUP" \
 	|| die "setup.sh was not updated (macOS sed? put gnu-sed first in PATH)"
 ok "pin moved to $TAG: tests/fixtures/rrb-unifi/, setup.sh"
-say "left to you: the version named in USAGE.md section 6 and CLAUDE.md, a REVERSE-ENGINEERING.md"
+say "left to you: the version named in USAGE.md section 6 and docs/agents/installers.md, a REVERSE-ENGINEERING.md"
 say "session-log row with what changed in the diff above, and 'lua tests/run_tests.lua' once more."

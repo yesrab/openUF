@@ -120,7 +120,7 @@ case "$ACTION" in
 		# is the natural way to upgrade, reset the modelmap to the generic
 		# one; on a DSA board that moves lan_cpueth and with it the identity
 		# MAC, and every inform afterwards is rejected with HTTP 400 while the
-		# old record goes Offline (CLAUDE.md: "lan_cpueth decides IDENTITY").
+		# old record goes Offline (docs/agents/device-maps.md: "lan_cpueth decides IDENTITY").
 		# Keep it, and ship the new default alongside as conf.lua.dist.
 		# setup.sh passes --replace-conf: it rewrites conf.lua from its own
 		# interview on purpose, and a re-run is meant to reproduce the whole
