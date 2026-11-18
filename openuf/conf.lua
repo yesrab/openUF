@@ -22,6 +22,8 @@
 	  jiorouter-ax6000-jidu6j01.lua      JioRouter AX6000 J-fam (DSA, 2-band)
 	  dynalink-dl-wrx36.lua              Dynalink DL-WRX36      (DSA, 2-band, 5 sockets; ⚠️ unverified)
 	  xiaomi-ax3000t.lua                 Xiaomi Mi Router AX3000T (DSA, 2-band)
+	  linksys-wrt3200acm.lua             Linksys WRT3200ACM     (DSA, 2-band + an unused third radio, 5 sockets; ⚠️ unverified)
+	  openwrt-one.lua                    OpenWrt One            (no switch, 2-band, 2 sockets eth0/eth1; ⚠️ unverified)
 	  bt-homehub-v5a.lua                 BT Home Hub 5 Type A   (DSA, 2-band; upstream's)
 	  generic-dualband-ap.lua            any other dual-band swconfig board
 	  generic-singleband-ap.lua          any other single-band swconfig board
@@ -40,9 +42,12 @@
 	The ufmodel controls the device identity presented to the controller:
 	  u6iw.lua  — presents as U6-InWall (U6IW)  ← default for AP emulation
 	  uhdiw.lua — presents as UAP-IW-HD (UHDIW), the WiFi 5 in-wall with the
-	              same five sockets ← the Archer A7/C7 map; ⚠️ not yet adopted
+	              same five sockets ← the Archer A7/C7 and WRT3200ACM maps;
+	              ⚠️ not yet adopted
 	  u7hd.lua  — presents as UAP-AC-HD (U7HD), the WiFi 5 ceiling AP with
 	              two sockets ← the Deco M5 and M4R maps; ⚠️ adopted once (M4R v1)
+	  u6mp.lua  — presents as U6 Mesh Pro (U6MP), the WiFi 6 AP with two
+	              sockets ← the OpenWrt One map; ⚠️ not yet adopted
 	  uapg1.lua — presents as UAP Gen1
 	  uapg2-ac-lr.lua — presents as UAP-AC-LR
 

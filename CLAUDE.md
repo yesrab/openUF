@@ -11,8 +11,9 @@ Two orthogonal concepts, constantly confused:
   sockets, switch geometry, status LED.
 - **ufmodel** (`openuf/ufmodel/*.lua`) — *the UniFi identity presented to the controller*.
   `u6iw` is the only one validated end-to-end. `uhdiw` (UAP-IW-HD: WiFi 5, the same five
-  sockets) and `u7hd` (UAP-AC-HD: WiFi 5, two sockets, for the Deco M5 and M4R) are sourced from
-  Ubiquiti's firmware catalog but have never adopted -- see "Adding a UniFi identity" below.
+  sockets), `u7hd` (UAP-AC-HD: WiFi 5, two sockets, for the Deco M5 and M4R; adopted once) and
+  `u6mp` (U6 Mesh Pro: WiFi 6, two sockets, for the OpenWrt One; never adopted) are sourced from
+  Ubiquiti's firmware catalog and device database -- see "Adding a UniFi identity" below.
 
 `openuf/conf.lua` picks one of each and holds runtime options. It is the file users
 hand-edit on the device, so it (and `modelmap/*`) keep their comments when packaged.
@@ -190,7 +191,8 @@ and the map needs a ⚠️ rather than silence.
 varies by revision), `archer-c5-v1.lua` for swconfig with two CPU
 netdevs, `archer-a7-v5.lua` for swconfig with one tagged CPU trunk (`0@eth0`), `deco-m4r-v1.lua`
 for that trunk on a board OpenWrt gives no WAN role at all, `deco-m4r-v4.lua` for a DSA board whose
-sockets are named `eth0`/`eth1`.
+sockets are named `eth0`/`eth1`, `openwrt-one.lua` for a board with no switch at all (one ethernet
+MAC per socket: the DSA column of the table above applies, though neither on-device test says DSA).
 
 ```lua
 --[[
@@ -228,7 +230,9 @@ Then set:
   OpenWrt DTS alias already drives**: `led-boot`, `led-failsafe`, `led-running` and
   `led-upgrade` in the DTS claim specific LEDs, and openUF fighting procd over the same
   GPIO is visible confusion. `nil` makes Locate and the LED toggle silent no-ops.
-- **`dev.openuf.uap.hwassign`** — UCI radio names to report. Radio order is **not**
+- **`dev.openuf.uap.hwassign`** — UCI radio names to report. A board can have more radios than its
+  identity (the WRT3200ACM's third, an 88W8887 for DFS scanning and Bluetooth): leave the extra out
+  and say in the comment that `setup.sh` still enables it. Radio order is **not**
   band order: the Archer C5 has `radio0` = 5 GHz, the WDR3500 and jidu6101 have
   `radio0` = 2.4 GHz. Nothing depends on the order (band is read from each radio's own
   UCI `band`/`hwmode`) but the comment should say which is which. Radios left out of
@@ -238,9 +242,12 @@ Then set:
   showing a radio that never comes up. `"uhdiw"` (UAP-IW-HD) is the WiFi 5 dual-band
   choice -- the controller then offers 802.11ac modes instead of HE ones the hardware
   cannot run -- but it is unvalidated until a controller adopts under it. The
-  `archer-a7-v5` map is the first to use it, and names `u6iw` as the fallback. `"u7hd"` (UAP-AC-HD)
+  `archer-a7-v5` map is the first to use it (the `linksys-wrt3200acm` map the second), and names
+  `u6iw` as the fallback. `"u7hd"` (UAP-AC-HD)
   is the WiFi 5 choice for a TWO-socket board -- both in-wall identities carry five -- and has
   been adopted once, on a Deco M4R v1 (2026-10-18); the `deco-m5` and both `deco-m4r` maps use it.
+  `"u6mp"` (U6 Mesh Pro) is the WiFi 6 choice for a TWO-socket board; the `openwrt-one` map is the
+  first to use it, and no controller has adopted under it yet.
 
 ### 3. `lan_cpueth` decides the device's IDENTITY
 
@@ -310,7 +317,7 @@ Three places name the profiles and will drift silently:
 [ ] swconfig: dev.conf.vlan with verified physical port numbers
 [ ] led = an LED no DTS alias drives (or nil)
 [ ] hwassign, with a comment saying which radio is which band
-[ ] ufmodel: u6iw dual-band (uhdiw five-socket / u7hd two-socket for WiFi 5 hardware, once validated), uapg1-lr single-radio
+[ ] ufmodel: u6iw dual-band (u6mp for two sockets; uhdiw five-socket / u7hd two-socket for WiFi 5 hardware, once validated), uapg1-lr single-radio
 [ ] ⚠️ marks on everything not confirmed on real hardware
 [ ] board-specific test added to tests/test_modelmap.lua
 [ ] lua tests/run_tests.lua passes
@@ -321,7 +328,12 @@ Three places name the profiles and will drift silently:
 
 Rarer than a modelmap, and the facts come from Ubiquiti, not OpenWrt:
 
-- **The model code and current firmware** are in the controller's own catalog:
+- **The model code, port count and capabilities** are in Ubiquiti's public device database,
+  `https://static.ui.com/fingerprint/ui/public.json` (one entry per product: `shortnames`,
+  `unifi.network.model`, `numberOfPorts`, `deviceCapabilities`, `minAdoptVersion.net`). Look the
+  product up by name there first: the codes are not guessable (`U6MP` is the U6 Mesh Pro,
+  `UAP6MP` the U6 Pro). What the controller does with those capabilities is still unknown.
+- **The current firmware** is in the controller's own catalog:
   `https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-firmware&filter=eq~~platform~~<CODE>&filter=eq~~channel~~release`
   returns `"platform": "UHDIW", "version": "v6.7.57+15670"`. `fw.ver` is that version
   **bare**, `6.7.57.15670` -- the controller compares the inform's `version` to its catalog

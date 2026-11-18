@@ -635,6 +635,113 @@ return {
 		end
 	},
 	{
+		name = "modelmap: openwrt-one pins the switchless two-socket board and its U6 Mesh Pro identity",
+		fn = function()
+			-- Board-specific regression guard, from the OpenWrt tree rather
+			-- than a live unit (none has run openUF yet). The board has no
+			-- switch: mt7981b-openwrt-one.dts gives each socket its own
+			-- ethernet MAC (gmac0 = eth0, 2.5 GbE; gmac1 = eth1, GbE) and
+			-- board.d says ucidef_set_interfaces_lan_wan eth1 eth0.
+			local dev = dofile(MODELMAP_DIR .. "/openwrt-one.lua")
+
+			-- The netdev shape without a DSA switch: the bridge is the
+			-- identity / trunk netdev, the uplink is measured, and there
+			-- is no swconfig map. "eth0" as lan_cpueth -- the generic
+			-- maps' reading -- would name a bridge port here.
+			assert_eq(dev.conf.net.lan_cpueth, "br-lan", "the LAN bridge, not a socket")
+			assert_eq(dev.conf.net.uplink_detect, "fdb", "uplink is detected, never declared")
+			assert_nil(dev.conf.vlan, "no swconfig port map on a board with no switch")
+			assert_eq(dev.conf.net.wan_cpueth, "eth0", "OpenWrt's WAN role is the 2.5 GbE socket eth0")
+
+			-- One retail model, one compatible string (no DEVICE_ALT in
+			-- filogic.mk's Device/openwrt_one).
+			assert_eq(#dev.openwrt_boards, 1, "exactly one compatible string")
+			assert_eq(dev.openwrt_boards[1], "openwrt,one", "the DTS compatible")
+
+			-- Two sockets, pinned to their idx: the controller keys
+			-- per-port settings on it, so the order is a contract once a
+			-- unit is adopted. idx 1 is the 2.5 GbE / PoE-in socket, the
+			-- U6 Mesh Pro's port 1.
+			local ports = dev.conf.net.ports
+			assert_eq(#ports, 2, "one port per socket -- the board has two")
+			for _, p in ipairs(ports) do
+				assert_nil(p.uplink, "port " .. p.idx .. " is not statically flagged uplink")
+				assert_nil(p.swport, "port " .. p.idx .. " carries no swconfig port")
+			end
+			assert_eq(ports[1].idx, 1, "first entry is port 1")
+			assert_eq(ports[1].ifname, "eth0", "port 1 is eth0, the 2.5 GbE socket")
+			assert_eq(ports[2].idx, 2, "second entry is port 2")
+			assert_eq(ports[2].ifname, "eth1", "port 2 is eth1, the GbE socket")
+
+			-- The running LED: procd claims all three status channels
+			-- (DTS aliases), so the map takes led-running's.
+			assert_eq(dev.conf.led, "green:status", "the status light's green channel")
+
+			-- Nothing measured, so no policy that overrides the controller.
+			assert_nil(dev.conf.radio, "no radio policy until one is measured on a unit")
+
+			-- The WiFi 6 two-socket identity. If this ever reads u6iw it
+			-- should be because a controller refused U6MP, and the map
+			-- header should say so.
+			assert_eq(dev.openuf.uap.ufmodel, "u6mp", "presents as a U6 Mesh Pro")
+			assert_eq(#dev.openuf.uap.hwassign, 2, "both radios reported")
+		end
+	},
+	{
+		name = "modelmap: linksys-wrt3200acm pins the five-socket mv88e6xxx board, two of its three radios and the WPS LED",
+		fn = function()
+			-- Board-specific regression guard, from the OpenWrt tree and
+			-- the kernel's armada-385-linksys{.dtsi,-rango.dts} rather
+			-- than a live unit (none has run openUF yet).
+			local dev = dofile(MODELMAP_DIR .. "/linksys-wrt3200acm.lua")
+
+			-- DSA: the bridge is the identity / trunk netdev, the uplink is
+			-- measured, and there is no swconfig map to drift.
+			assert_eq(dev.conf.net.lan_cpueth, "br-lan", "the LAN bridge, per the DSA rule")
+			assert_eq(dev.conf.net.uplink_detect, "fdb", "uplink is detected, never declared")
+			assert_nil(dev.conf.vlan, "no swconfig port map on a DSA board")
+			assert_eq(dev.conf.net.wan_cpueth, "wan", "OpenWrt's WAN role is the socket wan")
+
+			-- board_name is the FIRST compatible string (patch 311).
+			-- "linksys,rango", the second, is never reported, and the
+			-- WRT32X ("linksys,wrt32x") is another device.
+			assert_eq(#dev.openwrt_boards, 1, "exactly one compatible string")
+			assert_eq(dev.openwrt_boards[1], "linksys,wrt3200acm", "the patched DTS compatible")
+
+			-- Five sockets in case order, pinned to their idx: the
+			-- controller keys per-port settings on it.
+			local ports = dev.conf.net.ports
+			assert_eq(#ports, 5, "one port per socket -- the board has five")
+			local want = {"lan1", "lan2", "lan3", "lan4", "wan"}
+			for i, p in ipairs(ports) do
+				assert_eq(p.idx, i, "entry " .. i .. " is port " .. i)
+				assert_eq(p.ifname, want[i], "port " .. i .. " is " .. want[i])
+				assert_nil(p.uplink, "port " .. i .. " is not statically flagged uplink")
+				assert_nil(p.swport, "port " .. i .. " carries no swconfig port")
+			end
+
+			-- The WPS light: the one no procd alias or board.d trigger
+			-- drives. And never the two "wlan" LEDs of the release
+			-- images, which are the WiFi cards' reset lines (patch 950):
+			-- blinking one takes a radio off the bus until a reboot.
+			assert_eq(dev.conf.led, "pca963x:rango:white:wps", "the WPS light's white channel")
+			assert_true(not tostring(dev.conf.led):find("wlan", 1, true),
+				"the LED is not one of the WiFi cards' reset lines")
+
+			-- Nothing measured, so no policy that overrides the controller.
+			assert_nil(dev.conf.radio, "no radio policy until one is measured on a unit")
+
+			-- Two radios reported. radio2 is the 88W8887 on SDIO, which a
+			-- UAP-IW-HD has no counterpart for; listing it would show the
+			-- controller a third radio.
+			local hw = dev.openuf.uap.hwassign
+			assert_eq(table.concat(hw, ","), "radio0,radio1", "the two 88W8964 cards, not radio2")
+
+			-- The five-socket WiFi 5 identity, as on the Archer A7 map.
+			assert_eq(dev.openuf.uap.ufmodel, "uhdiw", "presents as a UAP-IW-HD")
+		end
+	},
+	{
 		name = "modelmap: dynalink-dl-wrx36 pins the five-socket IPQ8072A board in the netdev shape",
 		fn = function()
 			-- Board-specific regression guard, from the OpenWrt tree rather

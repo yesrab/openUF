@@ -186,6 +186,27 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   OpenWrt DTS and `board.d`; the header flags what to check first (the bridge MAC against the sticker,
   which hole is switch port 0, the radio order, whether the PCB's extra LEDs show through the case).
   16 MB flash, so a stock image fits. Presents the same identity as the v1/v2
+- **Linksys WRT3200ACM** (dual-band 802.11ac Wave 2, Armada 385 / mvebu-cortexa9, DSA) — use
+  `modelmap/linksys-wrt3200acm.lua`. Presents as a **UAP-IW-HD** (`ufmodel/uhdiw.lua`): WiFi 5 and
+  five sockets, `lan1`..`lan4` as Ports 1-4 and `wan` as Port 5. ⚠️ **Not yet run on the
+  hardware**: derived from the OpenWrt tree and the kernel's device tree; the header flags what to
+  check first (that `br-lan`'s MAC survives a reboot, the radio order, 5 GHz first, and the LED
+  name). The board has a **third radio** (88W8887) that the profile does not report; `setup.sh`
+  enables it with the others, so switch `radio2` off by hand. Locate and the LED toggle use the
+  WPS light; ⚠️ **never** point the LED at `rango:white:wlan_2g`/`wlan_5g`, which on release images
+  are the WiFi cards' reset lines. ⚠️ The `mwlwifi` driver is unmaintained and nothing here has run
+  on it; WPA3 is reported elsewhere to fail with many clients. ⚠️ The identity is not validated
+  either; `u6iw` is the fallback. NAND flash, so space is a non-issue
+- **OpenWrt One** (dual-band 802.11ax, MT7981B / mediatek-filogic, two sockets and no switch) — use
+  `modelmap/openwrt-one.lua`. Presents as a **U6 Mesh Pro** (`ufmodel/u6mp.lua`): WiFi 6 with
+  **two** sockets, this board's count. The sockets are the netdevs `eth0` (2.5 GbE, Port 1) and
+  `eth1` (GbE, Port 2), each its own ethernet MAC, so the profile uses the bridge and detects the
+  uplink, as on the DSA boards here. ⚠️ **Not yet run on the hardware**: derived from the OpenWrt
+  DTS and `board.d`; the header flags what to check first (the bridge MAC against the sticker, the
+  radio order, the LED name `green:status`). ⚠️ **Pin the bridge MAC before adopting**: `br-lan`
+  follows `eth0` once the AP conversion has added it, and a port VLAN on Port 1 would change the
+  identity; the header has the three commands. ⚠️ The identity is not validated either; `u6iw`
+  is the fallback. NAND flash, so space is a non-issue
 - **Xiaomi Mi Router AX3000T** (dual-band 802.11ax, 2x2, MT7981 / mediatek-filogic) — use
   `modelmap/xiaomi-ax3000t.lua`. Profile adopted from upstream (jonasevcik/openUF), where
   it is verified on the hardware: HE on both bands, 160 MHz on 5 GHz, DSA. Its four sockets
@@ -255,7 +276,7 @@ report the whole LAN, gateway included, as hosts plugged into it:
 | Per-port VLAN assignment | supported (`switch_vlan` sections) | supported (the socket moves into the VLAN's bridge; Native VLAN only) |
 | `dev.conf.vlan` | required | must be **absent** |
 
-The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end.  `ufmodel/uhdiw.lua` (UAP-IW-HD, the WiFi 5 in-wall with the same five sockets) is selected by the Archer A7/C7 profile so a WiFi 5 board is offered 802.11ac modes rather than WiFi 6 ones it has to clamp; its model code and firmware version come from Ubiquiti's own firmware catalog, but ⚠️ no controller has adopted a device under it yet.  `ufmodel/u7hd.lua` (UAP-AC-HD, the WiFi 5 ceiling AP with **two** sockets) is selected by the Deco M5 and both Deco M4R profiles for the same reason and to match those boards' socket count; its facts come from the same catalog, and a controller has adopted it once so far, on a Deco M4R v1 (2026-10-18).  `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
+The *modelmap* describes your real hardware; the *ufmodel* picks the UniFi identity to present.  `ufmodel/u6iw.lua` (U6-InWall) is the default and the only one validated end-to-end.  `ufmodel/uhdiw.lua` (UAP-IW-HD, the WiFi 5 in-wall with the same five sockets) is selected by the Archer A7/C7 and Linksys WRT3200ACM profiles so a WiFi 5 board is offered 802.11ac modes rather than WiFi 6 ones it has to clamp; its model code and firmware version come from Ubiquiti's own firmware catalog, but ⚠️ no controller has adopted a device under it yet.  `ufmodel/u7hd.lua` (UAP-AC-HD, the WiFi 5 ceiling AP with **two** sockets) is selected by the Deco M5 and both Deco M4R profiles for the same reason and to match those boards' socket count; its facts come from the same catalog, and a controller has adopted it once so far, on a Deco M4R v1 (2026-10-18).  `ufmodel/u6mp.lua` (U6 Mesh Pro, the WiFi 6 AP with **two** sockets) is selected by the OpenWrt One profile to match that board's WiFi generation and socket count; its model code comes from Ubiquiti's public device database and its firmware version from the same catalog, but ⚠️ no controller has adopted a device under it yet.  `uapg1`, `uapg1-lr`, and `uapg2-ac-lr` are also provided but untested.
 
 ## Quick start
 
