@@ -489,6 +489,14 @@ dev = dofile("modelmap/jiorouter-ax6000-jidu6j01.lua")
 -- a U6-InWall like the JioRouters; pin br-lan's MAC before adopting, see the file's header):
 dev = dofile("modelmap/dynalink-dl-wrx36.lua")
 
+-- For Linksys WRT3200ACM (Armada 385 / mvebu — a DSA board, five sockets; presents as a
+-- UAP-IW-HD; reports two of its three radios, switch radio2 off by hand, see the file's header):
+dev = dofile("modelmap/linksys-wrt3200acm.lua")
+
+-- For OpenWrt One (MT7981B / filogic — no switch, its two sockets are the netdevs eth0 and
+-- eth1; presents as a U6 Mesh Pro; pin br-lan's MAC before adopting, see the file's header):
+dev = dofile("modelmap/openwrt-one.lua")
+
 -- For Xiaomi Mi Router AX3000T (MT7981 / filogic — DSA; adopted from upstream):
 dev = dofile("modelmap/xiaomi-ax3000t.lua")
 
@@ -750,7 +758,7 @@ uap = {
 }
 ```
 
-The Archer A7/C7 profile selects `ufmodel/uhdiw.lua` instead: the **UAP-IW-HD**, the WiFi 5
+The Archer A7/C7 and Linksys WRT3200ACM profiles select `ufmodel/uhdiw.lua` instead: the **UAP-IW-HD**, the WiFi 5
 in-wall AP with the same five sockets, so a controller offers that board 802.11ac modes rather
 than the WiFi 6 ones it would push at a U6-InWall and openUF would have to clamp.  Its
 `platform`/`model` are `UHDIW`, and its `fw.ver` (`6.7.57.15670`) is the release-channel entry
@@ -771,6 +779,16 @@ also has a USB-C socket Ubiquiti marks "reserved for future use"; no inform fiel
 so openUF reports nothing and the controller sees it as it would on a real unit.  ⚠️ Adopted
 once so far, a Deco M4R v1 on 2026-10-18; the port questions in the file's header are still
 open, and the same fallback applies.
+
+The OpenWrt One profile selects `ufmodel/u6mp.lua`: the **U6 Mesh Pro**, the WiFi 6 AP with
+**two** sockets, chosen because the U6-InWall carries five and the UAP-AC-HD is WiFi 5.
+`platform`/`model` are `U6MP` (Ubiquiti's public device database; `UAP6MP` is the one-socket
+U6 Pro) and `fw.ver` (`8.8.14.20179`) is the catalog's release entry for that platform, subject
+to the same bare-version rule.  Ubiquiti's database lists the U6 Mesh Pro without the
+AP-with-a-switch capability the U6-InWall has, so the controller may show the second socket's
+wired clients and offer no per-port settings, or not read the port table at all.  ⚠️ No
+controller has adopted a device under this identity yet, and it needs Network 8.1.127 or newer;
+the same fallback applies.
 
 ### `/etc/config/openuf` (package installs)
 

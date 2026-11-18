@@ -109,7 +109,25 @@ return {
 		end
 	},
 	{
-		name = "ufmodel: every WiFi 5 identity has every field the validated u6iw identity has",
+		name = "ufmodel: u6mp is the U6 Mesh Pro with the catalog's bare firmware version",
+		fn = function()
+			-- The WiFi 6 TWO-socket identity, for the OpenWrt One. Same
+			-- sourcing rules as uhdiw and u7hd; the model code is the one
+			-- Ubiquiti's public device database gives the U6 Mesh Pro
+			-- (URL in the file header). UAP6MP would be the U6 Pro, a
+			-- one-socket AP, and is the typo this pins against.
+			local uap = dofile(UFMODEL_DIR .. "/u6mp.lua")
+			assert_eq(uap.model, "U6MP", "model is Ubiquiti's code for the U6 Mesh Pro")
+			assert_eq(uap.platform, "U6MP", "platform matches model, as u6iw's does")
+			assert_true(uap.fw.ver:match("^%d+%.%d+%.%d+%.%d+$") ~= nil,
+				"fw.ver is bare M.m.p.build, got " .. tostring(uap.fw.ver))
+			assert_eq(uap.fw.pre, "U6MP.", "discovery prefix is the model code plus a dot")
+			assert_true(uap.fw.buildtime:match("^%d%d%d%d%d%d%.%d%d%d%d$") ~= nil,
+				"fw.buildtime is YYMMDD.HHMM, got " .. tostring(uap.fw.buildtime))
+		end
+	},
+	{
+		name = "ufmodel: every later dual-band identity has every field the validated u6iw identity has",
 		fn = function()
 			-- u6iw is the identity validated end-to-end and the one
 			-- build_json / announce were written against. Every other
@@ -117,7 +135,7 @@ return {
 			-- read those two files make finds a value, rather than a default
 			-- that happens to say "U6IW".
 			local ref = dofile(UFMODEL_DIR .. "/u6iw.lua")
-			for _, name in ipairs({"uhdiw", "u7hd"}) do
+			for _, name in ipairs({"uhdiw", "u7hd", "u6mp"}) do
 				local uap = dofile(UFMODEL_DIR .. "/" .. name .. ".lua")
 				for k, v in pairs(ref) do
 					assert_not_nil(uap[k], name .. " carries u6iw's field " .. k)
@@ -130,7 +148,7 @@ return {
 		end
 	},
 	{
-		name = "ufmodel: every WiFi 5 identity builds a discovery packet that names the model and firmware",
+		name = "ufmodel: every later dual-band identity builds a discovery packet that names the model and firmware",
 		fn = function()
 			-- announce.lua catstr's five of the identity's strings into TLVs
 			-- with no nil check; a field the file forgot is a crash on the
@@ -140,7 +158,7 @@ return {
 			OPENUF_TEST_MODE = true
 			if not ufpkt then dofile("openuf/lib/lib.lua") end
 			local announce = dofile("openuf/announce.lua")
-			for _, id in ipairs({{"uhdiw", "UHDIW"}, {"u7hd", "U7HD"}}) do
+			for _, id in ipairs({{"uhdiw", "UHDIW"}, {"u7hd", "U7HD"}, {"u6mp", "U6MP"}}) do
 				local name, code = id[1], id[2]
 				local uap = dofile(UFMODEL_DIR .. "/" .. name .. ".lua")
 				local pkt = announce.build_packet({
