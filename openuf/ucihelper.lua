@@ -1191,6 +1191,10 @@ function M.wlan_add(radio, ssid, security, password, extra, network, wlanconf_id
 			-- handed to the binding as-is -- tostring() would write the
 			-- literal "table: 0x...". Same convention rf_config already uses
 			-- for basic_rate/supported_rates.
+			-- An empty one is no list: libuci-lua throws on {} (an allow
+			-- filter with no MAC yet failed the whole wifi push).
+			elseif type(v) == "table" and next(v) == nil then
+				cursor:delete("wireless", section_name, k)
 			elseif type(v) == "table" then
 				cursor:set("wireless", section_name, k, v)
 			else
