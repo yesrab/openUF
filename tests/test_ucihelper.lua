@@ -1596,6 +1596,29 @@ return {
 		end
 	},
 	{
+		-- The controller sends an allow filter with no MAC yet as an empty
+		-- list; libuci-lua refuses an empty table ("Cannot set an uci option to
+		-- an empty table value") and the whole wifi push failed. An empty list
+		-- is no maclist: ap.uc still writes the (empty) accept file, so nobody
+		-- joins, as on a UniFi AP.
+		name = "ucihelper: an allow filter with no MAC writes no maclist, never an empty table",
+		fn = function()
+			with_ucihelper(function(db)
+				local function push(list)
+					ucihelper.apply_config({radio_table = {}, vap_table = {
+						{ssid = "corp", radio = "radio0", security = "wpa2",
+						 x_passphrase = "hunter22", mac_filter_policy = "allow",
+						 mac_filter_list = list}}}, nil)
+				end
+				push({"02:11:22:33:44:55"})
+				push({})
+				local s = db.wireless.openuf_radio0_corp
+				assert_eq(s.macfilter, "allow", "the filter stays on")
+				assert_nil(s.maclist, "the old list is deleted, not set to {}")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: apply_config OMITS macfilter when the filter is off",
 		fn = function()
 			with_ucihelper(function(db)
