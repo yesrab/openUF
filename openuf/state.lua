@@ -94,6 +94,10 @@ local TYPED = {
 	static_netmask            = "string",
 	static_gateway            = "string",
 	static_dns                = "table",
+	-- Commit-confirm for a management address change: the old mode and
+	-- static_* values plus a snapshot, until a controller reply confirms
+	-- the new address (inform.lua _ip_rollback).
+	ip_rollback               = "table",
 	-- Live kernel state, not UCI, so it is reapplied from here at startup the
 	-- way the blocked-client rules are. locate_prev_trigger is the LED
 	-- trigger a Locate displaced, for the unset-locate that may arrive after
