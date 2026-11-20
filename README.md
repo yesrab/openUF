@@ -207,7 +207,7 @@ same goal. The protocol groundwork
 came from [amd989/unifi-gateway](https://github.com/amd989/unifi-gateway),
 [jeffreykog/unifi-inform-protocol](https://github.com/jeffreykog/unifi-inform-protocol) and
 [fxkr/unifi-protocol-reverse-engineering](https://github.com/fxkr/unifi-protocol-reverse-engineering).
-Security fixes and bug fixes by [Fantastic792](https://github.com/Fantastic792).
+Security fixes and bug fixes, the static IP fix among them, by [Fantastic792](https://github.com/Fantastic792).
 Built on [OpenWrt](https://openwrt.org/) and [LuCI](https://github.com/openwrt/luci).
 
 ## License
