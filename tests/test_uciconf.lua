@@ -103,6 +103,15 @@ return {
 				assert_not_nil(got, tostring(err))
 				assert_eq(got.dev.modelmap_name, "jiorouter-ax6000-jidu6j01", "the J family map")
 			end)
+			-- Community snapshots use the family string. The proposed OpenWrt
+			-- DTS files each use a SKU string for the same hardware layout.
+			for _, sku in ipairs({"6j11", "6111", "6411", "6611", "6711", "6811", "6911"}) do
+				with_board("jiorouter,ax6000-jidu" .. sku, function()
+					local got, err = uciconf.load(mock_cursor({main({})}), DEFAULTS)
+					assert_not_nil(got, tostring(err))
+					assert_eq(got.dev.modelmap_name, "jiorouter-ax6000-jidu6j11", "Qualcomm JIDU" .. sku)
+				end)
+			end
 			with_board("tplink,archer-c5-v1", function()
 				local got = uciconf.load(mock_cursor({main({modelmap = "auto"})}), DEFAULTS)
 				assert_eq(got.dev.modelmap_name, "archer-c5-v1", "a swconfig board")

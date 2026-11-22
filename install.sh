@@ -283,11 +283,13 @@ case "$ACTION" in
 		# this package was installed, at which point the very next config push
 		# created every VAP.
 		MISSING=""
-		for pkg in lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw; do
+		for pkg in lua lua-cjson luasocket lua-openssl luabitop libuci-lua; do
 			if ! pkg_installed "$pkg"; then
 				MISSING="$MISSING $pkg"
 			fi
 		done
+		# iw-full can supply iw without an exact package named iw.
+		command -v iw >/dev/null 2>&1 || MISSING="$MISSING iw"
 		if [ -n "$MISSING" ]; then
 			echo "Installing required packages:$MISSING"
 			pkg_add $MISSING || {

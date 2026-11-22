@@ -20,6 +20,7 @@
 	  deco-m4r-v4.lua                    TP-Link Deco M4R v4 (DSA, 2-band, 2 sockets named eth0/eth1; ⚠️ unverified)
 	  jiorouter-ax6000-jidu6101.lua      JioRouter AX6000       (DSA, 2-band)
 	  jiorouter-ax6000-jidu6j01.lua      JioRouter AX6000 J-fam (DSA, 2-band)
+	  jiorouter-ax6000-jidu6j11.lua      JioRouter AX6000 6J11 family (Qualcomm, 2-band)
 	  dynalink-dl-wrx36.lua              Dynalink DL-WRX36      (DSA, 2-band, 5 sockets; ⚠️ unverified)
 	  xiaomi-ax3000t.lua                 Xiaomi Mi Router AX3000T (DSA, 2-band)
 	  linksys-wrt3200acm.lua             Linksys WRT3200ACM     (DSA, 2-band + an unused third radio, 5 sockets; ⚠️ unverified)

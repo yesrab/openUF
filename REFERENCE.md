@@ -244,6 +244,13 @@ USB extroot or a custom build with the crypto baked into squashfs.  Known-workin
   adopted and in daily use since October 2026. Derived from the OpenWrt DTS plus the
   JIDU6101 profile, which is the same SoC and the same MT7976 radios, and inherits that
   board’s measured `dev.conf.radio` policy
+- **JioRouter AX6000 JIDU6J11 / JIDU6111 / JIDU6411 / JIDU6611 / JIDU6711 / JIDU6811 / JIDU6911**
+  (Qualcomm IPQ9554 / qualcommbe-ipq95xx, dual-band 802.11ax) — use
+  `modelmap/jiorouter-ax6000-jidu6j11.lua`. Matches the family string used by community
+  snapshots and the six SKU strings in [OpenWrt PR #26498](https://github.com/openwrt/openwrt/pull/26498).
+  The bridge, five socket netdevs and radios were checked on a JIDU6J11 snapshot.
+  Locate is disabled because OpenWrt assigns all three status LEDs. Controller provisioning
+  and individual SKU hardware remain unverified.
 - **Dynalink DL-WRX36** (dual-band 802.11ax, IPQ8072A / qualcommax-ipq807x) — use
   `modelmap/dynalink-dl-wrx36.lua`. Presents as a **U6-InWall**, like the JioRouter profiles: WiFi 6
   on two bands and five sockets, four GbE LAN and a 2.5 GbE WAN. Every socket is its own netdev, so

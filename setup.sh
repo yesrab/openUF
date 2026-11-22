@@ -961,6 +961,13 @@ pkg_update || warn "index refresh failed; installs below may not resolve"
 #                 shouted about at daemon startup rather than left to be
 #                 discovered by a day of debugging.
 REQUIRED="lua lua-cjson luasocket lua-openssl luabitop libuci-lua iw"
+# iw-full can supply iw without an exact package named iw.
+required_installed() {
+	case "$1" in
+		iw) command -v iw >/dev/null 2>&1 ;;
+		*)  pkg_installed "$1" ;;
+	esac
+}
 # OPTIONAL. Each absence silently disables exactly one feature -- provisioning
 # still reports success while the feature does nothing -- so they go in when
 # they fit rather than being merely mentioned.
@@ -986,12 +993,12 @@ case "$INFORM_URL" in https*) OPTIONAL="$OPTIONAL luasec" ;; esac
 [ "$OPT_ROAMING" = 1 ] && OPTIONAL="$OPTIONAL ucode-mod-socket kmod-veth"
 
 MISSING=""
-for p in $REQUIRED; do pkg_installed "$p" || MISSING="$MISSING $p"; done
+for p in $REQUIRED; do required_installed "$p" || MISSING="$MISSING $p"; done
 if [ -n "$MISSING" ]; then
 	info "required:$MISSING"
 	pkg_add_v $MISSING || warn "could not install all of:$MISSING"
 	STILL=""
-	for p in $MISSING; do pkg_installed "$p" || STILL="$STILL $p"; done
+	for p in $MISSING; do required_installed "$p" || STILL="$STILL $p"; done
 	if [ -n "$STILL" ]; then
 		die "these are required and could not be installed:$STILL
        Fix the package feeds (or free up flash) and re-run. Without
