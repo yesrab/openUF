@@ -269,6 +269,26 @@ return {
 		end
 	},
 	{
+		name = "modelmap: Qualcomm JIDU6J11 uses its own bridge, ports, radios and LED policy",
+		fn = function()
+			local dev = dofile(MODELMAP_DIR .. "/jiorouter-ax6000-jidu6j11.lua")
+			local net = dev.conf.net
+			assert_eq(net.lan_cpueth, "br-lan", "the bridge on the snapshot")
+			assert_eq(net.wan_cpueth, "wan", "WAN netdev from board.d")
+			assert_eq(net.uplink_detect, "fdb", "detect the uplink socket")
+			assert_eq(#net.ports, 5, "five sockets in the shared DTS")
+			for idx, name in ipairs({"lan1", "lan2", "lan3", "lan4", "wan"}) do
+				assert_eq(net.ports[idx].idx, idx, "stable controller port index")
+				assert_eq(net.ports[idx].ifname, name, "DTS port label")
+			end
+			assert_nil(dev.conf.vlan, "ports are netdevs")
+			assert_nil(dev.conf.led, "OpenWrt owns all three status LEDs")
+			assert_nil(dev.conf.radio, "no MediaTek radio policy")
+			assert_eq(dev.openuf.uap.ufmodel, "u6iw", "two-band WiFi 6 with five sockets")
+			assert_eq(table.concat(dev.openuf.uap.hwassign, ","), "radio0,radio1", "both ath11k radios")
+		end
+	},
+	{
 		name = "modelmap: uplink_detect is only ever asked for on the netdev shape",
 		fn = function()
 			-- The two uplink-detection paths read different sources (bridge FDB

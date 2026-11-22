@@ -94,6 +94,7 @@ Any dual-band OpenWrt device with **16 MB of flash or more** and about 5 MB free
 | TP-Link Archer C5 v1 | The reference device, confirmed end to end |
 | TP-Link TL-WDR3500 v1 | Confirmed; 8 MB flash, needs a custom image with the crypto built in |
 | JioRouter AX6000 JIDU6101 and JIDU6J01 family | Confirmed; WiFi 6, DSA, the project's own lab APs |
+| JioRouter AX6000 JIDU6J11 family | Qualcomm WiFi 6, five port netdevs. Hardware layout checked on a JIDU6J11 snapshot. Controller provisioning pending |
 | TP-Link Deco M4R v1 / v2 | Adopted and meshed on a v1 by a user |
 | Xiaomi Mi Router AX3000T | Confirmed upstream, WiFi 6 |
 | TP-Link Archer A7 v5 / C7 v4 / C7 v5 | From the OpenWrt sources, not yet run on the board |

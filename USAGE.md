@@ -485,6 +485,9 @@ dev = dofile("modelmap/jiorouter-ax6000-jidu6101.lua")
 -- For JioRouter AX6000 JIDU6J01 / 6201 / 6401 / 6601 / 6701 (one map, all five):
 dev = dofile("modelmap/jiorouter-ax6000-jidu6j01.lua")
 
+-- For the Qualcomm JioRouter AX6000 JIDU6J11 family (qualcommbe-ipq95xx):
+dev = dofile("modelmap/jiorouter-ax6000-jidu6j11.lua")
+
 -- For Dynalink DL-WRX36 (IPQ8072A / qualcommax — five sockets, one netdev each; presents as
 -- a U6-InWall like the JioRouters; pin br-lan's MAC before adopting, see the file's header):
 dev = dofile("modelmap/dynalink-dl-wrx36.lua")
