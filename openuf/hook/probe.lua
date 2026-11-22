@@ -271,6 +271,8 @@ function M.describe(dev, config, opts)
 		roam_assist_diff_db = c.roam_assist_diff_db, country_override = c.country_override,
 		bootstrap_adopt_user = c.bootstrap_adopt_user, debug_dump_file = c.debug_dump_file,
 		debug_dump_requests = c.debug_dump_requests, debug_dump_max_bytes = c.debug_dump_max_bytes,
+		igmp_snooping = c.igmp_snooping,
+		rts_threshold_ng = c.rts_threshold_ng, rts_threshold_na = c.rts_threshold_na,
 		state_file = c.state_file, unhandled_file = c.unhandled_file,
 		debug_overrides = (c.debug_caps ~= nil or c.debug_payload_extra ~= nil) or nil,
 	}

@@ -67,6 +67,7 @@ return {
 			local c = mock_cursor({main({modelmap = "jiorouter-ax6000-jidu6101",
 				use_only_unifi_wlan = "0", rrm_request_interval = "300", inform_url = "http://c:8080/inform",
 				debug_dump_file = "", keep_wlan_section = {"a", "b"}, country_override = "SE",
+				igmp_snooping = "1", rts_threshold_ng = "500",
 				plugin = "rrb-unifi"})})
 			local got, err = uciconf.load(c, DEFAULTS)
 			assert_not_nil(got, tostring(err))
@@ -80,6 +81,9 @@ return {
 			assert_eq(got.config.neighbour_scan_interval, 0, "including numbers")
 			assert_eq(#got.config.keep_wlan_sections, 2, "a list arrives as a list")
 			assert_eq(got.config.country_override, "SE", "optional strings")
+			assert_eq(got.config.igmp_snooping, true, "igmp_snooping is a boolean option")
+			assert_eq(got.config.rts_threshold_ng, 500, "an RTS threshold per band is a number")
+			assert_nil(got.config.rts_threshold_na, "and absent for the band left out")
 			assert_eq(got.dev.modelmap_name, "jiorouter-ax6000-jidu6101", "the named preset")
 			assert_eq(got.dev.conf.net.lan_cpueth, "br-lan", "and its fields")
 			assert_nil(got.uap, "no custom identity")

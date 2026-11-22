@@ -127,20 +127,29 @@ return {
 			w = sat.window(w, {packets = 200, retries = 60, dropped = 0}, 1050)
 			assert_nil(w.mov, "50 s: still not")
 			w = sat.window(w, {packets = 300, retries = 70, dropped = 2}, 1060)
-			assert_eq(w.mov.tries, 200, "60 s: frames over the minute")
+			assert_eq(w.mov.tries, 258,
+				"60 s: attempts over the minute, 198 delivered (200 less 2 dropped) plus 60 retries")
 			assert_eq(w.mov.retries, 60, "retries over the minute")
 			assert_eq(w.mov.dropped, 2, "drops over the minute")
 			w = sat.window(w, {packets = 900, retries = 700, dropped = 2}, 1110)
-			assert_eq(w.mov.tries, 200, "the minute holds until the next one completes")
+			assert_eq(w.mov.tries, 258, "the minute holds until the next one completes")
 			w = sat.window(w, {packets = 1000, retries = 700, dropped = 2}, 1120)
-			assert_eq(w.mov.tries, 700, "next minute")
+			assert_eq(w.mov.tries, 1330, "next minute: 700 delivered plus 630 retries")
 			assert_eq(w.mov.retries, 630, "next minute's retries")
 			w = sat.window(w, {packets = 5, retries = 0, dropped = 0}, 1130)
 			assert_nil(w.mov, "counters going backwards: a new association starts over")
 			w = sat.window(w, {packets = 50, retries = 1}, 1190)
 			assert_eq(w.mov.dropped, 0, "no drop counter: 0")
 			local kept = sat.window(w, {}, 1200)
-			assert_eq(kept.mov.tries, 45, "a sample without counters keeps the last minute")
+			assert_eq(kept.mov.tries, 46, "a sample without counters keeps the last minute (45 delivered, 1 retry)")
+			-- A U6 Pro's wifi_tx_attempts_mov counts the retries in, so the
+			-- firmware's retries / attempts can never pass 100 %: a minute
+			-- of 100 frames and 30 retries is 23 %, under the 25 % where
+			-- points start to go.
+			local m = sat.window(sat.window(nil, {packets = 0, retries = 0, dropped = 0}, 0),
+				{packets = 100, retries = 30, dropped = 0}, 60).mov
+			assert_eq(m.tries, 130, "100 delivered + 30 retries")
+			assert_eq((sat.retry_score(m.tries, m.retries, m.dropped)), 100, "23 % costs nothing")
 		end
 	},
 	{

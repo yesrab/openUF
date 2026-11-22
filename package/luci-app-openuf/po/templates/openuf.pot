@@ -90,12 +90,19 @@ msgstr ""
 msgid "%ds ago"
 msgstr ""
 
+#: htdocs/luci-static/resources/view/openuf/overview.js:319
+msgid ""
+"%s (the installed version is not a release, so the two cannot be compared)"
+msgstr ""
+
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:586
 msgid "%s ago"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:248
-#: htdocs/luci-static/resources/view/openuf/overview.js:252
+#: htdocs/luci-static/resources/view/openuf/overview.js:288
+#: htdocs/luci-static/resources/view/openuf/overview.js:294
+#: htdocs/luci-static/resources/view/openuf/overview.js:376
+#: htdocs/luci-static/resources/view/openuf/overview.js:380
 msgid "%s failed: %s"
 msgstr ""
 
@@ -124,6 +131,14 @@ msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:575
 msgid "%s used · %s free of %s"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:315
+msgid "%s, published %s"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:317
+msgid "%s: this device is up to date"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/overview.js:89
@@ -213,7 +228,7 @@ msgstr ""
 msgid "AES-GCM, as current controllers require"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:331
+#: htdocs/luci-static/resources/view/openuf/overview.js:459
 msgid ""
 "Add-ons that change the wireless settings the controller pushes. Fast "
 "roaming with genuine UniFi access points is one (rrb-unifi, by d-malinowski)."
@@ -292,7 +307,7 @@ msgstr ""
 msgid "Automatic (this board: %s)"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:229
+#: htdocs/luci-static/resources/view/openuf/overview.js:357
 msgid "BSSID"
 msgstr ""
 
@@ -332,8 +347,9 @@ msgid "CPU port of the WAN"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/overview.js:135
-#: htdocs/luci-static/resources/view/openuf/overview.js:264
-#: htdocs/luci-static/resources/view/openuf/overview.js:294
+#: htdocs/luci-static/resources/view/openuf/overview.js:283
+#: htdocs/luci-static/resources/view/openuf/overview.js:392
+#: htdocs/luci-static/resources/view/openuf/overview.js:422
 #: htdocs/luci-static/resources/view/openuf/settings.js:199
 msgid "Cancel"
 msgstr ""
@@ -347,6 +363,14 @@ msgstr ""
 msgid "Channels allowed for automatic selection"
 msgstr ""
 
+#: htdocs/luci-static/resources/view/openuf/overview.js:332
+msgid "Check again"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:332
+msgid "Check for updates"
+msgstr ""
+
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:326
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:371
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:514
@@ -354,6 +378,7 @@ msgid "Clients"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/overview.js:141
+#: htdocs/luci-static/resources/view/openuf/overview.js:234
 #: htdocs/luci-static/resources/view/openuf/settings.js:571
 msgid "Close"
 msgstr ""
@@ -387,11 +412,11 @@ msgstr ""
 msgid "Controller configuration"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:326
+#: htdocs/luci-static/resources/view/openuf/overview.js:454
 msgid "Controller connection"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:359
+#: htdocs/luci-static/resources/view/openuf/overview.js:487
 msgid "Controller features not supported yet"
 msgstr ""
 
@@ -473,7 +498,7 @@ msgstr ""
 msgid "Disabled"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:298
+#: htdocs/luci-static/resources/view/openuf/overview.js:426
 msgid "Done. The device is ready to be adopted again."
 msgstr ""
 
@@ -557,7 +582,7 @@ msgstr ""
 msgid "Firmware version"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:316
+#: htdocs/luci-static/resources/view/openuf/overview.js:444
 msgid ""
 "Fix it on the Settings page or in /etc/config/openuf and restart openUF."
 msgstr ""
@@ -582,13 +607,13 @@ msgid ""
 "reboot) and empty this field when done."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:297
-#: htdocs/luci-static/resources/view/openuf/overview.js:299
-#: htdocs/luci-static/resources/view/openuf/overview.js:302
+#: htdocs/luci-static/resources/view/openuf/overview.js:425
+#: htdocs/luci-static/resources/view/openuf/overview.js:427
+#: htdocs/luci-static/resources/view/openuf/overview.js:430
 msgid "Forget the controller"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:291
+#: htdocs/luci-static/resources/view/openuf/overview.js:419
 msgid "Forget the controller?"
 msgstr ""
 
@@ -610,6 +635,7 @@ msgid "Gateway, this device, its radios and networks"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/overview.js:147
+#: htdocs/luci-static/resources/view/openuf/overview.js:296
 msgid "Go ahead"
 msgstr ""
 
@@ -660,6 +686,10 @@ msgstr ""
 msgid "Installed"
 msgstr ""
 
+#: htdocs/luci-static/resources/view/openuf/overview.js:320
+msgid "Installed version"
+msgstr ""
+
 #: htdocs/luci-static/resources/view/openuf/overview.js:140
 msgid "Installing"
 msgstr ""
@@ -672,7 +702,7 @@ msgstr ""
 msgid "Interface whose address identifies the device"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:321
+#: htdocs/luci-static/resources/view/openuf/overview.js:449
 msgid ""
 "It has no 802.11v support, which every network from the controller needs. "
 "Replace it with the full build under \"Software openUF needs\" below."
@@ -717,6 +747,10 @@ msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:591
 msgid "Last failure"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:320
+msgid "Latest release"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/settings.js:197
@@ -807,7 +841,7 @@ msgstr ""
 msgid "Network"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:226
+#: htdocs/luci-static/resources/view/openuf/overview.js:354
 msgid "Network name"
 msgstr ""
 
@@ -871,7 +905,7 @@ msgstr ""
 msgid "None connected"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:223
+#: htdocs/luci-static/resources/view/openuf/overview.js:351
 msgid ""
 "None yet. The controller sends its WiFi networks once the device is adopted."
 msgstr ""
@@ -888,7 +922,7 @@ msgstr ""
 msgid "Nothing to export: %s"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:269
+#: htdocs/luci-static/resources/view/openuf/overview.js:397
 msgid "Nothing was changed:"
 msgstr ""
 
@@ -903,7 +937,7 @@ msgid ""
 "such per-socket view."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:230
+#: htdocs/luci-static/resources/view/openuf/overview.js:358
 msgid "On air"
 msgstr ""
 
@@ -960,11 +994,11 @@ msgstr ""
 msgid "Platform code"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:341
+#: htdocs/luci-static/resources/view/openuf/overview.js:469
 msgid "Plugin"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:330
+#: htdocs/luci-static/resources/view/openuf/overview.js:458
 #: htdocs/luci-static/resources/view/openuf/settings.js:326
 msgid "Plugins"
 msgstr ""
@@ -1004,7 +1038,7 @@ msgid ""
 "vacated at any time."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:227
+#: htdocs/luci-static/resources/view/openuf/overview.js:355
 msgid "Radio"
 msgstr ""
 
@@ -1027,7 +1061,7 @@ msgstr ""
 msgid "Rate"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:272
+#: htdocs/luci-static/resources/view/openuf/overview.js:400
 #: htdocs/luci-static/resources/view/openuf/settings.js:212
 msgid "Rebooting"
 msgstr ""
@@ -1040,15 +1074,15 @@ msgstr ""
 msgid "Replace hostapd with the full build and install the missing packages"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:283
+#: htdocs/luci-static/resources/view/openuf/overview.js:411
 msgid "Restart"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:285
+#: htdocs/luci-static/resources/view/openuf/overview.js:413
 msgid "Restart openUF"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:275
+#: htdocs/luci-static/resources/view/openuf/overview.js:403
 msgid "Restore the router configuration and reboot"
 msgstr ""
 
@@ -1060,7 +1094,7 @@ msgstr ""
 msgid "SSH account for adoption"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:287
+#: htdocs/luci-static/resources/view/openuf/overview.js:415
 msgid "Scan"
 msgstr ""
 
@@ -1068,17 +1102,17 @@ msgstr ""
 msgid "Scan for nearby networks every (seconds)"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:289
+#: htdocs/luci-static/resources/view/openuf/overview.js:417
 msgid "Scan for nearby networks now"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:288
+#: htdocs/luci-static/resources/view/openuf/overview.js:416
 msgid ""
 "Scan requested. openUF sweeps every radio within the next ten seconds and "
 "reports the result to the controller; clients notice a short pause."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:228
+#: htdocs/luci-static/resources/view/openuf/overview.js:356
 msgid "Security"
 msgstr ""
 
@@ -1105,7 +1139,7 @@ msgstr ""
 msgid "Socket"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:379
+#: htdocs/luci-static/resources/view/openuf/overview.js:507
 msgid "Software openUF needs"
 msgstr ""
 
@@ -1114,7 +1148,11 @@ msgstr ""
 msgid "Standard"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:342
+#: htdocs/luci-static/resources/view/openuf/overview.js:232
+msgid "Starting."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:470
 msgid "State"
 msgstr ""
 
@@ -1159,7 +1197,7 @@ msgstr ""
 msgid "Take an address from the network's DHCP server (recommended)"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:325
+#: htdocs/luci-static/resources/view/openuf/overview.js:453
 msgid ""
 "Testing overrides are active in conf.lua (debug_caps or "
 "debug_payload_extra): the device is telling the controller it supports "
@@ -1184,7 +1222,7 @@ msgid ""
 "configuration."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:380
+#: htdocs/luci-static/resources/view/openuf/overview.js:508
 msgid ""
 "The OpenWrt packages openUF works through, and the hostapd build. The openuf "
 "package brings every one of them in except the hostapd build, which OpenWrt "
@@ -1211,7 +1249,7 @@ msgid ""
 "notice as a short pause."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:262
+#: htdocs/luci-static/resources/view/openuf/overview.js:390
 msgid ""
 "The configuration files backed up when the device was converted are put back "
 "and the services that were enabled then are enabled again, then the device "
@@ -1227,12 +1265,12 @@ msgid ""
 "the LAN."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:361
+#: htdocs/luci-static/resources/view/openuf/overview.js:489
 msgid ""
 "The controller has not sent anything this version of openUF does not handle."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:360
+#: htdocs/luci-static/resources/view/openuf/overview.js:488
 msgid ""
 "The controller has sent %d kinds of setting or command that this version of "
 "openUF does not act on. That is normal: openUF records them in %s (passwords "
@@ -1244,7 +1282,7 @@ msgstr ""
 msgid "The conversion was refused, nothing was changed:"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:292
+#: htdocs/luci-static/resources/view/openuf/overview.js:420
 msgid ""
 "The device forgets its adoption and the controller's address, and the "
 "controller shows it as disconnected until it is adopted again. The device is "
@@ -1252,7 +1290,7 @@ msgid ""
 "start."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:273
+#: htdocs/luci-static/resources/view/openuf/overview.js:401
 msgid "The device reboots now and comes back as a router."
 msgstr ""
 
@@ -1270,6 +1308,11 @@ msgstr ""
 msgid ""
 "The fixed address must be written as address/prefix, for example "
 "192.168.1.20/24."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:511
+msgid ""
+"The latest openUF release on GitHub. Nothing is looked up until you ask."
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/settings.js:311
@@ -1292,6 +1335,18 @@ msgid ""
 "openUF is restarted. The device needs internet access for this."
 msgstr ""
 
+#: htdocs/luci-static/resources/view/openuf/overview.js:263
+msgid ""
+"The page lost contact with the device. The update may still have finished: "
+"reload the page and look at the installed version."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:277
+msgid ""
+"The release archive is downloaded from GitHub, checked against the checksum "
+"published with it and installed over the current files, keeping conf.lua."
+msgstr ""
+
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:288
 msgid "The service is not running"
 msgstr ""
@@ -1302,7 +1357,27 @@ msgid ""
 "the others; openUF never assumes the cable is in it."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:374
+#: htdocs/luci-static/resources/view/openuf/overview.js:254
+msgid ""
+"The update has not reported an end. Reload the page and look at the "
+"installed version; the log below says how far it got."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:281
+msgid ""
+"Then openUF is restarted. The controller sees a pause of a few seconds; WiFi "
+"clients stay connected, and the configuration and the adoption are kept. If "
+"the new version does not start, the previous one is put back. The device "
+"needs internet access for this."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:278
+msgid ""
+"These packages are downloaded from GitHub, checked against the checksums "
+"published with them and installed: %s."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:502
 msgid ""
 "This OpenWrt device presents itself to a UniFi Network Application as a "
 "Ubiquiti access point. This page refreshes every ten seconds."
@@ -1312,7 +1387,7 @@ msgstr ""
 msgid "This access point"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:327
+#: htdocs/luci-static/resources/view/openuf/overview.js:455
 msgid "This device"
 msgstr ""
 
@@ -1369,7 +1444,7 @@ msgstr ""
 msgid "Troubleshooting"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:278
+#: htdocs/luci-static/resources/view/openuf/overview.js:406
 msgid "Turn back into a router"
 msgstr ""
 
@@ -1379,7 +1454,7 @@ msgid ""
 "Takes effect on the next page load."
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:261
+#: htdocs/luci-static/resources/view/openuf/overview.js:389
 msgid "Turn this device back into a router?"
 msgstr ""
 
@@ -1420,6 +1495,18 @@ msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:512
 msgid "Up"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:274
+msgid "Update to %s"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:510
+msgid "Updates"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:231
+msgid "Updating openUF to %s"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:276
@@ -1476,6 +1563,10 @@ msgstr ""
 msgid "Waiting for %s"
 msgstr ""
 
+#: htdocs/luci-static/resources/view/openuf/overview.js:266
+msgid "Waiting for LuCI to come back."
+msgstr ""
+
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:289
 msgid "Waiting for a controller"
 msgstr ""
@@ -1486,6 +1577,10 @@ msgid ""
 "access point's state and where it is managed from, with openUF's settings "
 "behind the root password; LuCI is reached from there and offers \"Exit LuCI "
 "mode\" to go back."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:322
+msgid "What changed"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/settings.js:297
@@ -1522,12 +1617,16 @@ msgstr ""
 msgid "WiFi behaviour"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:328
+#: htdocs/luci-static/resources/view/openuf/overview.js:456
 msgid "WiFi networks from the controller"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/settings.js:517
 msgid "Widest channel width to use"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:257
+msgid "Working."
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/settings.js:361
@@ -1536,6 +1635,10 @@ msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/settings.js:399
 msgid "Written as vendor,model"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:328
+msgid "`openuf ota --check` produced nothing"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/overview.js:176
@@ -1556,6 +1659,10 @@ msgstr ""
 msgid "all"
 msgstr ""
 
+#: htdocs/luci-static/resources/view/openuf/overview.js:308
+msgid "asking GitHub"
+msgstr ""
+
 #: htdocs/luci-static/resources/view/openuf/settings.js:405
 msgid "bridge"
 msgstr ""
@@ -1572,6 +1679,10 @@ msgstr ""
 
 #: htdocs/luci-static/resources/view/status/include/05_openuf.js:44
 msgid "configuration error, see Services → openUF"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:312
+msgid "could not be checked"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/overview.js:178
@@ -1619,7 +1730,7 @@ msgstr ""
 msgid "last 5 minutes"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:347
+#: htdocs/luci-static/resources/view/openuf/overview.js:475
 msgid "loaded"
 msgstr ""
 
@@ -1685,11 +1796,15 @@ msgstr ""
 msgid "not adopted yet"
 msgstr ""
 
+#: htdocs/luci-static/resources/view/openuf/overview.js:310
+msgid "not checked yet"
+msgstr ""
+
 #: htdocs/luci-static/resources/view/openuf/overview.js:174
 msgid "not from a package"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:348
+#: htdocs/luci-static/resources/view/openuf/overview.js:476
 msgid "not loaded: %s"
 msgstr ""
 
@@ -1699,6 +1814,10 @@ msgstr ""
 
 #: htdocs/luci-static/resources/view/status/include/05_openuf.js:40
 msgid "not running: hostapd is a basic build, see Services → openUF"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:244
+msgid "not updated"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/overview.js:200
@@ -1718,12 +1837,12 @@ msgstr ""
 msgid "one network interface per socket"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:373
+#: htdocs/luci-static/resources/view/openuf/overview.js:501
 #: root/usr/share/luci/menu.d/luci-app-openuf.json:16
 msgid "openUF"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:314
+#: htdocs/luci-static/resources/view/openuf/overview.js:442
 msgid "openUF cannot start because its configuration does not load:"
 msgstr ""
 
@@ -1737,7 +1856,7 @@ msgstr ""
 msgid "openUF is not running"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:320
+#: htdocs/luci-static/resources/view/openuf/overview.js:448
 msgid "openUF is not running: hostapd is a basic build (%s)."
 msgstr ""
 
@@ -1745,7 +1864,7 @@ msgstr ""
 msgid "openUF log"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:284
+#: htdocs/luci-static/resources/view/openuf/overview.js:412
 msgid ""
 "openUF restarted. The controller sees a pause of a few seconds and nothing "
 "else changes."
@@ -1792,7 +1911,7 @@ msgstr ""
 msgid "running"
 msgstr ""
 
-#: htdocs/luci-static/resources/view/openuf/overview.js:348
+#: htdocs/luci-static/resources/view/openuf/overview.js:476
 msgid "see the system log"
 msgstr ""
 
@@ -1824,11 +1943,16 @@ msgstr ""
 msgid "the basic build"
 msgstr ""
 
+#: htdocs/luci-static/resources/view/openuf/overview.js:288
+msgid "the update did not start"
+msgstr ""
+
 #: htdocs/luci-static/resources/view/openuf/settings.js:426
 msgid "trigger %s"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/overview.js:105
+#: htdocs/luci-static/resources/view/openuf/overview.js:303
 msgid "unknown"
 msgstr ""
 
@@ -1838,6 +1962,10 @@ msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/dashboard.js:446
 msgid "up %s"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/openuf/overview.js:244
+msgid "updated"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/openuf/settings.js:425

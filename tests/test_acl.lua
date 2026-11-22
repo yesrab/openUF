@@ -24,4 +24,20 @@ return {
 			end
 		end
 	},
+	{
+		-- `openuf ota`: looking is read, installing is write, and the only
+		-- form a session may start is the detached one with a tag.
+		name = "acl: read can check for an update and follow one; only write can start it",
+		fn = function()
+			local a = acl()
+			if not a then return end
+			assert_true(a.read.file["/usr/bin/openuf ota --check"] ~= nil, "read: --check")
+			assert_true(a.read.file["/usr/bin/openuf ota --status"] ~= nil, "read: --status")
+			for cmd in pairs(a.read.file) do
+				assert_nil(cmd:find("ota --start", 1, true), "read must not start an update: " .. cmd)
+				assert_nil(cmd:find("ota --install", 1, true), "nor run one: " .. cmd)
+			end
+			assert_true(a.write.file["/usr/bin/openuf ota --start --tag *"] ~= nil, "write: --start --tag")
+		end
+	},
 }

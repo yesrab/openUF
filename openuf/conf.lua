@@ -244,6 +244,32 @@ config = {
 	-- (logfwd.lua) sealed with the controller's key. Needs lua-openssl.
 	encrypted_syslog = false,
 
+	-- IGMP/MLD snooping on the LAN bridge and on openUF's VLAN bridges, as a
+	-- UniFi AP runs its own bridges: a multicast group a client joined (IPTV,
+	-- a casting stream) goes only to the WLANs with a member, where a bridge
+	-- without snooping sends it out of every SSID at the lowest rate. Off by
+	-- default, which is OpenWrt's own setting. true writes it to the running
+	-- bridges only (never to /etc/config/network) and keeps it there; back
+	-- to false and a restart switches off what openUF switched on. Without a
+	-- multicast querier on the network nothing is pruned and nothing breaks.
+	-- mDNS and the other link-local groups are never pruned. Not yet run on
+	-- an AP from this tree (mcsnoop.lua).
+	igmp_snooping = false,
+
+	-- RTS/CTS, per band: frames longer than this many bytes are announced
+	-- with an RTS first. A UniFi AP turns RTS on (enablertscts on a U6 Pro);
+	-- OpenWrt leaves it off. It costs a little airtime per frame and saves
+	-- whole retransmissions where clients cannot hear each other (two ends
+	-- of a house on one 2.4 GHz channel), so it is worth a try on a band
+	-- whose clients show high TX retries and useless on a clean one. nil
+	-- (the default) leaves the radio as it is; 0-2347, where 500 is a common
+	-- starting point and 2347 means off. Written as the radio's UCI `rts`
+	-- at the controller's next configuration push; nil again removes it at
+	-- the push after. The effect on mt76 has not been measured from this
+	-- tree: compare a client's TX retries before and after.
+	rts_threshold_ng = nil,   -- 2.4 GHz
+	rts_threshold_na = nil,   -- 5 GHz
+
 	-- Roaming Assistant (controller: WLAN -> Advanced, 5 GHz): how much louder,
 	-- in dB, another AP must hear a weak client before openUF moves it there.
 	-- The threshold itself comes from the controller.

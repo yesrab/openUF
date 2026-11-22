@@ -3340,6 +3340,44 @@ Wiphy phy2
 		end
 	},
 	{
+		-- A U6 Pro runs RTS on (enablertscts 0x21); OpenWrt leaves it off.
+		-- config.rts_threshold_ng / _na reach rf_config as opts.rts_threshold.
+		name = "ucihelper: an RTS threshold is written per band, stamped, and removed with the option",
+		fn = function()
+			with_ucihelper(function(db)
+				seed_radios({"radio0", "radio1"})
+				local c = ucihelper._uci.cursor()
+				c:set("wireless", "radio0", "band", "2g")
+				c:set("wireless", "radio1", "band", "5g")
+				c:set("wireless", "radio1", "rts", "1000")   -- the operator's own
+				local function push(t)
+					for _, r in ipairs({"radio0", "radio1"}) do
+						ucihelper.rf_config(r, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+							{rts_threshold = t})
+					end
+				end
+				push({ng = 500})
+				assert_eq(db.wireless.radio0.rts, "500", "2.4 GHz gets its threshold")
+				assert_eq(db.wireless.radio0.openuf_rts, "1", "and the stamp")
+				assert_eq(db.wireless.radio1.rts, "1000", "5 GHz, not named, keeps the operator's value")
+				assert_nil(db.wireless.radio1.openuf_rts, "unstamped")
+				push({ng = 500.9, na = 2347})
+				assert_eq(db.wireless.radio0.rts, "500", "whole bytes")
+				assert_eq(db.wireless.radio1.rts, "2347", "5 GHz named: written")
+				push({ng = 9999, na = -1})
+				assert_nil(db.wireless.radio0.rts, "out of 0-2347 is no threshold: ours is removed")
+				assert_nil(db.wireless.radio0.openuf_rts, "with its stamp")
+				assert_nil(db.wireless.radio1.rts, "likewise below 0")
+				push({ng = 800})
+				push(nil)
+				assert_nil(db.wireless.radio0.rts, "the option gone: the radio is as OpenWrt ships it")
+				c:set("wireless", "radio0", "rts", "700")
+				push(nil)
+				assert_eq(db.wireless.radio0.rts, "700", "a hand-set rts is never removed")
+			end)
+		end
+	},
+	{
 		name = "ucihelper: a country override programs the driver but reports the controller's",
 		fn = function()
 			with_ucihelper(function(db)

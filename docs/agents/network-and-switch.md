@@ -55,3 +55,9 @@ The bridge-MAC and `lan_cpueth` rules are in [device-maps.md](device-maps.md).
   before the port, port out before the guard, one atomic `nft -f` (not `util.nft_apply`,
   whose fallback deletes the table first). Never move that port into UCI: netifd would
   bring it up at boot, before any guard exists.
+- **IGMP snooping is sysfs, never `/etc/config/network`** (`mcsnoop.lua`, `config.igmp_snooping`).
+  `br-lan`'s `config device` belongs to the installer or the operator; the three values a U6 Pro
+  sets are written to the running bridge and re-checked once a minute because netifd re-creating
+  a bridge loses them. The ledger (`/var/run/openuf.mcsnoop`) lists only bridges openUF switched
+  from 0, so "off" never stops snooping somebody else turned on. `multicast_querier` is written 0
+  on those, as the firmware has it; a bridge that snooped already keeps its own querier.

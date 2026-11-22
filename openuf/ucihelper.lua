@@ -1596,6 +1596,8 @@ end
 --                         WLAN on it has the controller's "Force WiFi 4 Mode"
 --                         on -- see apply_config, where it is collected per
 --                         radio.
+--   opts.rts_threshold    {ng = n, na = n}: the RTS threshold per band
+--                         (config.rts_threshold_*), written as UCI `rts`.
 --   opts.country_override ISO 3166-1 alpha-2 regdomain to program into UCI
 --                         INSTEAD of the controller's, decoupling what the
 --                         driver enforces from what the controller is told.
@@ -1897,6 +1899,22 @@ function M.rf_config(radio, htmode, chan, txpwr, minrssi_enabled, minrssi_raw, r
 			and (tostring(eff_chan) == "auto" or tostring(eff_chan) == "0")
 			and not (policy and policy.acs_exclude_dfs) then
 		cursor:set("wireless", radio, "acs_exclude_dfs", acs_exclude_dfs and "1" or "0")
+	end
+	-- RTS/CTS (config.rts_threshold_ng / _na, conf.lua): the radio's UCI
+	-- `rts`, which both wifi generators hand to `iw phy set rts`. A U6 Pro
+	-- runs with RTS on (cfg80211tool enablertscts 0x21, dyn_bw_rts 1) and
+	-- OpenWrt with it off. Stamped, so that taking the option away removes
+	-- only an `rts` openUF wrote and never one the operator set by hand. A
+	-- value outside 0-2347 (802.11's range; 2347 is "never") is ignored like
+	-- an absent one. A radio whose band is unknown gets none.
+	local rts = type(opts) == "table" and type(opts.rts_threshold) == "table"
+		and band and tonumber(opts.rts_threshold[band]) or nil
+	if rts and rts >= 0 and rts <= 2347 then
+		cursor:set("wireless", radio, "rts", tostring(math.floor(rts)))
+		cursor:set("wireless", radio, "openuf_rts", "1")
+	elseif cursor:get("wireless", radio, "openuf_rts") then
+		cursor:delete("wireless", radio, "rts")
+		cursor:delete("wireless", radio, "openuf_rts")
 	end
 	-- The ACS candidate list, UCI `channels` (24.10's generator reads that
 	-- list; 25.12's schema declares it as the alias of `chanlist`, which is
@@ -2233,7 +2251,10 @@ function M.apply_config(resp, cfg, opts)
 				 acs_exclude_dfs = radio.acs_exclude_dfs,
 				 acs_blacklist = radio.acs_blacklist,
 				 country_override = cfg and cfg.config
-					and cfg.config.country_override or nil})
+					and cfg.config.country_override or nil,
+				 rts_threshold = cfg and cfg.config and {
+					ng = cfg.config.rts_threshold_ng,
+					na = cfg.config.rts_threshold_na} or nil})
 		end
 	end
 
@@ -3021,6 +3042,7 @@ local FORGET_RADIO_OPTS  = {"minrssi_enabled", "minrssi_rssi", "loadbalance_maxs
 local FORGET_RADIO_STAMP = {
 	openuf_minrssi = {"rssi_reject_assoc_rssi", "rssi_ignore_probe_request"},
 	openuf_rates   = {"basic_rate", "supported_rates", "legacy_rates", "beacon_rate"},
+	openuf_rts     = {"rts"},
 }
 
 -- Undo what apply_config wrote, for a controller "Forget" (setdefault) or a

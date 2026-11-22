@@ -358,6 +358,31 @@ touched, and a daemon restart between two ten-second informs is invisible to bot
 controller and the clients (`wifi reload` only ever happens on a config push). Three ways
 to run that, from the least to the most involved:
 
+**To the latest release, from the device or from LuCI.** `openuf ota` asks GitHub for the
+latest published release and installs it, whichever way the device was installed:
+
+```sh
+openuf ota --check      # JSON: installed version, latest release, whether it is newer
+openuf ota --install    # update now; --tag v0.4.2 for a named release, --force to reinstall
+```
+
+In LuCI it is *Services → openUF → Overview → Updates*: **Check for updates** shows the
+installed version next to the latest release, and **Update to x.y.z** installs it and shows
+the log while it runs. Nothing is looked up until you press the button.
+
+What it installs depends on the install. A package install (`/usr/lib/openuf`) gets the
+release's packages for its package manager (`openuf`, and `luci-app-openuf` and
+`luci-theme-halo` where those are installed and changed); a tarball install (`/opt/openuf`)
+gets the release archive through `openuf-update`, below. Every file is checked against the
+sha256 GitHub publishes for it before anything is installed, and a download whose TLS
+certificate cannot be verified is refused. openUF is then restarted and the update waits
+for the new daemon's first completed cycle: a controller that does not answer is reported
+and the update kept, a daemon that does not run is rolled back to the version that was
+installed (its packages are downloaded first, for that purpose). `/etc/config/openuf`,
+`conf.lua` and `state.json` are never touched, the radios are not restarted, and no
+re-adoption is needed. Run in a test VM on 2026-11-22 (0.4.0 → 0.4.1 from the command line
+and from the button, and a forced rollback); the tarball path has not been run.
+
 **On the device.** `install.sh` installs the updater as `openuf-update`:
 
 ```sh
@@ -808,7 +833,7 @@ address; see § 2, "The device page".
 |---|---|
 | `modelmap` | `auto` (the shipped profile that declares this board), a profile name from `/usr/lib/openuf/modelmap/`, or `custom` (the `device`, `port`, `vlan`, `swport` and `radio` sections) |
 | `ufmodel` | `auto` (the profile's own identity), a name from `/usr/lib/openuf/ufmodel/`, or `custom` (the `identity` section) |
-| `inform_url`, `use_only_unifi_wlan`, `keep_wlan_section` (a list), `l2_announce`, `neighbour_scan_interval`, `rrm_enrichment`, `rrm_request_interval`, `assoc_tracker`, `neighbour_list`, `apply_rollback`, `device_login`, `encrypted_syslog`, `roam_assist_diff_db`, `country_override`, `bootstrap_adopt_user`, `debug_dump_file`, `debug_dump_requests`, `debug_dump_max_bytes`, `state_file`, `unhandled_file` | The `conf.lua` option of the same name, below. Booleans are `1`/`0`; an empty string clears an optional one |
+| `inform_url`, `use_only_unifi_wlan`, `keep_wlan_section` (a list), `l2_announce`, `neighbour_scan_interval`, `rrm_enrichment`, `rrm_request_interval`, `assoc_tracker`, `neighbour_list`, `apply_rollback`, `device_login`, `encrypted_syslog`, `roam_assist_diff_db`, `igmp_snooping`, `rts_threshold_ng`, `rts_threshold_na`, `country_override`, `bootstrap_adopt_user`, `debug_dump_file`, `debug_dump_requests`, `debug_dump_max_bytes`, `state_file`, `unhandled_file` | The `conf.lua` option of the same name, below. Booleans are `1`/`0`; an empty string clears an optional one |
 
 A custom hardware profile is the modelmap's fields as UCI sections -- one `port` section
 per RJ45 socket (`idx`, then `ifname` on DSA or `swport` on swconfig), a `vlan` section
@@ -855,6 +880,9 @@ config = {
     device_login = false,        -- create the controller's Device SSH login (§ 6d)
     encrypted_syslog = false,    -- claim "this controller, encrypted" remote logging (§ 6d)
     roam_assist_diff_db = 8,     -- Roaming Assistant: dB another AP must hear a client louder
+    igmp_snooping = false,       -- IGMP/MLD snooping on the bridges, as a UniFi AP (see below)
+    rts_threshold_ng = nil,      -- RTS/CTS threshold in bytes, 2.4 GHz (see below)
+    rts_threshold_na = nil,      -- the same for 5 GHz
     country_override = nil,      -- see below
     bootstrap_adopt_user = nil,  -- see below
 }
@@ -982,6 +1010,28 @@ is a sane value. The first scan happens one interval after start, never at boot.
 `roam_assist_diff_db` — Roaming Assistant's margin: how many dB louder another AP must hear
 a weak client before openUF moves it there (default 8). The threshold itself is the
 controller's per-WLAN setting; see § 6.
+
+`igmp_snooping` — IGMP/MLD snooping on the LAN bridge and on openUF's VLAN bridges, the way a
+UniFi AP runs its own (`multicast_snooping 1`, no querier, `hash_max 2048`; read from a U6
+Pro on 8.8.14). A multicast group a client has joined then goes only to the WLANs that have a
+member; without snooping the bridge sends it out of every SSID at the lowest rate. Off by
+default, as on OpenWrt. `true` (UCI: `option igmp_snooping '1'`) writes the three values to
+the running bridges only, never to `/etc/config/network`, and checks them once a minute;
+`false` and a restart switches off what openUF switched on, and leaves a bridge that was
+snooping already as it was. It matters only where there is multicast to prune (IPTV, a
+casting stream) and a querier on the network (most gateways with IGMP proxy or snooping
+on); mDNS and the other link-local groups are always flooded. Not yet run on an AP from
+this tree.
+
+`rts_threshold_ng` / `rts_threshold_na` — RTS/CTS per band (2.4 GHz / 5 GHz): a frame longer
+than this many bytes is announced with an RTS first. A UniFi AP has RTS on, OpenWrt has it
+off. Worth trying on a band whose clients show high TX retries because they cannot hear each
+other; on a clean band it only costs airtime. `nil` (the default) leaves the radio alone;
+`0`-`2347`, with `500` a common starting point. It becomes the radio's UCI `rts` at the
+controller's next configuration push (`tools/hotpatch.sh --repush`, or any change in the
+controller), which restarts that radio once, and is removed again the push after the option
+is taken away. An `rts` you set by hand is never touched. The effect on mt76 has not been
+measured from this tree: compare a client's TX retries before and after.
 
 `rrm_enrichment` / `rrm_request_interval` — client-assisted neighbour discovery, adopted
 from upstream. Every `rrm_request_interval` seconds (default 600; upstream moved to 3600
