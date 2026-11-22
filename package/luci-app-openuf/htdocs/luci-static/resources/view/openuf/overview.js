@@ -217,6 +217,134 @@ function softwareBlock(s) {
 	return E('div', {}, parts);
 }
 
+// Updates: nothing is asked of GitHub until the button is pressed. `openuf
+// ota --check` (hook/openuf-ota.sh) says what is installed, what the latest
+// release is and what an update would install; `--start` runs the update
+// detached, because installing luci-app-openuf restarts the rpcd and uhttpd
+// this page talks through, and `--status` is polled until it has finished.
+// Rendered once, outside the polled block (see render()).
+function otaCall(args, type) {
+	return fs.exec_direct('/usr/bin/openuf', [ 'ota' ].concat(args), type || 'json', false, true);
+}
+
+function otaProgress(target) {
+	const title = _('Updating openUF to %s').format(target);
+	const note = E('p', { 'class': 'spinning' }, _('Starting.'));
+	const log = E('pre', {}, '');
+	const close = E('div', { 'class': 'right' }, E('button', { 'class': 'btn', 'click': function() { window.location.reload(); } }, _('Close')));
+	ui.showModal(title, [ note, log ]);
+	let misses = 0, polls = 0;
+	const tick = function() {
+		return otaCall([ '--status' ]).then(function(st) {
+			misses = 0;
+			st = st || {};
+			log.textContent = st.log || '';
+			if (st.state == 'done' || st.state == 'failed') {
+				const parts = [ E('p', {}, E('span', { 'class': 'label ' + (st.state == 'done' ? 'success' : 'danger') },
+					st.state == 'done' ? _('updated') : _('not updated'))) ];
+				if (st.message)
+					parts.push(E('p', {}, st.message));
+				parts.push(log, close);
+				ui.showModal(title, parts);
+				return;
+			}
+			// An update takes two or three minutes. One that still reports
+			// no end after fifteen is not left spinning without a way out.
+			if (++polls > 300) {
+				ui.showModal(title, [ E('p', {}, _('The update has not reported an end. Reload the page and look at the installed version; the log below says how far it got.')), log, close ]);
+				return;
+			}
+			note.textContent = st.message || _('Working.');
+			window.setTimeout(tick, 3000);
+		}).catch(function() {
+			// The web server and rpcd restart while LuCI's own package is
+			// installed: a few unanswered polls are expected.
+			if (++misses > 40) {
+				ui.showModal(title, [ E('p', {}, _('The page lost contact with the device. The update may still have finished: reload the page and look at the installed version.')), log, close ]);
+				return;
+			}
+			note.textContent = _('Waiting for LuCI to come back.');
+			window.setTimeout(tick, 3000);
+		});
+	};
+	window.setTimeout(tick, 1500);
+}
+
+function otaButton(info) {
+	const label = _('Update to %s').format(info.latest);
+	return E('button', { 'class': 'btn cbi-button cbi-button-positive', 'click': function() {
+		const what = (info.kind == 'tarball')
+			? _('The release archive is downloaded from GitHub, checked against the checksum published with it and installed over the current files, keeping conf.lua.')
+			: _('These packages are downloaded from GitHub, checked against the checksums published with them and installed: %s.').format(arr(info.packages).join(', '));
+		ui.showModal(label, [
+			E('p', {}, what),
+			E('p', {}, _('Then openUF is restarted. The controller sees a pause of a few seconds; WiFi clients stay connected, and the configuration and the adoption are kept. If the new version does not start, the previous one is put back. The device needs internet access for this.')),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')), ' ',
+				E('button', { 'class': 'btn cbi-button-positive', 'click': ui.createHandlerFn(this, function() {
+					return otaCall([ '--start', '--tag', info.tag ]).then(function(r) {
+						if (!r || !r.started) {
+							ui.hideModal();
+							ui.addNotification(null, E('p', _('%s failed: %s').format(label, (r && r.error) || _('the update did not start'))), 'danger');
+							return;
+						}
+						otaProgress(info.latest);
+					}).catch(function(e) {
+						ui.hideModal();
+						ui.addNotification(null, E('p', _('%s failed: %s').format(label, e.message || e)), 'danger');
+					});
+				}) }, _('Go ahead'))
+			])
+		]);
+	} }, label);
+}
+
+function updateBlock(s) {
+	const installed = s.version ? '%s (%s)'.format(s.version, s.build || '') : (s.build || _('unknown'));
+	const out = E('div', {});
+	const draw = function(info, busy) {
+		let latest, extra = null;
+		if (busy)
+			latest = E('em', { 'class': 'spinning' }, _('asking GitHub'));
+		else if (!info)
+			latest = E('em', {}, _('not checked yet'));
+		else if (info.error && !info.latest)
+			latest = E('span', { 'class': 'label warning' }, _('could not be checked'));
+		else if (info.newer === true)
+			latest = E('span', { 'class': 'label notice' }, info.published
+				? _('%s, published %s').format(info.latest, info.published.substring(0, 10)) : info.latest);
+		else if (info.newer === false)
+			latest = E('span', { 'class': 'label success' }, _('%s: this device is up to date').format(info.latest));
+		else
+			latest = E('span', { 'class': 'label' }, _('%s (the installed version is not a release, so the two cannot be compared)').format(info.latest));
+		const rows = [ [ _('Installed version'), installed ], [ _('Latest release'), latest ] ];
+		if (info && info.url && info.latest)
+			rows.push([ _('What changed'), E('a', { 'href': info.url, 'target': '_blank', 'rel': 'noreferrer' }, info.url) ]);
+		if (info && info.error)
+			extra = E('p', {}, info.error);
+		const check = E('button', { 'class': 'btn cbi-button', 'disabled': busy ? '' : null, 'click': function() {
+			draw(null, true);
+			return otaCall([ '--check' ]).then(function(r) {
+				draw((r && typeof r == 'object') ? r : { error: _('`openuf ota --check` produced nothing') });
+			}).catch(function(e) {
+				draw({ error: String(e.message || e) });
+			});
+		} }, info ? _('Check again') : _('Check for updates'));
+		const buttons = [ check ];
+		// Also when the two cannot be compared (newer is null): the latest
+		// release can still be installed over a build that is not one.
+		if (info && info.latest && info.tag && !info.error && info.newer !== false)
+			buttons.push(' ', otaButton(info));
+		const parts = [ table(rows) ];
+		if (extra)
+			parts.push(extra);
+		parts.push(E('div', {}, buttons));
+		dom.content(out, parts);
+	};
+	draw(null);
+	return out;
+}
+
 function wlanBlock(s) {
 	const w = arr(s.wlans);
 	if (!w.length)
@@ -378,7 +506,10 @@ return view.extend({
 			// after which the page reloads.
 			section(_('Software openUF needs'), softwareBlock(status),
 				_('The OpenWrt packages openUF works through, and the hostapd build. The openuf package brings every one of them in except the hostapd build, which OpenWrt cannot express as a dependency.')),
-			// Polled on its own so it can sit below the software section.
+			// Not polled: its answer comes from the button, never from a timer.
+			section(_('Updates'), updateBlock(status),
+				_('The latest openUF release on GitHub. Nothing is looked up until you ask.')),
+			// Polled on its own so it can sit below the unpolled sections.
 			E('div', { 'id': 'openuf-ledger' }, ledgerBlock(status)),
 			actions(status)
 		]);

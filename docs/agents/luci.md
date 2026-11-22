@@ -33,3 +33,9 @@ prefixes and `/etc/config/openuf` are in [installers.md](installers.md).
 - **A LuCI MultiValue/ListValue with no choices throws and blanks the whole page**
   (`Cannot convert undefined or null to object` in ui.js): build such an option only when
   there is something to choose (settings.js' radio picker on a board with no radio).
+- **The overview's Updates section never asks GitHub by itself, and its update outlives the
+  request that started it.** `openuf ota --check` runs on the button only; `--start` is
+  detached and `--status` is polled (see installers.md, "Changing `openuf-ota.sh`"). The ACL
+  splits them: `--check` and `--status` under read, `--start --tag *` under write
+  (`tests/test_acl.lua`). `dom.content()` renders a `null` in its list as the text "null":
+  build the list without it.

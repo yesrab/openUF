@@ -148,6 +148,46 @@ a leftover `/etc/init.d/openuf-rrb`; the veth sections an old build wrote
 `ft_iface` vanishes fails), and `inform._migrate_legacy_rrb` asks the controller for that push
 at startup. `install.sh uninstall` still removes both.
 
+## Changing `openuf-ota.sh` (`openuf ota`, the LuCI "Check for updates" button)
+
+The updater to the latest RELEASE, for both install kinds: a package install gets the
+release's `.apk`/`.ipk` files, a tarball install the release archive through `openuf-update`.
+`--check` and `--status` print JSON for the overview page; `--start` is the detached run the
+page uses and `--install` the foreground one.
+
+- **`uclient-fetch` on 25.12 cannot download from `github.com`.** The TLS handshake stalls
+  for 30 s and ends in "Connection timed out", on the test VM and on AP2 alike (2026-11-22,
+  libustream-mbedtls), while `api.github.com`, `codeload.github.com` and
+  `raw.githubusercontent.com` answer at once. Release files are therefore fetched from the
+  API's own address for the asset (`.../releases/assets/<id>` with `Accept:
+  application/octet-stream`, which redirects to the file); the plain download URL is only the
+  second try. `update.sh` is unaffected (codeload). Anything else in the tree that fetches
+  `github.com/<repo>/releases/download/...` on the device is suspect for the same reason.
+- **Everything in the release JSON is hostile until the Lua parser has passed it.** Tag, file
+  names and both URLs end up on command lines: the parser lets through a version-shaped tag,
+  names of `[A-Za-z0-9._-]` and URLs that are exactly this repository's download and API
+  asset addresses. Keep new fields behind the same kind of check.
+- **No fallback to an unverified download, and no install without a checksum.** GitHub
+  publishes a sha256 per asset (`digest`); a file without one, or that does not match, stops
+  the update before anything is installed. `setup.sh`'s `--no-check-certificate` retry is
+  for a first install at a keyboard; this runs unattended as root.
+- **The detached run exists because the update restarts the page's own plumbing.**
+  `luci-app-openuf`'s postinst HUPs rpcd and may restart uhttpd; `--start` copies the script
+  to `/tmp` (the package replaces the file a shell is still reading) and runs it with its
+  output in `/tmp/openuf-ota.log`, and the page polls `--status`, tolerating two minutes of
+  unanswered polls. A `--check` uses its own scratch directory so it cannot remove a running
+  update's files.
+- **The way back is the installed version's own release**, downloaded before the install
+  (`--plan-of`, `PLAN_ALL=1`: every installed package, also one whose version did not
+  change). `apk add --allow-untrusted <older files>` downgrades (run on the VM);
+  `opkg` needs `--force-downgrade` and has not been run. A daemon that runs but gets no
+  answer is KEPT, as in `update.sh`: the old version would face the same controller.
+- **apk does not restart a running service on upgrade** (`start` on an unchanged procd
+  instance is a no-op), so the script restarts openUF itself and re-enables it when it was
+  enabled before.
+- Run on the VM 2026-11-22: 0.4.0 → 0.4.1 by command line and by the button, and a rollback
+  forced with an unloadable configuration. Not run: opkg, the tarball path, a real AP.
+
 ## Landmines
 
 - **Two install prefixes, one rule for the configuration.** The OpenWrt package installs

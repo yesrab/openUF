@@ -49,6 +49,12 @@
 				"/usr/bin/openuf 11k-scan": [
 					"exec"
 				],
+				"/usr/bin/openuf ota --check": [
+					"exec"
+				],
+				"/usr/bin/openuf ota --status": [
+					"exec"
+				],
 				"/proc/cpuinfo": [
 					"read"
 				]
@@ -69,6 +75,9 @@
 					"exec"
 				],
 				"/usr/bin/openuf deps --install *": [
+					"exec"
+				],
+				"/usr/bin/openuf ota --start --tag *": [
 					"exec"
 				],
 				"/etc/init.d/openuf restart": [

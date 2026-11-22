@@ -14,6 +14,10 @@
 #                               basic wpad for a full one (hook/openuf-deps.sh)
 #   openuf bootstrap-account    create the ubnt/ubnt adoption login
 #                               (hook/openuf-bootstrap.sh)
+#   openuf ota --check | --install | --start | --status
+#                               update to the latest release from GitHub: what is
+#                               installed and what is published, and the update
+#                               itself (hook/openuf-ota.sh)
 #
 # The set-*/reset-*/11k-scan verbs are syswrapper.sh's, the hook the
 # controller itself drives over SSH; this wrapper only saves typing its name.
@@ -27,7 +31,7 @@ for d in /usr/lib/openuf /opt/openuf; do
 done
 
 usage() {
-	sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "$1" in
@@ -67,6 +71,11 @@ case "$1" in
 		[ -n "$DIR" ] || { echo "openuf: not installed" >&2; exit 1; }
 		shift
 		exec "$DIR/hook/openuf-deps.sh" "$@"
+		;;
+	ota)
+		[ -n "$DIR" ] || { echo "openuf: not installed" >&2; exit 1; }
+		shift
+		exec sh "$DIR/hook/openuf-ota.sh" "$@"
 		;;
 	bootstrap-account)
 		[ -n "$DIR" ] || { echo "openuf: not installed" >&2; exit 1; }

@@ -146,7 +146,7 @@ opkg install ./openuf_<ver>_all.ipk ./luci-app-openuf_<ver>_all.ipk         # Op
 openuf deps --install        # swaps a wpad-basic build for the full one
 ```
 
-Upgrades: `openuf-update` on the device, or install the next release's packages. The
+Upgrades: `openuf ota --install` on the device or *Check for updates* on the LuCI overview (the latest release, checksum-verified, rolled back if it does not start); `openuf-update` for a branch or a local archive. The
 [usage guide](USAGE.md) covers configuration, the device page, upgrading, uninstalling and
 troubleshooting.
 

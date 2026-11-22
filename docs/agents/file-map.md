@@ -61,6 +61,8 @@ openuf/
                     hostapd's rrm_nr_set; inert where usteer runs
   devlogin.lua      Device SSH Authentication (opt-in): the pushed users.* login as a uid-0
                     account, only after adoption, only accounts it made
+  mcsnoop.lua       IGMP/MLD snooping (config.igmp_snooping, opt-in): a U6 Pro's three bridge
+                    values on the LAN bridge and br-openuf<vid>, sysfs only, ledger in /var/run
   l2guard.lua       the ebtables.* block as nft `bridge openuf_l2guard`: BPDU and 802.1Q
                     drop on the AP VAPs only; intent + names in state.json for the reboot
   backhaul.lua      the mesh (wireless uplink): plan of the WDS downlink/uplink sections,
@@ -81,7 +83,9 @@ openuf/
                     openuf-convert.sh (/usr/sbin/openuf-convert: setup.sh's AP
                     conversion as --check/--convert/--revert), openuf-deps.sh
                     (/usr/sbin/openuf-deps, `openuf deps`: what openUF needs
-                    installed as JSON and the basic-to-full wpad swap)
+                    installed as JSON and the basic-to-full wpad swap), openuf-ota.sh
+                    (`openuf ota`: the latest GitHub release, checked and installed
+                    for either install kind; the LuCI overview's Updates section)
   etc/init.d/openuf procd service: announce + inform instances; finds either prefix
 package/            the OpenWrt feed: openuf (net/), luci-app-openuf (the LuCI pages, the device
                     page htdocs/openuf/ and its gate root/usr/share/ucode/openuf/gate.uc) and

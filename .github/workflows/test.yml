@@ -98,6 +98,8 @@ jobs:
           dash -n update.sh
           dash -n tools/deploy.sh
           bash -n openuf/hook/openuf-deps.sh && dash -n openuf/hook/openuf-deps.sh
+          bash -n openuf/hook/openuf-ota.sh && dash -n openuf/hook/openuf-ota.sh
+          bash -n openuf/hook/openuf-cli.sh && dash -n openuf/hook/openuf-cli.sh
           bash -n openuf/hook/openuf-rrb.sh && dash -n openuf/hook/openuf-rrb.sh
           bash -n openuf/etc/init.d/openuf-rrb || true  # rc.common sourcing, as openuf's
           # The LuCI packages' uci-defaults run under busybox ash on the device.
