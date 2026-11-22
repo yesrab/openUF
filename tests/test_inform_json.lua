@@ -826,8 +826,12 @@ return {
 			-- the permanent "TX Retries: High (100%)" on the Devices view.
 			local d = build({with_uci = true, with_clients = true})
 			local vap, rs = d.vap_table[1], d.radio_table_stats[1]
-			assert_eq(vap.wifi_tx_attempts, vap.tx_packets,
-				"attempts are the frames sent, retries not included, as sta_table defines them")
+			-- A U6 Pro's vap_table (8.8.14 mca-dump): wifi_tx_attempts ==
+			-- tx_total - wifi_tx_dropped + tx_retries, exactly.
+			assert_eq(vap.wifi_tx_attempts, vap.tx_packets - vap.wifi_tx_dropped + vap.tx_retries,
+				"attempts are the frames delivered plus the retries, as sta_table defines them")
+			assert_eq(vap.tx_total, vap.tx_packets, "tx_total: every frame, delivered or dropped")
+			assert_eq(vap.tx_combined_retries, vap.tx_retries, "no RTS retries from mac80211")
 			assert_eq(vap.wifi_tx_dropped, vap.tx_dropped, "dropped is the driver's drop count")
 			assert_eq(rs.wifi_tx_attempts, vap.wifi_tx_attempts,
 				"radio sums its VAPs' attempts")
@@ -1008,16 +1012,22 @@ return {
 			-- The client panel's "TX Retries" is the controller's delta of
 			-- tx_retries over retries + wifi_tx_attempts + dropped (devmgr
 			-- TtZhv): without tx_retries per station it read 0.0 % for
-			-- every client. Attempts are the 287 frames sent; 4 retries.
+			-- every client. 287 frames, 4 retries. As a U6 Pro on 8.8.14
+			-- sends them (19 stations of 19 in its mca-dump):
+			-- wifi_tx_attempts == wifi_tx_success + tx_retries and
+			-- tx_total == wifi_tx_success + wifi_tx_dropped.
 			local st = sta_table[1]
 			assert_eq(st.tx_retries, 4, "tx_retries is sent per station")
-			assert_eq(st.wifi_tx_attempts, 287, "wifi_tx_attempts = tx_packets, retries not included")
 			assert_not_nil(st.wifi_tx_dropped, "wifi_tx_dropped is sent per station")
+			assert_eq(st.tx_total, 287, "tx_total = tx_packets")
+			assert_eq(st.wifi_tx_success, 287 - st.wifi_tx_dropped, "delivered = total less dropped")
+			assert_eq(st.wifi_tx_attempts, st.wifi_tx_success + 4, "attempts = delivered + retries")
+			assert_eq(st.tx_combined_retries, 4, "tx_combined_retries: no RTS retries to add")
 			-- exact value round-trips through cjson's %.14g float encoding,
 			-- so compare with a tolerance rather than bit-for-bit equality
 			assert_true(math.abs(st.wifi_tx_retries_percentage
-				- 4 * 100 / (287 + 4 + st.wifi_tx_dropped)) < 1e-10,
-				"wifi_tx_retries_percentage = retries / (retries + attempts + dropped)")
+				- 4 * 100 / (st.wifi_tx_attempts + st.wifi_tx_dropped)) < 1e-10,
+				"wifi_tx_retries_percentage = retries / (attempts + dropped)")
 			-- satisfaction (satisfaction.lua): signal avg -63 dBm is far
 			-- above the noise floor (100), the mean of 144.4 and 72.2
 			-- Mbit/s is 108300 kbps (90), and the retry window has no
@@ -3376,11 +3386,13 @@ return {
 			end
 			step(c, 100, 40, 5)
 			local score, reason, anomalies = inform_once(c)
-			assert_eq(score, 50, "the minute: 40 % retries -> 80, less 30 drops")
+			-- 600 frames, 30 of them dropped, 240 retries: 810 attempts
+			-- (570 delivered + 240 retries), 29 % -> 95, less 30 drops.
+			assert_eq(score, 65, "the minute: 240 retries in 810 attempts -> 95, less 30 drops")
 			assert_eq(reason, 16, "reason: wifi_retries")
-			assert_eq(anomalies, 0, "50 is not yet an anomaly")
+			assert_eq(anomalies, 0, "65 is not an anomaly")
 			step(c, 100, 0, 0)
-			assert_eq(inform_once(c), 50, "the minute's score holds until the next one")
+			assert_eq(inform_once(c), 65, "the minute's score holds until the next one")
 
 			-- mt76's tx failed counts failed attempts, not drops.
 			inform._sta_stats_cache = {}
@@ -3389,11 +3401,11 @@ return {
 			inform_once(c)
 			for _ = 1, 6 do step(c, 100, 40, 40) end
 			t = t + 50
-			assert_eq(inform_once(c), 80, "mt76: retries judged, failed attempts not counted as drops")
+			assert_eq(inform_once(c), 96, "mt76: 240 retries in 840 attempts, failed attempts not counted as drops")
 			assert_eq(last_vap.tx_dropped, 0, "nor in the VAP's drops")
 			for _ = 1, 6 do step(c, 100, 40, 42) end
 			t = t + 50
-			assert_eq(inform_once(c), 68, "mt76: failed beyond the retries are drops: 80 less 12")
+			assert_eq(inform_once(c), 84, "mt76: failed beyond the retries are drops: 96 less 12")
 			assert_eq(last_vap.tx_dropped, 12, "and the VAP reports those 12, not 492")
 			assert_eq(last_vap.wifi_tx_dropped, 12, "as does the pair the controller divides")
 			-- An underflowed counter (count - 1 with count 0) is no 2^32 retries.

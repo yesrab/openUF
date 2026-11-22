@@ -5430,6 +5430,32 @@ return {
 		end
 	},
 	{
+		name = "inform: _mcsnoop_resync hands the option and the LAN bridge to mcsnoop once a minute",
+		fn = function()
+			local orig = {mc = inform._mcsnoop, time = inform._time, lb = inform._sysinfo.lan_bridge}
+			local seen = {}
+			inform._mcsnoop = {resync = function(on, br) seen[#seen + 1] = {on, br}; return 3 end}
+			inform._sysinfo.lan_bridge = function(ifname) return ifname == "lan1" and "br-lan" or nil end
+			local now = 9000
+			inform._time = function() return now end
+			inform._mcsnoop_next = 0
+			local first = inform._mcsnoop_resync({config = {igmp_snooping = true}, net = {lan_cpueth = "lan1"}})
+			now = now + 10
+			local too_soon = inform._mcsnoop_resync({config = {igmp_snooping = true}})
+			now = now + 60
+			inform._mcsnoop_resync({config = {}, net = {lan_cpueth = "eth9"}})
+			inform._mcsnoop, inform._time, inform._sysinfo.lan_bridge = orig.mc, orig.time, orig.lb
+			inform._mcsnoop_next = 0
+			assert_eq(first, 3, "the values mcsnoop wrote")
+			assert_eq(too_soon, 0, "rate-limited")
+			assert_eq(#seen, 2, "two passes in 70 s")
+			assert_true(seen[1][1], "on")
+			assert_eq(seen[1][2], "br-lan", "a socket named as lan_cpueth resolves to its bridge")
+			assert_false(seen[2][1], "the option absent is off, so an earlier run is undone")
+			assert_nil(seen[2][2], "an unresolvable LAN bridge is passed as none")
+		end
+	},
+	{
 		name = "inform: _hairpin_resync checks once a minute, whether or not the ebtables block was pushed",
 		fn = function()
 			local orig = {l2 = inform._l2guard, time = inform._time}

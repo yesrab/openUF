@@ -16,7 +16,9 @@
 	           umac.ko); mac80211 has no equivalent, so they score 100, which
 	           is what the firmware's own formula gives with no TCP seen
 	  wifi_retries
-	           retries per frame over the last full minute: <=25 % -> 100,
+	           retries per attempt over the last full minute (an attempt is
+	           a frame delivered or a retry, as wifi_tx_attempts_mov counts
+	           them on a U6 Pro, 8.8.14): <=25 % -> 100,
 	           then down to 0 at 100 %; minus one point per frame dropped in
 	           that minute
 	  wifi_latency
@@ -89,8 +91,8 @@ function M.phy_score(tx_kbps, rx_kbps)
 	return 100, false
 end
 
--- tries/retries/dropped: the last minute's frames sent, retries and frames
--- dropped. Returns the score and whether it is a high_wifi_retries anomaly.
+-- tries/retries/dropped: the last minute's attempts (frames delivered plus
+-- retries, the firmware's wifi_tx_attempts_mov), retries and frames dropped. Returns the score and whether it is a high_wifi_retries anomaly.
 function M.retry_score(tries, retries, dropped)
 	tries, retries, dropped = tries or 0, retries or 0, dropped or 0
 	if retries > tries then return 0, true end
@@ -127,7 +129,11 @@ end
 -- The per-minute window behind the retry term. prev: this station's last
 -- state (nil for a new one); cur: {packets, retries, dropped} lifetime
 -- counters. Returns the new state, whose mov = {tries, retries, dropped} is
--- the last completed minute's deltas (nil before the first one). A counter
+-- the last completed minute's deltas (nil before the first one). tries are
+-- the attempts as inform.lua reports them in wifi_tx_attempts: the frames
+-- delivered (packets less the dropped) plus the retries. Until 2026-11-22
+-- they were the packets alone, so a client at 30 retries per 100 frames
+-- read 30 % and lost points where the firmware reads 23 % and takes none. A counter
 -- going backwards is a new association: the window restarts.
 function M.window(prev, cur, now)
 	local base = prev and prev.base
@@ -145,7 +151,9 @@ function M.window(prev, cur, now)
 	end
 	return {
 		base = {t = now, packets = cur.packets, retries = cur.retries, dropped = dropped},
-		mov = {tries = cur.packets - base.packets, retries = cur.retries - base.retries,
+		mov = {tries = math.max((cur.packets - base.packets) - (dropped - base.dropped), 0)
+				+ (cur.retries - base.retries),
+			retries = cur.retries - base.retries,
 			dropped = dropped - base.dropped},
 	}
 end

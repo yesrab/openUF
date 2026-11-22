@@ -130,3 +130,8 @@ WLAN or a radio (`usteer`, `roamassist`, `shaper`, `minrssi`, `loadbalance`, `wl
   never assign the list. RADIUS MAC authentication fails CLOSED (a WLAN that cannot have its
   ACL is skipped, loudly); Hotspot 2.0 lists are raw lines; MAC-based VLANs write the accept
   file BEFORE pointing hostapd at it. A `wpad-basic-*` has no RADIUS client: warn, never gate.
+- **`rts` on a radio is the operator's unless `openuf_rts` is stamped.** `config.rts_threshold_ng`
+  / `_na` reach `rf_config` as `opts.rts_threshold` and are written only with the stamp; the
+  option taken away removes only a stamped value, and `forget` does the same. They are config
+  options and not modelmap radio policy on purpose: `dev.conf.radio` comes from UCI only for a
+  `custom` map, and both production APs run a preset. Nothing here has been measured on mt76.
