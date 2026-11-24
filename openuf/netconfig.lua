@@ -12,7 +12,7 @@
 	All operations are safe no-ops without an iface (unconfigured hardware),
 	matching led.lua/ucihelper.lua's convention.
 
-	Where it lands (plan v2.0 Task 9b): given the UCI interface name
+	Where it lands: given the UCI interface name
 	(dev.conf.net.lan_name) and a libuci that knows it, the address is written
 	to network.<name> and netifd is reloaded -- persistent, and on the L3
 	device netifd runs rather than a bridge port. Otherwise (no libuci, no

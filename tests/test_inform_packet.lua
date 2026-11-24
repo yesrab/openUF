@@ -9876,4 +9876,30 @@ return {
 			if not ok then error(err, 0) end
 		end
 	},
+	{
+		name = "inform packet: a static IP netconfig could not apply is not recorded",
+		fn = function()
+			local nc = inform._netconfig
+			local o = {nc.snapshot, nc.apply_static}
+			local ok, err = pcall(with_tick_env, function()
+				nc.snapshot = function() return {addrs = {}, dns = {}} end
+				-- e.g. the UCI commit failed (overlay full): nothing changed
+				nc.apply_static = function() return false end
+				inform._time = function() return 1000 end
+				inform._announce.get_mac = function() return {2, 0, 0, 0, 0, 1} end
+				local st = sample_state({ip_mode = "dhcp", ip = "192.0.2.10"})
+				with_stderr(function()
+					inform.handle_response('{"_type":"setparam","system_cfg":"netconf.1.ip=198.51.100.50\n'
+						.. 'netconf.1.netmask=255.255.255.0\nresolv.nameserver.1.ip=198.51.100.1\n"}',
+						st, {net = {lan_cpueth = "eth0", lan_name = "lan"}})
+				end)
+				assert_eq(st.ip_mode, "dhcp", "ip_mode")
+				assert_eq(st.static_ip, nil, "static_ip")
+				assert_eq(st.static_dns, nil, "static_dns")
+				assert_eq(st.ip, "192.0.2.10", "ip")
+			end)
+			nc.snapshot, nc.apply_static = o[1], o[2]
+			if not ok then error(err, 0) end
+		end
+	},
 }

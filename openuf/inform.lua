@@ -4821,11 +4821,19 @@ function M.handle_response(json_str, st, cfg)
 					-- the same hazard as the flush+re-lease guarded above.
 					st.static_dns = nil
 				else
-					st.ip_mode = "static"
-					st.static_ip, st.static_netmask, st.static_gateway = ip, netmask, gateway
-					st.static_dns = (#dns > 0) and dns or nil
-					if M._netconfig.apply_static(iface, ip, netmask, gateway, dns, ifname) then
-						st.ip = ip  -- known directly, no need to re-read the interface
+					local applied = M._netconfig.apply_static(iface, ip, netmask, gateway, dns, ifname)
+					-- A failed apply (UCI commit refused, overlay full) is not
+					-- recorded: state.json would claim a static address that
+					-- is not there and _reapply_static_ip would retry it at
+					-- every start. With no interface configured nothing was
+					-- tried, so the controller's assignment is still kept.
+					if applied or not iface then
+						st.ip_mode = "static"
+						st.static_ip, st.static_netmask, st.static_gateway = ip, netmask, gateway
+						st.static_dns = (#dns > 0) and dns or nil
+						if applied then st.ip = ip end  -- known directly, no need to re-read the interface
+					else
+						io.stderr:write("inform: static IP " .. ip .. " not applied; IP Settings left as they were\n")
 					end
 				end
 				-- Save NOW, not at the end of the function with everything
